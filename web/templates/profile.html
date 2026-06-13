@@ -1,0 +1,190 @@
+<!-- Copyright (C) 2026 Zhang Yangming. MIT License -->
+{% extends "base.html" %}
+{% block title %}人物锐评{% endblock %}
+{% block content %}
+<h2 class="mb-4">🎯 AI 人物锐评</h2>
+
+{% if not api_ok %}
+<div class="alert alert-warning">⚠️ 请先配置 DeepSeek API Key 以使用 AI 分析功能</div>
+{% endif %}
+
+<div id="profileLoading" class="text-center py-5 d-none">
+    <div class="spinner-border text-primary" role="status"></div>
+    <p class="mt-2 text-muted">AI 正在深度分析人物性格，请稍候...</p>
+</div>
+
+<div id="profileContent">
+    <div class="row" id="selfProfile"></div>
+    <div class="row" id="otherProfile"></div>
+</div>
+
+<div class="text-center py-5" id="profilePlaceholder">
+    <div style="font-size: 4rem;">🎯</div>
+    <p class="mt-3 text-muted">点击下方按钮，让 AI 对双方进行深度性格锐评</p>
+    <button class="btn btn-lg btn-primary" onclick="runProfile()">🚀 开始锐评</button>
+</div>
+
+<script>
+function runProfile() {
+    $('#profilePlaceholder').hide();
+    $('#profileLoading').removeClass('d-none');
+    $('#profileContent').empty();
+
+    $.post('/api/analyze/profile', function(data) {
+        if (data.error) {
+            $('#profileLoading').html('<div class="alert alert-danger">' + data.error + '</div>');
+            return;
+        }
+        $('#profileLoading').addClass('d-none');
+        sessionStorage.setItem('ai_profile', JSON.stringify(data));
+        renderProfile(data);
+    }).fail(function(xhr) {
+        $('#profileLoading').html('<div class="alert alert-danger">' + (xhr.responseJSON?.error || '请求失败') + '</div>');
+    });
+}
+
+function renderProfile(data) {
+    var html = '';
+    ['self', 'other'].forEach(function(key) {
+        var d = data[key];
+        if (!d) return;
+        var p = d.personality_analysis || {};
+        var cs = d.chat_style_analysis || {};
+        var ep = d.emotional_pattern || {};
+        var iq = d.intelligence_indicators || {};
+        var rd = d.relationship_dynamics || {};
+        var gr = d.growth_observation || {};
+        var sc = d.scoring || {};
+
+        html += '<div class="col-lg-6 mb-4"><div class="card h-100">' +
+            '<div class="card-header bg-dark text-white" style="font-size:1.2rem;">' +
+            '🎯 ' + d.name + ' 的锐评画像</div><div class="card-body">';
+
+        // 第一印象 + 评分
+        html += '<div class="d-flex align-items-center justify-content-between mb-3">' +
+            '<div class="alert alert-info mb-0 flex-grow-1"><strong>💡 第一印象：</strong>' + (d.overall_impression || '') + '</div>';
+
+        // 最终锐评（小标签）
+        if (d.verdict) {
+            html += '<div class="ms-2 badge bg-warning text-dark" style="font-size:0.9rem;white-space:normal;max-width:200px;">🏆 ' + d.verdict + '</div>';
+        }
+        html += '</div>';
+
+        // 评分仪表
+        if (sc.expressiveness || sc.social_energy) {
+            html += '<div class="row text-center mb-3 g-1">' +
+                '<div class="col-3"><div class="border rounded p-1"><small>表达欲</small><br><strong>' + (sc.expressiveness || '-') + '</strong></div></div>' +
+                '<div class="col-3"><div class="border rounded p-1"><small>情绪丰富</small><br><strong>' + (sc.emotional_richness || '-') + '</strong></div></div>' +
+                '<div class="col-3"><div class="border rounded p-1"><small>社交能量</small><br><strong>' + (sc.social_energy || '-') + '</strong></div></div>' +
+                '<div class="col-3"><div class="border rounded p-1"><small>独特程度</small><br><strong>' + (sc.uniqueness || '-') + '</strong></div></div>' +
+                '</div>';
+            if (sc.logical_ratio) {
+                html += '<div class="text-center small text-muted">🧠 ' + sc.logical_ratio + '</div>';
+            }
+        }
+
+        // 🧠 性格分析
+        html += '<h5 class="border-bottom pb-2">🧠 性格分析</h5>' +
+            '<p><span class="badge bg-primary" style="font-size:1rem;">' + (p.core_type || '') + '</span>' +
+            ' · 思维方式：<strong>' + (p.thinking_style || '') + '</strong>' +
+            ' · 幽默：<strong>' + (p.humor_style || '') + '</strong>' +
+            ' · ' + (p.social_tendency || '') + '</p>';
+
+        if (p.strengths && p.strengths.length) {
+            html += '<p><strong>✅ 优点</strong></p><ul>';
+            p.strengths.forEach(function(s) { html += '<li class="small">' + s + '</li>'; });
+            html += '</ul>';
+        }
+        if (p.weaknesses && p.weaknesses.length) {
+            html += '<p><strong>⚠️ 缺点</strong></p><ul>';
+            p.weaknesses.forEach(function(s) { html += '<li class="small">' + s + '</li>'; });
+            html += '</ul>';
+        }
+        if (p.quirks && p.quirks.length) {
+            html += '<p><strong>🦄 奇特小习惯</strong></p><ul>';
+            p.quirks.forEach(function(s) { html += '<li>' + s + '</li>'; });
+            html += '</ul>';
+        }
+
+        // 💬 聊天风格
+        html += '<h5 class="border-bottom pb-2 mt-3">💬 聊天风格</h5>' +
+            '<div class="row"><div class="col-6"><small class="text-muted">开启对话</small><br>' + (cs.opener || '') + '</div>' +
+            '<div class="col-6"><small class="text-muted">回应方式</small><br>' + (cs.responder || '') + '</div></div>' +
+            '<div class="row mt-2"><div class="col-6"><small class="text-muted">标点风格</small><br>' + (cs.punctuation_style || '') + '</div>' +
+            '<div class="col-6"><small class="text-muted">表情使用</small><br>' + (cs.emoji_usage || '') + '</div></div>';
+
+        if (cs.signature_phrases && cs.signature_phrases.length) {
+            html += '<p class="mt-2"><strong>🗣️ 标志性用语</strong></p><ul>';
+            cs.signature_phrases.forEach(function(s) { html += '<li><em>' + s + '</em></li>'; });
+            html += '</ul>';
+        }
+        if (cs.topic_preference && cs.topic_preference.length) {
+            html += '<p><strong>📌 常聊话题：</strong>' + cs.topic_preference.join('、') + '</p>';
+        }
+        if (cs.topic_avoid && cs.topic_avoid.length) {
+            html += '<p><strong>🚫 回避话题：</strong>' + cs.topic_avoid.join('、') + '</p>';
+        }
+
+        // ❤️ 情绪模式
+        html += '<h5 class="border-bottom pb-2 mt-3">❤️ 情绪模式</h5>' +
+            '<div class="row"><div class="col-4"><small class="text-muted">频率</small><br>' +
+            '<span class="badge bg-' + (ep.frequency === 'high' ? 'danger' : ep.frequency === 'medium' ? 'warning' : 'success') + '">' + (ep.frequency || '') + '</span></div>' +
+            '<div class="col-4"><small class="text-muted">恢复速度</small><br><strong>' + (ep.recovery_speed || '') + '</strong></div>' +
+            '<div class="col-4"><small class="text-muted">常见状态</small><br>' + (ep.typical_state || '') + '</div></div>' +
+            '<p class="mt-2"><small class="text-muted">压力反应：</small>' + (ep.stress_response || '') + '</p>' +
+            '<p><small class="text-muted">安慰方式：</small>' + (ep.support_style || '') + '</p>';
+        if (ep.trigger_topics && ep.trigger_topics.length) {
+            html += '<p><small class="text-danger">⚡ 情绪触发话题：</small>' + ep.trigger_topics.join('、') + '</p>';
+        }
+
+        // 🎓 智力/思维指标
+        html += '<h5 class="border-bottom pb-2 mt-3">🎓 思维特征</h5>' +
+            '<p><strong>思维深度：</strong>' + (iq.thinking_depth || '') + '</p>' +
+            '<p><strong>学习方式：</strong>' + (iq.learning_style || '') + '</p>' +
+            '<p>词汇丰富度：<span class="badge bg-' + (iq.language_richness === 'rich' ? 'success' : iq.language_richness === 'medium' ? 'warning' : 'secondary') + '">' + (iq.language_richness || '') + '</span>' +
+            ' · 逻辑一致性：<span class="badge bg-' + (iq.logic_consistency === 'high' ? 'success' : iq.logic_consistency === 'medium' ? 'warning' : 'secondary') + '">' + (iq.logic_consistency || '') + '</span></p>';
+
+        // 🔗 关系动态
+        html += '<h5 class="border-bottom pb-2 mt-3">🔗 关系动态</h5>' +
+            '<div class="alert alert-secondary">' + (rd.role_in_relationship || '') + '</div>' +
+            '<p><small class="text-muted">话题发起：</small>' + (rd.initiation_pattern || '') + '</p>' +
+            '<p><small class="text-muted">冲突反应：</small>' + (rd.response_to_conflict || '') + '</p>' +
+            '<p>自我暴露程度：<span class="badge bg-' + (rd.vulnerability_level === 'high' ? 'warning' : rd.vulnerability_level === 'medium' ? 'info' : 'secondary') + '">' + (rd.vulnerability_level || '') + '</span></p>';
+        if (rd.what_they_seek && rd.what_they_seek.length) {
+            html += '<p><strong>🎯 寻求什么：</strong>' + rd.what_they_seek.join('、') + '</p>';
+        }
+
+        // 📈 成长观察
+        if (gr.has_changed) {
+            html += '<h5 class="border-bottom pb-2 mt-3">📈 成长变化</h5>' +
+                '<p>' + (gr.change_description || '') + '</p>';
+            if (gr.possible_reasons && gr.possible_reasons.length) {
+                html += '<p><small class="text-muted">可能原因：</small></p><ul>';
+                gr.possible_reasons.forEach(function(r) { html += '<li class="small">' + r + '</li>'; });
+                html += '</ul>';
+            }
+        }
+
+        // 有趣事实
+        if (d.fun_facts && d.fun_facts.length) {
+            html += '<h5 class="border-bottom pb-2 mt-3">🤪 有趣事实</h5><ul>';
+            d.fun_facts.forEach(function(f) { html += '<li>' + f + '</li>'; });
+            html += '</ul>';
+        }
+
+        html += '</div></div></div>';
+    });
+
+    $('#profileContent').html(html);
+}
+
+// 如果已经分析过，直接显示
+$(function() {
+    var data = sessionStorage.getItem('ai_profile');
+    if (data) {
+        $('#profilePlaceholder').hide();
+        renderProfile(JSON.parse(data));
+    }
+});
+</script>
+{% endblock %}
