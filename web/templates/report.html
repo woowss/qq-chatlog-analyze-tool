@@ -1,0 +1,248 @@
+<!-- Copyright (C) 2026 Zhang Yangming. MIT License -->
+{% extends "base.html" %}
+{% block title %}全篇报告{% endblock %}
+
+{% block head %}
+<style>
+@media print {
+    .navbar, .footer, .no-print { display: none !important; }
+    .card { break-inside: avoid; box-shadow: none !important; border: 1px solid #ddd !important; }
+    body { font-size: 12pt; }
+    .container { max-width: 100% !important; width: 100% !important; }
+}
+.report-header { text-align: center; padding: 2rem 0; }
+.report-header h1 { font-size: 2rem; font-weight: 700; }
+.report-header .meta { color: #666; font-size: 0.9rem; }
+.section-title { font-size: 1.3rem; font-weight: 700; margin: 1.5rem 0 1rem; padding-bottom: 0.5rem; border-bottom: 2px solid #333; }
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; margin-bottom: 1rem; }
+.stat-item { text-align: center; padding: 12px; background: #f8f9fa; border-radius: 8px; }
+.stat-item .num { font-size: 1.6rem; font-weight: 700; color: #1a1a2e; }
+.stat-item .label { font-size: 0.8rem; color: #666; }
+table.ai-detail { width: 100%; border-collapse: collapse; margin-bottom: 1rem; }
+table.ai-detail th, table.ai-detail td { padding: 8px 12px; border: 1px solid #dee2e6; text-align: left; vertical-align: top; }
+table.ai-detail th { background: #f0f0f0; font-weight: 600; width: 100px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="report-header">
+    <h1>📊 QQ 聊天记录分析报告</h1>
+    <div class="meta">
+        <p id="reportMeta">聊天对象：<strong>{{ overview.other_name }}</strong>
+        · 统计期间：{{ overview.total_days }} 天 · {{ overview.total_messages }} 条消息</p>
+        <p id="reportDate" class="small"></p>
+    </div>
+    <button class="btn btn-primary no-print" onclick="window.print()">🖨️ 打印 / 导出 PDF</button>
+    <button class="btn btn-outline-secondary no-print ms-2" onclick="downloadReport()">⬇️ 下载 HTML</button>
+</div>
+
+<!-- ======== 第一部分：基本统计 ======== -->
+<h3 class="section-title">📈 第一部分：基本统计数据</h3>
+
+<div class="stat-grid">
+    <div class="stat-item"><div class="num">{{ overview.total_messages }}</div><div class="label">总消息数</div></div>
+    <div class="stat-item"><div class="num">{{ overview.total_days }}</div><div class="label">聊天天数</div></div>
+    <div class="stat-item"><div class="num">{{ overview.avg_daily }}</div><div class="label">日均消息</div></div>
+    <div class="stat-item"><div class="num">{{ overview.total_images }}</div><div class="label">图片总数</div></div>
+    <div class="stat-item"><div class="num">{{ overview.exchange_rounds }}</div><div class="label">对话轮次</div></div>
+</div>
+
+<h5 class="mt-3">👤 双方数据对比</h5>
+<table class="table table-bordered">
+    <thead><tr><th>指标</th><th>{{ overview.self_name }}</th><th>{{ overview.other_name }}</th></tr></thead>
+    <tbody>
+        <tr><td>消息数</td><td>{{ overview.self_count }}（{{ (overview.self_count / overview.total_messages * 100) | round(1) }}%）</td><td>{{ overview.other_count }}（{{ (overview.other_count / overview.total_messages * 100) | round(1) }}%）</td></tr>
+        <tr><td>总字数</td><td>{{ overview.self_chars }} 字</td><td>{{ overview.other_chars }} 字</td></tr>
+        <tr><td>平均每句</td><td>{{ length_stats.self.avg }} 字</td><td>{{ length_stats.other.avg }} 字</td></tr>
+        <tr><td>平均回复</td><td>{{ response_time.self_avg_seconds }} 秒</td><td>{{ response_time.other_avg_seconds }} 秒</td></tr>
+    </tbody>
+</table>
+
+<h5>😊 表情使用 Top 5</h5>
+<div class="row">
+    <div class="col-md-6">
+        <p><strong>{{ overview.self_name }}：</strong></p>
+        <ol>
+        {% for name, count in (face_stats.self or {}).items() | list %}
+        {% if loop.index <= 5 %}<li>{{ name }}（{{ count }} 次）</li>{% endif %}
+        {% endfor %}
+        </ol>
+    </div>
+    <div class="col-md-6">
+        <p><strong>{{ overview.other_name }}：</strong></p>
+        <ol>
+        {% for name, count in (face_stats.other or {}).items() | list %}
+        {% if loop.index <= 5 %}<li>{{ name }}（{{ count }} 次）</li>{% endif %}
+        {% endfor %}
+        </ol>
+    </div>
+</div>
+
+<h5>📝 高频词 Top 10</h5>
+<div class="row">
+    <div class="col-md-6">
+        <p><strong>{{ overview.self_name }}：</strong></p>
+        <ol>
+        {% for item in (word_freq.self or [])[:10] %}
+        <li>{{ item.word }}（{{ item.count }} 次）</li>
+        {% endfor %}
+        </ol>
+    </div>
+    <div class="col-md-6">
+        <p><strong>{{ overview.other_name }}：</strong></p>
+        <ol>
+        {% for item in (word_freq.other or [])[:10] %}
+        <li>{{ item.word }}（{{ item.count }} 次）</li>
+        {% endfor %}
+        </ol>
+    </div>
+</div>
+
+<!-- ======== 第二部分：AI 深度分析（由 JavaScript 填充） ======== -->
+<h3 class="section-title">🤖 第二部分：AI 深度分析</h3>
+
+<div id="reportAiContent">
+    <p class="text-muted">请先在对应页面运行 AI 分析，数据会在此处显示。<br>
+    需要分析：情绪分析、人际关系、个人习惯、人物锐评、话题趋势。</p>
+</div>
+
+<p class="text-muted small mt-4">📌 报告生成时间：<span id="reportGenTime"></span></p>
+
+<script>
+function downloadReport() {
+    var html = document.documentElement.outerHTML;
+    var blob = new Blob([
+        '<!DOCTYPE html>\n' + html.replace(/<button[\s\S]*?<\/button>/g, '').replace(/no-print/g, '')
+    ], { type: 'text/html;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'QQ聊天分析报告_{{ overview.other_name }}.html';
+    a.click();
+    URL.revokeObjectURL(url);
+}
+
+$(function() {
+    // 报告生成时间
+    $('#reportGenTime').text(new Date().toLocaleString('zh-CN'));
+    $('#reportDate').text('报告生成：' + new Date().toLocaleString('zh-CN'));
+
+    // 从 sessionStorage 读取 AI 分析结果
+    var sections = [];
+
+    // 情绪分析
+    var emotion = sessionStorage.getItem('ai_emotion');
+    if (emotion) {
+        var data = JSON.parse(emotion);
+        var months = Object.keys(data).sort();
+        var html = '<h5 class="mt-4">😊 情绪分析</h5><table class="ai-detail"><tr><th>月份</th><th>{{ overview.self_name }}</th><th>{{ overview.other_name }}</th><th>基调</th></tr>';
+        months.forEach(function(m) {
+            var d = data[m];
+            if (!d) return;
+            html += '<tr><td>' + m + '</td><td>' + d.self_emotion + '(' + d.self_intensity + ')' +
+                '<br><small>' + (d.self_keywords || []).join('、') + '</small></td>' +
+                '<td>' + d.other_emotion + '(' + d.other_intensity + ')' +
+                '<br><small>' + (d.other_keywords || []).join('、') + '</small></td>' +
+                '<td>' + d.overall_tone + '</td></tr>';
+        });
+        html += '</table>';
+        sections.push(html);
+    }
+
+    // 人际关系
+    var rel = sessionStorage.getItem('ai_relationship');
+    if (rel) {
+        var data = JSON.parse(rel);
+        var months = Object.keys(data).sort();
+        var html = '<h5 class="mt-4">👥 人际关系</h5><table class="ai-detail"><tr><th>月份</th><th>亲密</th><th>风格</th><th>角色</th><th>摘要</th></tr>';
+        months.forEach(function(m) {
+            var d = data[m];
+            if (!d) return;
+            html += '<tr><td>' + m + '</td><td>' + d.closeness_score + '/10 (' + d.closeness_trend + ')</td>' +
+                '<td>' + d.interaction_style + '</td>' +
+                '<td>' + d.self_role + ' / ' + d.other_role + '</td>' +
+                '<td>' + (d.relationship_summary || '') + '</td></tr>';
+        });
+        html += '</table>';
+        sections.push(html);
+    }
+
+    // 个人习惯
+    var habits = sessionStorage.getItem('ai_habits');
+    if (habits) {
+        var data = JSON.parse(habits);
+        var html = '<h5 class="mt-4">🧑 个人习惯</h5><div class="row">';
+        ['self', 'other'].forEach(function(key) {
+            var d = data[key];
+            if (!d) return;
+            html += '<div class="col-md-6"><div class="card mb-2"><div class="card-header"><strong>' + d.name + '</strong></div><div class="card-body">' +
+                '<p><strong>性格标签：</strong>' + (d.personality_tags || []).join('、') + '</p>' +
+                '<p><strong>口头禅：</strong>' + (d.common_phrases || []).join('、') + '</p>' +
+                '<p><strong>句子长度：</strong>' + d.sentence_length + '</p>' +
+                '<p><strong>回复速度：</strong>' + d.reply_speed + '</p>' +
+                '</div></div></div>';
+        });
+        html += '</div>';
+        sections.push(html);
+    }
+
+    // 人物锐评
+    var profile = sessionStorage.getItem('ai_profile');
+    if (profile) {
+        var data = JSON.parse(profile);
+        var html = '<h5 class="mt-4">🎯 人物锐评</h5><div class="row">';
+        ['self', 'other'].forEach(function(key) {
+            var d = data[key];
+            if (!d) return;
+            var p = d.personality_analysis || {};
+            var cs = d.chat_style_analysis || {};
+            var ep = d.emotional_pattern || {};
+            var rd = d.relationship_dynamics || {};
+            var sc = d.scoring || {};
+            html += '<div class="col-md-6"><div class="card mb-2"><div class="card-header"><strong>' + d.name + '</strong></div><div class="card-body">' +
+                '<div class="alert alert-info py-1">' + (d.overall_impression || '') + '</div>' +
+                '<p><strong>🎯 锐评：</strong>' + (d.verdict || '') + '</p>' +
+                '<p><strong>核心性格：</strong><span class="badge bg-primary">' + (p.core_type || '') + '</span></p>' +
+                '<p><strong>思维方式：</strong>' + (p.thinking_style || '') + ' · <strong>幽默：</strong>' + (p.humor_style || '') + '</p>' +
+                '<p><strong>✅ 优点：</strong></p><ul>' + (p.strengths || []).map(function(s) { return '<li>' + s + '</li>'; }).join('') + '</ul>' +
+                '<p><strong>⚠️ 缺点：</strong></p><ul>' + (p.weaknesses || []).map(function(s) { return '<li>' + s + '</li>'; }).join('') + '</ul>' +
+                '<p><strong>💬 聊天风格：</strong>开启=' + (cs.opener || '') + ' · 回应=' + (cs.responder || '') + '</p>' +
+                '<p><strong>📌 常聊话题：</strong>' + ((cs.topic_preference || []).join('、') || '-') + '</p>' +
+                '<p><strong>🔗 关系角色：</strong>' + (rd.role_in_relationship || '') + '</p>' +
+                '<p><strong>情绪频率：</strong>' + (ep.frequency || '') + ' · <strong>常见状态：</strong>' + (ep.typical_state || '') + '</p>';
+            if (sc.expressiveness) {
+                html += '<p><strong>评分：</strong>表达' + sc.expressiveness + '/10 · 情绪' + (sc.emotional_richness || '-') + '/10 · 社交' + (sc.social_energy || '-') + '/10 · 独特' + (sc.uniqueness || '-') + '/10</p>';
+            }
+            if (d.fun_facts && d.fun_facts.length) {
+                html += '<p><strong>🤪 有趣事实：</strong>' + d.fun_facts.slice(0, 3).join('；') + '</p>';
+            }
+            html += '</div></div></div>';
+        });
+        html += '</div>';
+        sections.push(html);
+    }
+
+    // 话题趋势
+    var topics = sessionStorage.getItem('ai_topics');
+    if (topics) {
+        var data = JSON.parse(topics);
+        var months = Object.keys(data).sort();
+        var html = '<h5 class="mt-4">📈 话题趋势</h5><table class="ai-detail"><tr><th>月份</th><th>话题</th><th>摘要</th></tr>';
+        months.forEach(function(m) {
+            var d = data[m];
+            if (!d) return;
+            var tags = (d.topics || []).map(function(t) {
+                return t.name + '(' + Math.round(t.weight * 100) + '%)';
+            }).join('、');
+            html += '<tr><td>' + m + '</td><td>' + tags + '</td><td>' + (d.summary || '') + '</td></tr>';
+        });
+        html += '</table>';
+        sections.push(html);
+    }
+
+    if (sections.length) {
+        $('#reportAiContent').html(sections.join(''));
+    }
+});
+</script>
+{% endblock %}

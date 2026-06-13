@@ -1,0 +1,23 @@
+# API Key
+.env
+
+# Flask session files
+flask_session/
+
+# Uploaded chat files
+uploads/*.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+logs/*.log
+
+# Upload directory
+uploads/
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,31 @@
+<!-- Copyright (C) 2026 Zhang Yangming. MIT License -->
+{% extends "base.html" %}
+{% block title %}话题趋势{% endblock %}
+{% block content %}
+<h2 class="mb-4">📈 话题趋势分析</h2>
+
+{% if not api_ok %}
+<div class="alert alert-warning">⚠️ 请先配置 DeepSeek API Key 以使用 AI 分析功能</div>
+{% endif %}
+
+<div class="card mb-4">
+    <div class="card-header">📊 话题分布</div>
+    <div class="card-body">
+        <div id="topicsChart" style="height: 400px;"></div>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-header">📋 逐月话题摘要</div>
+    <div class="card-body" id="topicsDetails">
+        <p class="text-muted text-center">请先在仪表盘中点击"话题趋势"按钮获取 AI 分析</p>
+    </div>
+</div>
+
+<script>
+$(function() {
+    const data = sessionStorage.getItem('ai_topics');
+    if (data) renderTopicsCharts(JSON.parse(data));
+});
+</script>
+{% endblock %}
