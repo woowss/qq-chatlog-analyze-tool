@@ -1,0 +1,88 @@
+<!-- Copyright (C) 2026 Zhang Yangming. MIT License -->
+{% extends "base.html" %}
+{% block title %}个人习惯{% endblock %}
+{% block content %}
+<h2 class="mb-4">🧑 个人习惯与风格</h2>
+
+{% if not api_ok %}
+<div class="alert alert-warning">⚠️ 请先配置 DeepSeek API Key 以使用 AI 分析功能</div>
+{% endif %}
+
+<div class="row mb-4">
+    <div class="col-md-6 mb-3">
+        <div class="card">
+            <div class="card-header">{{ overview.self_name }} 的表情排行</div>
+            <div class="card-body" id="selfFaceChart" style="height: 300px;"></div>
+        </div>
+    </div>
+    <div class="col-md-6 mb-3">
+        <div class="card">
+            <div class="card-header">{{ overview.other_name }} 的表情排行</div>
+            <div class="card-body" id="otherFaceChart" style="height: 300px;"></div>
+        </div>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">⏰ 一周活跃热力图</div>
+            <div class="card-body">
+                <div id="heatmapChart" style="height: 350px;"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 高频词词云 -->
+<div class="row mb-4">
+    <div class="col-md-6 mb-3">
+        <div class="card">
+            <div class="card-header">{{ overview.self_name }} 的高频词</div>
+            <div class="card-body">
+                <div id="selfWordCloud" style="height: 400px;"></div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6 mb-3">
+        <div class="card">
+            <div class="card-header">{{ overview.other_name }} 的高频词</div>
+            <div class="card-body">
+                <div id="otherWordCloud" style="height: 400px;"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-header">🤖 AI 风格分析</div>
+    <div class="card-body" id="habitsInsight">
+        <p class="text-muted text-center">请先在仪表盘中点击"个人习惯"按钮获取 AI 分析</p>
+    </div>
+</div>
+
+<script>
+$(function() {
+    // 表情排行
+    {% if face_stats %}
+    renderFaceBarChart('selfFaceChart', {{ face_stats.self | tojson }}, '{{ overview.self_name }}');
+    renderFaceBarChart('otherFaceChart', {{ face_stats.other | tojson }}, '{{ overview.other_name }}');
+    {% endif %}
+
+    // 热力图
+    {% if weekly_activity %}
+    renderHeatmapChart('heatmapChart', {{ weekly_activity | tojson }});
+    {% endif %}
+
+    // 词云
+    {% if word_freq %}
+    renderWordCloud('selfWordCloud', {{ word_freq.self | tojson }}, '{{ overview.self_name }}');
+    renderWordCloud('otherWordCloud', {{ word_freq.other | tojson }}, '{{ overview.other_name }}');
+    {% endif %}
+
+    // AI 分析
+    const data = sessionStorage.getItem('ai_habits');
+    if (data) renderHabitsInsight(JSON.parse(data));
+});
+</script>
+{% endblock %}

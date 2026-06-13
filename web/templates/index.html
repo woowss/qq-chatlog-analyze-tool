@@ -1,0 +1,84 @@
+<!-- Copyright (C) 2026 Zhang Yangming. MIT License -->
+{% extends "base.html" %}
+{% block title %}首页{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-lg-8">
+        <div class="card shadow-sm">
+            <div class="card-body text-center p-5">
+                <h1 class="display-5 mb-3">📊 QQ 聊天记录分析</h1>
+                <p class="lead text-muted mb-4">
+                    导入 QQChatExporter 导出的 JSON 聊天记录，<br>
+                    通过 DeepSeek AI 分析你们的情绪、话题、关系和习惯
+                </p>
+
+                {% if not api_ok %}
+                <div class="alert alert-warning">
+                    <strong>⚠️ DeepSeek API Key 未配置</strong><br>
+                    <span class="small">本地统计功能仍可用。如需 AI 分析，请编辑项目根目录的 <code>.env</code> 文件填入 Key。</span>
+                </div>
+                {% endif %}
+
+                <form action="/upload" method="post" enctype="multipart/form-data" id="uploadForm">
+                    <div class="upload-zone mb-3" id="dropZone">
+                        <div class="upload-icon">📁</div>
+                        <p class="mb-2">拖拽 JSON 文件到此处，或点击选择文件</p>
+                        <input type="file" name="file" id="fileInput" accept=".json" class="d-none">
+                        <button type="button" class="btn btn-outline-primary" onclick="$('#fileInput').click()">
+                            选择文件
+                        </button>
+                        <div id="fileName" class="mt-2 small text-success d-none"></div>
+                    </div>
+                    <button type="submit" class="btn btn-primary btn-lg" id="submitBtn" disabled>
+                        🚀 开始分析
+                    </button>
+                </form>
+
+                <hr class="my-4">
+
+                <div class="text-start small text-muted">
+                    <h6>📋 使用说明</h6>
+                    <ol>
+                        <li>使用 <a href="https://github.com/shuakami/qq-chat-exporter" target="_blank">QQChatExporter</a> 导出私聊 JSON</li>
+                        <li>上传导出的 .json 文件</li>
+                        <li>在仪表盘查看本地统计数据</li>
+                        <li>配置 API Key 后可获取 AI 深度分析</li>
+                    </ol>
+                    <h6>🔒 隐私说明</h6>
+                    <p>所有数据仅在本地处理，不上传至任何第三方服务器（AI 分析时仅将文本片段发送至 DeepSeek API）。</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+$(function() {
+    $('#fileInput').on('change', function() {
+        const file = this.files[0];
+        if (file) {
+            $('#fileName').text('✅ 已选择: ' + file.name).removeClass('d-none');
+            $('#submitBtn').prop('disabled', false);
+        }
+    });
+
+    const dropZone = $('#dropZone');
+    dropZone.on('dragover', function(e) { e.preventDefault(); $(this).addClass('drag-over'); });
+    dropZone.on('dragleave', function() { $(this).removeClass('drag-over'); });
+    dropZone.on('drop', function(e) {
+        e.preventDefault();
+        $(this).removeClass('drag-over');
+        const files = e.originalEvent.dataTransfer.files;
+        if (files.length) {
+            $('#fileInput')[0].files = files;
+            $('#fileName').text('✅ 已选择: ' + files[0].name).removeClass('d-none');
+            $('#submitBtn').prop('disabled', false);
+        }
+    });
+
+    $('#uploadForm').on('submit', function() {
+        $('#submitBtn').prop('disabled', true).text('⏳ 上传解析中...');
+    });
+});
+</script>
+{% endblock %}

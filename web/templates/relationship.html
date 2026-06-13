@@ -1,0 +1,82 @@
+<!-- Copyright (C) 2026 Zhang Yangming. MIT License -->
+{% extends "base.html" %}
+{% block title %}人际关系{% endblock %}
+{% block content %}
+<h2 class="mb-4">👥 人际关系分析</h2>
+
+{% if not api_ok %}
+<div class="alert alert-warning">⚠️ 请先配置 DeepSeek API Key 以使用 AI 分析功能</div>
+{% endif %}
+
+<div class="row mb-4">
+    <div class="col-md-4 mb-3">
+        <div class="card stat-card text-center h-100">
+            <div class="card-body">
+                <div class="stat-value">{{ exchange_rounds }}</div>
+                <div class="stat-label">对话轮次</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4 mb-3">
+        <div class="card stat-card text-center h-100">
+            <div class="card-body">
+                <div class="stat-value text-primary">{{ response_time.self_avg_seconds }}s</div>
+                <div class="stat-label">{{ overview.self_name }} 平均回复</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4 mb-3">
+        <div class="card stat-card text-center h-100">
+            <div class="card-body">
+                <div class="stat-value text-success">{{ response_time.other_avg_seconds }}s</div>
+                <div class="stat-label">{{ overview.other_name }} 平均回复</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-6 mb-3">
+        <div class="card">
+            <div class="card-header">📊 消息占比</div>
+            <div class="card-body">
+                <div id="relationPieChart" style="height: 300px;"></div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6 mb-3">
+        <div class="card">
+            <div class="card-header">⚡ 平均回复速度对比</div>
+            <div class="card-body">
+                <div id="responseChart" style="height: 300px;"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-header">🤖 AI 关系洞察</div>
+    <div class="card-body" id="relationshipInsight">
+        <p class="text-muted text-center">请先在仪表盘中点击"人际关系"按钮获取 AI 分析</p>
+    </div>
+</div>
+
+<script>
+$(function() {
+    renderPieChart('relationPieChart', [
+        {name: '{{ overview.self_name }}', value: {{ overview.self_count }}},
+        {name: '{{ overview.other_name }}', value: {{ overview.other_count }}}
+    ], '消息数');
+
+    renderResponseChart('responseChart', {
+        self: {{ response_time.self_avg_seconds }},
+        other: {{ response_time.other_avg_seconds }},
+        selfName: '{{ overview.self_name }}',
+        otherName: '{{ overview.other_name }}'
+    });
+
+    const data = sessionStorage.getItem('ai_relationship');
+    if (data) renderRelationshipInsight(JSON.parse(data));
+});
+</script>
+{% endblock %}
