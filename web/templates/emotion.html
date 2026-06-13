@@ -1,0 +1,54 @@
+<!-- Copyright (C) 2026 Zhang Yangming. MIT License -->
+{% extends "base.html" %}
+{% block title %}情绪分析{% endblock %}
+{% block content %}
+<h2 class="mb-4">😊 情绪分析</h2>
+
+{% if not api_ok %}
+<div class="alert alert-warning">⚠️ 请先配置 DeepSeek API Key 以使用 AI 分析功能</div>
+{% endif %}
+
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">📈 情绪强度变化</div>
+            <div class="card-body">
+                <div id="emotionLineChart" style="height: 400px;"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-6 mb-3">
+        <div class="card">
+            <div class="card-header">😊 {{ overview.self_name }} 情绪分布</div>
+            <div class="card-body">
+                <div id="selfEmotionPie" style="height: 300px;"></div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6 mb-3">
+        <div class="card">
+            <div class="card-header">😊 {{ overview.other_name }} 情绪分布</div>
+            <div class="card-body">
+                <div id="otherEmotionPie" style="height: 300px;"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-header">📋 逐月情绪详情</div>
+    <div class="card-body" id="emotionDetails">
+        <p class="text-muted text-center">请先在仪表盘中点击"情绪分析"按钮获取数据</p>
+    </div>
+</div>
+
+<script>
+$(function() {
+    const data = sessionStorage.getItem('ai_emotion');
+    if (data) renderEmotionCharts(JSON.parse(data));
+});
+</script>
+{% endblock %}

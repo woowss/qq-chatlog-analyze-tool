@@ -1,0 +1,77 @@
+/* Copyright (C) 2026 Zhang Yangming. All Rights Reserved.
+ * Licensed under MIT License.
+ * SPDX-License-Identifier: MIT
+ *
+ * QQ 聊天记录分析工具 — 自定义样式 */
+body {
+    background-color: #f5f7fa;
+    font-family: -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif;
+}
+
+/* 统计卡片 */
+.stat-card {
+    border: none;
+    border-radius: 12px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+    transition: transform 0.2s;
+}
+.stat-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.1);
+}
+.stat-value {
+    font-size: 2.2rem;
+    font-weight: 700;
+    color: #1a1a2e;
+}
+.stat-label {
+    font-size: 0.9rem;
+    color: #6c757d;
+    margin-top: 4px;
+}
+
+/* 上传区域 */
+.upload-zone {
+    border: 2px dashed #ccc;
+    border-radius: 16px;
+    padding: 40px 20px;
+    background: #fafafa;
+    cursor: pointer;
+    transition: all 0.3s;
+}
+.upload-zone:hover, .upload-zone.drag-over {
+    border-color: #0d6efd;
+    background: #eaf4ff;
+}
+.upload-icon {
+    font-size: 3rem;
+    margin-bottom: 10px;
+}
+
+/* 通用卡片 */
+.card {
+    border: none;
+    border-radius: 12px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+}
+.card-header {
+    background: white;
+    border-bottom: 1px solid #f0f0f0;
+    font-weight: 600;
+    border-radius: 12px 12px 0 0 !important;
+}
+
+/* 导航 */
+.navbar {
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+}
+
+/* 页脚 */
+.footer {
+    border-top: 1px solid #eee;
+}
+
+/* 响应式 */
+@media (max-width: 768px) {
+    .stat-value { font-size: 1.6rem; }
+}
