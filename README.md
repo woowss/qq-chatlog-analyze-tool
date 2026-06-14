@@ -133,4 +133,4 @@ jieba>=0.42
 
 ## 📜 许可证
 
-[MIT](LICENSE)
+[GPL](LICENSE)
