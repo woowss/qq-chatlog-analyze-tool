@@ -59,6 +59,8 @@ python app.py
 
 浏览器打开 http://localhost:5000
 
+> 默认关闭调试模式（避免调试器暴露风险）。本地开发需要自动重载时，设置环境变量 `FLASK_DEBUG=true` 再启动。
+
 ### 5. 使用
 
 1. 上传 QQChatExporter 导出的 `.json` 文件
@@ -68,7 +70,7 @@ python app.py
 ## 📂 项目结构
 
 ```
-E:\qqchatlog\
+qqchatlog/
 ├── app.py                     # Flask 主应用 + 路由
 ├── config.py                  # 配置读取
 ├── requirements.txt           # 依赖清单
@@ -133,4 +135,4 @@ jieba>=0.42
 
 ## 📜 许可证
 
-[GPL](LICENSE)
+[GPL v3](LICENSE)

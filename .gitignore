@@ -1,5 +1,6 @@
 # API Key
 .env
+.secret_key
 
 # Flask session files
 flask_session/
