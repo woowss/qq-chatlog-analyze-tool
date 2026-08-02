@@ -18,14 +18,15 @@
 # ========================================
 
 import os
+import secrets
+import time
 import uuid
 from pathlib import Path
 
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify
 from flask_session import Session
-from werkzeug.middleware.proxy_fix import ProxyFix
 
-from config import UPLOAD_FOLDER, SECRET_KEY
+from config import FLASK_DEBUG, MAX_CONTENT_LENGTH, SECRET_KEY, SESSION_FILE_DIR, UPLOAD_FOLDER
 from parser.qq_parser import load_chat
 from analyzer.local_stats import (
     calc_overview,
@@ -61,17 +62,17 @@ app = Flask(__name__,
             static_url_path="/static")
 app.secret_key = SECRET_KEY
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 
 # 服务端文件系统 session (避免 cookie 大小限制)
 app.config["SESSION_TYPE"] = "filesystem"
-app.config["SESSION_FILE_DIR"] = os.path.join(Path(__file__).parent, "flask_session")
+app.config["SESSION_FILE_DIR"] = SESSION_FILE_DIR
 app.config["SESSION_PERMANENT"] = False
 app.config["SESSION_USE_SIGNER"] = True
 Session(app)
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(app.config["SESSION_FILE_DIR"], exist_ok=True)
+os.makedirs(SESSION_FILE_DIR, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -82,9 +83,8 @@ os.makedirs(app.config["SESSION_FILE_DIR"], exist_ok=True)
 @app.before_request
 def log_request():
     """记录每个请求的方法/路径/来源IP"""
-    from flask import request as req
-    ip = req.remote_addr or "127.0.0.1"
-    logger.info("%s %s [%s]", req.method, req.path, ip)
+    ip = request.remote_addr or "127.0.0.1"
+    logger.info("%s %s [%s]", request.method, request.path, ip)
 
 
 @app.after_request
@@ -93,6 +93,84 @@ def log_response(response):
     if response.status_code >= 400:
         logger.warning("--> %s %s", response.status_code, request.path)
     return response
+
+
+# ---------------------------------------------------------------------------
+# CSRF / 来源校验
+# ---------------------------------------------------------------------------
+
+
+@app.before_request
+def ensure_csrf_token():
+    """确保会话中存在 CSRF token（session 服务端存储，攻击者无法读取）"""
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_hex(32)
+
+
+@app.context_processor
+def inject_csrf_token():
+    """向所有模板注入 csrf_token，供表单与 AJAX 请求使用"""
+    return {"csrf_token": session.get("csrf_token", "")}
+
+
+def _check_csrf() -> bool:
+    """校验请求携带的 CSRF token 与会话一致"""
+    provided = (request.headers.get("X-CSRF-Token") or request.form.get("csrf_token") or "")
+    expected = session.get("csrf_token", "")
+    return bool(expected) and secrets.compare_digest(expected, provided)
+
+
+def _origin_allowed() -> bool:
+    """校验浏览器 Origin 来源（存在时）。拒绝非本机来源，防御跨站提交/DNS rebinding。
+
+    curl 等非浏览器请求不带 Origin，交由 CSRF token 校验兜底。
+    """
+    origin = request.headers.get("Origin")
+    if not origin:
+        return True
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(origin).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in ("localhost", "127.0.0.1")
+
+
+def _guard_post():
+    """POST 请求统一防护：Origin 校验 + CSRF token 校验"""
+    if not _origin_allowed():
+        logger.warning("拦截非本机来源请求: %s", request.headers.get("Origin"))
+        return "非法来源", 403
+    if not _check_csrf():
+        logger.warning("CSRF 校验失败: %s %s", request.method, request.path)
+        return "CSRF 校验失败", 400
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 临时文件清理（uploads/ 与 flask_session/ 只增不减，长期运行会占用磁盘）
+# ---------------------------------------------------------------------------
+
+
+def _cleanup_old_files(max_age_seconds: int = 86400):
+    """删除超过 max_age_seconds 的临时文件"""
+    now = time.time()
+    cleaned = 0
+    for directory in (UPLOAD_FOLDER, SESSION_FILE_DIR):
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            continue
+        for name in entries:
+            path = os.path.join(directory, name)
+            try:
+                if now - os.path.getmtime(path) > max_age_seconds:
+                    os.remove(path)
+                    cleaned += 1
+            except OSError:
+                continue
+    if cleaned:
+        logger.info("已清理 %d 个过期临时文件", cleaned)
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +187,10 @@ def index():
 @app.route("/upload", methods=["POST"])
 def upload():
     """接收上传的 JSON 文件, 解析并存入 session"""
+    guard = _guard_post()
+    if guard:
+        return guard
+
     if "file" not in request.files:
         logger.warning("上传请求中没有 file 字段")
         return "请选择文件", 400
@@ -118,6 +200,14 @@ def upload():
     if orig_name == "" or not orig_name.endswith(".json"):
         logger.warning("上传文件格式无效: %s", orig_name)
         return "请选择有效的 .json 文件", 400
+
+    # 删除上一次会话遗留的上传文件，避免孤儿文件堆积
+    old_path = session.get("filepath")
+    if old_path and os.path.exists(old_path) and os.path.dirname(old_path) == UPLOAD_FOLDER:
+        try:
+            os.remove(old_path)
+        except OSError:
+            pass
 
     filename = f"{uuid.uuid4().hex}.json"
     filepath = os.path.join(UPLOAD_FOLDER, filename)
@@ -263,6 +353,10 @@ DIMENSION_NAMES = {
 @app.route("/api/analyze/<dimension>", methods=["POST"])
 def api_analyze(dimension: str):
     """调用 DeepSeek 分析指定维度"""
+    guard = _guard_post()
+    if guard:
+        return jsonify({"error": guard[0]}), guard[1]
+
     dim_name = DIMENSION_NAMES.get(dimension, dimension)
 
     if "filepath" not in session:
@@ -302,6 +396,9 @@ def api_analyze(dimension: str):
 
     try:
         result = func_map[dimension](chat)
+        if not result:
+            logger.error("%s 无任何结果", dim_name)
+            return jsonify({"error": "分析未产生结果：可能单月消息过多超出模型上下文或 API 报错，请查看日志排查"}), 500
         month_count = len(result) if isinstance(result, dict) else "?"
         logger.info("%s 完成, 返回 %s 个月的数据", dim_name, month_count)
         return jsonify(result)
@@ -339,12 +436,17 @@ if __name__ == "__main__":
     else:
         _p("  [OK] DeepSeek API 已配置")
     _p(sep)
+    _p("  调试模式: %s" % ("开" if FLASK_DEBUG else "关"))
     _p("  日志文件: logs/app.log (自动轮转, 保留 5x5MB)")
     _p(sep)
+
+    # 启动时清理超过 24 小时的上传文件与 session 文件
+    _cleanup_old_files(max_age_seconds=86400)
 
     logger.info("=" * 40)
     logger.info("应用启动 - http://localhost:5000")
     logger.info("API Key: %s", "已配置" if is_api_configured() else "未配置")
+    logger.info("调试模式: %s", FLASK_DEBUG)
     logger.info("=" * 40)
 
-    app.run(debug=True, host="127.0.0.1", port=5000)
+    app.run(debug=FLASK_DEBUG, host="127.0.0.1", port=5000)

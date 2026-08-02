@@ -80,8 +80,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 $(function() {
     // 表情排行
     {% if face_stats %}
-    renderFaceBarChart('selfFaceChart', {{ face_stats.self | tojson }}, '{{ overview.self_name }}');
-    renderFaceBarChart('otherFaceChart', {{ face_stats.other | tojson }}, '{{ overview.other_name }}');
+    renderFaceBarChart('selfFaceChart', {{ face_stats.self | tojson }}, {{ overview.self_name | tojson }});
+    renderFaceBarChart('otherFaceChart', {{ face_stats.other | tojson }}, {{ overview.other_name | tojson }});
     {% endif %}
 
     // 热力图
@@ -91,8 +91,8 @@ $(function() {
 
     // 词云
     {% if word_freq %}
-    renderWordCloud('selfWordCloud', {{ word_freq.self | tojson }}, '{{ overview.self_name }}');
-    renderWordCloud('otherWordCloud', {{ word_freq.other | tojson }}, '{{ overview.other_name }}');
+    renderWordCloud('selfWordCloud', {{ word_freq.self | tojson }}, {{ overview.self_name | tojson }});
+    renderWordCloud('otherWordCloud', {{ word_freq.other | tojson }}, {{ overview.other_name | tojson }});
     {% endif %}
 
     // AI 分析

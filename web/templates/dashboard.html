@@ -162,7 +162,7 @@ $('.btn-analyze').on('click', function() {
 
     $.post('/api/analyze/' + dim, function(data) {
         if (data.error) {
-            status.html('<div class="alert alert-danger">' + data.error + '</div>');
+            status.html('<div class="alert alert-danger">' + esc(data.error) + '</div>');
             btn.prop('disabled', false).text(orig);
         } else {
             sessionStorage.setItem('ai_' + dim, JSON.stringify(data));
@@ -173,7 +173,7 @@ $('.btn-analyze').on('click', function() {
         }
     }).fail(function(xhr) {
         const msg = xhr.responseJSON?.error || '请求失败';
-        status.html('<div class="alert alert-danger">' + msg + '</div>');
+        status.html('<div class="alert alert-danger">' + esc(msg) + '</div>');
         btn.prop('disabled', false).text(orig);
     });
 });
@@ -182,13 +182,13 @@ $('.btn-analyze').on('click', function() {
 
 <script>
 renderPieChart('messageRatioChart', [
-    {name: '{{ overview.self_name }}', value: {{ overview.self_count }}},
-    {name: '{{ overview.other_name }}', value: {{ overview.other_count }}}
+    {name: {{ overview.self_name | tojson }}, value: {{ overview.self_count }}},
+    {name: {{ overview.other_name | tojson }}, value: {{ overview.other_count }}}
 ], '消息数');
 
 renderPieChart('charRatioChart', [
-    {name: '{{ overview.self_name }}', value: {{ overview.self_chars }}},
-    {name: '{{ overview.other_name }}', value: {{ overview.other_chars }}}
+    {name: {{ overview.self_name | tojson }}, value: {{ overview.self_chars }}},
+    {name: {{ overview.other_name | tojson }}, value: {{ overview.other_chars }}}
 ], '字数');
 
 renderLineChart('dailyChart', {{ daily_counts | tojson }}, '消息数');

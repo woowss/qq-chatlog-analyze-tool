@@ -35,6 +35,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                 {% endif %}
 
                 <form action="/upload" method="post" enctype="multipart/form-data" id="uploadForm">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                     <div class="upload-zone mb-3" id="dropZone">
                         <div class="upload-icon">📁</div>
                         <p class="mb-2">拖拽 JSON 文件到此处，或点击选择文件</p>
@@ -93,6 +94,10 @@ $(function() {
 
     $('#uploadForm').on('submit', function() {
         $('#submitBtn').prop('disabled', true).text('⏳ 上传解析中...');
+        // 上传新聊天记录时清掉上一次的 AI 分析结果，避免在新聊天页面展示旧数据
+        ['emotion', 'relationship', 'habits', 'topics', 'profile'].forEach(function(k) {
+            sessionStorage.removeItem('ai_' + k);
+        });
     });
 });
 </script>
