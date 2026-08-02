@@ -17,15 +17,13 @@
 """本地统计分析 — 不依赖大模型 API"""
 import re
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any
 
 import jieba
 import jieba.analyse
 
-from parser.qq_parser import ChatData, Message
-
-CST = timezone(timedelta(hours=8))
+from parser.qq_parser import CST, ChatData, Message
 
 # 中文停用词（常见虚词、标点、语气词、QQ 专用词汇）
 _STOP_WORDS: set[str] = {
@@ -46,7 +44,7 @@ _STOP_WORDS: set[str] = {
     "可以", "没有", "已经", "还是", "还是", "就是", "不是",
     "哈哈", "呵呵", "嘿嘿", "嘻嘻", "hhhh", "hhh", "hh",
     "草", "靠", "操", "tm", "tmd", "md","吃糖","问题","答案","这种",
-    "不会","你们","他们",
+    "不会","你们","他们","emmm","emmmm","emmmmm","emmmmmmm","emmmmmmmm",
     " ", "", "：", "：", "，", "。", "！", "？", "…", "·", "、",
     "（", "）", "【", "】", "—", "～", "~", "\"", "\"", "''",
     "的", "了", "是", "不", "我", "你", "他", "她", "它",
@@ -212,10 +210,13 @@ def calc_face_stats(chat: ChatData) -> dict:
 
 
 def calc_response_time(chat: ChatData) -> dict:
-    """平均响应时间（秒）"""
+    """平均响应时间（秒）—— 只统计对方发来后本方做出的回复间隔"""
     self_times, other_times = [], []
     for i in range(1, len(chat.messages)):
         prev, curr = chat.messages[i - 1], chat.messages[i]
+        # 同一人连续发言不是"响应"，跳过，避免拉低/污染平均值
+        if prev.sender_uid == curr.sender_uid:
+            continue
         gap = (curr.timestamp - prev.timestamp) / 1000
         if gap > 3600 * 6:          # 超过 6 小时不算同轮
             continue

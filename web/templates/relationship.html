@@ -79,15 +79,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <script>
 $(function() {
     renderPieChart('relationPieChart', [
-        {name: '{{ overview.self_name }}', value: {{ overview.self_count }}},
-        {name: '{{ overview.other_name }}', value: {{ overview.other_count }}}
+        {name: {{ overview.self_name | tojson }}, value: {{ overview.self_count }}},
+        {name: {{ overview.other_name | tojson }}, value: {{ overview.other_count }}}
     ], '消息数');
 
     renderResponseChart('responseChart', {
         self: {{ response_time.self_avg_seconds }},
         other: {{ response_time.other_avg_seconds }},
-        selfName: '{{ overview.self_name }}',
-        otherName: '{{ overview.other_name }}'
+        selfName: {{ overview.self_name | tojson }},
+        otherName: {{ overview.other_name | tojson }}
     });
 
     const data = sessionStorage.getItem('ai_relationship');

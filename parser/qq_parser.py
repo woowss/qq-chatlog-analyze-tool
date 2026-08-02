@@ -16,8 +16,10 @@
 #
 """QQ JSON 聊天记录解析器 — 支持 QQChatExporter V5 格式"""
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+
+# 北京时间固定偏移，供月份分组与本地统计共用，避免口径不一致
+CST = timezone(timedelta(hours=8))
 
 
 @dataclass
@@ -66,13 +68,20 @@ def load_chat(filepath: str) -> ChatData:
     self_uid = chat_info.get("selfUid", "")
     self_name = chat_info.get("selfName", "")
 
-    # 确定对方的显示名
+    # 确定双方的显示名
     senders = raw.get("statistics", {}).get("senders", [])
     other_name = chat_info.get("name", "对方")
     for s in senders:
         if s.get("uid") != self_uid and s.get("name"):
             other_name = s["name"]
             break
+
+    # 缺少 selfUid 时，尝试按显示名从 senders 里找回自己的 UID
+    if not self_uid and self_name:
+        for s in senders:
+            if s.get("name") == self_name and s.get("uid"):
+                self_uid = s["uid"]
+                break
 
     chat = ChatData(
         chat_name=chat_info.get("name", ""),
@@ -91,8 +100,16 @@ def load_chat(filepath: str) -> ChatData:
             chat.other_uid = sender_uid
 
         content = msg.get("content", {})
-        raw_text = content.get("text", "")
-        elements = content.get("elements", [])
+        if isinstance(content, str):
+            # 部分导出器把 content 直接写成纯文本
+            raw_text = content
+            elements = []
+        elif isinstance(content, dict):
+            raw_text = content.get("text", "")
+            elements = content.get("elements", [])
+        else:
+            raw_text = ""
+            elements = []
 
         text_parts = []
         face_ids = []
@@ -119,6 +136,11 @@ def load_chat(filepath: str) -> ChatData:
                 is_reply = True
 
         clean_text = "".join(text_parts).strip()
+        # 没有结构化 text 元素但原始文本存在时（如无 elements 的纯文本消息），
+        # 回退到原始文本，避免消息内容丢失；有 elements 的消息不回落，
+        # 以免把 "[图片]" 之类的占位符当成正文统计。
+        if not clean_text and not elements and raw_text:
+            clean_text = raw_text.strip()
 
         parsed = Message(
             id=msg.get("id", ""),
@@ -152,7 +174,7 @@ def split_by_month(chat: ChatData) -> dict[str, list[Message]]:
     """按月分组消息，返回 {"2024-01": [messages]}"""
     groups: dict[str, list[Message]] = {}
     for msg in chat.messages:
-        dt = datetime.fromtimestamp(msg.timestamp / 1000)
+        dt = datetime.fromtimestamp(msg.timestamp / 1000, tz=CST)
         key = dt.strftime("%Y-%m")
         if key not in groups:
             groups[key] = []

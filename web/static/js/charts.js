@@ -17,13 +17,23 @@
 // QQ 聊天记录分析 — ECharts 图表渲染
 // ====================================
 
+// HTML 转义：AI 分析结果 / 聊天内容可能包含 HTML，插入 DOM 前必须转义，防止 XSS
+function esc(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 function renderPieChart(domId, data, name) {
     const el = document.getElementById(domId);
     if (!el) return;
     const chart = echarts.init(el);
     const colors = ['#5470c6', '#91cc75', '#fac858', '#ee6666', '#73c0de'];
     chart.setOption({
-        tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
+        tooltip: { trigger: 'item', formatter: function(p) { return esc(p.name) + ': ' + p.value + ' (' + p.percent + '%)'; } },
         legend: { bottom: 0 },
         series: [{
             type: 'pie',
@@ -164,8 +174,8 @@ function renderWordCloud(domId, data, title) {
     var colors = ['#1a237e','#2e7d32','#bf360c','#4a148c','#01579b','#e65100','#004d40','#b71c1c','#3e2723','#283593','#00695c','#37474f','#0d47a1','#33691e','#5d4037'];
 
     chart.setOption({
-        title: { text: title, left: 'center', textStyle: { fontSize: 14 } },
-        tooltip: { formatter: function(p) { return p.name + ': ' + p.value + ' 次'; } },
+        title: { text: esc(title), left: 'center', textStyle: { fontSize: 14 } },
+        tooltip: { formatter: function(p) { return esc(p.name) + ': ' + p.value + ' 次'; } },
         series: [{
             type: 'wordCloud',
             shape: 'circle',
@@ -183,14 +193,15 @@ function renderWordCloud(domId, data, title) {
                 fontFamily: 'Microsoft YaHei, sans-serif',
                 fontWeight: 'bold'
             },
-            data: data.map(function(d) {
+            data: data.map(function(d, i) {
                 var fontSize = 14 + 34 * (d.count - minCount) / (maxCount - minCount || 1);
                 return {
                     name: d.word,
                     value: d.count,
                     textStyle: {
                         fontSize: fontSize,
-                        color: colors[Math.floor(Math.random() * colors.length)]
+                        // 按出现顺序固定配色，刷新时颜色稳定
+                        color: colors[i % colors.length]
                     }
                 };
             })
@@ -209,7 +220,7 @@ function renderFaceBarChart(domId, data, personName) {
     }
     const chart = echarts.init(el);
     chart.setOption({
-        tooltip: { trigger: 'axis', formatter: function(p) { return p.name + ': ' + p.value + ' 次'; } },
+        tooltip: { trigger: 'axis', formatter: function(p) { return esc(p.name) + ': ' + p.value + ' 次'; } },
         grid: { left: '5%', right: '10%', containLabel: true },
         xAxis: { type: 'value', name: '次数' },
         yAxis: {
@@ -323,13 +334,13 @@ function renderEmotionCharts(data) {
         var d = data[m];
         if (!d) return;
         html += '<div class="card mb-2"><div class="card-body py-2">' +
-            '<strong>' + m + '</strong>' +
-            '<span class="badge bg-primary ms-2">自己: ' + d.self_emotion + '(' + d.self_intensity + ')</span>' +
-            '<span class="badge bg-success ms-1">对方: ' + d.other_emotion + '(' + d.other_intensity + ')</span>' +
-            '<span class="badge bg-info ms-1">基调: ' + d.overall_tone + '</span>' +
+            '<strong>' + esc(m) + '</strong>' +
+            '<span class="badge bg-primary ms-2">自己: ' + esc(d.self_emotion) + '(' + esc(d.self_intensity) + ')</span>' +
+            '<span class="badge bg-success ms-1">对方: ' + esc(d.other_emotion) + '(' + esc(d.other_intensity) + ')</span>' +
+            '<span class="badge bg-info ms-1">基调: ' + esc(d.overall_tone) + '</span>' +
             '<div class="mt-1 small text-muted">' +
-            '自己关键词: ' + (d.self_keywords || []).join('、') + '<br>' +
-            '对方关键词: ' + (d.other_keywords || []).join('、') +
+            '自己关键词: ' + (d.self_keywords || []).map(esc).join('、') + '<br>' +
+            '对方关键词: ' + (d.other_keywords || []).map(esc).join('、') +
             '</div></div></div>';
     });
     $('#emotionDetails').html(html);
@@ -342,13 +353,13 @@ function renderRelationshipInsight(data) {
         var d = data[m];
         if (!d) return;
         html += '<div class="card mb-2"><div class="card-body py-2">' +
-            '<strong>' + m + '</strong>' +
-            '<span class="badge bg-info ms-2">亲密: ' + d.closeness_score + '/10</span>' +
-            '<span class="badge bg-secondary ms-1">趋势: ' + d.closeness_trend + '</span>' +
-            '<span class="badge bg-warning ms-1">风格: ' + d.interaction_style + '</span>' +
+            '<strong>' + esc(m) + '</strong>' +
+            '<span class="badge bg-info ms-2">亲密: ' + esc(d.closeness_score) + '/10</span>' +
+            '<span class="badge bg-secondary ms-1">趋势: ' + esc(d.closeness_trend) + '</span>' +
+            '<span class="badge bg-warning ms-1">风格: ' + esc(d.interaction_style) + '</span>' +
             '<div class="mt-1 small text-muted">' +
-            '自己角色: ' + d.self_role + ' · 对方角色: ' + d.other_role + '<br>' +
-            (d.relationship_summary || '') +
+            '自己角色: ' + esc(d.self_role) + ' · 对方角色: ' + esc(d.other_role) + '<br>' +
+            esc(d.relationship_summary) +
             '</div></div></div>';
     });
     if (html) $('#relationshipInsight').html(html);
@@ -360,18 +371,18 @@ function renderHabitsInsight(data) {
         var d = data[key];
         if (!d) return;
         html += '<div class="card mb-3">' +
-            '<div class="card-header">' + d.name + '</div>' +
+            '<div class="card-header">' + esc(d.name) + '</div>' +
             '<div class="card-body">' +
             '<div class="row"><div class="col-md-6">' +
-            '<p><strong>性格标签:</strong> ' + (d.personality_tags || []).join('、') + '</p>' +
-            '<p><strong>口头禅:</strong> ' + (d.common_phrases || []).join('、') + '</p>' +
-            '<p><strong>表情风格:</strong> ' + d.emoji_style + '</p>' +
+            '<p><strong>性格标签:</strong> ' + (d.personality_tags || []).map(esc).join('、') + '</p>' +
+            '<p><strong>口头禅:</strong> ' + (d.common_phrases || []).map(esc).join('、') + '</p>' +
+            '<p><strong>表情风格:</strong> ' + esc(d.emoji_style) + '</p>' +
             '</div><div class="col-md-6">' +
-            '<p><strong>句子长度:</strong> ' + d.sentence_length + '</p>' +
-            '<p><strong>回复速度:</strong> ' + d.reply_speed + '</p>' +
-            '<p><strong>话题跳跃:</strong> ' + d.topic_jumping + '</p>' +
+            '<p><strong>句子长度:</strong> ' + esc(d.sentence_length) + '</p>' +
+            '<p><strong>回复速度:</strong> ' + esc(d.reply_speed) + '</p>' +
+            '<p><strong>话题跳跃:</strong> ' + esc(d.topic_jumping) + '</p>' +
             '</div></div>' +
-            '<p><strong>独特习惯:</strong> ' + (d.unique_traits || []).join('、') + '</p>' +
+            '<p><strong>独特习惯:</strong> ' + (d.unique_traits || []).map(esc).join('、') + '</p>' +
             '</div></div>';
     });
     if (html) $('#habitsInsight').html(html);
@@ -401,12 +412,12 @@ function renderTopicsCharts(data) {
         var d = data[m];
         if (!d) return;
         var tags = (d.topics || []).map(function(t) {
-            return '<span class="badge bg-secondary me-1">' + t.name + ' (' + Math.round(t.weight * 100) + '%)</span>';
+            return '<span class="badge bg-secondary me-1">' + esc(t.name) + ' (' + Math.round(t.weight * 100) + '%)</span>';
         }).join('');
         html += '<div class="card mb-2"><div class="card-body py-2">' +
-            '<strong>' + m + '</strong>' +
+            '<strong>' + esc(m) + '</strong>' +
             '<div class="mt-1">' + tags + '</div>' +
-            '<div class="small text-muted mt-1">' + (d.summary || '') + '</div>' +
+            '<div class="small text-muted mt-1">' + esc(d.summary) + '</div>' +
             '</div></div>';
     });
     if (html) $('#topicsDetails').html(html);
