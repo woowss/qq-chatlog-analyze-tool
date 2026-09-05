@@ -165,121 +165,128 @@ $(function() {
     $('#reportGenTime').text(new Date().toLocaleString('zh-CN'));
     $('#reportDate').text('报告生成：' + new Date().toLocaleString('zh-CN'));
 
-    // 从 sessionStorage 读取 AI 分析结果
-    var sections = [];
-
-    // 情绪分析
-    var emotion = sessionStorage.getItem('ai_emotion');
-    if (emotion) {
-        var data = JSON.parse(emotion);
-        var months = Object.keys(data).sort();
-        var html = '<h5 class="mt-4">😊 情绪分析</h5><table class="ai-detail"><tr><th>月份</th><th>{{ overview.self_name }}</th><th>{{ overview.other_name }}</th><th>基调</th></tr>';
-        months.forEach(function(m) {
-            var d = data[m];
-            if (!d) return;
-            html += '<tr><td>' + esc(m) + '</td><td>' + esc(d.self_emotion) + '(' + esc(d.self_intensity) + ')' +
-                '<br><small>' + joinEsc(d.self_keywords) + '</small></td>' +
-                '<td>' + esc(d.other_emotion) + '(' + esc(d.other_intensity) + ')' +
-                '<br><small>' + joinEsc(d.other_keywords) + '</small></td>' +
-                '<td>' + esc(d.overall_tone) + '</td></tr>';
+    // 从服务端缓存聚合 AI 分析结果（跨标签页/重启浏览器仍有效），回退 sessionStorage
+    var results = {};
+    var pending = 5;
+    ['emotion', 'relationship', 'habits', 'profile', 'topics'].forEach(function(dim) {
+        loadAnalysis(dim, function(d) {
+            results[dim] = d;
+            if (--pending === 0) renderSections();
         });
-        html += '</table>';
-        sections.push(html);
-    }
+    });
 
-    // 人际关系
-    var rel = sessionStorage.getItem('ai_relationship');
-    if (rel) {
-        var data = JSON.parse(rel);
-        var months = Object.keys(data).sort();
-        var html = '<h5 class="mt-4">👥 人际关系</h5><table class="ai-detail"><tr><th>月份</th><th>亲密</th><th>风格</th><th>角色</th><th>摘要</th></tr>';
-        months.forEach(function(m) {
-            var d = data[m];
-            if (!d) return;
-            html += '<tr><td>' + esc(m) + '</td><td>' + esc(d.closeness_score) + '/10 (' + esc(d.closeness_trend) + ')</td>' +
-                '<td>' + esc(d.interaction_style) + '</td>' +
-                '<td>' + esc(d.self_role) + ' / ' + esc(d.other_role) + '</td>' +
-                '<td>' + esc(d.relationship_summary) + '</td></tr>';
-        });
-        html += '</table>';
-        sections.push(html);
-    }
+    function renderSections() {
+        var sections = [];
+        var data, months, html;
 
-    // 个人习惯
-    var habits = sessionStorage.getItem('ai_habits');
-    if (habits) {
-        var data = JSON.parse(habits);
-        var html = '<h5 class="mt-4">🧑 个人习惯</h5><div class="row">';
-        ['self', 'other'].forEach(function(key) {
-            var d = data[key];
-            if (!d) return;
-            html += '<div class="col-md-6"><div class="card mb-2"><div class="card-header"><strong>' + esc(d.name) + '</strong></div><div class="card-body">' +
-                '<p><strong>性格标签：</strong>' + joinEsc(d.personality_tags) + '</p>' +
-                '<p><strong>口头禅：</strong>' + joinEsc(d.common_phrases) + '</p>' +
-                '<p><strong>句子长度：</strong>' + esc(d.sentence_length) + '</p>' +
-                '<p><strong>回复速度：</strong>' + esc(d.reply_speed) + '</p>' +
-                '</div></div></div>';
-        });
-        html += '</div>';
-        sections.push(html);
-    }
+        // 情绪分析
+        if (results.emotion) {
+            data = results.emotion;
+            months = Object.keys(data).sort();
+            html = '<h5 class="mt-4">😊 情绪分析</h5><table class="ai-detail"><tr><th>月份</th><th>{{ overview.self_name }}</th><th>{{ overview.other_name }}</th><th>基调</th></tr>';
+            months.forEach(function(m) {
+                var d = data[m];
+                if (!d) return;
+                html += '<tr><td>' + esc(m) + '</td><td>' + esc(d.self_emotion) + '(' + esc(d.self_intensity) + ')' +
+                    '<br><small>' + joinEsc(d.self_keywords) + '</small></td>' +
+                    '<td>' + esc(d.other_emotion) + '(' + esc(d.other_intensity) + ')' +
+                    '<br><small>' + joinEsc(d.other_keywords) + '</small></td>' +
+                    '<td>' + esc(d.overall_tone) + '</td></tr>';
+            });
+            html += '</table>';
+            sections.push(html);
+        }
 
-    // 人物锐评
-    var profile = sessionStorage.getItem('ai_profile');
-    if (profile) {
-        var data = JSON.parse(profile);
-        var html = '<h5 class="mt-4">🎯 人物锐评</h5><div class="row">';
-        ['self', 'other'].forEach(function(key) {
-            var d = data[key];
-            if (!d) return;
-            var p = d.personality_analysis || {};
-            var cs = d.chat_style_analysis || {};
-            var ep = d.emotional_pattern || {};
-            var rd = d.relationship_dynamics || {};
-            var sc = d.scoring || {};
-            html += '<div class="col-md-6"><div class="card mb-2"><div class="card-header"><strong>' + esc(d.name) + '</strong></div><div class="card-body">' +
-                '<div class="alert alert-info py-1">' + esc(d.overall_impression) + '</div>' +
-                '<p><strong>🎯 锐评：</strong>' + esc(d.verdict) + '</p>' +
-                '<p><strong>核心性格：</strong><span class="badge bg-primary">' + esc(p.core_type) + '</span></p>' +
-                '<p><strong>思维方式：</strong>' + esc(p.thinking_style) + ' · <strong>幽默：</strong>' + esc(p.humor_style) + '</p>' +
-                '<p><strong>✅ 优点：</strong></p><ul>' + (p.strengths || []).map(function(s) { return '<li>' + esc(s) + '</li>'; }).join('') + '</ul>' +
-                '<p><strong>⚠️ 缺点：</strong></p><ul>' + (p.weaknesses || []).map(function(s) { return '<li>' + esc(s) + '</li>'; }).join('') + '</ul>' +
-                '<p><strong>💬 聊天风格：</strong>开启=' + esc(cs.opener) + ' · 回应=' + esc(cs.responder) + '</p>' +
-                '<p><strong>📌 常聊话题：</strong>' + (joinEsc(cs.topic_preference) || '-') + '</p>' +
-                '<p><strong>🔗 关系角色：</strong>' + esc(rd.role_in_relationship) + '</p>' +
-                '<p><strong>情绪频率：</strong>' + esc(ep.frequency) + ' · <strong>常见状态：</strong>' + esc(ep.typical_state) + '</p>';
-            if (sc.expressiveness) {
-                html += '<p><strong>评分：</strong>表达' + esc(sc.expressiveness) + '/10 · 情绪' + esc(sc.emotional_richness || '-') + '/10 · 社交' + esc(sc.social_energy || '-') + '/10 · 独特' + esc(sc.uniqueness || '-') + '/10</p>';
-            }
-            if (d.fun_facts && d.fun_facts.length) {
-                html += '<p><strong>🤪 有趣事实：</strong>' + d.fun_facts.slice(0, 3).map(esc).join('；') + '</p>';
-            }
-            html += '</div></div></div>';
-        });
-        html += '</div>';
-        sections.push(html);
-    }
+        // 人际关系
+        if (results.relationship) {
+            data = results.relationship;
+            months = Object.keys(data).sort();
+            html = '<h5 class="mt-4">👥 人际关系</h5><table class="ai-detail"><tr><th>月份</th><th>亲密</th><th>风格</th><th>角色</th><th>摘要</th></tr>';
+            months.forEach(function(m) {
+                var d = data[m];
+                if (!d) return;
+                html += '<tr><td>' + esc(m) + '</td><td>' + esc(d.closeness_score) + '/10 (' + esc(d.closeness_trend) + ')</td>' +
+                    '<td>' + esc(d.interaction_style) + '</td>' +
+                    '<td>' + esc(d.self_role) + ' / ' + esc(d.other_role) + '</td>' +
+                    '<td>' + esc(d.relationship_summary) + '</td></tr>';
+            });
+            html += '</table>';
+            sections.push(html);
+        }
 
-    // 话题趋势
-    var topics = sessionStorage.getItem('ai_topics');
-    if (topics) {
-        var data = JSON.parse(topics);
-        var months = Object.keys(data).sort();
-        var html = '<h5 class="mt-4">📈 话题趋势</h5><table class="ai-detail"><tr><th>月份</th><th>话题</th><th>摘要</th></tr>';
-        months.forEach(function(m) {
-            var d = data[m];
-            if (!d) return;
-            var tags = (d.topics || []).map(function(t) {
-                return esc(t.name) + '(' + Math.round(t.weight * 100) + '%)';
-            }).join('、');
-            html += '<tr><td>' + esc(m) + '</td><td>' + tags + '</td><td>' + esc(d.summary) + '</td></tr>';
-        });
-        html += '</table>';
-        sections.push(html);
-    }
+        // 个人习惯
+        if (results.habits) {
+            data = results.habits;
+            html = '<h5 class="mt-4">🧑 个人习惯</h5><div class="row">';
+            ['self', 'other'].forEach(function(key) {
+                var d = data[key];
+                if (!d) return;
+                html += '<div class="col-md-6"><div class="card mb-2"><div class="card-header"><strong>' + esc(d.name) + '</strong></div><div class="card-body">' +
+                    '<p><strong>性格标签：</strong>' + joinEsc(d.personality_tags) + '</p>' +
+                    '<p><strong>口头禅：</strong>' + joinEsc(d.common_phrases) + '</p>' +
+                    '<p><strong>句子长度：</strong>' + esc(d.sentence_length) + '</p>' +
+                    '<p><strong>回复速度：</strong>' + esc(d.reply_speed) + '</p>' +
+                    '</div></div></div>';
+            });
+            html += '</div>';
+            sections.push(html);
+        }
 
-    if (sections.length) {
-        $('#reportAiContent').html(sections.join(''));
+        // 人物锐评
+        if (results.profile) {
+            data = results.profile;
+            html = '<h5 class="mt-4">🎯 人物锐评</h5><div class="row">';
+            ['self', 'other'].forEach(function(key) {
+                var d = data[key];
+                if (!d) return;
+                var p = d.personality_analysis || {};
+                var cs = d.chat_style_analysis || {};
+                var ep = d.emotional_pattern || {};
+                var rd = d.relationship_dynamics || {};
+                var sc = d.scoring || {};
+                html += '<div class="col-md-6"><div class="card mb-2"><div class="card-header"><strong>' + esc(d.name) + '</strong></div><div class="card-body">' +
+                    '<div class="alert alert-info py-1">' + esc(d.overall_impression) + '</div>' +
+                    '<p><strong>🎯 锐评：</strong>' + esc(d.verdict) + '</p>' +
+                    '<p><strong>核心性格：</strong><span class="badge bg-primary">' + esc(p.core_type) + '</span></p>' +
+                    '<p><strong>思维方式：</strong>' + esc(p.thinking_style) + ' · <strong>幽默：</strong>' + esc(p.humor_style) + '</p>' +
+                    '<p><strong>✅ 优点：</strong></p><ul>' + (p.strengths || []).map(function(s) { return '<li>' + esc(s) + '</li>'; }).join('') + '</ul>' +
+                    '<p><strong>⚠️ 缺点：</strong></p><ul>' + (p.weaknesses || []).map(function(s) { return '<li>' + esc(s) + '</li>'; }).join('') + '</ul>' +
+                    '<p><strong>💬 聊天风格：</strong>开启=' + esc(cs.opener) + ' · 回应=' + esc(cs.responder) + '</p>' +
+                    '<p><strong>📌 常聊话题：</strong>' + (joinEsc(cs.topic_preference) || '-') + '</p>' +
+                    '<p><strong>🔗 关系角色：</strong>' + esc(rd.role_in_relationship) + '</p>' +
+                    '<p><strong>情绪频率：</strong>' + esc(ep.frequency) + ' · <strong>常见状态：</strong>' + esc(ep.typical_state) + '</p>';
+                if (sc.expressiveness) {
+                    html += '<p><strong>评分：</strong>表达' + esc(sc.expressiveness) + '/10 · 情绪' + esc(sc.emotional_richness || '-') + '/10 · 社交' + esc(sc.social_energy || '-') + '/10 · 独特' + esc(sc.uniqueness || '-') + '/10</p>';
+                }
+                if (d.fun_facts && d.fun_facts.length) {
+                    html += '<p><strong>🤪 有趣事实：</strong>' + d.fun_facts.slice(0, 3).map(esc).join('；') + '</p>';
+                }
+                html += '</div></div></div>';
+            });
+            html += '</div>';
+            sections.push(html);
+        }
+
+        // 话题趋势
+        if (results.topics) {
+            data = results.topics;
+            months = Object.keys(data).sort();
+            html = '<h5 class="mt-4">📈 话题趋势</h5><table class="ai-detail"><tr><th>月份</th><th>话题</th><th>摘要</th></tr>';
+            months.forEach(function(m) {
+                var d = data[m];
+                if (!d) return;
+                var tags = (d.topics || []).map(function(t) {
+                    return esc(t.name) + '(' + Math.round(t.weight * 100) + '%)';
+                }).join('、');
+                html += '<tr><td>' + esc(m) + '</td><td>' + tags + '</td><td>' + esc(d.summary) + '</td></tr>';
+            });
+            html += '</table>';
+            sections.push(html);
+        }
+
+        if (sections.length) {
+            $('#reportAiContent').html(sections.join(''));
+        }
     }
 });
 </script>

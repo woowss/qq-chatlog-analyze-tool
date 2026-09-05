@@ -30,6 +30,7 @@ DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"
 BASE_DIR = Path(__file__).parent
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 SESSION_FILE_DIR = os.path.join(BASE_DIR, "flask_session")
+AI_CACHE_DIR = os.path.join(BASE_DIR, "ai_cache")  # AI 分析结果缓存（含敏感内容，勿提交/定期清理）
 MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
 
 
@@ -57,3 +58,10 @@ SECRET_KEY = _load_or_create_secret()
 # 调试模式开关：默认关闭（避免暴露 Werkzeug 调试器导致任意代码执行风险），
 # 本地开发时可设环境变量 FLASK_DEBUG=true 开启自动重载
 FLASK_DEBUG = os.getenv("FLASK_DEBUG", "false").strip().lower() in ("1", "true", "yes", "on")
+
+# 绑定地址与端口：默认仅本机。Windows 上 5000 常被 AirPlay/Hyper-V 占用，可改 FLASK_PORT
+FLASK_HOST = os.getenv("FLASK_HOST", "127.0.0.1").strip() or "127.0.0.1"
+FLASK_PORT = int(os.getenv("FLASK_PORT", "5000") or 5000)
+
+# 访问口令：设置后所有页面需先登录；绑定非回环地址时强制要求（否则拒绝启动）
+ACCESS_PASSWORD = os.getenv("ACCESS_PASSWORD", "").strip()

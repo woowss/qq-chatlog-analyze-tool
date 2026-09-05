@@ -298,7 +298,7 @@ function renderEmotionCharts(data) {
         legend: { data: ['自己情绪强度', '对方情绪强度'], bottom: 0 },
         grid: { left: '3%', right: '4%', bottom: '15%', containLabel: true },
         xAxis: { type: 'category', data: months },
-        yAxis: { type: 'value', name: '情绪强度', min: 1, max: 10 },
+        yAxis: { type: 'value', name: '情绪强度', min: 0, max: 10 },
         series: [
             {
                 name: '自己情绪强度', type: 'line',

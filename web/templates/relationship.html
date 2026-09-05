@@ -90,8 +90,9 @@ $(function() {
         otherName: {{ overview.other_name | tojson }}
     });
 
-    const data = sessionStorage.getItem('ai_relationship');
-    if (data) renderRelationshipInsight(JSON.parse(data));
+    loadAnalysis('relationship', function(data) {
+        if (data) renderRelationshipInsight(data);
+    });
 });
 </script>
 {% endblock %}

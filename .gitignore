@@ -8,6 +8,9 @@ flask_session/
 # Uploaded chat files
 uploads/*.json
 
+# AI analysis result cache (derived from chat logs — sensitive)
+ai_cache/
+
 # Python cache
 __pycache__/
 *.pyc
