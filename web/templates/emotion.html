@@ -62,8 +62,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 <script>
 $(function() {
-    const data = sessionStorage.getItem('ai_emotion');
-    if (data) renderEmotionCharts(JSON.parse(data));
+    loadAnalysis('emotion', function(data) {
+        if (data) renderEmotionCharts(data);
+    });
 });
 </script>
 {% endblock %}

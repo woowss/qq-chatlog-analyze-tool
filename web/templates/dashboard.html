@@ -135,13 +135,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <div class="card mb-4 border-primary">
     <div class="card-header bg-primary text-white">🤖 AI 深度分析</div>
     <div class="card-body text-center">
-        <p class="mb-3">点击按钮调用 DeepSeek API 分析聊天记录<br><small class="text-muted">按月份分段分析，可能需要 1-2 分钟</small></p>
+        <p class="mb-3">点击按钮调用 DeepSeek API 分析聊天记录<br><small class="text-muted">按月份分段并发分析，实时显示进度；已分析过的维度会直接命中缓存，不再产生 API 费用</small></p>
         <div class="d-flex justify-content-center gap-2 flex-wrap">
             <button class="btn btn-outline-primary btn-analyze" data-dim="emotion" data-orig="😊 情绪分析">😊 情绪分析</button>
             <button class="btn btn-outline-primary btn-analyze" data-dim="relationship" data-orig="👥 人际关系">👥 人际关系</button>
             <button class="btn btn-outline-primary btn-analyze" data-dim="habits" data-orig="🧑 个人习惯">🧑 个人习惯</button>
             <button class="btn btn-outline-primary btn-analyze" data-dim="topics" data-orig="📈 话题趋势">📈 话题趋势</button>
             <button class="btn btn-outline-danger btn-analyze" data-dim="profile" data-orig="🎯 人物锐评">🎯 人物锐评</button>
+        </div>
+        <div class="form-check mt-2 d-inline-block">
+            <input class="form-check-input" type="checkbox" id="forceRefresh">
+            <label class="form-check-label small text-muted" for="forceRefresh">强制重新分析（忽略缓存，会产生 API 费用）</label>
         </div>
         <div id="analyzeStatus" class="mt-3"></div>
         <div class="mt-2">
@@ -156,26 +160,45 @@ $('.btn-analyze').on('click', function() {
     const dim = btn.data('dim');
     const orig = btn.data('orig');
     const status = $('#analyzeStatus');
+    const refresh = $('#forceRefresh').is(':checked');
+
+    const opts = {
+        refresh: refresh,
+        onProgress: function(done, total) {
+            if (done < 0) { $('#aText').text('正在取消…'); return; }
+            if (total > 0) {
+                const pct = Math.round(done / total * 100);
+                $('#aProg').css('width', pct + '%');
+                $('#aText').text('已完成 ' + done + '/' + total + '（' + pct + '%）');
+            } else {
+                $('#aText').text('准备中…');
+            }
+        },
+        onDone: function(result) {
+            sessionStorage.setItem('ai_' + dim, JSON.stringify(result));
+            status.html('<div class="alert alert-success mb-0">✅ 分析完成！即将跳转...</div>');
+            setTimeout(function() { window.location.href = '/' + dim; }, 600);
+        },
+        onError: function(msg) {
+            status.html('<div class="alert alert-danger mb-0">' + esc(msg) + '</div>');
+            btn.prop('disabled', false).text(orig);
+        }
+    };
 
     btn.prop('disabled', true).text('⏳ 分析中...');
-    status.html('<div class="spinner-border text-primary" role="status"></div> 正在分析，请稍候...');
-
-    $.post('/api/analyze/' + dim, function(data) {
-        if (data.error) {
-            status.html('<div class="alert alert-danger">' + esc(data.error) + '</div>');
-            btn.prop('disabled', false).text(orig);
-        } else {
-            sessionStorage.setItem('ai_' + dim, JSON.stringify(data));
-            status.html('<div class="alert alert-success">✅ 分析完成！即将跳转...</div>');
-            setTimeout(function() {
-                window.location.href = '/' + dim;
-            }, 800);
-        }
-    }).fail(function(xhr) {
-        const msg = xhr.responseJSON?.error || '请求失败';
-        status.html('<div class="alert alert-danger">' + esc(msg) + '</div>');
-        btn.prop('disabled', false).text(orig);
+    status.html(
+        '<div class="spinner-border spinner-border-sm text-primary" role="status"></div>' +
+        '<div class="progress mx-auto mt-2" style="max-width:320px;height:8px;">' +
+        '<div id="aProg" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div></div>' +
+        '<div id="aText" class="small text-muted mt-1">准备中…</div>' +
+        '<button id="aCancel" class="btn btn-sm btn-outline-secondary mt-2">取消</button>'
+    );
+    $('#aCancel').on('click', function() {
+        $(this).prop('disabled', true).text('取消中…');
+        cancelAnalyze(opts);
     });
+
+    startAnalyze(dim, opts);
 });
 </script>
 {% endif %}

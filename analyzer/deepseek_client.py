@@ -25,7 +25,7 @@ from typing import Any, Callable, Optional
 from openai import OpenAI
 
 from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL, DEEPSEEK_BASE_URL
-from parser.qq_parser import CST, ChatData, split_by_month
+from parser.qq_parser import CST, ChatData, is_statistical, split_by_month
 from analyzer.logger import get_logger
 from analyzer.prompts import (
     SYSTEM_PROMPT_EMOTION,
@@ -45,8 +45,15 @@ CONCURRENCY = 3
 # 单次 API 请求超时（秒）
 REQUEST_TIMEOUT = 120
 
-# 不应进入 AI 分析的 msg_type：系统消息 / 转发 / 商城表情等
-_SKIP_MSG_TYPES = {"type_11", "type_17", "type_23"}
+# 各维度输出 token 预算：锐评 schema 有 30+ 字段且要求逐条附原句证据，
+# 2048 必然截断（截断的 JSON 解析失败后原样重试只会重复烧钱），单独放大。
+MAX_TOKENS_BY_DIM = {
+    "emotion": 1024,
+    "topics": 1024,
+    "relationship": 1024,
+    "habits": 2048,
+    "profile": 8192,
+}
 
 
 def _get_client() -> Optional[OpenAI]:
@@ -145,7 +152,7 @@ def _build_dialog(messages: list, self_uid: str, self_name: str, other_name: str
     返回形如 "统计：共 N 条消息（我方 a 条 / 对方 b 条，图片 c 张）。\n\n[时间] 昵称: 内容 [标注]\n..."。
     统计头给模型全貌（即使抽样截断也能知道真实消息量），避免被样本误导。
     """
-    valid = [m for m in messages if _has_content(m) and m.msg_type not in _SKIP_MSG_TYPES]
+    valid = [m for m in messages if _has_content(m) and is_statistical(m)]
     if not valid:
         return ""
     total = len(valid)
@@ -171,8 +178,15 @@ def _build_dialog(messages: list, self_uid: str, self_name: str, other_name: str
     return f"{head}。\n\n" + "\n".join(lines)
 
 
-def _call_api(system_prompt: str, user_content: str, retry: int = 2) -> Optional[dict]:
-    """调用 DeepSeek API，返回解析后的 JSON"""
+def _call_api(system_prompt: str, user_content: str, max_tokens: int = 2048,
+              retry: int = 2) -> Optional[dict]:
+    """调用 DeepSeek API，返回解析后的 JSON。
+
+    错误分类策略：
+    - 网络/API 错误（含 429）：指数退避重试，429 优先遵循 Retry-After；
+    - 输出被 max_tokens 截断或返回非法 JSON：重试无意义（输入相同、结果确定），
+      记录日志后返回 None，由上层按"该月失败"处理。
+    """
     client = _get_client()
     if client is None:
         return None
@@ -186,32 +200,58 @@ def _call_api(system_prompt: str, user_content: str, retry: int = 2) -> Optional
                     {"role": "user", "content": user_content},
                 ],
                 temperature=0.3,
-                max_tokens=2048,
+                max_tokens=max_tokens,
                 response_format={"type": "json_object"},
             )
-            content = resp.choices[0].message.content
-            return json.loads(content)
+            choice = resp.choices[0]
+            if resp.usage:
+                logger.info("token 用量: prompt=%s completion=%s finish=%s",
+                            resp.usage.prompt_tokens, resp.usage.completion_tokens,
+                            choice.finish_reason)
+            if choice.finish_reason == "length":
+                logger.error("模型输出被 max_tokens=%s 截断，放弃本次结果（不重试）", max_tokens)
+                return None
+            try:
+                return json.loads(choice.message.content)
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.error("模型返回非法 JSON（不重试）: %s", e)
+                return None
         except Exception as e:
             if attempt < retry:
-                time.sleep(2 ** attempt)
+                delay = 2 ** attempt
+                status = getattr(e, "status_code", None)
+                if status == 429:
+                    headers = getattr(getattr(e, "response", None), "headers", None)
+                    try:
+                        delay = max(delay, float(dict(headers or {}).get("retry-after", 0)))
+                    except (TypeError, ValueError):
+                        pass
+                logger.warning("API 调用失败（第 %s 次，%ss 后重试）: %s", attempt + 1, delay, e)
+                time.sleep(delay)
                 continue
             raise  # 最后仍失败则抛出
 
 
 def _analyze_periods(months: dict[str, list], system_prompt: str,
-                     make_prompt: Callable[[str, list], str]) -> dict[str, Any]:
+                     make_prompt: Callable[[str, list], str], max_tokens: int,
+                     on_progress: Optional[Callable[[int, int], None]] = None,
+                     should_cancel: Optional[Callable[[], bool]] = None) -> dict[str, Any]:
     """并发逐月调用 API，返回 {period: result}。
 
     单月失败仅记录日志并跳过，不中断整体分析。
+    on_progress(done, total) 每完成一个月回调一次；
+    should_cancel() 返回 True 时不再启动新任务并尽快返回已完成部分。
     """
     results: dict[str, Any] = {}
+    total = len(months)
+    done = 0
 
     def _work(period: str, msgs: list) -> tuple[str, Optional[dict]]:
         try:
             prompt = make_prompt(period, msgs)
             if not prompt.strip():
                 return period, None
-            result = _call_api(system_prompt, prompt)
+            result = _call_api(system_prompt, prompt, max_tokens=max_tokens)
             if result:
                 result["period"] = period
                 result["month"] = period
@@ -222,11 +262,21 @@ def _analyze_periods(months: dict[str, list], system_prompt: str,
 
     items = list(months.items())
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(_work, period, msgs) for period, msgs in items]
-        for fut in concurrent.futures.as_completed(futures):
+        futures = {}
+        for period, msgs in items:
+            if should_cancel and should_cancel():
+                break
+            futures[pool.submit(_work, period, msgs)] = period
+        for fut in concurrent.futures.as_completed(list(futures)):
             period, result = fut.result()
             if result:
                 results[period] = result
+            done += 1
+            if on_progress:
+                try:
+                    on_progress(done, total)
+                except Exception:
+                    pass
 
     # 按月份自然序返回
     return {period: results[period] for period in months if period in results}
@@ -277,7 +327,7 @@ def _normalize_topic_weights(obj: dict) -> None:
             t["weight"] = 0.0
 
 
-def analyze_emotion(chat: ChatData) -> dict[str, Any]:
+def analyze_emotion(chat: ChatData, on_progress=None, should_cancel=None) -> dict[str, Any]:
     """逐月情绪分析，返回 {"2025-09": {...}, ...}"""
     months = split_by_month(chat)
     results = _analyze_periods(
@@ -285,6 +335,8 @@ def analyze_emotion(chat: ChatData) -> dict[str, Any]:
         SYSTEM_PROMPT_EMOTION,
         lambda p, msgs: f"以下是 {p} 月的对话数据：\n\n"
                         f"{_build_dialog(msgs, chat.self_uid, chat.self_name, chat.other_name)}",
+        max_tokens=MAX_TOKENS_BY_DIM["emotion"],
+        on_progress=on_progress, should_cancel=should_cancel,
     )
     # 强度夹紧到 0-10，防御越界/非法值
     for r in results.values():
@@ -293,7 +345,7 @@ def analyze_emotion(chat: ChatData) -> dict[str, Any]:
     return results
 
 
-def analyze_topics(chat: ChatData) -> dict[str, Any]:
+def analyze_topics(chat: ChatData, on_progress=None, should_cancel=None) -> dict[str, Any]:
     """逐月话题分析"""
     months = split_by_month(chat)
     results = _analyze_periods(
@@ -301,6 +353,8 @@ def analyze_topics(chat: ChatData) -> dict[str, Any]:
         SYSTEM_PROMPT_TOPICS,
         lambda p, msgs: f"以下是 {p} 月的对话数据：\n\n"
                         f"{_build_dialog(msgs, chat.self_uid, chat.self_name, chat.other_name)}",
+        max_tokens=MAX_TOKENS_BY_DIM["topics"],
+        on_progress=on_progress, should_cancel=should_cancel,
     )
     # 权重归一化，保证各月话题占比之和恒为 1.0
     for r in results.values():
@@ -308,7 +362,7 @@ def analyze_topics(chat: ChatData) -> dict[str, Any]:
     return results
 
 
-def analyze_relationship(chat: ChatData) -> dict[str, Any]:
+def analyze_relationship(chat: ChatData, on_progress=None, should_cancel=None) -> dict[str, Any]:
     """逐月人际关系分析"""
     months = split_by_month(chat)
     results = _analyze_periods(
@@ -316,6 +370,8 @@ def analyze_relationship(chat: ChatData) -> dict[str, Any]:
         SYSTEM_PROMPT_RELATIONSHIP,
         lambda p, msgs: f"以下是 {p} 月的对话数据：\n\n"
                         f"{_build_dialog(msgs, chat.self_uid, chat.self_name, chat.other_name)}",
+        max_tokens=MAX_TOKENS_BY_DIM["relationship"],
+        on_progress=on_progress, should_cancel=should_cancel,
     )
     for r in results.values():
         _clamp_int(r, "closeness_score", 1, 10)
@@ -324,60 +380,76 @@ def analyze_relationship(chat: ChatData) -> dict[str, Any]:
 
 
 def _analyze_person(system_prompt: str, sample_size: int, msgs: list,
-                    display_name: str, prompt_template: str) -> Optional[dict]:
-    """单人的习惯/锐评分析：取最近 sample_size 条样本，失败仅记日志。"""
+                    display_name: str, prompt_template: str, max_tokens: int) -> Optional[dict]:
+    """单人的习惯/锐评分析：先过滤再取最近 sample_size 条样本，失败仅记日志。"""
     try:
-        sample = msgs[-sample_size:]
-        valid = [m for m in sample if _has_content(m) and m.msg_type not in _SKIP_MSG_TYPES]
+        valid_all = [m for m in msgs if _has_content(m) and is_statistical(m)]
+        sample = valid_all[-sample_size:]
+        valid = sample
         if not valid:
             return None
         lines = [_message_line(m, display_name) for m in valid]
         original_n = len(lines)
         lines = _fit_lines(lines, MAX_DIALOG_CHARS)
-        head = f"统计：{display_name} 共发言 {len(msgs)} 条（样本 {len(valid)} 条，图片 "
+        head = f"统计：{display_name} 共发言 {len(valid_all)} 条（样本 {len(valid)} 条，图片 "
         head += f"{sum(1 for m in valid if m.has_image)} 张）"
         if len(lines) < original_n:
             head += f"，因篇幅限制展示其中 {len(lines)} 条"
         dialog = f"{head}。\n\n" + "\n".join(lines)
         if not dialog.strip():
             return None
-        result = _call_api(system_prompt, prompt_template.format(display_name=display_name, dialog=dialog))
+        result = _call_api(system_prompt, prompt_template.format(display_name=display_name, dialog=dialog),
+                           max_tokens=max_tokens)
         if result:
             result["name"] = display_name
-            result["total_messages"] = len(msgs)
+            result["total_messages"] = len(valid_all)
             return result
     except Exception as e:
         logger.error("%s 的 AI 分析失败: %s", display_name, e)
     return None
 
 
-def analyze_habits(chat: ChatData) -> dict[str, Any]:
+def analyze_habits(chat: ChatData, on_progress=None, should_cancel=None) -> dict[str, Any]:
     """分析双方的语言习惯"""
     self_msgs = [m for m in chat.messages if m.sender_uid == chat.self_uid]
     other_msgs = [m for m in chat.messages if m.sender_uid != chat.self_uid]
 
     results: dict[str, Any] = {}
     template = "分析以下 {display_name} 的发言，总结其说话风格：\n\n{dialog}"
+    total, done = 2, 0
     for person_key, msgs in [("self", self_msgs), ("other", other_msgs)]:
+        if should_cancel and should_cancel():
+            break
         display_name = chat.self_name if person_key == "self" else chat.other_name
-        result = _analyze_person(SYSTEM_PROMPT_HABITS, 200, msgs, display_name, template)
+        result = _analyze_person(SYSTEM_PROMPT_HABITS, 200, msgs, display_name, template,
+                                 max_tokens=MAX_TOKENS_BY_DIM["habits"])
         if result:
             results[person_key] = result
+        done += 1
+        if on_progress:
+            on_progress(done, total)
     return results
 
 
-def analyze_profile(chat: ChatData) -> dict[str, Any]:
+def analyze_profile(chat: ChatData, on_progress=None, should_cancel=None) -> dict[str, Any]:
     """AI 人物锐评 — 分析双方的性格画像"""
     self_msgs = [m for m in chat.messages if m.sender_uid == chat.self_uid]
     other_msgs = [m for m in chat.messages if m.sender_uid != chat.self_uid]
 
     results: dict[str, Any] = {}
     template = "以下是 {display_name} 在私聊中的发言记录，请对其进行深度性格分析：\n\n{dialog}"
+    total, done = 2, 0
     for person_key, msgs in [("self", self_msgs), ("other", other_msgs)]:
+        if should_cancel and should_cancel():
+            break
         display_name = chat.self_name if person_key == "self" else chat.other_name
-        result = _analyze_person(SYSTEM_PROMPT_PROFILE, 300, msgs, display_name, template)
+        result = _analyze_person(SYSTEM_PROMPT_PROFILE, 300, msgs, display_name, template,
+                                 max_tokens=MAX_TOKENS_BY_DIM["profile"])
         if result:
             results[person_key] = result
+        done += 1
+        if on_progress:
+            on_progress(done, total)
     return results
 
 

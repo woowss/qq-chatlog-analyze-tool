@@ -47,6 +47,13 @@ pip install -r requirements.txt
 DEEPSEEK_API_KEY=你的DeepSeek_API_Key
 DEEPSEEK_MODEL=deepseek-chat
 DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+
+# 可选运行/安全配置（默认值即安全）
+# FLASK_DEBUG=false          # 调试模式（默认关闭，调试器可执行任意代码，仅限本机开发）
+# FLASK_HOST=127.0.0.1       # 绑定地址；非回环地址必须同时设置 ACCESS_PASSWORD
+# FLASK_PORT=5000            # 端口被占用时（Windows 5000 常见）可改 5001
+# ACCESS_PASSWORD=           # 访问口令；设置后所有页面需登录
+# SECRET_KEY=                # Session 签名密钥；留空自动生成并持久化到 .secret_key
 ```
 
 > 不配置 API Key 也能使用本地统计功能。AI 分析需要 [DeepSeek API Key](https://platform.deepseek.com/api_keys)。
@@ -60,12 +67,14 @@ python app.py
 浏览器打开 http://localhost:5000
 
 > 默认关闭调试模式（避免调试器暴露风险）。本地开发需要自动重载时，设置环境变量 `FLASK_DEBUG=true` 再启动。
+> 若提示端口被占用（Windows 上 5000 常被 AirPlay/Hyper-V 占用），在 `.env` 中设置 `FLASK_PORT=5001`。
 
 ### 5. 使用
 
 1. 上传 QQChatExporter 导出的 `.json` 文件
 2. 查看仪表盘获取本地统计数据
-3. 如果配置了 API Key，点击 AI 分析按钮获取深度洞察
+3. 如果配置了 API Key，点击 AI 分析按钮获取深度洞察（后台任务实时显示进度，可随时取消）
+4. 已分析过的结果会缓存在 `ai_cache/`，重开页面/换标签查看**不再重复调用 API**；勾选"强制重新分析"才会重跑
 
 ## 📂 项目结构
 
@@ -121,18 +130,13 @@ qqchatlog/
 
 - 聊天记录**仅保存在本地**，不上传至任何第三方服务器
 - AI 分析时仅将文本片段发送至 DeepSeek API，多媒体文件不会被上传
-- 上传文件与 session 数据（`uploads/`、`flask_session/`）超过 24 小时会在启动时自动清理；重新上传时旧文件即时删除。若需立即清除，手动删除这两个目录即可
-- 服务默认仅绑定 `127.0.0.1`，POST 请求带 CSRF token 与 Origin 双重校验
+- 上传文件、session 与 AI 结果缓存（`uploads/`、`flask_session/`、`ai_cache/`）超过 24 小时会在启动时自动清理；重新上传时旧文件即时删除。若需立即清除，手动删除这三个目录即可
+- 服务默认仅绑定 `127.0.0.1`，POST 请求带 CSRF token 与 Origin 双重校验；绑定非回环地址时必须设置 `ACCESS_PASSWORD` 访问口令，否则拒绝启动
 
 ## 📦 依赖
 
-```
-flask>=3.0
-flask-session>=0.8
-openai>=1.0
-python-dotenv>=1.0
-jieba>=0.42
-```
+核心依赖：Flask、Flask-Session、OpenAI SDK（DeepSeek 兼容接口）、python-dotenv、jieba。
+完整锁定清单见 `requirements.txt`（`pip install -r requirements.txt` 即可）。
 
 ## 📜 许可证
 

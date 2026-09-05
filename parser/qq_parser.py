@@ -21,6 +21,9 @@ from datetime import datetime, timedelta, timezone
 # 北京时间固定偏移，供月份分组与本地统计共用，避免口径不一致
 CST = timezone(timedelta(hours=8))
 
+# 不应进入统计与 AI 分析的消息类型：合并转发 / 频道类 / 商城表情等
+SKIP_MSG_TYPES = {"type_11", "type_17", "type_23"}
+
 
 @dataclass
 class Message:
@@ -37,6 +40,14 @@ class Message:
     is_reply: bool
     face_ids: list[int] = field(default_factory=list)
     face_names: list[str] = field(default_factory=list)  # 表情名称
+    recalled: bool = False  # 已被撤回（导出器仍会保留该条目）
+    system: bool = False    # 系统提示消息（"对方撤回了一条消息"等）
+
+
+def is_statistical(m: "Message") -> bool:
+    """是否应进入统计与 AI 分析：排除系统消息、撤回消息与转发类消息"""
+    return (not m.system and not m.recalled
+            and m.msg_type not in SKIP_MSG_TYPES)
 
 
 @dataclass
@@ -52,6 +63,10 @@ class ChatData:
     time_start: str = ""
     time_end: str = ""
     duration_days: int = 0
+
+    def statistical(self) -> list["Message"]:
+        """参与统计与分析的消息子集（过滤系统/撤回/转发）"""
+        return [m for m in self.messages if is_statistical(m)]
 
 
 def load_chat(filepath: str) -> ChatData:
@@ -155,6 +170,8 @@ def load_chat(filepath: str) -> ChatData:
             is_reply=is_reply,
             face_ids=face_ids,
             face_names=face_names,
+            recalled=bool(msg.get("recalled", False)),
+            system=bool(msg.get("system", False)),
         )
         chat.messages.append(parsed)
 
