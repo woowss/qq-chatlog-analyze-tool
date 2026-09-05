@@ -95,9 +95,10 @@ $(function() {
     renderWordCloud('otherWordCloud', {{ word_freq.other | tojson }}, {{ overview.other_name | tojson }});
     {% endif %}
 
-    // AI 分析
-    const data = sessionStorage.getItem('ai_habits');
-    if (data) renderHabitsInsight(JSON.parse(data));
+    // AI 分析（服务端缓存优先，回退 sessionStorage）
+    loadAnalysis('habits', function(data) {
+        if (data) renderHabitsInsight(data);
+    });
 });
 </script>
 {% endblock %}

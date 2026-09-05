@@ -14,21 +14,26 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 # -*- coding: utf-8 -*-
-"""核心逻辑测试：解析器健壮性、统计口径、AI 对话截断、CSRF 防护"""
+"""核心逻辑测试：解析器健壮性、统计口径、AI 对话截断、CSRF 防护、缓存与异步任务"""
+import io
 import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 # 让测试可以从项目根目录导入包
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from parser.qq_parser import CST, ChatData, Message, load_chat, split_by_month
-from analyzer.deepseek_client import MAX_DIALOG_CHARS, _build_dialog, _fit_lines
-from analyzer.local_stats import calc_response_time
+from parser.qq_parser import (CST, ChatData, Message, is_statistical,
+                              load_chat, split_by_month)
+from analyzer.deepseek_client import (MAX_DIALOG_CHARS, _build_dialog,
+                                      _fit_lines)
+from analyzer.local_stats import calc_overview, calc_response_time
 
 
 def _write_chat(data: dict) -> str:
@@ -204,6 +209,155 @@ class TestCsrfProtection(unittest.TestCase):
         # 通过防护后，因为没带文件，返回"请选择文件"而不是 400 防护错误
         self.assertEqual(r.status_code, 400)
         self.assertIn("请选择文件", r.get_data(as_text=True))
+
+
+class TestStatisticalFiltering(unittest.TestCase):
+    """系统/撤回/转发消息不进入统计与 AI 分析"""
+
+    def _flagged(self):
+        normal = _msg("self", 1000, text="正常消息")
+        recalled = _msg("self", 2000, text="被撤回的")
+        recalled.recalled = True
+        system = _msg("other", 3000, text="对方撤回了一条消息")
+        system.system = True
+        forwarded = _msg("other", 4000, text="转发内容", msg_type="type_11")
+        return normal, recalled, system, forwarded
+
+    def test_is_statistical(self):
+        normal, recalled, system, forwarded = self._flagged()
+        self.assertTrue(is_statistical(normal))
+        self.assertFalse(is_statistical(recalled))
+        self.assertFalse(is_statistical(system))
+        self.assertFalse(is_statistical(forwarded))
+
+    def test_overview_excludes_non_statistical(self):
+        normal, recalled, system, forwarded = self._flagged()
+        chat = ChatData(chat_name="", self_name="我", other_name="对方",
+                        self_uid="self", other_uid="other",
+                        messages=[normal, recalled, system, forwarded])
+        ov = calc_overview(chat)
+        self.assertEqual(ov["total_messages"], 1)
+        self.assertEqual(ov["self_count"], 1)
+        self.assertEqual(ov["other_count"], 0)
+
+    def test_dialog_excludes_recalled_and_system(self):
+        normal, recalled, system, forwarded = self._flagged()
+        dialog = _build_dialog([normal, recalled, system, forwarded],
+                               "self", "我", "对方", max_chars=MAX_DIALOG_CHARS)
+        self.assertIn("正常消息", dialog)
+        self.assertNotIn("被撤回的", dialog)
+        self.assertNotIn("撤回了一条消息", dialog)
+        self.assertNotIn("转发内容", dialog)
+
+    def test_parser_reads_recalled_and_system_flags(self):
+        data = {
+            "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
+            "statistics": {"senders": [{"uid": "u_self", "name": "我"},
+                                       {"uid": "u_other", "name": "对方"}]},
+            "messages": [
+                {"id": "1", "timestamp": 1704067200000, "time": "2024-01-01 08:00:00",
+                 "sender": {"uid": "u_other", "name": "对方"},
+                 "content": "hi", "recalled": True, "system": False},
+                {"id": "2", "timestamp": 1704067201000, "time": "2024-01-01 08:00:01",
+                 "sender": {"uid": "u_other", "name": "系统"},
+                 "content": "对方撤回了一条消息", "recalled": False, "system": True},
+            ],
+        }
+        chat = load_chat(_write_chat(data))
+        self.assertTrue(chat.messages[0].recalled)
+        self.assertTrue(chat.messages[1].system)
+        self.assertEqual(len(chat.statistical()), 0)
+
+
+class TestAiCache(unittest.TestCase):
+    """服务端缓存：哈希稳定、读写往返、api_analyze 命中缓存不再调用模型"""
+
+    def test_chat_hash_stable_and_cache_roundtrip(self):
+        import app as appmod
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        try:
+            h1 = appmod._chat_hash(path)
+            h2 = appmod._chat_hash(path)
+            self.assertEqual(h1, h2)
+            self.assertEqual(len(h1), 16)
+            payload = {"2024-01": {"self_emotion": "快乐"}}
+            appmod._write_cache("emotion", h1, payload)
+            got = appmod._read_cache("emotion", h1)
+            self.assertEqual(got, payload)
+        finally:
+            os.remove(path)
+            for f in Path(appmod.AI_CACHE_DIR).glob(f"emotion_{h1}_*"):
+                f.unlink()
+
+    def test_api_analyze_uses_cache_then_job(self):
+        import app as appmod
+        appmod.app.config["TESTING"] = True
+        client = appmod.app.test_client()
+        # 建立 session + 上传一个最小聊天文件
+        client.get("/")
+        with client.session_transaction() as sess:
+            token = sess["csrf_token"]
+        chat_json = json.dumps({
+            "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
+            "statistics": {"senders": [{"uid": "u_self", "name": "我"},
+                                       {"uid": "u_other", "name": "对方"}],
+                           "totalMessages": 2},
+            "messages": [
+                {"id": "1", "timestamp": 1704067200000, "time": "2024-01-01 08:00:00",
+                 "sender": {"uid": "u_self", "name": "我"}, "content": "在吗"},
+                {"id": "2", "timestamp": 1704067260000, "time": "2024-01-01 08:01:00",
+                 "sender": {"uid": "u_other", "name": "对方"}, "content": "在的"},
+            ],
+        }, ensure_ascii=False).encode("utf-8")
+        r = client.post("/upload", data={"file": (io.BytesIO(chat_json), "chat.json")},
+                        headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+        self.assertEqual(r.status_code, 302)
+        with client.session_transaction() as sess:
+            uploaded_path = sess.get("filepath")
+
+        fake_result = {"self_emotion": "平静", "other_emotion": "快乐",
+                       "self_intensity": 5, "other_intensity": 7,
+                       "self_keywords": ["在吗"], "other_keywords": ["在的"],
+                       "overall_tone": "轻松愉快"}
+        try:
+            with mock.patch("analyzer.deepseek_client._call_api", return_value=fake_result) as m:
+                with mock.patch("analyzer.deepseek_client.is_api_configured", return_value=True), \
+                     mock.patch("app.is_api_configured", return_value=True):
+                    r = client.post("/api/analyze/emotion",
+                                    headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+                    body = r.get_json()
+                    self.assertIn("job", body)
+                    # 轮询直到任务结束
+                    deadline = time.time() + 15
+                    status = None
+                    while time.time() < deadline:
+                        s = client.get("/api/analyze-job/" + body["job"]).get_json()
+                        status = s["status"]
+                        if status in ("done", "error", "cancelled"):
+                            break
+                        time.sleep(0.1)
+                    self.assertEqual(status, "done", f"任务未完成: {s}")
+                    self.assertEqual(m.call_count, 1)
+
+                    # 第二次请求应命中缓存，不再调用模型
+                    r2 = client.post("/api/analyze/emotion",
+                                     headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+                    b2 = r2.get_json()
+                    self.assertTrue(b2.get("cached"))
+                    self.assertIn("2024-01", b2["result"])
+                    self.assertEqual(m.call_count, 1)  # 没有新的 API 调用
+
+                    # GET 接口能读到缓存
+                    r3 = client.get("/api/analysis/emotion")
+                    self.assertTrue(r3.get_json().get("cached"))
+        finally:
+            if uploaded_path and os.path.exists(uploaded_path):
+                os.remove(uploaded_path)
+            with client.session_transaction() as sess:
+                fp = sess.get("filepath")
+            if fp and os.path.exists(fp):
+                os.remove(fp)
 
 
 if __name__ == "__main__":

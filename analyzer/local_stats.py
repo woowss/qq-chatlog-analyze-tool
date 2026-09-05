@@ -63,10 +63,7 @@ def calc_word_freq(chat: ChatData, top_n: int = 50) -> dict:
     self_texts: list[str] = []
     other_texts: list[str] = []
 
-    for msg in chat.messages:
-        # 跳过转发消息（含 XML 碎片）、撤回消息、系统消息
-        if msg.msg_type in ("type_11", "type_17"):
-            continue
+    for msg in chat.statistical():
         text = msg.text.strip()
         if not text or len(text) < 2:
             continue
@@ -131,7 +128,7 @@ def calc_word_freq(chat: ChatData, top_n: int = 50) -> dict:
 def calc_daily_counts(chat: ChatData) -> list[dict]:
     """每日消息量，返回 [{"date": "2024-01-01", "self": 5, "other": 3}]"""
     daily: dict[str, dict] = {}
-    for msg in chat.messages:
+    for msg in chat.statistical():
         dt = datetime.fromtimestamp(msg.timestamp / 1000, tz=CST)
         key = dt.strftime("%Y-%m-%d")
         if key not in daily:
@@ -144,7 +141,7 @@ def calc_daily_counts(chat: ChatData) -> list[dict]:
 def calc_hourly_distribution(chat: ChatData) -> list[dict]:
     """24小时分布，返回 [{"hour": 0, "self": 10, "other": 8}]"""
     hourly = [{"hour": h, "self": 0, "other": 0} for h in range(24)]
-    for msg in chat.messages:
+    for msg in chat.statistical():
         dt = datetime.fromtimestamp(msg.timestamp / 1000, tz=CST)
         h = dt.hour
         k = "self" if msg.sender_uid == chat.self_uid else "other"
@@ -156,7 +153,7 @@ def calc_weekly_distribution(chat: ChatData) -> list[dict]:
     """按星期分布（0=周一 … 6=周日）"""
     weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
     weekly = [{"weekday": i, "self": 0, "other": 0} for i in range(7)]
-    for msg in chat.messages:
+    for msg in chat.statistical():
         dt = datetime.fromtimestamp(msg.timestamp / 1000, tz=CST)
         w = dt.weekday()
         k = "self" if msg.sender_uid == chat.self_uid else "other"
@@ -169,7 +166,7 @@ def calc_weekly_distribution(chat: ChatData) -> list[dict]:
 def calc_message_length_stats(chat: ChatData) -> dict:
     """发言长度统计"""
     self_lens, other_lens = [], []
-    for msg in chat.messages:
+    for msg in chat.statistical():
         L = len(msg.text)
         if msg.sender_uid == chat.self_uid:
             self_lens.append(L)
@@ -194,7 +191,7 @@ def calc_face_stats(chat: ChatData) -> dict:
     """表情使用排行，返回 {"self": {"name": count}, "other": {...}}"""
     self_faces: Counter = Counter()
     other_faces: Counter = Counter()
-    for msg in chat.messages:
+    for msg in chat.statistical():
         names = [n for n in msg.face_names if n]
         if not names:
             # 回退到 face_ids
@@ -212,8 +209,9 @@ def calc_face_stats(chat: ChatData) -> dict:
 def calc_response_time(chat: ChatData) -> dict:
     """平均响应时间（秒）—— 只统计对方发来后本方做出的回复间隔"""
     self_times, other_times = [], []
-    for i in range(1, len(chat.messages)):
-        prev, curr = chat.messages[i - 1], chat.messages[i]
+    msgs = chat.statistical()
+    for i in range(1, len(msgs)):
+        prev, curr = msgs[i - 1], msgs[i]
         # 同一人连续发言不是"响应"，跳过，避免拉低/污染平均值
         if prev.sender_uid == curr.sender_uid:
             continue
@@ -238,7 +236,7 @@ def calc_exchange_rounds(chat: ChatData) -> int:
     """对话轮次（同一人连续发言算一轮）"""
     rounds = 0
     last = ""
-    for msg in chat.messages:
+    for msg in chat.statistical():
         if msg.sender_uid != last:
             rounds += 1
             last = msg.sender_uid
@@ -248,24 +246,25 @@ def calc_exchange_rounds(chat: ChatData) -> int:
 def calc_weekly_activity(chat: ChatData) -> list[dict]:
     """星期×小时热力图 [{"weekday":0,"hour":0,"count":5}]"""
     grid: dict[tuple[int, int], int] = defaultdict(int)
-    for msg in chat.messages:
+    for msg in chat.statistical():
         dt = datetime.fromtimestamp(msg.timestamp / 1000, tz=CST)
         grid[(dt.weekday(), dt.hour)] += 1
     return [{"weekday": w, "hour": h, "count": c} for (w, h), c in grid.items()]
 
 
 def calc_overview(chat: ChatData) -> dict:
-    """总览统计"""
-    self_count = sum(1 for m in chat.messages if m.sender_uid == chat.self_uid)
-    other_count = sum(1 for m in chat.messages if m.sender_uid != chat.self_uid)
-    self_chars = sum(len(m.text) for m in chat.messages if m.sender_uid == chat.self_uid)
-    other_chars = sum(len(m.text) for m in chat.messages if m.sender_uid != chat.self_uid)
-    total_images = sum(1 for m in chat.messages if m.has_image)
-    total_faces = sum(len(m.face_ids) for m in chat.messages)
+    """总览统计（口径：仅计入系统/撤回/转发之外的消息）"""
+    msgs = chat.statistical()
+    self_count = sum(1 for m in msgs if m.sender_uid == chat.self_uid)
+    other_count = sum(1 for m in msgs if m.sender_uid != chat.self_uid)
+    self_chars = sum(len(m.text) for m in msgs if m.sender_uid == chat.self_uid)
+    other_chars = sum(len(m.text) for m in msgs if m.sender_uid != chat.self_uid)
+    total_images = sum(1 for m in msgs if m.has_image)
+    total_faces = sum(len(m.face_ids) for m in msgs)
     days = chat.duration_days or max(len(calc_daily_counts(chat)), 1)
 
     return {
-        "total_messages": len(chat.messages),
+        "total_messages": len(msgs),
         "total_days": chat.duration_days or days,
         "total_images": total_images,
         "total_faces": total_faces,
@@ -276,5 +275,5 @@ def calc_overview(chat: ChatData) -> dict:
         "self_chars": self_chars,
         "other_chars": other_chars,
         "exchange_rounds": calc_exchange_rounds(chat),
-        "avg_daily": round(len(chat.messages) / days, 1),
+        "avg_daily": round(len(msgs) / days, 1),
     }
