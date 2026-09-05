@@ -174,7 +174,8 @@ function renderWordCloud(domId, data, title) {
     var colors = ['#1a237e','#2e7d32','#bf360c','#4a148c','#01579b','#e65100','#004d40','#b71c1c','#3e2723','#283593','#00695c','#37474f','#0d47a1','#33691e','#5d4037'];
 
     chart.setOption({
-        title: { text: esc(title), left: 'center', textStyle: { fontSize: 14 } },
+        // 标题渲染在 canvas 上（非 DOM），不需要 esc——转义反而会显示字面实体
+        title: { text: title, left: 'center', textStyle: { fontSize: 14 } },
         tooltip: { formatter: function(p) { return esc(p.name) + ': ' + p.value + ' 次'; } },
         series: [{
             type: 'wordCloud',
