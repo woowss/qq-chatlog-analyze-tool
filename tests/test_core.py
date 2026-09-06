@@ -33,7 +33,7 @@ from parser.qq_parser import (CST, ChatData, Message, is_statistical,
                               load_chat, split_by_month)
 from analyzer.deepseek_client import (MAX_DIALOG_CHARS, _build_dialog,
                                       _fit_lines)
-from analyzer.local_stats import calc_overview, calc_response_time
+from analyzer.local_stats import calc_milestones, calc_overview, calc_response_time
 
 
 def _write_chat(data: dict) -> str:
@@ -454,6 +454,151 @@ class TestEmptyMonthSkipped(unittest.TestCase):
         self.assertEqual(m.call_count, 1)          # 十月整月无效，未调用
         self.assertIn("2024-01", out)
         self.assertNotIn("2024-02", out)
+
+
+class TestMilestones(unittest.TestCase):
+    """时光里程碑：连续纪录/沉默期/深夜/峰值"""
+
+    @staticmethod
+    def _at(uid, y, mo, d, h, text="hi"):
+        ts = int(datetime(y, mo, d, h, 30, tzinfo=CST).timestamp() * 1000)
+        return _msg(uid, ts, text=text)
+
+    def test_milestones(self):
+        msgs = [
+            self._at("self", 2025, 1, 1, 21), self._at("other", 2025, 1, 1, 22),
+            self._at("self", 2025, 1, 2, 10),
+            self._at("self", 2025, 1, 3, 3),    # 凌晨 3 点
+            self._at("other", 2025, 1, 3, 4),   # 双方都熬夜 → mutual_nights
+            self._at("self", 2025, 1, 10, 23),
+            self._at("other", 2025, 1, 10, 23),
+            self._at("self", 2025, 1, 10, 23),  # 峰值日 3 条
+        ]
+        chat = ChatData(chat_name="", self_name="我", other_name="对方",
+                        self_uid="self", other_uid="other", messages=msgs)
+        ms = calc_milestones(chat)
+        self.assertEqual(ms["first_day"], "2025-01-01")
+        self.assertEqual(ms["last_day"], "2025-01-10")
+        self.assertEqual(ms["active_days"], 4)
+        self.assertEqual(ms["longest_streak"]["days"], 3)
+        self.assertEqual(ms["longest_silence"]["days"], 6)   # 01-03 → 01-10
+        self.assertEqual(ms["midnight_days"], 1)             # 01-03
+        self.assertEqual(ms["midnight_msgs"], 2)
+        self.assertEqual(ms["late_night_msgs"], 2)
+        self.assertEqual(ms["mutual_nights"], 1)
+        self.assertEqual(ms["peak_day"], {"date": "2025-01-10", "count": 3})
+        self.assertEqual(ms["busiest_month"]["month"], "2025-01")
+
+    def test_milestones_empty(self):
+        chat = ChatData(chat_name="", self_name="我", other_name="对方",
+                        self_uid="self", other_uid="other", messages=[])
+        self.assertEqual(calc_milestones(chat), {})
+
+
+class TestUsageRecord(unittest.TestCase):
+    """token 用量按天×维度聚合，原子落盘"""
+
+    def test_record_and_aggregate(self):
+        import analyzer.usage as usage
+        fd, tmp = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        os.remove(tmp)  # 从空文件状态开始
+        orig = usage.TOKEN_USAGE_FILE
+        usage.TOKEN_USAGE_FILE = tmp
+        try:
+            usage.record_call("model-a", "emotion", 100, 20)
+            usage.record_call("model-a", "emotion", 50, 10)
+            usage.record_call("model-a", "profile", 30, 70)
+            u = usage.get_usage()
+            self.assertEqual(u["total"]["calls"], 3)
+            self.assertEqual(u["total"]["prompt"], 180)
+            self.assertEqual(u["total"]["completion"], 100)
+            self.assertEqual(u["total"]["total"], 280)
+            self.assertEqual(u["dims"]["emotion|model-a"]["calls"], 2)
+            self.assertEqual(u["dims"]["profile|model-a"]["calls"], 1)
+            self.assertEqual(len(u["days"]), 1)
+        finally:
+            usage.TOKEN_USAGE_FILE = orig
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+
+class TestAnalyzeAll(unittest.TestCase):
+    """一键全量：5 维度跑完并写缓存；再跑一次全部命中缓存不再调用 API"""
+
+    def test_analyze_all_flow(self):
+        import app as appmod
+        appmod.app.config["TESTING"] = True
+        client = appmod.app.test_client()
+        client.get("/")
+        with client.session_transaction() as sess:
+            token = sess["csrf_token"]
+        chat_json = json.dumps({
+            "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
+            "statistics": {"senders": [{"uid": "u_self", "name": "我"},
+                                       {"uid": "u_other", "name": "对方"}]},
+            "messages": [
+                {"id": "1", "timestamp": 1704067200000, "time": "2024-01-01 08:00:00",
+                 "sender": {"uid": "u_self", "name": "我"}, "content": "在吗"},
+                {"id": "2", "timestamp": 1704067260000, "time": "2024-01-01 08:01:00",
+                 "sender": {"uid": "u_other", "name": "对方"}, "content": "在的"},
+            ],
+        }, ensure_ascii=False).encode("utf-8")
+        r = client.post("/upload", data={"file": (io.BytesIO(chat_json), "chat.json")},
+                        headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+        self.assertEqual(r.status_code, 302)
+        with client.session_transaction() as sess:
+            uploaded_path = sess.get("filepath")
+
+        fake = {"self_emotion": "平静", "other_emotion": "快乐",
+                "self_intensity": 5, "other_intensity": 7,
+                "self_keywords": [], "other_keywords": [],
+                "overall_tone": "轻松愉快", "topics": [], "summary": "s"}
+        cache_dir = Path(appmod.AI_CACHE_DIR)
+        cache_before = set(cache_dir.glob("*"))
+        try:
+            with mock.patch("analyzer.deepseek_client._call_api", return_value=fake) as m, \
+                 mock.patch("app.is_api_configured", return_value=True):
+                r = client.post("/api/analyze-all",
+                                headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+                body = r.get_json()
+                self.assertIn("job", body)
+                deadline = time.time() + 20
+                s = {}
+                while time.time() < deadline:
+                    s = client.get("/api/analyze-job/" + body["job"]).get_json()
+                    if s.get("status") in ("done", "error", "cancelled"):
+                        break
+                    time.sleep(0.1)
+                self.assertEqual(s.get("status"), "done", f"未完成: {s}")
+                self.assertEqual(len(s["result"]), 5)
+                self.assertTrue(all(v == "done" for v in s["result"].values()))
+                calls_after_first = m.call_count
+                self.assertGreaterEqual(calls_after_first, 5)  # 每维度至少一次
+
+                # 再跑一次：全部命中缓存，零新增调用
+                r2 = client.post("/api/analyze-all",
+                                 headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+                b2 = r2.get_json()
+                s2 = {}
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    s2 = client.get("/api/analyze-job/" + b2["job"]).get_json()
+                    if s2.get("status") in ("done", "error", "cancelled"):
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(s2.get("status"), "done")
+                self.assertTrue(all(v == "cached" for v in s2["result"].values()))
+                self.assertEqual(m.call_count, calls_after_first)  # 没有新调用
+        finally:
+            if uploaded_path and os.path.exists(uploaded_path):
+                os.remove(uploaded_path)
+            cache_after = set(cache_dir.glob("*"))
+            for f in cache_after - cache_before:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":

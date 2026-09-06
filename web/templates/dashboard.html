@@ -131,6 +131,48 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </div>
 </div>
 
+{% if milestones %}
+<div class="card mb-4 border-warning">
+    <div class="card-header bg-dark text-white">🕰️ 时光里程碑</div>
+    <div class="card-body">
+        <div class="row text-center g-3">
+            <div class="col-6 col-md-3">
+                <div class="stat-value" style="font-size:1.3rem;">{{ milestones.first_day }}</div>
+                <div class="stat-label">💞 故事开始的那天</div>
+            </div>
+            <div class="col-6 col-md-3">
+                <div class="stat-value" style="font-size:1.3rem;">{{ milestones.active_days }} 天</div>
+                <div class="stat-label">📅 实际聊过的日子</div>
+            </div>
+            <div class="col-6 col-md-3">
+                <div class="stat-value" style="font-size:1.3rem;">{{ milestones.longest_streak.days }} 天</div>
+                <div class="stat-label">🔥 连续聊天纪录<br><small class="text-muted">{{ milestones.longest_streak.start }} ~ {{ milestones.longest_streak.end }}</small></div>
+            </div>
+            <div class="col-6 col-md-3">
+                <div class="stat-value" style="font-size:1.3rem;">{{ milestones.longest_silence.days }} 天</div>
+                <div class="stat-label">🕳️ 最长沉默<br><small class="text-muted">{{ milestones.longest_silence.before }} → {{ milestones.longest_silence.after }}</small></div>
+            </div>
+            <div class="col-6 col-md-3">
+                <div class="stat-value" style="font-size:1.3rem;">{{ milestones.midnight_days }} 晚</div>
+                <div class="stat-label">🌙 跨零点聊天（{{ milestones.midnight_msgs }} 条）</div>
+            </div>
+            <div class="col-6 col-md-3">
+                <div class="stat-value" style="font-size:1.3rem;">{{ milestones.mutual_nights }} 晚</div>
+                <div class="stat-label">🤝 双方都熬到凌晨 2-6 点</div>
+            </div>
+            <div class="col-6 col-md-3">
+                <div class="stat-value" style="font-size:1.3rem;">{{ milestones.peak_day.count }} 条</div>
+                <div class="stat-label">📈 单日峰值（{{ milestones.peak_day.date }}）</div>
+            </div>
+            <div class="col-6 col-md-3">
+                <div class="stat-value" style="font-size:1.3rem;">{{ milestones.busiest_month.month }}</div>
+                <div class="stat-label">🗓️ 最活跃的月份（{{ milestones.busiest_month.count }} 条）</div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endif %}
+
 {% if api_ok %}
 <div class="card mb-4 border-primary">
     <div class="card-header bg-primary text-white">🤖 AI 深度分析</div>
@@ -142,6 +184,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             <button class="btn btn-outline-primary btn-analyze" data-dim="habits" data-orig="🧑 个人习惯">🧑 个人习惯</button>
             <button class="btn btn-outline-primary btn-analyze" data-dim="topics" data-orig="📈 话题趋势">📈 话题趋势</button>
             <button class="btn btn-outline-danger btn-analyze" data-dim="profile" data-orig="🎯 人物锐评">🎯 人物锐评</button>
+            <button class="btn btn-primary" id="btn-analyze-all">🚀 一键全量分析</button>
         </div>
         <div class="form-check mt-2 d-inline-block">
             <input class="form-check-input" type="checkbox" id="forceRefresh">
@@ -200,8 +243,101 @@ $('.btn-analyze').on('click', function() {
 
     startAnalyze(dim, opts);
 });
+
+$('#btn-analyze-all').on('click', function() {
+    const btn = $(this);
+    const status = $('#analyzeStatus');
+    const refresh = $('#forceRefresh').is(':checked');
+    $('.btn-analyze, #btn-analyze-all').prop('disabled', true);
+    btn.text('🚀 全量分析中...');
+
+    const opts = {
+        refresh: refresh,
+        onProgress: function(done, total, detail) {
+            if (done < 0) { $('#aText').text('正在取消…'); return; }
+            const pct = total > 0 ? Math.round(done / total * 100) : 0;
+            $('#aProg').css('width', pct + '%');
+            $('#aText').text(detail ? ('维度 ' + detail) : '准备中…');
+        },
+        onDone: function(summary) {
+            const parts = Object.entries(summary || {}).map(function(kv) {
+                const label = {emotion:'情绪',topics:'话题',relationship:'关系',habits:'习惯',profile:'锐评'}[kv[0]] || kv[0];
+                const st = {done:'✅ 新分析', cached:'⚡ 命中缓存', empty:'∅ 无结果', error:'❌ 失败', aborted:'⛔ 中止'}[kv[1]] || kv[1];
+                return label + ' ' + st;
+            });
+            status.html('<div class="alert alert-success mb-0">✅ 全量完成：' + esc(parts.join(' · ')) + '，即将跳转报告…</div>');
+            setTimeout(function() { window.location.href = '/report'; }, 1200);
+        },
+        onError: function(msg) {
+            status.html('<div class="alert alert-danger mb-0">' + esc(msg) + '</div>');
+            $('.btn-analyze').prop('disabled', false);
+            btn.prop('disabled', false).text('🚀 一键全量分析');
+        }
+    };
+
+    status.html(
+        '<div class="spinner-border spinner-border-sm text-primary" role="status"></div>' +
+        '<div class="progress mx-auto mt-2" style="max-width:320px;height:8px;">' +
+        '<div id="aProg" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div></div>' +
+        '<div id="aText" class="small text-muted mt-1">准备中…</div>' +
+        '<button id="aCancel" class="btn btn-sm btn-outline-secondary mt-2">取消</button>'
+    );
+    $('#aCancel').on('click', function() {
+        $(this).prop('disabled', true).text('取消中…');
+        cancelAnalyze(opts);
+    });
+    startAnalyzeAll(opts);
+});
 </script>
 {% endif %}
+
+<div class="card mb-4 d-none" id="usageCard">
+    <div class="card-header">💰 LLM 用量统计 <small class="text-muted">（本地累计，仅数字不含聊天内容）</small></div>
+    <div class="card-body">
+        <div id="usageTotal" class="mb-2"></div>
+        <div class="row">
+            <div class="col-md-6">
+                <h6 class="small text-muted">按维度</h6>
+                <table class="table table-sm" id="usageDims"></table>
+            </div>
+            <div class="col-md-6">
+                <h6 class="small text-muted">按天（最近 14 天）</h6>
+                <table class="table table-sm" id="usageDays"></table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+(function() {
+    const DIM_LABEL = {emotion:'😊 情绪',topics:'📈 话题',relationship:'👥 关系',habits:'🧑 习惯',profile:'🎯 锐评',unknown:'其他'};
+    function fmt(n) { return (n || 0).toLocaleString(); }
+    $.get('/api/usage', function(u) {
+        if (!u || !u.total || !u.total.calls) return;
+        $('#usageTotal').html('累计 <strong>' + fmt(u.total.calls) + '</strong> 次调用 · prompt <strong>' +
+            fmt(u.total.prompt) + '</strong> + completion <strong>' + fmt(u.total.completion) +
+            '</strong> = <strong>' + fmt(u.total.total) + ' tokens</strong>');
+        var dimRows = Object.entries(u.dims || {}).sort(function(a, b) {
+            return (b[1].prompt + b[1].completion) - (a[1].prompt + a[1].completion);
+        }).map(function(kv) {
+            var key = kv[0], e = kv[1];
+            var name = DIM_LABEL[key.split('|')[0]] || key;
+            return '<tr><td>' + esc(name) + '</td><td class="text-end">' + fmt(e.calls) + ' 次</td>' +
+                '<td class="text-end">' + fmt(e.prompt + e.completion) + ' tok</td></tr>';
+        });
+        var dayRows = Object.entries(u.days || {}).sort(function(a, b) {
+            return b[0] < a[0] ? -1 : 1;
+        }).slice(0, 14).map(function(kv) {
+            var d = kv[0], e = kv[1];
+            return '<tr><td>' + esc(d) + '</td><td class="text-end">' + fmt(e.calls) + ' 次</td>' +
+                '<td class="text-end">' + fmt(e.prompt + e.completion) + ' tok</td></tr>';
+        });
+        $('#usageDims').html(dimRows.join(''));
+        $('#usageDays').html(dayRows.join(''));
+        $('#usageCard').removeClass('d-none');
+    });
+})();
+</script>
 
 <script>
 renderPieChart('messageRatioChart', [

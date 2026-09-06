@@ -55,8 +55,11 @@ from analyzer.local_stats import (
     calc_exchange_rounds,
     calc_weekly_activity,
     calc_word_freq,
+    calc_milestones,
 )
+from analyzer.usage import get_usage
 from analyzer.deepseek_client import (
+    QuotaExhaustedError,
     analyze_emotion,
     analyze_topics,
     analyze_relationship,
@@ -308,6 +311,7 @@ def upload():
     session["exchange_rounds"] = calc_exchange_rounds(chat)
     session["weekly_activity"] = calc_weekly_activity(chat)
     session["word_freq"] = calc_word_freq(chat, top_n=80)
+    session["milestones"] = calc_milestones(chat)
     session["total_messages"] = len(chat.messages)
     logger.info("本地统计完成, 共 %d 项数据已缓存", len(session) - 4)
 
@@ -328,6 +332,7 @@ def dashboard():
         weekly_dist=session.get("weekly_dist"),
         length_stats=session.get("length_stats"),
         exchange_rounds=session.get("exchange_rounds"),
+        milestones=session.get("milestones"),
         api_ok=is_api_configured(),
         chat_name=session.get("chat_name"),
     )
@@ -564,6 +569,8 @@ def api_analyze_job(job_id: str):
         if not j or j.get("sid") != session.sid:
             return jsonify({"error": "任务不存在"}), 404
         resp = {"status": j["status"], "done": j["done"], "total": j["total"]}
+        if j.get("detail"):
+            resp["detail"] = j["detail"]
         if j["status"] == "done":
             resp["result"] = j["result"]
         elif j["status"] == "error":
@@ -597,6 +604,117 @@ def api_analysis_result(dimension: str):
     if cached is None:
         return jsonify({"error": "暂无该维度的分析结果"}), 404
     return jsonify({"cached": True, "result": cached})
+
+
+def _run_analyze_all(job_id: str, filepath: str, chat_hash: str, refresh: bool) -> None:
+    """一键全量分析：按维度顺序执行（维度内部已有月份级并发），
+    已缓存的维度直接跳过（refresh 时强制重跑），单维度失败不阻断其余维度。"""
+    try:
+        chat = load_chat(filepath)
+        dims = list(ANALYZE_FUNCS)
+        total = len(dims)
+        summary: dict[str, str] = {}
+
+        def should_cancel() -> bool:
+            with JOBS_LOCK:
+                return bool(JOBS.get(job_id, {}).get("cancel"))
+
+        for idx, dim in enumerate(dims, 1):
+            if should_cancel():
+                break
+            dim_name = DIMENSION_NAMES.get(dim, dim)
+            with JOBS_LOCK:
+                j = JOBS.get(job_id)
+                if j:
+                    j["detail"] = f"{idx}/{total} {dim_name}"
+            if not refresh and _read_cache(dim, chat_hash) is not None:
+                summary[dim] = "cached"
+            else:
+                def on_inner(done: int, tot: int, _dim=dim_name, _idx=idx):
+                    with JOBS_LOCK:
+                        j = JOBS.get(job_id)
+                        if j:
+                            j["detail"] = f"{_idx}/{total} {_dim}（{_done_str(done, tot)}）"
+                try:
+                    result = ANALYZE_FUNCS[dim](chat, on_progress=on_inner,
+                                                should_cancel=should_cancel)
+                    if result:
+                        _write_cache(dim, chat_hash, result)
+                        summary[dim] = "done"
+                    else:
+                        summary[dim] = "empty"
+                except QuotaExhaustedError as e:
+                    # 配额/限流致命：已完成的维度结果已落盘缓存，如实报告
+                    summary[dim] = "aborted"
+                    with JOBS_LOCK:
+                        j = JOBS.get(job_id)
+                        if j:
+                            j.update(status="error",
+                                     error=f"{e}（已完成维度：{len(summary)}，其结果已缓存）",
+                                     finished_at=time.time())
+                    return
+                except Exception as e:
+                    logger.error("一键全量分析 %s 失败: %s", dim_name, e)
+                    summary[dim] = "error"
+            with JOBS_LOCK:
+                j = JOBS.get(job_id)
+                if j:
+                    j.update(done=idx, total=total)
+        with JOBS_LOCK:
+            j = JOBS.get(job_id)
+            if not j:
+                return
+            if j.get("cancel"):
+                j.update(status="cancelled", finished_at=time.time())
+            else:
+                j.update(status="done", result=summary, finished_at=time.time())
+        logger.info("一键全量分析完成（任务 %s）: %s", job_id[:8], summary)
+    except Exception as e:
+        logger.error("一键全量分析失败: %s", e)
+        with JOBS_LOCK:
+            j = JOBS.get(job_id)
+            if j:
+                j.update(status="error", error=f"AI 分析失败: {e}", finished_at=time.time())
+
+
+def _done_str(done: int, total: int) -> str:
+    return "准备中" if total == 0 else f"{done}/{total} 月"
+
+
+@app.route("/api/analyze-all", methods=["POST"])
+def api_analyze_all():
+    """一键全量分析：五个维度顺序跑完，进度按维度汇报"""
+    guard = _guard_post()
+    if guard:
+        return jsonify({"error": guard[0]}), guard[1]
+
+    if not is_api_configured():
+        return jsonify({"error": "API Key 未配置, 请编辑 .env 文件"}), 400
+
+    filepath, err = _session_chat_file()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+
+    chat_hash = _chat_hash(filepath)
+    refresh = request.args.get("refresh") == "1"
+
+    _prune_jobs()
+    job_id = uuid.uuid4().hex
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "status": "running", "dim": "all", "done": 0, "total": len(ANALYZE_FUNCS),
+            "detail": "", "cancel": False, "chat_hash": chat_hash, "sid": session.sid,
+            "created": time.time(),
+        }
+    threading.Thread(target=_run_analyze_all,
+                     args=(job_id, filepath, chat_hash, refresh), daemon=True).start()
+    return jsonify({"job": job_id})
+
+
+@app.route("/api/usage")
+def api_usage():
+    """LLM token 用量统计（按天 × 维度聚合，仅数字无聊天内容）"""
+    return jsonify(get_usage())
 
 
 @app.route("/api/status")

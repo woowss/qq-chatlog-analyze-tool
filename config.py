@@ -31,6 +31,7 @@ BASE_DIR = Path(__file__).parent
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 SESSION_FILE_DIR = os.path.join(BASE_DIR, "flask_session")
 AI_CACHE_DIR = os.path.join(BASE_DIR, "ai_cache")  # AI 分析结果缓存（含敏感内容，勿提交/定期清理）
+TOKEN_USAGE_FILE = os.path.join(BASE_DIR, "logs", "token_usage.json")  # LLM 用量聚合统计（仅数字）
 MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
 
 
