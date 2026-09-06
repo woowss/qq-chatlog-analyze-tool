@@ -14,7 +14,7 @@
 - **对话轮次** — 统计对话来回次数
 - **回复速度** — 双方平均响应时间
 
-### 🤖 AI 深度分析（需 DeepSeek API Key）
+### 🤖 AI 深度分析（需 LLM API Key）
 | 功能 | 说明 |
 |---|---|
 | 😊 **情绪分析** | 逐月分析双方情绪变化、情绪强度曲线 |
@@ -41,14 +41,25 @@ pip install -r requirements.txt
 
 ### 3. 配置 API Key（可选）
 
-在项目根目录创建 `.env` 文件：
+在项目根目录创建 `.env` 文件。任何 **OpenAI 兼容接口**均可使用，例如 DeepSeek：
 
 ```env
-DEEPSEEK_API_KEY=你的DeepSeek_API_Key
+DEEPSEEK_API_KEY=你的API_Key
 DEEPSEEK_MODEL=deepseek-chat
 DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+```
 
-# 可选运行/安全配置（默认值即安全）
+或阿里云 Token Plan（Qwen）：
+
+```env
+DEEPSEEK_API_KEY=你的Token_Plan_Key
+DEEPSEEK_MODEL=qwen3.8-flash
+DEEPSEEK_BASE_URL=https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+```
+
+可选运行 / 安全配置（默认值即安全）：
+
+```env
 # FLASK_DEBUG=false          # 调试模式（默认关闭，调试器可执行任意代码，仅限本机开发）
 # FLASK_HOST=127.0.0.1       # 绑定地址；非回环地址必须同时设置 ACCESS_PASSWORD
 # FLASK_PORT=5000            # 端口被占用时（Windows 5000 常见）可改 5001
@@ -56,7 +67,7 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
 # SECRET_KEY=                # Session 签名密钥；留空自动生成并持久化到 .secret_key
 ```
 
-> 不配置 API Key 也能使用本地统计功能。AI 分析需要 [DeepSeek API Key](https://platform.deepseek.com/api_keys)。
+> 不配置 API Key 也能使用本地统计功能。AI 分析需要任一 OpenAI 兼容服务的 Key（如 [DeepSeek](https://platform.deepseek.com/api_keys) 或阿里云 Token Plan）。
 
 ### 4. 启动
 
@@ -130,13 +141,13 @@ qqchatlog/
 | 后端 | Python 3.10+, Flask 3.x |
 | 前端 | Bootstrap 5, jQuery, ECharts 5 |
 | 分词 | jieba |
-| AI API | DeepSeek Chat（OpenAI 兼容接口） |
+| AI API | OpenAI 兼容接口（DeepSeek / 阿里云 Token Plan Qwen 等，`.env` 可配） |
 | Session | flask-session（服务端文件存储） |
 
 ## 🔒 隐私说明
 
 - 聊天记录**仅保存在本地**，不上传至任何第三方服务器
-- AI 分析时仅将文本片段发送至 DeepSeek API，多媒体文件不会被上传
+- AI 分析时仅将文本片段发送至所配置的 LLM API，多媒体文件不会被上传
 - 上传文件、session 与 AI 结果缓存（`uploads/`、`flask_session/`、`ai_cache/`）超过 24 小时会在启动时自动清理；重新上传时旧文件即时删除。若需立即清除，手动删除这三个目录即可
 - 服务默认仅绑定 `127.0.0.1`，POST 请求带 CSRF token 与 Origin 双重校验；绑定非回环地址时必须设置 `ACCESS_PASSWORD` 访问口令，否则拒绝启动
 

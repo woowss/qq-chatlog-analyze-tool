@@ -56,9 +56,13 @@ MAX_TOKENS_BY_DIM = {
 }
 
 
+# .env 模板中的占位符值，视为"未配置"
+_PLACEHOLDER_KEYS = {"", "你的DeepSeek_API_Key", "你的API_Key"}
+
+
 def _get_client() -> Optional[OpenAI]:
     """获取 OpenAI 客户端；未配置 API Key 则返回 None"""
-    if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY == "你的DeepSeek_API_Key":
+    if DEEPSEEK_API_KEY.strip() in _PLACEHOLDER_KEYS:
         return None
     return OpenAI(
         api_key=DEEPSEEK_API_KEY,
@@ -471,5 +475,5 @@ def analyze_all(chat: ChatData) -> dict:
 
 
 def is_api_configured() -> bool:
-    """检查 API Key 是否已配置"""
-    return bool(DEEPSEEK_API_KEY) and DEEPSEEK_API_KEY != "你的DeepSeek_API_Key"
+    """检查 API Key 是否已配置（占位符视为未配置）"""
+    return DEEPSEEK_API_KEY.strip() not in _PLACEHOLDER_KEYS
