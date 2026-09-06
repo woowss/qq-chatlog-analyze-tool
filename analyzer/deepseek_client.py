@@ -327,14 +327,22 @@ def _normalize_topic_weights(obj: dict) -> None:
             t["weight"] = 0.0
 
 
+def _month_prompt(chat: ChatData, period: str, msgs: list) -> str:
+    """构建单月 prompt；该月经过滤（系统/撤回/转发/空文本）后无有效消息时返回空串，
+    由 _analyze_periods 跳过，避免为空月份白白消耗一次 API 调用。"""
+    dialog = _build_dialog(msgs, chat.self_uid, chat.self_name, chat.other_name)
+    if not dialog.strip():
+        return ""
+    return f"以下是 {period} 月的对话数据：\n\n{dialog}"
+
+
 def analyze_emotion(chat: ChatData, on_progress=None, should_cancel=None) -> dict[str, Any]:
     """逐月情绪分析，返回 {"2025-09": {...}, ...}"""
     months = split_by_month(chat)
     results = _analyze_periods(
         months,
         SYSTEM_PROMPT_EMOTION,
-        lambda p, msgs: f"以下是 {p} 月的对话数据：\n\n"
-                        f"{_build_dialog(msgs, chat.self_uid, chat.self_name, chat.other_name)}",
+        lambda p, msgs: _month_prompt(chat, p, msgs),
         max_tokens=MAX_TOKENS_BY_DIM["emotion"],
         on_progress=on_progress, should_cancel=should_cancel,
     )
@@ -351,8 +359,7 @@ def analyze_topics(chat: ChatData, on_progress=None, should_cancel=None) -> dict
     results = _analyze_periods(
         months,
         SYSTEM_PROMPT_TOPICS,
-        lambda p, msgs: f"以下是 {p} 月的对话数据：\n\n"
-                        f"{_build_dialog(msgs, chat.self_uid, chat.self_name, chat.other_name)}",
+        lambda p, msgs: _month_prompt(chat, p, msgs),
         max_tokens=MAX_TOKENS_BY_DIM["topics"],
         on_progress=on_progress, should_cancel=should_cancel,
     )
@@ -368,8 +375,7 @@ def analyze_relationship(chat: ChatData, on_progress=None, should_cancel=None) -
     results = _analyze_periods(
         months,
         SYSTEM_PROMPT_RELATIONSHIP,
-        lambda p, msgs: f"以下是 {p} 月的对话数据：\n\n"
-                        f"{_build_dialog(msgs, chat.self_uid, chat.self_name, chat.other_name)}",
+        lambda p, msgs: _month_prompt(chat, p, msgs),
         max_tokens=MAX_TOKENS_BY_DIM["relationship"],
         on_progress=on_progress, should_cancel=should_cancel,
     )

@@ -98,6 +98,7 @@ qqchatlog/
 │   ├── templates/             # HTML 模板
 │   │   ├── base.html          # 基础布局
 │   │   ├── index.html         # 首页 / 上传
+│   │   ├── login.html         # 访问口令登录页
 │   │   ├── dashboard.html     # 总览仪表盘
 │   │   ├── emotion.html       # 情绪分析
 │   │   ├── relationship.html  # 人际关系
@@ -107,8 +108,14 @@ qqchatlog/
 │   │   └── report.html        # 全篇报告
 │   └── static/
 │       ├── css/style.css      # 自定义样式
-│       └── js/charts.js       # ECharts 图表渲染
+│       └── js/
+│           ├── charts.js      # ECharts 图表渲染
+│           └── analyze.js     # AI 分析任务：轮询进度/取消/缓存读取
+├── tests/
+│   └── test_core.py           # 核心逻辑单元测试
+├── .github/workflows/test.yml # CI：py_compile + unittest
 ├── uploads/                   # 上传文件暂存
+├── ai_cache/                  # AI 结果缓存（敏感，已 gitignore，24h 自动清理）
 ├── flask_session/             # Session 文件（自动生成）
 ├── logs/                      # 日志文件（自动生成）
 └── docs/                      # 设计文档与计划
