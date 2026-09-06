@@ -485,18 +485,30 @@ def analyze_relationship(chat: ChatData, on_progress=None, should_cancel=None) -
 
 def _analyze_person(system_prompt: str, sample_size: int, msgs: list,
                     display_name: str, prompt_template: str, max_tokens: int,
-                    tag: str = "unknown") -> Optional[dict]:
-    """单人的习惯/锐评分析：先过滤再取最近 sample_size 条样本，失败仅记日志。"""
+                    tag: str = "unknown", stratified: bool = False) -> Optional[dict]:
+    """单人的习惯/锐评分析：先过滤再取样本，失败仅记日志。
+
+    stratified=False（习惯）：取最近 sample_size 条 —— 语言习惯看当下。
+    stratified=True（锐评）：按时间均匀抽样覆盖整个时段 —— 否则 growth_observation
+    要求的"这段时间的变化"根本不在样本里，模型只能编或写数据不足。
+    """
     try:
         valid_all = [m for m in msgs if _has_content(m) and is_statistical(m)]
-        sample = valid_all[-sample_size:]
+        if stratified and len(valid_all) > sample_size:
+            # 向上取整步长：保证抽样后条数 <= sample_size 且覆盖整个时间轴
+            stride = (len(valid_all) + sample_size - 1) // sample_size
+            sample = valid_all[::stride]
+            span_note = "，按时间均匀抽样覆盖整个时段"
+        else:
+            sample = valid_all[-sample_size:]
+            span_note = ""
         valid = sample
         if not valid:
             return None
         lines = [_message_line(m, display_name) for m in valid]
         original_n = len(lines)
         lines = _fit_lines(lines, MAX_DIALOG_CHARS)
-        head = f"统计：{display_name} 共发言 {len(valid_all)} 条（样本 {len(valid)} 条，图片 "
+        head = f"统计：{display_name} 共发言 {len(valid_all)} 条（样本 {len(valid)} 条{span_note}，图片 "
         head += f"{sum(1 for m in valid if m.has_image)} 张）"
         if len(lines) < original_n:
             head += f"，因篇幅限制展示其中 {len(lines)} 条"
@@ -558,7 +570,8 @@ def analyze_profile(chat: ChatData, on_progress=None, should_cancel=None) -> dic
         display_name = chat.self_name if person_key == "self" else chat.other_name
         try:
             result = _analyze_person(SYSTEM_PROMPT_PROFILE, 300, msgs, display_name, template,
-                                     max_tokens=MAX_TOKENS_BY_DIM["profile"], tag="profile")
+                                     max_tokens=MAX_TOKENS_BY_DIM["profile"], tag="profile",
+                                     stratified=True)
         except QuotaExhaustedError:
             if results:
                 logger.error("配额耗尽，剩余对象未分析（已完成 %d/2）", len(results))
