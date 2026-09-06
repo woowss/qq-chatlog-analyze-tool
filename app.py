@@ -67,6 +67,7 @@ from analyzer.deepseek_client import (
     analyze_profile,
     is_api_configured,
 )
+from analyzer.prompts import PROMPT_VERSION
 from analyzer.logger import get_logger
 
 logger = get_logger("app")
@@ -212,11 +213,20 @@ def login():
 # ---------------------------------------------------------------------------
 
 
-def _cleanup_old_files(max_age_seconds: int = 86400):
-    """删除超过 max_age_seconds 的临时文件（含 AI 缓存——缓存内容源自聊天记录，属敏感数据）"""
+def _cleanup_old_files(max_age_seconds: int = 86400, cache_max_age: int = 30 * 86400):
+    """删除过期的临时文件。
+
+    生命周期分层：
+    - uploads/ 与 flask_session/：24h —— 原始聊天记录，敏感，尽快清；
+    - ai_cache/：30 天 —— 派生分析结果。若同样 24h 清，"缓存省钱"对低频使用者
+      形同虚设；30 天覆盖"每周用几次"的节奏。重新上传/删除聊天文件时其缓存会被
+      联动清除（_purge_chat_caches），孤儿缓存最迟 30 天后回收。
+    """
     now = time.time()
     cleaned = 0
-    for directory in (UPLOAD_FOLDER, SESSION_FILE_DIR, AI_CACHE_DIR):
+    for directory, ttl in ((UPLOAD_FOLDER, max_age_seconds),
+                           (SESSION_FILE_DIR, max_age_seconds),
+                           (AI_CACHE_DIR, cache_max_age)):
         try:
             entries = os.listdir(directory)
         except OSError:
@@ -224,7 +234,7 @@ def _cleanup_old_files(max_age_seconds: int = 86400):
         for name in entries:
             path = os.path.join(directory, name)
             try:
-                if now - os.path.getmtime(path) > max_age_seconds:
+                if now - os.path.getmtime(path) > ttl:
                     os.remove(path)
                     cleaned += 1
             except OSError:
@@ -265,13 +275,14 @@ def upload():
         logger.warning("上传文件格式无效: %s", orig_name)
         return "请选择有效的 .json 文件", 400
 
-    # 删除上一次会话遗留的上传文件，避免孤儿文件堆积
+    # 旧文件信息先记下，等新文件解析成功后再处置（解析失败不伤及当前会话）
     old_path = session.get("filepath")
+    old_hash = None
     if old_path and os.path.exists(old_path) and os.path.dirname(old_path) == UPLOAD_FOLDER:
         try:
-            os.remove(old_path)
+            old_hash = _chat_hash(old_path)
         except OSError:
-            pass
+            old_hash = None
 
     filename = f"{uuid.uuid4().hex}.json"
     filepath = os.path.join(UPLOAD_FOLDER, filename)
@@ -286,18 +297,30 @@ def upload():
                     len(chat.messages), chat.duration_days)
     except Exception as e:
         logger.error("解析失败: %s", e)
-        # 解析失败的孤儿文件立即删除，不留到 24h 过期清理
+        # 解析失败的孤儿文件立即删除；旧文件与缓存保持原样，会话不受影响
         try:
             os.remove(filepath)
         except OSError:
             pass
         return f"解析失败: {e}", 400
 
+    # 新文件解析成功：处置旧文件。内容未变则保留其缓存（重传同文件应命中缓存省钱），
+    # 内容变了才联动清除旧文件的派生缓存，避免敏感分析结果成为孤儿
+    new_hash = _chat_hash(filepath)
+    if old_path and old_path != filepath and os.path.exists(old_path):
+        if old_hash and old_hash != new_hash:
+            _purge_chat_caches(old_hash)
+        try:
+            os.remove(old_path)
+        except OSError:
+            pass
+
     # 存入 session
     session["chat_name"] = chat.chat_name
     session["self_name"] = chat.self_name
     session["other_name"] = chat.other_name
     session["filepath"] = filepath
+    session["chat_hash"] = new_hash
 
     # 缓存本地统计结果
     logger.info("开始计算本地统计...")
@@ -451,7 +474,30 @@ def _chat_hash(filepath: str) -> str:
 
 
 def _cache_path(dimension: str, chat_hash: str) -> str:
-    return os.path.join(AI_CACHE_DIR, f"{dimension}_{chat_hash}_{DEEPSEEK_MODEL}.json")
+    # 键含提示词版本：prompt/采样改动 bump PROMPT_VERSION 后旧缓存自动失效，
+    # 避免旧风格结果顶着"新分析"的名义返回
+    return os.path.join(AI_CACHE_DIR,
+                        f"{dimension}_{chat_hash}_{DEEPSEEK_MODEL}_{PROMPT_VERSION}.json")
+
+
+def _purge_chat_caches(chat_hash: str) -> int:
+    """删除某聊天文件的全部缓存（跨版本/模型）。聊天源文件被删时联动调用，
+    避免派生的分析结果（含聊天内容摘要）成为孤儿残留。"""
+    if not chat_hash:
+        return 0
+    removed = 0
+    try:
+        entries = os.listdir(AI_CACHE_DIR)
+    except OSError:
+        return 0
+    for name in entries:
+        if f"_{chat_hash}_" in name:
+            try:
+                os.remove(os.path.join(AI_CACHE_DIR, name))
+                removed += 1
+            except OSError:
+                pass
+    return removed
 
 
 def _read_cache(dimension: str, chat_hash: str):
@@ -522,6 +568,17 @@ def _session_chat_file():
     return filepath, None
 
 
+def _find_running_job(dimension: str, chat_hash: str):
+    """同 session 同维度同文件已有 running job 时直接复用，防止双开标签页/连点
+    导致同一维度重复调 API 烧钱"""
+    with JOBS_LOCK:
+        for jid, j in JOBS.items():
+            if (j["status"] == "running" and j.get("sid") == session.sid
+                    and j.get("dim") == dimension and j.get("chat_hash") == chat_hash):
+                return jid
+    return None
+
+
 @app.route("/api/analyze/<dimension>", methods=["POST"])
 def api_analyze(dimension: str):
     """发起维度分析：命中缓存直接返回，否则启动后台任务并返回 job id"""
@@ -539,7 +596,7 @@ def api_analyze(dimension: str):
     if err:
         return jsonify({"error": err[0]}), err[1]
 
-    chat_hash = _chat_hash(filepath)
+    chat_hash = session.get("chat_hash") or _chat_hash(filepath)
 
     # 缓存命中（除非显式 refresh=1 强制重跑）
     if request.args.get("refresh") != "1":
@@ -547,6 +604,11 @@ def api_analyze(dimension: str):
         if cached is not None:
             logger.info("%s 命中缓存，直接返回", DIMENSION_NAMES.get(dimension, dimension))
             return jsonify({"cached": True, "result": cached})
+
+    running = _find_running_job(dimension, chat_hash)
+    if running:
+        logger.info("复用进行中的 %s 任务 %s", dimension, running[:8])
+        return jsonify({"job": running, "reused": True})
 
     _prune_jobs()
     job_id = uuid.uuid4().hex
@@ -600,7 +662,7 @@ def api_analysis_result(dimension: str):
     filepath, err = _session_chat_file()
     if err:
         return jsonify({"error": err[0]}), err[1]
-    cached = _read_cache(dimension, _chat_hash(filepath))
+    cached = _read_cache(dimension, session.get("chat_hash") or _chat_hash(filepath))
     if cached is None:
         return jsonify({"error": "暂无该维度的分析结果"}), 404
     return jsonify({"cached": True, "result": cached})
@@ -695,8 +757,13 @@ def api_analyze_all():
     if err:
         return jsonify({"error": err[0]}), err[1]
 
-    chat_hash = _chat_hash(filepath)
+    chat_hash = session.get("chat_hash") or _chat_hash(filepath)
     refresh = request.args.get("refresh") == "1"
+
+    running = _find_running_job("all", chat_hash)
+    if running:
+        logger.info("复用进行中的一键全量任务 %s", running[:8])
+        return jsonify({"job": running, "reused": True})
 
     _prune_jobs()
     job_id = uuid.uuid4().hex
