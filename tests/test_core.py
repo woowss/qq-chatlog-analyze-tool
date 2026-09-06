@@ -601,5 +601,39 @@ class TestAnalyzeAll(unittest.TestCase):
                     pass
 
 
+class TestPromptContract(unittest.TestCase):
+    """JSON 契约防漂移：前端渲染依赖的老字段名必须始终存在于对应 prompt 中"""
+
+    def test_field_names_present(self):
+        from analyzer import prompts as P
+        cases = [
+            (P.SYSTEM_PROMPT_EMOTION, ["self_emotion", "other_emotion", "self_intensity",
+                                       "other_intensity", "self_keywords", "other_keywords",
+                                       "overall_tone"]),
+            (P.SYSTEM_PROMPT_TOPICS, ["topics", "weight", "keywords", "summary",
+                                      "topic_shift_detected", "shift_description"]),
+            (P.SYSTEM_PROMPT_RELATIONSHIP, ["initiator_tendency", "initiator_ratio_self",
+                                            "interaction_style", "closeness_score",
+                                            "closeness_trend", "self_role", "other_role",
+                                            "relationship_summary"]),
+            (P.SYSTEM_PROMPT_HABITS, ["personality_tags", "common_phrases", "emoji_style",
+                                      "top_emojis", "sentence_length", "reply_speed",
+                                      "topic_jumping", "unique_traits"]),
+            (P.SYSTEM_PROMPT_PROFILE, ["overall_impression", "core_type", "strengths",
+                                       "weaknesses", "quirks", "signature_phrases",
+                                       "fun_facts", "scoring", "verdict",
+                                       "counter_evidence", "confidence"]),
+        ]
+        for prompt, fields in cases:
+            for f in fields:
+                self.assertIn(f, prompt, f"字段 {f} 从 prompt 中消失，前端契约被破坏")
+
+    def test_objectivity_and_humor_rules_present(self):
+        """客观/幽默机制必须写进共用守则"""
+        from analyzer import prompts as P
+        for keyword in ("反例自查", "置信度", "证据优先", "损而不伤", "反套话黑名单"):
+            self.assertIn(keyword, P._OBSERVER_CREED)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
