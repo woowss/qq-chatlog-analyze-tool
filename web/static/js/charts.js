@@ -342,6 +342,9 @@ function renderEmotionCharts(data) {
             '<div class="mt-1 small text-muted">' +
             '自己关键词: ' + (d.self_keywords || []).map(esc).join('、') + '<br>' +
             '对方关键词: ' + (d.other_keywords || []).map(esc).join('、') +
+            '</div>' +
+            (d.month_vibe ? '<div class="mt-1 small">🎬 ' + esc(d.month_vibe) + '</div>' : '') +
+            (d.turning_point ? '<div class="mt-1 small text-warning">⚡ ' + esc(d.turning_point) + '</div>' : '') +
             '</div></div></div>';
     });
     $('#emotionDetails').html(html);
@@ -417,6 +420,7 @@ function renderTopicsCharts(data) {
         }).join('');
         html += '<div class="card mb-2"><div class="card-body py-2">' +
             '<strong>' + esc(m) + '</strong>' +
+            (d.month_title ? ' <span class="text-muted small">' + esc(d.month_title) + '</span>' : '') +
             '<div class="mt-1">' + tags + '</div>' +
             '<div class="small text-muted mt-1">' + esc(d.summary) + '</div>' +
             '</div></div>';

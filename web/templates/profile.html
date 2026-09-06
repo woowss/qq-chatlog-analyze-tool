@@ -104,6 +104,11 @@ function renderProfile(data) {
         }
         html += '</div>';
 
+        // 一句话人物小传（v2 新增）
+        if (d.one_line_bio) {
+            html += '<p class="text-muted fst-italic">📜 ' + j(d.one_line_bio) + '</p>';
+        }
+
         // 评分仪表
         if (sc.expressiveness || sc.social_energy) {
             html += '<div class="row text-center mb-3 g-1">' +
@@ -204,6 +209,16 @@ function renderProfile(data) {
             html += '<h5 class="border-bottom pb-2 mt-3">🤪 有趣事实</h5><ul>';
             d.fun_facts.forEach(function(f) { html += '<li>' + esc(f) + '</li>'; });
             html += '</ul>';
+        }
+
+        // 反例自查 + 自嘲免责声明（v2 客观性字段）
+        if (d.counter_evidence && d.counter_evidence.length) {
+            html += '<h5 class="border-bottom pb-2 mt-3">🪞 反例自查</h5><ul class="small text-muted">';
+            d.counter_evidence.forEach(function(c) { html += '<li>' + j(c) + '</li>'; });
+            html += '</ul>';
+        }
+        if (d.roast_note) {
+            html += '<p class="small text-muted fst-italic">️ ' + j(d.roast_note) + '</p>';
         }
 
         html += '</div></div></div>';
