@@ -320,6 +320,8 @@ class TestAiCache(unittest.TestCase):
                        "self_intensity": 5, "other_intensity": 7,
                        "self_keywords": ["在吗"], "other_keywords": ["在的"],
                        "overall_tone": "轻松愉快"}
+        cache_dir = Path(appmod.AI_CACHE_DIR)
+        cache_before = set(cache_dir.glob("*")) if cache_dir.exists() else set()
         try:
             with mock.patch("analyzer.deepseek_client._call_api", return_value=fake_result) as m:
                 with mock.patch("analyzer.deepseek_client.is_api_configured", return_value=True), \
@@ -358,6 +360,35 @@ class TestAiCache(unittest.TestCase):
                 fp = sess.get("filepath")
             if fp and os.path.exists(fp):
                 os.remove(fp)
+            # 清理本测试新写入的缓存文件，不污染真实 ai_cache/
+            cache_after = set(cache_dir.glob("*")) if cache_dir.exists() else set()
+            for f in cache_after - cache_before:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+
+
+class TestEmptyMonthSkipped(unittest.TestCase):
+    """整月只有撤回/系统消息时，不调用 API"""
+
+    def test_recalled_only_month_not_sent(self):
+        import analyzer.deepseek_client as dc
+        sep_msg = _msg("self", 1704067200000, text="一月消息")   # 2024-01
+        oct_recalled = _msg("other", 1706745600000, text="二月被撤回")  # 2024-02
+        oct_recalled.recalled = True
+        chat = ChatData(chat_name="", self_name="我", other_name="对方",
+                        self_uid="self", other_uid="other",
+                        messages=[sep_msg, oct_recalled])
+        result = {"self_emotion": "平静", "other_emotion": "平静",
+                  "self_intensity": 5, "other_intensity": 5,
+                  "self_keywords": [], "other_keywords": [],
+                  "overall_tone": "平淡日常"}
+        with mock.patch.object(dc, "_call_api", return_value=result) as m:
+            out = dc.analyze_emotion(chat)
+        self.assertEqual(m.call_count, 1)          # 十月整月无效，未调用
+        self.assertIn("2024-01", out)
+        self.assertNotIn("2024-02", out)
 
 
 if __name__ == "__main__":
