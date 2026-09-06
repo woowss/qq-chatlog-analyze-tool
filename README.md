@@ -129,7 +129,7 @@ qqchatlog/
 │   └── test_core.py           # 核心逻辑单元测试
 ├── .github/workflows/test.yml # CI：py_compile + unittest
 ├── uploads/                   # 上传文件暂存
-├── ai_cache/                  # AI 结果缓存（敏感，已 gitignore，24h 自动清理）
+├── ai_cache/                  # AI 结果缓存（敏感，已 gitignore，30 天回收/随源文件联动删除）
 ├── flask_session/             # Session 文件（自动生成）
 ├── logs/                      # 日志文件（自动生成）
 └── docs/                      # 设计文档与计划
@@ -151,7 +151,7 @@ qqchatlog/
 
 - 聊天记录**仅保存在本地**，不上传至任何第三方服务器
 - AI 分析时仅将文本片段发送至所配置的 LLM API，多媒体文件不会被上传
-- 上传文件、session 与 AI 结果缓存（`uploads/`、`flask_session/`、`ai_cache/`）超过 24 小时会在启动时自动清理；重新上传时旧文件即时删除。若需立即清除，手动删除这三个目录即可
+- 上传文件与 session 数据（`uploads/`、`flask_session/`）超过 24 小时会在启动时自动清理；重新上传时旧文件**及其派生 AI 缓存**即时删除。AI 结果缓存（`ai_cache/`）保留 30 天以便跨会话复用省钱，孤儿缓存最迟 30 天回收。想立即清除：删这三个目录即可
 - 服务默认仅绑定 `127.0.0.1`，POST 请求带 CSRF token 与 Origin 双重校验；绑定非回环地址时必须设置 `ACCESS_PASSWORD` 访问口令，否则拒绝启动
 
 ## 📦 依赖

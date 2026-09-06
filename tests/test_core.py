@@ -635,5 +635,176 @@ class TestPromptContract(unittest.TestCase):
             self.assertIn(keyword, P._OBSERVER_CREED)
 
 
+class TestCacheLifecycle(unittest.TestCase):
+    """缓存键含提示词版本；聊天文件删除时派生缓存联动清除"""
+
+    def test_cache_path_includes_prompt_version(self):
+        import app as appmod
+        from analyzer.prompts import PROMPT_VERSION
+        path = appmod._cache_path("emotion", "deadbeef" * 2)
+        self.assertIn(PROMPT_VERSION, path)
+
+    def test_purge_chat_caches(self):
+        import app as appmod
+        appmod._write_cache("emotion", "hashAAA", {"x": 1})
+        appmod._write_cache("topics", "hashAAA", {"x": 2})
+        appmod._write_cache("emotion", "hashBBB", {"x": 3})
+        try:
+            self.assertEqual(appmod._purge_chat_caches("hashAAA"), 2)
+            self.assertIsNone(appmod._read_cache("emotion", "hashAAA"))
+            self.assertIsNotNone(appmod._read_cache("emotion", "hashBBB"))
+        finally:
+            appmod._purge_chat_caches("hashBBB")
+
+
+class TestJobDedup(unittest.TestCase):
+    """同 session 同维度并发发起时复用 running job，不重复烧 API"""
+
+    def test_reuses_running_job(self):
+        import threading
+        import app as appmod
+        appmod.app.config["TESTING"] = True
+        client = appmod.app.test_client()
+        client.get("/")
+        with client.session_transaction() as sess:
+            token = sess["csrf_token"]
+        chat_json = json.dumps({
+            "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
+            "statistics": {"senders": [{"uid": "u_self", "name": "我"},
+                                       {"uid": "u_other", "name": "对方"}]},
+            "messages": [
+                {"id": "1", "timestamp": 1758031009000, "time": "2025-09-16 21:56:49",
+                 "sender": {"uid": "u_self", "name": "我"}, "content": "在吗"},
+            ],
+        }, ensure_ascii=False).encode("utf-8")
+        r = client.post("/upload", data={"file": (io.BytesIO(chat_json), "chat.json")},
+                        headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+        with client.session_transaction() as sess:
+            uploaded_path = sess.get("filepath")
+        self.assertEqual(r.status_code, 302)
+
+        release = threading.Event()
+        fake = {"self_emotion": "平静", "other_emotion": "平静",
+                "self_intensity": 5, "other_intensity": 5,
+                "self_keywords": [], "other_keywords": [], "overall_tone": "平淡日常"}
+
+        def blocking(*a, **k):
+            self.assertTrue(release.wait(15), "测试超时未放行")
+            return fake
+
+        cache_dir = Path(appmod.AI_CACHE_DIR)
+        cache_before = set(cache_dir.glob("*"))
+        try:
+            with mock.patch("analyzer.deepseek_client._call_api", side_effect=blocking), \
+                 mock.patch("app.is_api_configured", return_value=True):
+                h = {"Origin": "http://localhost:5000", "X-CSRF-Token": token}
+                b1 = client.post("/api/analyze/emotion", headers=h).get_json()
+                b2 = client.post("/api/analyze/emotion", headers=h).get_json()
+                self.assertIn("job", b1)
+                self.assertEqual(b1["job"], b2["job"])   # 复用同一任务
+                self.assertTrue(b2.get("reused"))
+            release.set()
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                s = client.get("/api/analyze-job/" + b1["job"]).get_json()
+                if s.get("status") in ("done", "error", "cancelled"):
+                    break
+                time.sleep(0.1)
+            self.assertEqual(s.get("status"), "done")
+        finally:
+            release.set()
+            if uploaded_path and os.path.exists(uploaded_path):
+                os.remove(uploaded_path)
+            for f in set(cache_dir.glob("*")) - cache_before:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+
+
+class TestStratifiedProfileSample(unittest.TestCase):
+    """锐评样本必须覆盖整个时间轴（growth_observation 的前提），而非只取最近"""
+
+    def test_profile_sample_spans_timeline(self):
+        import analyzer.deepseek_client as dc
+        msgs = []
+        for i in range(400):   # 每天一条，跨 ~13 个月
+            m = _msg("self", 1735689600000 + i * 86400000, text=f"消息{i}")
+            m.time_str = datetime.fromtimestamp(m.timestamp / 1000, tz=CST) \
+                            .strftime("%Y-%m-%d %H:%M:%S")
+            msgs.append(m)
+        chat = ChatData(chat_name="", self_name="我", other_name="对方",
+                        self_uid="self", other_uid="other", messages=msgs)
+        captured = []
+
+        def spy(system_prompt, user_content, **k):
+            captured.append(user_content)
+            return None   # 不产生结果，只看 prompt
+
+        with mock.patch.object(dc, "_call_api", side_effect=spy):
+            dc.analyze_profile(chat)
+
+        self.assertEqual(len(captured), 1)   # other 一方无发言
+        prompt = captured[0]
+        self.assertIn("按时间均匀抽样覆盖整个时段", prompt)
+        self.assertIn("消息0", prompt)       # 最早
+        self.assertIn("消息398", prompt)     # 最晚（stride=2 时最后一个偶数下标）
+        self.assertNotIn("消息1\n", prompt)  # 中间奇数条目被抽稀
+
+
+class TestReuploadCacheLifecycle(unittest.TestCase):
+    """重传同一文件应保留缓存（省钱）；换不同文件才联动清除旧缓存"""
+
+    def _upload(self, client, token, payload: dict, name="chat.json"):
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        return client.post("/upload", data={"file": (io.BytesIO(data), name)},
+                           headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+
+    def test_same_file_keeps_cache_different_file_purges(self):
+        import app as appmod
+        appmod.app.config["TESTING"] = True
+        client = appmod.app.test_client()
+        client.get("/")
+        with client.session_transaction() as sess:
+            token = sess["csrf_token"]
+        chat_a = {
+            "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
+            "statistics": {"senders": [{"uid": "u_self", "name": "我"},
+                                       {"uid": "u_other", "name": "对方"}]},
+            "messages": [
+                {"id": "1", "timestamp": 1758031009000, "time": "2025-09-16 21:56:49",
+                 "sender": {"uid": "u_self", "name": "我"}, "content": "A内容"},
+            ],
+        }
+        chat_b = json.loads(json.dumps(chat_a))
+        chat_b["messages"][0]["content"] = "B内容（不同哈希）"
+
+        r = self._upload(client, token, chat_a)
+        self.assertEqual(r.status_code, 302)
+        with client.session_transaction() as sess:
+            hash_a = sess["chat_hash"]
+            path_a = sess["filepath"]
+        appmod._write_cache("emotion", hash_a, {"keep": True})
+
+        # 重传同一文件：旧文件删除但缓存保留
+        r2 = self._upload(client, token, chat_a)
+        self.assertEqual(r2.status_code, 302)
+        self.assertFalse(os.path.exists(path_a))          # 旧文件已清理
+        self.assertIsNotNone(appmod._read_cache("emotion", hash_a))  # 缓存还在
+
+        # 换不同内容文件：旧哈希的缓存被联动清除
+        r3 = self._upload(client, token, chat_b)
+        self.assertEqual(r3.status_code, 302)
+        self.assertIsNone(appmod._read_cache("emotion", hash_a))
+        with client.session_transaction() as sess:
+            path_b = sess.get("filepath")
+            hash_b = sess.get("chat_hash")
+        try:
+            appmod._purge_chat_caches(hash_b)
+        finally:
+            if path_b and os.path.exists(path_b):
+                os.remove(path_b)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
