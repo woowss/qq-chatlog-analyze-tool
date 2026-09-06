@@ -369,6 +369,36 @@ class TestAiCache(unittest.TestCase):
                     pass
 
 
+class TestQuotaExhausted(unittest.TestCase):
+    """insufficient_quota 必须快速失败：不重试、中止剩余月份、错误信息透传"""
+
+    class _QuotaErr(Exception):
+        code = "insufficient_quota"
+
+    def test_call_api_no_retry_on_quota(self):
+        import analyzer.deepseek_client as dc
+        fake = mock.Mock()
+        fake.chat.completions.create.side_effect = TestQuotaExhausted._QuotaErr(
+            '429 {"code":"insufficient_quota"}')
+        with mock.patch.object(dc, "_get_client", return_value=fake):
+            with self.assertRaises(dc.QuotaExhaustedError):
+                dc._call_api("sys", "user", retry=2)
+        self.assertEqual(fake.chat.completions.create.call_count, 1)  # 不重试
+
+    def test_periods_abort_remaining(self):
+        import analyzer.deepseek_client as dc
+        fake = mock.Mock()
+        fake.chat.completions.create.side_effect = TestQuotaExhausted._QuotaErr(
+            '429 {"code":"insufficient_quota"}')
+        months = {f"2025-{m:02d}": [_msg("self", 1735689600000 + i * 2678400000, text="hi")]
+                  for m, i in [(1, 0), (2, 1), (3, 2), (4, 3), (5, 4)]}
+        with mock.patch.object(dc, "_get_client", return_value=fake):
+            with self.assertRaises(dc.QuotaExhaustedError):
+                dc._analyze_periods(months, "sys", lambda p, m: "prompt", max_tokens=1024)
+        # 每月份至多一次调用（无重试），且中止后总调用数远小于 月份数×重试数
+        self.assertLessEqual(fake.chat.completions.create.call_count, len(months))
+
+
 class TestEmptyMonthSkipped(unittest.TestCase):
     """整月只有撤回/系统消息时，不调用 API"""
 

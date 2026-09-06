@@ -56,6 +56,22 @@ MAX_TOKENS_BY_DIM = {
 }
 
 
+class QuotaExhaustedError(RuntimeError):
+    """上游套餐额度耗尽（insufficient_quota）。与限流不同，重试无意义，必须快速失败。"""
+
+
+def _is_quota_error(e: Exception) -> bool:
+    """识别阿里云 Token Plan / OpenAI 兼容接口的配额耗尽错误"""
+    if getattr(e, "code", None) == "insufficient_quota":
+        return True
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error") or {}
+        if isinstance(err, dict) and err.get("code") == "insufficient_quota":
+            return True
+    return "insufficient_quota" in str(e)
+
+
 # .env 模板中的占位符值，视为"未配置"
 _PLACEHOLDER_KEYS = {"", "你的DeepSeek_API_Key", "你的API_Key"}
 
@@ -221,6 +237,11 @@ def _call_api(system_prompt: str, user_content: str, max_tokens: int = 2048,
                 logger.error("模型返回非法 JSON（不重试）: %s", e)
                 return None
         except Exception as e:
+            if _is_quota_error(e):
+                raise QuotaExhaustedError(
+                    "API 套餐额度已耗尽（insufficient_quota）：请到服务商控制台查看用量、"
+                    "提升额度或等待配额周期重置后重试。剩余月份已中止，不再浪费请求。"
+                ) from e
             if attempt < retry:
                 delay = 2 ** attempt
                 status = getattr(e, "status_code", None)
@@ -249,6 +270,7 @@ def _analyze_periods(months: dict[str, list], system_prompt: str,
     results: dict[str, Any] = {}
     total = len(months)
     done = 0
+    fatal: dict[str, str] = {}   # 配额耗尽等致命错误：中止剩余月份
 
     def _work(period: str, msgs: list) -> tuple[str, Optional[dict]]:
         try:
@@ -260,6 +282,9 @@ def _analyze_periods(months: dict[str, list], system_prompt: str,
                 result["period"] = period
                 result["month"] = period
                 return period, result
+        except QuotaExhaustedError as e:
+            fatal.setdefault("error", str(e))
+            logger.error("%s 月 AI 分析中止（配额耗尽）", period)
         except Exception as e:
             logger.error("%s 月 AI 分析失败: %s", period, e)
         return period, None
@@ -268,7 +293,7 @@ def _analyze_periods(months: dict[str, list], system_prompt: str,
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
         futures = {}
         for period, msgs in items:
-            if should_cancel and should_cancel():
+            if fatal or (should_cancel and should_cancel()):
                 break
             futures[pool.submit(_work, period, msgs)] = period
         for fut in concurrent.futures.as_completed(list(futures)):
@@ -281,6 +306,16 @@ def _analyze_periods(months: dict[str, list], system_prompt: str,
                     on_progress(done, total)
                 except Exception:
                     pass
+            if fatal:
+                # 配额耗尽：取消尚未开始的月份任务
+                for f in futures:
+                    f.cancel()
+                break
+
+    if fatal:
+        if not results:
+            raise QuotaExhaustedError(fatal["error"])
+        logger.error("部分月份因配额耗尽未完成: %s", fatal["error"])
 
     # 按月份自然序返回
     return {period: results[period] for period in months if period in results}
@@ -414,6 +449,8 @@ def _analyze_person(system_prompt: str, sample_size: int, msgs: list,
             result["name"] = display_name
             result["total_messages"] = len(valid_all)
             return result
+    except QuotaExhaustedError:
+        raise  # 配额耗尽需中止整个维度，不能被当作单人失败吞掉
     except Exception as e:
         logger.error("%s 的 AI 分析失败: %s", display_name, e)
     return None
@@ -431,8 +468,14 @@ def analyze_habits(chat: ChatData, on_progress=None, should_cancel=None) -> dict
         if should_cancel and should_cancel():
             break
         display_name = chat.self_name if person_key == "self" else chat.other_name
-        result = _analyze_person(SYSTEM_PROMPT_HABITS, 200, msgs, display_name, template,
-                                 max_tokens=MAX_TOKENS_BY_DIM["habits"])
+        try:
+            result = _analyze_person(SYSTEM_PROMPT_HABITS, 200, msgs, display_name, template,
+                                     max_tokens=MAX_TOKENS_BY_DIM["habits"])
+        except QuotaExhaustedError:
+            if results:  # 已有部分结果：保留已完成者，向上报告配额问题
+                logger.error("配额耗尽，剩余对象未分析（已完成 %d/2）", len(results))
+                break
+            raise
         if result:
             results[person_key] = result
         done += 1
@@ -453,8 +496,14 @@ def analyze_profile(chat: ChatData, on_progress=None, should_cancel=None) -> dic
         if should_cancel and should_cancel():
             break
         display_name = chat.self_name if person_key == "self" else chat.other_name
-        result = _analyze_person(SYSTEM_PROMPT_PROFILE, 300, msgs, display_name, template,
-                                 max_tokens=MAX_TOKENS_BY_DIM["profile"])
+        try:
+            result = _analyze_person(SYSTEM_PROMPT_PROFILE, 300, msgs, display_name, template,
+                                     max_tokens=MAX_TOKENS_BY_DIM["profile"])
+        except QuotaExhaustedError:
+            if results:
+                logger.error("配额耗尽，剩余对象未分析（已完成 %d/2）", len(results))
+                break
+            raise
         if result:
             results[person_key] = result
         done += 1
