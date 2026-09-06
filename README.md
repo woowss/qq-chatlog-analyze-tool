@@ -156,6 +156,16 @@ qqchatlog/
 核心依赖：Flask、Flask-Session、OpenAI SDK（DeepSeek 兼容接口）、python-dotenv、jieba。
 完整锁定清单见 `requirements.txt`（`pip install -r requirements.txt` 即可）。
 
+## ❓ 常见问题
+
+**Q：AI 分析时报 429 "Allocated quota exceeded / insufficient_quota"？**
+
+这是**每分钟限流（TPM/RPM）**，不是套餐额度耗尽（该报错文案有误导性，[官方文档](https://www.alibabacloud.com/help/en/model-studio/rate-limit) 明确限流按主账号聚合、通常 1 分钟内自动恢复）。应用已内置应对：全局 3 秒调用间隔平滑突发、命中 429 自动等待 25s 重试最多 4 次、多次不恢复才中止并保留部分结果。若仍频繁触发：
+
+1. 在 `.env` 中下调：`LLM_CONCURRENCY=1`、`LLM_CALL_MIN_INTERVAL=5`，或减小 `LLM_MAX_DIALOG_CHARS=30000`（每请求更省 token）
+2. 到百炼控制台「限流提额」页临时提升该模型的 TPM 配额（立即生效）
+3. 避开同账号其他程序（如编码 Agent）的大量请求时段——所有 API Key 共享同一个限流池
+
 ## 📜 许可证
 
 [GPL v3](LICENSE)

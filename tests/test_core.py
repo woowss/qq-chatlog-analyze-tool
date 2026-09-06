@@ -369,33 +369,68 @@ class TestAiCache(unittest.TestCase):
                     pass
 
 
-class TestQuotaExhausted(unittest.TestCase):
-    """insufficient_quota 必须快速失败：不重试、中止剩余月份、错误信息透传"""
+class TestQuotaAndThrottle(unittest.TestCase):
+    """429=每分钟限流（TPM/RPM，等待后重试，官方称约1分钟恢复）；
+    403/欠费=真正额度耗尽（快速失败，中止剩余任务）"""
 
-    class _QuotaErr(Exception):
-        code = "insufficient_quota"
+    @staticmethod
+    def _err(status, msg):
+        e = Exception(msg)
+        e.status_code = status
+        return e
 
-    def test_call_api_no_retry_on_quota(self):
+    @staticmethod
+    def _ok_resp(content='{"a": 1}'):
+        r = mock.MagicMock()
+        r.choices = [mock.MagicMock()]
+        r.choices[0].finish_reason = "stop"
+        r.choices[0].message.content = content
+        r.usage = None
+        return r
+
+    def setUp(self):
         import analyzer.deepseek_client as dc
+        self.dc = dc
+        self._orig_interval = dc.CALL_MIN_INTERVAL
+        dc.CALL_MIN_INTERVAL = 0.0  # 测试中关闭全局调用闸门，避免拖慢
+
+    def tearDown(self):
+        self.dc.CALL_MIN_INTERVAL = self._orig_interval
+
+    def test_tpm_retries_then_raises(self):
         fake = mock.Mock()
-        fake.chat.completions.create.side_effect = TestQuotaExhausted._QuotaErr(
-            '429 {"code":"insufficient_quota"}')
-        with mock.patch.object(dc, "_get_client", return_value=fake):
-            with self.assertRaises(dc.QuotaExhaustedError):
-                dc._call_api("sys", "user", retry=2)
+        fake.chat.completions.create.side_effect = self._err(429, "Allocated quota exceeded")
+        with mock.patch.object(self.dc, "_get_client", return_value=fake):
+            with self.assertRaises(self.dc.QuotaExhaustedError):
+                self.dc._call_api("s", "u", retry=2, tpm_wait=0.01)
+        self.assertEqual(fake.chat.completions.create.call_count, self.dc.TPM_MAX_ATTEMPTS)
+
+    def test_tpm_transient_then_success(self):
+        fake = mock.Mock()
+        fake.chat.completions.create.side_effect = [
+            self._err(429, "Allocated quota exceeded"), self._ok_resp()]
+        with mock.patch.object(self.dc, "_get_client", return_value=fake):
+            out = self.dc._call_api("s", "u", retry=2, tpm_wait=0.01)
+        self.assertEqual(out, {"a": 1})
+        self.assertEqual(fake.chat.completions.create.call_count, 2)
+
+    def test_plan_exhausted_fails_fast(self):
+        fake = mock.Mock()
+        fake.chat.completions.create.side_effect = self._err(403, "Free allocated quota exceeded")
+        with mock.patch.object(self.dc, "_get_client", return_value=fake):
+            with self.assertRaises(self.dc.QuotaExhaustedError):
+                self.dc._call_api("s", "u", retry=2, tpm_wait=0.01)
         self.assertEqual(fake.chat.completions.create.call_count, 1)  # 不重试
 
-    def test_periods_abort_remaining(self):
-        import analyzer.deepseek_client as dc
+    def test_periods_abort_remaining_on_fatal(self):
         fake = mock.Mock()
-        fake.chat.completions.create.side_effect = TestQuotaExhausted._QuotaErr(
-            '429 {"code":"insufficient_quota"}')
+        fake.chat.completions.create.side_effect = self._err(403, "Free allocated quota exceeded")
         months = {f"2025-{m:02d}": [_msg("self", 1735689600000 + i * 2678400000, text="hi")]
                   for m, i in [(1, 0), (2, 1), (3, 2), (4, 3), (5, 4)]}
-        with mock.patch.object(dc, "_get_client", return_value=fake):
-            with self.assertRaises(dc.QuotaExhaustedError):
-                dc._analyze_periods(months, "sys", lambda p, m: "prompt", max_tokens=1024)
-        # 每月份至多一次调用（无重试），且中止后总调用数远小于 月份数×重试数
+        with mock.patch.object(self.dc, "_get_client", return_value=fake):
+            with self.assertRaises(self.dc.QuotaExhaustedError):
+                self.dc._analyze_periods(months, "sys", lambda p, m: "prompt", max_tokens=1024)
+        # 致命错误后剩余月份被中止：调用数不超过月份总数（无重试放大）
         self.assertLessEqual(fake.chat.completions.create.call_count, len(months))
 
 
