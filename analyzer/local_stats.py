@@ -277,3 +277,88 @@ def calc_overview(chat: ChatData) -> dict:
         "exchange_rounds": calc_exchange_rounds(chat),
         "avg_daily": round(len(msgs) / days, 1),
     }
+
+
+def calc_milestones(chat: ChatData) -> dict:
+    """时光里程碑：纯本地计算的纪念性统计，零 API 成本。
+
+    返回字段（口径均基于 statistical() 过滤后的消息）：
+    - first_day/last_day: 首条/末条消息日期
+    - active_days: 实际聊过的天数
+    - longest_streak: 连续聊天纪录 {days, start, end}
+    - longest_silence: 最长沉默期 {days, before, after}（两个活跃日之间的空档天数）
+    - midnight_days/midnight_msgs: 跨零点（0-5 点有发言）的天数与条数
+    - late_night_msgs: 凌晨 2-5 点的发言条数
+    - peak_day: 单日消息峰值 {date, count}
+    - busiest_month: 最活跃月份 {month, count}
+    - mutual_nights: 双方都熬到凌晨 2-5 点的天数（互相陪伴的深夜）
+    """
+    from datetime import date as _date
+
+    msgs = chat.statistical()
+    if not msgs:
+        return {}
+
+    day_counter: Counter = Counter()
+    midnight_msg_count = 0          # 0-6 点的发言条数
+    late_night_msgs = 0             # 2-6 点的发言条数
+    midnight_day_set: set[str] = set()
+    late_by_day: dict[str, set] = {}   # date -> {self/other}
+    month_counter: Counter = Counter()
+
+    for m in msgs:
+        dt = datetime.fromtimestamp(m.timestamp / 1000, tz=CST)
+        key = dt.strftime("%Y-%m-%d")
+        day_counter[key] += 1
+        month_counter[dt.strftime("%Y-%m")] += 1
+        if dt.hour < 6:
+            midnight_msg_count += 1
+            midnight_day_set.add(key)
+            if dt.hour >= 2:
+                late_night_msgs += 1
+                who = "self" if m.sender_uid == chat.self_uid else "other"
+                late_by_day.setdefault(key, set()).add(who)
+
+    sorted_days = sorted(day_counter)
+    first_day, last_day = sorted_days[0], sorted_days[-1]
+
+    # 连续聊天纪录
+    best_run = cur_run = 1
+    best_start = best_end = cur_start = _date.fromisoformat(first_day)
+    for prev, cur in zip(sorted_days, sorted_days[1:]):
+        if (_date.fromisoformat(cur) - _date.fromisoformat(prev)).days == 1:
+            cur_run += 1
+        else:
+            cur_run = 1
+            cur_start = _date.fromisoformat(cur)
+        if cur_run > best_run:
+            best_run = cur_run
+            best_start = cur_start
+            best_end = _date.fromisoformat(cur)
+
+    # 最长沉默期（相邻活跃日之间的空档）
+    silence_days, sil_before, sil_after = 0, "", ""
+    for prev, cur in zip(sorted_days, sorted_days[1:]):
+        gap = (_date.fromisoformat(cur) - _date.fromisoformat(prev)).days - 1
+        if gap > silence_days:
+            silence_days, sil_before, sil_after = gap, prev, cur
+
+    peak_day, peak_count = max(day_counter.items(), key=lambda kv: kv[1])
+    busiest_month, busiest_count = max(month_counter.items(), key=lambda kv: kv[1])
+    mutual_nights = sum(1 for v in late_by_day.values() if len(v) >= 2)
+
+    return {
+        "first_day": first_day,
+        "last_day": last_day,
+        "active_days": len(sorted_days),
+        "longest_streak": {"days": best_run,
+                           "start": best_start.isoformat(),
+                           "end": best_end.isoformat()},
+        "longest_silence": {"days": silence_days, "before": sil_before, "after": sil_after},
+        "midnight_days": len(midnight_day_set),
+        "midnight_msgs": midnight_msg_count,
+        "late_night_msgs": late_night_msgs,
+        "peak_day": {"date": peak_day, "count": peak_count},
+        "busiest_month": {"month": busiest_month, "count": busiest_count},
+        "mutual_nights": mutual_nights,
+    }

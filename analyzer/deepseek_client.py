@@ -29,6 +29,7 @@ from openai import OpenAI
 from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL, DEEPSEEK_BASE_URL
 from parser.qq_parser import CST, ChatData, is_statistical, split_by_month
 from analyzer.logger import get_logger
+from analyzer.usage import record_call
 from analyzer.prompts import (
     SYSTEM_PROMPT_EMOTION,
     SYSTEM_PROMPT_TOPICS,
@@ -236,7 +237,8 @@ def _build_dialog(messages: list, self_uid: str, self_name: str, other_name: str
 
 
 def _call_api(system_prompt: str, user_content: str, max_tokens: int = 2048,
-              retry: int = 2, tpm_wait: Optional[float] = None) -> Optional[dict]:
+              retry: int = 2, tpm_wait: Optional[float] = None,
+              tag: str = "unknown") -> Optional[dict]:
     """调用 LLM API，返回解析后的 JSON。
 
     错误分类策略：
@@ -269,9 +271,12 @@ def _call_api(system_prompt: str, user_content: str, max_tokens: int = 2048,
             )
             choice = resp.choices[0]
             if resp.usage:
-                logger.info("token 用量: prompt=%s completion=%s finish=%s",
-                            resp.usage.prompt_tokens, resp.usage.completion_tokens,
+                logger.info("token 用量[%s]: prompt=%s completion=%s finish=%s",
+                            tag, resp.usage.prompt_tokens, resp.usage.completion_tokens,
                             choice.finish_reason)
+                record_call(DEEPSEEK_MODEL, tag,
+                            resp.usage.prompt_tokens or 0,
+                            resp.usage.completion_tokens or 0)
             if choice.finish_reason == "length":
                 logger.error("模型输出被 max_tokens=%s 截断，放弃本次结果（不重试）", max_tokens)
                 return None
@@ -309,6 +314,7 @@ def _call_api(system_prompt: str, user_content: str, max_tokens: int = 2048,
 
 def _analyze_periods(months: dict[str, list], system_prompt: str,
                      make_prompt: Callable[[str, list], str], max_tokens: int,
+                     tag: str = "unknown",
                      on_progress: Optional[Callable[[int, int], None]] = None,
                      should_cancel: Optional[Callable[[], bool]] = None) -> dict[str, Any]:
     """并发逐月调用 API，返回 {period: result}。
@@ -327,7 +333,7 @@ def _analyze_periods(months: dict[str, list], system_prompt: str,
             prompt = make_prompt(period, msgs)
             if not prompt.strip():
                 return period, None
-            result = _call_api(system_prompt, prompt, max_tokens=max_tokens)
+            result = _call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag)
             if result:
                 result["period"] = period
                 result["month"] = period
@@ -433,6 +439,7 @@ def analyze_emotion(chat: ChatData, on_progress=None, should_cancel=None) -> dic
         SYSTEM_PROMPT_EMOTION,
         lambda p, msgs: _month_prompt(chat, p, msgs),
         max_tokens=MAX_TOKENS_BY_DIM["emotion"],
+        tag="emotion",
         on_progress=on_progress, should_cancel=should_cancel,
     )
     # 强度夹紧到 0-10，防御越界/非法值
@@ -450,6 +457,7 @@ def analyze_topics(chat: ChatData, on_progress=None, should_cancel=None) -> dict
         SYSTEM_PROMPT_TOPICS,
         lambda p, msgs: _month_prompt(chat, p, msgs),
         max_tokens=MAX_TOKENS_BY_DIM["topics"],
+        tag="topics",
         on_progress=on_progress, should_cancel=should_cancel,
     )
     # 权重归一化，保证各月话题占比之和恒为 1.0
@@ -466,6 +474,7 @@ def analyze_relationship(chat: ChatData, on_progress=None, should_cancel=None) -
         SYSTEM_PROMPT_RELATIONSHIP,
         lambda p, msgs: _month_prompt(chat, p, msgs),
         max_tokens=MAX_TOKENS_BY_DIM["relationship"],
+        tag="relationship",
         on_progress=on_progress, should_cancel=should_cancel,
     )
     for r in results.values():
@@ -475,7 +484,8 @@ def analyze_relationship(chat: ChatData, on_progress=None, should_cancel=None) -
 
 
 def _analyze_person(system_prompt: str, sample_size: int, msgs: list,
-                    display_name: str, prompt_template: str, max_tokens: int) -> Optional[dict]:
+                    display_name: str, prompt_template: str, max_tokens: int,
+                    tag: str = "unknown") -> Optional[dict]:
     """单人的习惯/锐评分析：先过滤再取最近 sample_size 条样本，失败仅记日志。"""
     try:
         valid_all = [m for m in msgs if _has_content(m) and is_statistical(m)]
@@ -494,7 +504,7 @@ def _analyze_person(system_prompt: str, sample_size: int, msgs: list,
         if not dialog.strip():
             return None
         result = _call_api(system_prompt, prompt_template.format(display_name=display_name, dialog=dialog),
-                           max_tokens=max_tokens)
+                           max_tokens=max_tokens, tag=tag)
         if result:
             result["name"] = display_name
             result["total_messages"] = len(valid_all)
@@ -520,7 +530,7 @@ def analyze_habits(chat: ChatData, on_progress=None, should_cancel=None) -> dict
         display_name = chat.self_name if person_key == "self" else chat.other_name
         try:
             result = _analyze_person(SYSTEM_PROMPT_HABITS, 200, msgs, display_name, template,
-                                     max_tokens=MAX_TOKENS_BY_DIM["habits"])
+                                     max_tokens=MAX_TOKENS_BY_DIM["habits"], tag="habits")
         except QuotaExhaustedError:
             if results:  # 已有部分结果：保留已完成者，向上报告配额问题
                 logger.error("配额耗尽，剩余对象未分析（已完成 %d/2）", len(results))
@@ -548,7 +558,7 @@ def analyze_profile(chat: ChatData, on_progress=None, should_cancel=None) -> dic
         display_name = chat.self_name if person_key == "self" else chat.other_name
         try:
             result = _analyze_person(SYSTEM_PROMPT_PROFILE, 300, msgs, display_name, template,
-                                     max_tokens=MAX_TOKENS_BY_DIM["profile"])
+                                     max_tokens=MAX_TOKENS_BY_DIM["profile"], tag="profile")
         except QuotaExhaustedError:
             if results:
                 logger.error("配额耗尽，剩余对象未分析（已完成 %d/2）", len(results))

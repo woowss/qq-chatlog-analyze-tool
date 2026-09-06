@@ -38,7 +38,7 @@ function startAnalyze(dim, opts) {
 function pollAnalyzeJob(jobId, opts) {
     var timer = setInterval(function() {
         $.get('/api/analyze-job/' + jobId, function(s) {
-            if (opts.onProgress) opts.onProgress(s.done || 0, s.total || 0);
+            if (opts.onProgress) opts.onProgress(s.done || 0, s.total || 0, s.detail || '');
             if (s.status === 'done') {
                 clearInterval(timer);
                 opts.onDone(s.result);
@@ -57,6 +57,18 @@ function pollAnalyzeJob(jobId, opts) {
     opts.timer = timer;
     opts.jobId = jobId;
     return timer;
+}
+
+// 一键全量分析（五个维度顺序执行，进度按维度汇报）
+function startAnalyzeAll(opts) {
+    var url = '/api/analyze-all' + (opts.refresh ? '?refresh=1' : '');
+    $.post(url, function(data) {
+        if (data.error) { opts.onError(data.error); return; }
+        if (data.job) pollAnalyzeJob(data.job, opts);
+        else opts.onError('未知响应格式');
+    }).fail(function(xhr) {
+        opts.onError((xhr.responseJSON && xhr.responseJSON.error) || '请求失败');
+    });
 }
 
 function cancelAnalyze(opts) {
