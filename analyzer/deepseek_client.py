@@ -65,17 +65,23 @@ MAX_TOKENS_BY_DIM = {
 
 _call_gate = threading.Lock()
 _next_call_at = [0.0]
+_cooldown_until = [0.0]   # 全局冷却：任一请求吃到 429 后，所有线程共同退避
 
 
 def _pace() -> None:
-    """全局调用闸门：把并发线程的请求排队成均匀节奏，降低突发限流概率"""
+    """全局调用闸门：均匀排队 + 遵守 429 触发的全局冷却，避免并发线程各自撞墙"""
     with _call_gate:
         now = time.monotonic()
-        start = max(now, _next_call_at[0])
+        start = max(now, _next_call_at[0], _cooldown_until[0])
         _next_call_at[0] = start + CALL_MIN_INTERVAL
         delay = start - now
     if delay > 0:
         time.sleep(delay)
+
+
+def _set_cooldown(seconds: float) -> None:
+    with _call_gate:
+        _cooldown_until[0] = max(_cooldown_until[0], time.monotonic() + seconds)
 
 
 class QuotaExhaustedError(RuntimeError):
@@ -283,8 +289,9 @@ def _call_api(system_prompt: str, user_content: str, max_tokens: int = 2048,
             if _is_tpm_throttle(e):
                 tpm_hits += 1
                 if tpm_hits < TPM_MAX_ATTEMPTS:
-                    logger.warning("触发每分钟限流（TPM/RPM），等待 %.0fs 后重试（%d/%d）",
+                    logger.warning("触发每分钟限流（TPM/RPM），全局冷却 %.0fs 后重试（%d/%d）",
                                    tpm_wait, tpm_hits, TPM_MAX_ATTEMPTS)
+                    _set_cooldown(tpm_wait)   # 让所有并发线程一起退避，而非各自撞
                     time.sleep(tpm_wait)
                     continue
                 raise QuotaExhaustedError(
