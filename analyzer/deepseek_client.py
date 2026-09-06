@@ -17,6 +17,8 @@
 """DeepSeek API 调用封装"""
 import concurrent.futures
 import json
+import os
+import threading
 import time
 from collections import Counter
 from datetime import datetime
@@ -39,11 +41,17 @@ logger = get_logger("deepseek")
 
 # 单月对话文本上限（字符数）。超出上限的月份会做等间隔抽样，
 # 保证整月分布仍在模型上下文窗口内，避免 "context length exceeded" 导致整体失败。
-MAX_DIALOG_CHARS = 50000
-# 并发分析的月份数（兼顾速度与 API 限流）
-CONCURRENCY = 3
+MAX_DIALOG_CHARS = int(os.getenv("LLM_MAX_DIALOG_CHARS", "50000") or 50000)
+# 并发分析的月份数。百炼限流按主账号聚合（同账号所有 key 共享 TPM），
+# 若本机还有编码 Agent 等在跑，调低此值可减少 429。
+CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "2") or 2)
 # 单次 API 请求超时（秒）
 REQUEST_TIMEOUT = 120
+# 全局请求平滑：两次 API 调用之间的最小间隔（秒），避免突发触发 RPS/TPS 保护
+CALL_MIN_INTERVAL = float(os.getenv("LLM_CALL_MIN_INTERVAL", "3") or 3)
+# TPM 限流（429 Allocated quota exceeded）：等待后重试，通常 1 分钟内恢复
+TPM_MAX_ATTEMPTS = 4
+TPM_WAIT_SECONDS = 25.0
 
 # 各维度输出 token 预算：锐评 schema 有 30+ 字段且要求逐条附原句证据，
 # 2048 必然截断（截断的 JSON 解析失败后原样重试只会重复烧钱），单独放大。
@@ -55,21 +63,44 @@ MAX_TOKENS_BY_DIM = {
     "profile": 8192,
 }
 
+_call_gate = threading.Lock()
+_next_call_at = [0.0]
+
+
+def _pace() -> None:
+    """全局调用闸门：把并发线程的请求排队成均匀节奏，降低突发限流概率"""
+    with _call_gate:
+        now = time.monotonic()
+        start = max(now, _next_call_at[0])
+        _next_call_at[0] = start + CALL_MIN_INTERVAL
+        delay = start - now
+    if delay > 0:
+        time.sleep(delay)
+
 
 class QuotaExhaustedError(RuntimeError):
-    """上游套餐额度耗尽（insufficient_quota）。与限流不同，重试无意义，必须快速失败。"""
+    """配额类致命错误：套餐耗尽/欠费，或 TPM 限流多次等待后仍未恢复。
+    重试已无意义，上层应中止剩余任务并保留部分结果。"""
 
 
-def _is_quota_error(e: Exception) -> bool:
-    """识别阿里云 Token Plan / OpenAI 兼容接口的配额耗尽错误"""
-    if getattr(e, "code", None) == "insufficient_quota":
+def _is_plan_exhausted(e: Exception) -> bool:
+    """真正的额度耗尽/账号异常（非限流，重试无意义）"""
+    status = getattr(e, "status_code", None)
+    s = str(e).lower()
+    if status in (401, 403) and "quota" in s:
         return True
-    body = getattr(e, "body", None)
-    if isinstance(body, dict):
-        err = body.get("error") or {}
-        if isinstance(err, dict) and err.get("code") == "insufficient_quota":
-            return True
-    return "insufficient_quota" in str(e)
+    return "arrearage" in s or "free allocated quota exceeded" in s
+
+
+def _is_tpm_throttle(e: Exception) -> bool:
+    """百炼 429 = TPM/RPM 每分钟限流（官方文档：通常 1 分钟内自动恢复），可重试。
+    注意其报错文案 'Allocated quota exceeded'/'insufficient_quota' 有误导性，
+    与套餐额度（7 天池）无关。"""
+    if getattr(e, "status_code", None) == 429:
+        return True
+    s = str(e).lower()
+    return any(m in s for m in ("allocated quota exceeded", "you exceeded your current quota",
+                                "insufficient_quota", "rate limit"))
 
 
 # .env 模板中的占位符值，视为"未配置"
@@ -199,20 +230,27 @@ def _build_dialog(messages: list, self_uid: str, self_name: str, other_name: str
 
 
 def _call_api(system_prompt: str, user_content: str, max_tokens: int = 2048,
-              retry: int = 2) -> Optional[dict]:
-    """调用 DeepSeek API，返回解析后的 JSON。
+              retry: int = 2, tpm_wait: Optional[float] = None) -> Optional[dict]:
+    """调用 LLM API，返回解析后的 JSON。
 
     错误分类策略：
-    - 网络/API 错误（含 429）：指数退避重试，429 优先遵循 Retry-After；
-    - 输出被 max_tokens 截断或返回非法 JSON：重试无意义（输入相同、结果确定），
-      记录日志后返回 None，由上层按"该月失败"处理。
+    - 429（TPM/RPM 每分钟限流，含误导性的 "Allocated quota exceeded/insufficient_quota"
+      文案）：等待约 25s 重试，最多 4 次——官方文档确认通常 1 分钟内自动恢复；
+    - 403/欠费等真正的额度耗尽：立即抛 QuotaExhaustedError，中止上层任务（重试无意义）；
+    - 输出被 max_tokens 截断或非法 JSON：记日志返回 None（输入相同则结果确定，重试浪费钱）；
+    - 其他网络错误：指数退避重试。
     """
     client = _get_client()
     if client is None:
         return None
 
-    for attempt in range(retry + 1):
+    tpm_wait = TPM_WAIT_SECONDS if tpm_wait is None else tpm_wait
+    tpm_hits = 0
+    max_attempts = max(retry, TPM_MAX_ATTEMPTS - 1) + 1
+
+    for attempt in range(max_attempts):
         try:
+            _pace()
             resp = client.chat.completions.create(
                 model=DEEPSEEK_MODEL,
                 messages=[
@@ -237,20 +275,25 @@ def _call_api(system_prompt: str, user_content: str, max_tokens: int = 2048,
                 logger.error("模型返回非法 JSON（不重试）: %s", e)
                 return None
         except Exception as e:
-            if _is_quota_error(e):
+            if _is_plan_exhausted(e):
                 raise QuotaExhaustedError(
-                    "API 套餐额度已耗尽（insufficient_quota）：请到服务商控制台查看用量、"
-                    "提升额度或等待配额周期重置后重试。剩余月份已中止，不再浪费请求。"
+                    "套餐额度耗尽或账号异常（403/欠费）：请到服务商控制台充值或等待配额周期"
+                    "重置后重试。剩余任务已中止。"
+                ) from e
+            if _is_tpm_throttle(e):
+                tpm_hits += 1
+                if tpm_hits < TPM_MAX_ATTEMPTS:
+                    logger.warning("触发每分钟限流（TPM/RPM），等待 %.0fs 后重试（%d/%d）",
+                                   tpm_wait, tpm_hits, TPM_MAX_ATTEMPTS)
+                    time.sleep(tpm_wait)
+                    continue
+                raise QuotaExhaustedError(
+                    "每分钟限流（TPM）多次等待后仍未恢复：可能同账号其他程序（如编码 Agent）"
+                    "正在占用配额。可稍后再试、调低 LLM_CONCURRENCY，"
+                    "或在百炼控制台「限流提额」页临时提升 TPM。"
                 ) from e
             if attempt < retry:
                 delay = 2 ** attempt
-                status = getattr(e, "status_code", None)
-                if status == 429:
-                    headers = getattr(getattr(e, "response", None), "headers", None)
-                    try:
-                        delay = max(delay, float(dict(headers or {}).get("retry-after", 0)))
-                    except (TypeError, ValueError):
-                        pass
                 logger.warning("API 调用失败（第 %s 次，%ss 后重试）: %s", attempt + 1, delay, e)
                 time.sleep(delay)
                 continue
