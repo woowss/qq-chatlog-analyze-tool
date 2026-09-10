@@ -17,12 +17,41 @@
 """QQ JSON 聊天记录解析器 — 支持 QQChatExporter V5 格式"""
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 # 北京时间固定偏移，供月份分组与本地统计共用，避免口径不一致
 CST = timezone(timedelta(hours=8))
 
 # 不应进入统计与 AI 分析的消息类型：合并转发 / 频道类 / 商城表情等
 SKIP_MSG_TYPES = {"type_11", "type_17", "type_23"}
+
+# 回退解析 time 字符串时支持的格式（导出器为 "%Y-%m-%d %H:%M:%S"）
+_TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M")
+
+
+def _parse_timestamp(value, time_str: str = "") -> Optional[int]:
+    """把导出文件里的时间戳统一成毫秒整数；无法解析时返回 None。
+
+    导出文件可能存在缺失/为 null/是字符串的时间戳。缺键时会 get 到 0，
+    若照单全收，该消息会被归入 1970-01 并作为一个"月份"送去 AI 分析；
+    为 null 或字符串时则会让排序/统计直接抛异常。这里统一兜底：
+    先按数值解析，失败再用 time 字符串回退，两者都不可用则返回 None（调用方丢弃该条）。
+    """
+    try:
+        ts = int(float(value))
+        if ts > 0:
+            return ts
+    except (TypeError, ValueError):
+        pass
+    text = (time_str or "").strip()
+    if text:
+        for fmt in _TIME_FORMATS:
+            try:
+                dt = datetime.strptime(text, fmt).replace(tzinfo=CST)
+                return int(dt.timestamp() * 1000)
+            except ValueError:
+                continue
+    return None
 
 
 @dataclass
@@ -63,6 +92,7 @@ class ChatData:
     time_start: str = ""
     time_end: str = ""
     duration_days: int = 0
+    dropped_messages: int = 0   # 因时间戳不可用被丢弃的消息数（0 表示全部可用）
 
     def statistical(self) -> list["Message"]:
         """参与统计与分析的消息子集（过滤系统/撤回/转发）"""
@@ -82,21 +112,31 @@ def load_chat(filepath: str) -> ChatData:
     chat_info = raw["chatInfo"]
     self_uid = chat_info.get("selfUid", "")
     self_name = chat_info.get("selfName", "")
-
-    # 确定双方的显示名
     senders = raw.get("statistics", {}).get("senders", [])
-    other_name = chat_info.get("name", "对方")
-    for s in senders:
-        if s.get("uid") != self_uid and s.get("name"):
-            other_name = s["name"]
-            break
 
-    # 缺少 selfUid 时，尝试按显示名从 senders 里找回自己的 UID
+    # 缺少 selfUid 时，先按显示名从 senders 里找回自己的 UID。
+    # 顺序很关键：必须先确定自己是谁，否则下面挑"对方"时会把
+    # senders 里的第一条（有可能就是自己）当成对方。
     if not self_uid and self_name:
         for s in senders:
             if s.get("name") == self_name and s.get("uid"):
                 self_uid = s["uid"]
                 break
+
+    # 双方身份无法确定时明确报错：继续跑下去会把所有消息静默判给"对方"，
+    # 统计与 AI 分析全盘失真（且用户看不出问题）。
+    if not self_uid:
+        raise ValueError(
+            "导出文件缺少 chatInfo.selfUid/selfName，无法区分自己与对方；"
+            "请用 QQChatExporter 重新导出，或在文件中补齐 selfUid"
+        )
+
+    # 确定对方的显示名
+    other_name = chat_info.get("name", "对方")
+    for s in senders:
+        if s.get("uid") != self_uid and s.get("name"):
+            other_name = s["name"]
+            break
 
     chat = ChatData(
         chat_name=chat_info.get("name", ""),
@@ -110,6 +150,13 @@ def load_chat(filepath: str) -> ChatData:
         sender = msg.get("sender", {})
         sender_uid = sender.get("uid", "")
         sender_name = sender.get("name", "") or sender.get("nickname", "")
+
+        # 时间戳不可用（缺失/null/非数值/<=0）时丢弃该条：
+        # 留着会让排序崩溃或把消息塞进 1970-01，进而多出一次无意义的 AI 调用。
+        timestamp = _parse_timestamp(msg.get("timestamp"), msg.get("time", ""))
+        if timestamp is None:
+            chat.dropped_messages += 1
+            continue
 
         if sender_uid != self_uid and not chat.other_uid:
             chat.other_uid = sender_uid
@@ -159,7 +206,7 @@ def load_chat(filepath: str) -> ChatData:
 
         parsed = Message(
             id=msg.get("id", ""),
-            timestamp=msg.get("timestamp", 0),
+            timestamp=timestamp,
             time_str=msg.get("time", ""),
             sender_name=sender_name,
             sender_uid=sender_uid,

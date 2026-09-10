@@ -17,16 +17,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {% extends "base.html" %}
 {% block title %}情绪分析{% endblock %}
 {% block content %}
-<h2 class="mb-4">😊 情绪分析</h2>
+<h2 class="page-title">情绪分析</h2>
 
 {% if not api_ok %}
-<div class="alert alert-warning">⚠️ 请先在 .env 中配置 API Key 以使用 AI 分析功能</div>
+<div class="alert alert-warning">未配置 API Key，无法运行 AI 分析；本地统计功能不受影响。</div>
 {% endif %}
 
 <div class="row mb-4">
     <div class="col-12">
         <div class="card">
-            <div class="card-header">📈 情绪强度变化</div>
+            <div class="card-header">情绪强度变化</div>
             <div class="card-body">
                 <div id="emotionLineChart" style="height: 400px;"></div>
             </div>
@@ -37,7 +37,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <div class="row mb-4">
     <div class="col-md-6 mb-3">
         <div class="card">
-            <div class="card-header">😊 {{ overview.self_name }} 情绪分布</div>
+            <div class="card-header">{{ overview.self_name }} 情绪分布</div>
             <div class="card-body">
                 <div id="selfEmotionPie" style="height: 300px;"></div>
             </div>
@@ -45,7 +45,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </div>
     <div class="col-md-6 mb-3">
         <div class="card">
-            <div class="card-header">😊 {{ overview.other_name }} 情绪分布</div>
+            <div class="card-header">{{ overview.other_name }} 情绪分布</div>
             <div class="card-body">
                 <div id="otherEmotionPie" style="height: 300px;"></div>
             </div>
@@ -54,9 +54,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 </div>
 
 <div class="card mb-4">
-    <div class="card-header">📋 逐月情绪详情</div>
+    <div class="card-header">逐月情绪详情</div>
     <div class="card-body" id="emotionDetails">
-        <p class="text-muted text-center">请先在仪表盘中点击"情绪分析"按钮获取数据</p>
+        <p class="text-muted text-center">尚无分析结果。回到仪表盘运行「情绪分析」后，结果会显示在这里。</p>
     </div>
 </div>
 

@@ -18,50 +18,49 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {% block title %}首页{% endblock %}
 {% block content %}
 <div class="row justify-content-center">
-    <div class="col-lg-8">
-        <div class="card shadow-sm">
-            <div class="card-body text-center p-5">
-                <h1 class="display-5 mb-3">📊 QQ 聊天记录分析</h1>
-                <p class="lead text-muted mb-4">
-                    导入 QQChatExporter 导出的 JSON 聊天记录，<br>
-                    通过 DeepSeek AI 分析你们的情绪、话题、关系和习惯
+    <div class="col-lg-7">
+        <div class="card">
+            <div class="card-body p-4 p-md-5">
+                <h1 class="mb-2" style="font-size:1.4rem;">QQ 聊天记录分析</h1>
+                <p class="text-muted mb-4" style="font-size:.9rem;">
+                    导入 QQChatExporter 导出的 JSON，先做本地统计，再用 LLM 分析情绪、话题、关系与说话习惯。
                 </p>
 
                 {% if not api_ok %}
                 <div class="alert alert-warning">
-                    <strong>⚠️ LLM API Key 未配置</strong><br>
-                    <span class="small">本地统计功能仍可用。如需 AI 分析，请编辑项目根目录的 <code>.env</code> 文件填入 Key。</span>
+                    <strong>未配置 LLM API Key</strong><br>
+                    <span class="small">本地统计功能不受影响；需要 AI 分析时，请在项目根目录的 <code>.env</code> 中填入 Key。</span>
                 </div>
                 {% endif %}
 
                 <form action="/upload" method="post" enctype="multipart/form-data" id="uploadForm">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                     <div class="upload-zone mb-3" id="dropZone">
-                        <div class="upload-icon">📁</div>
-                        <p class="mb-2">拖拽 JSON 文件到此处，或点击选择文件</p>
+                        <div class="upload-hint">拖拽 JSON 文件到此处，或点击下方按钮选择</div>
                         <input type="file" name="file" id="fileInput" accept=".json" class="d-none">
                         <button type="button" class="btn btn-outline-primary" onclick="$('#fileInput').click()">
                             选择文件
                         </button>
-                        <div id="fileName" class="mt-2 small text-success d-none"></div>
+                        <div id="fileName" class="mt-3 small text-success d-none"></div>
                     </div>
-                    <button type="submit" class="btn btn-primary btn-lg" id="submitBtn" disabled>
-                        🚀 开始分析
+                    <button type="submit" class="btn btn-primary" id="submitBtn" disabled>
+                        上传并分析
                     </button>
                 </form>
 
                 <hr class="my-4">
 
-                <div class="text-start small text-muted">
-                    <h6>📋 使用说明</h6>
-                    <ol>
-                        <li>使用 <a href="https://github.com/shuakami/qq-chat-exporter" target="_blank">QQChatExporter</a> 导出私聊 JSON</li>
-                        <li>上传导出的 .json 文件</li>
-                        <li>在仪表盘查看本地统计数据</li>
-                        <li>配置 API Key 后可获取 AI 深度分析</li>
+                <div class="small text-muted">
+                    <div class="mb-1 fw-semibold text-body">使用步骤</div>
+                    <ol class="mb-3">
+                        <li>用 <a href="https://github.com/shuakami/qq-chat-exporter" target="_blank">QQChatExporter</a> 导出私聊 JSON</li>
+                        <li>上传文件，在仪表盘查看本地统计</li>
+                        <li>配置 API Key 后，按维度运行 AI 分析</li>
                     </ol>
-                    <h6>🔒 隐私说明</h6>
-                    <p>所有数据仅在本地处理，不上传至任何第三方服务器（AI 分析时仅将文本片段发送至所配置的 LLM API）。</p>
+                    <div class="mb-1 fw-semibold text-body">隐私</div>
+                    <p class="mb-0">
+                        数据仅保存在本机；仅 AI 分析时会把文本片段发送给你配置的 LLM 接口，图片等多媒体不会上传。
+                    </p>
                 </div>
             </div>
         </div>
@@ -73,7 +72,7 @@ $(function() {
     $('#fileInput').on('change', function() {
         const file = this.files[0];
         if (file) {
-            $('#fileName').text('✅ 已选择: ' + file.name).removeClass('d-none');
+            $('#fileName').text('已选择: ' + file.name).removeClass('d-none');
             $('#submitBtn').prop('disabled', false);
         }
     });
@@ -87,13 +86,13 @@ $(function() {
         const files = e.originalEvent.dataTransfer.files;
         if (files.length) {
             $('#fileInput')[0].files = files;
-            $('#fileName').text('✅ 已选择: ' + files[0].name).removeClass('d-none');
+            $('#fileName').text('已选择: ' + files[0].name).removeClass('d-none');
             $('#submitBtn').prop('disabled', false);
         }
     });
 
     $('#uploadForm').on('submit', function() {
-        $('#submitBtn').prop('disabled', true).text('⏳ 上传解析中...');
+        $('#submitBtn').prop('disabled', true).text('上传中…');
         // 上传新聊天记录时清掉上一次的 AI 分析结果，避免在新聊天页面展示旧数据
         ['emotion', 'relationship', 'habits', 'topics', 'profile'].forEach(function(k) {
             sessionStorage.removeItem('ai_' + k);

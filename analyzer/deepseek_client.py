@@ -16,6 +16,8 @@
 #
 """DeepSeek API 调用封装"""
 import concurrent.futures
+import hashlib
+import inspect
 import json
 import os
 import threading
@@ -30,6 +32,7 @@ from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL, DEEPSEEK_BASE_URL
 from parser.qq_parser import CST, ChatData, is_statistical, split_by_month
 from analyzer.logger import get_logger
 from analyzer.usage import record_call
+from analyzer.local_stats import SESSION_GAP_MS
 from analyzer.prompts import (
     SYSTEM_PROMPT_EMOTION,
     SYSTEM_PROMPT_TOPICS,
@@ -40,29 +43,78 @@ from analyzer.prompts import (
 
 logger = get_logger("deepseek")
 
+
+def _env_number(name: str, default: float, low: float, high: float) -> float:
+    """环境变量数值校验：非法/越界不再让任务在并发池里抛 ValueError，而是回退并告警"""
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("%s=%r 不是数字，已回退为 %s", name, raw, default)
+        return default
+    if not low <= value <= high:
+        logger.warning("%s=%s 超出范围 [%s, %s]，已回退为 %s", name, value, low, high, default)
+        return default
+    return value
+
+
 # 单月对话文本上限（字符数）。超出上限的月份会做等间隔抽样，
 # 保证整月分布仍在模型上下文窗口内，避免 "context length exceeded" 导致整体失败。
-MAX_DIALOG_CHARS = int(os.getenv("LLM_MAX_DIALOG_CHARS", "50000") or 50000)
-# 并发分析的月份数。百炼限流按主账号聚合（同账号所有 key 共享 TPM），
-# 若本机还有编码 Agent 等在跑，调低此值可减少 429。
-CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "2") or 2)
+MAX_DIALOG_CHARS = int(_env_number("LLM_MAX_DIALOG_CHARS", 50000, 1000, 2_000_000))
+
+# 限流节奏默认值按服务商自适应：官方 DeepSeek（并发上限 2500）可以快得多，
+# 而阿里云百炼的 TPM 是按主账号聚合的，必须保守。两个值都可用环境变量覆盖。
+_OFFICIAL = "api.deepseek.com" in DEEPSEEK_BASE_URL.lower()
+_DEFAULT_INTERVAL = 0.5 if _OFFICIAL else 3.0
+_DEFAULT_CONCURRENCY = 6 if _OFFICIAL else 2
+CONCURRENCY = int(_env_number("LLM_CONCURRENCY", _DEFAULT_CONCURRENCY, 1, 64))
+# 全局请求平滑：两次 API 调用之间的最小间隔（秒）。注意 _pace() 是串行闸门，
+# N 次调用的排队下限是 (N-1)×该值，所以它直接决定多月份分析的墙钟时间。
+CALL_MIN_INTERVAL = float(_env_number("LLM_CALL_MIN_INTERVAL", _DEFAULT_INTERVAL, 0.0, 60.0))
 # 单次 API 请求超时（秒）
 REQUEST_TIMEOUT = 120
-# 全局请求平滑：两次 API 调用之间的最小间隔（秒），避免突发触发 RPS/TPS 保护
-CALL_MIN_INTERVAL = float(os.getenv("LLM_CALL_MIN_INTERVAL", "3") or 3)
 # TPM 限流（429 Allocated quota exceeded）：等待后重试，通常 1 分钟内恢复
 TPM_MAX_ATTEMPTS = 4
 TPM_WAIT_SECONDS = 25.0
 
 # 各维度输出 token 预算：锐评 schema 有 30+ 字段且要求逐条附原句证据，
-# 2048 必然截断（截断的 JSON 解析失败后原样重试只会重复烧钱），单独放大。
+# 2048 必然截断（截断的 JSON 解析失败后原样重试只会重复烧钱），单独放大；
+# profile 额外开启思考模式（见 THINKING_DIMS），思维链 token 计入 max_tokens，
+# 16384 才留得下"思维链 + 长 JSON"两部分。
 MAX_TOKENS_BY_DIM = {
     "emotion": 1024,
     "topics": 1024,
     "relationship": 1024,
     "habits": 2048,
-    "profile": 8192,
+    "profile": 16384,
 }
+
+# 思考模式：DeepSeek V4 系列（deepseek-flash / deepseek-v4-pro）默认开启思维链
+# （effort=high），思维链 token 同样计入 max_tokens 预算 —— emotion/topics 的
+# 1024 输出额度会被吃光导致 finish_reason=length（结果被判为截断丢弃，白花钱）；
+# 且思考模式下 temperature 不生效。
+# 因此策略是：全局默认关闭（LLM_THINKING），仅对留足预算的维度按需开启
+# （LLM_THINKING_DIMS=profile）。实测锐评开启后引用接地 16/16、耗时约 23s。
+# 非 DeepSeek 服务商（如百炼）不认识该字段，未显式配置时不发送，
+# 避免被严格网关判为非法参数（此时 LLM_THINKING_DIMS 也应留空）。
+_THINKING_ENV = (os.getenv("LLM_THINKING", "") or "").strip().lower()
+THINKING_DEFAULT = _THINKING_ENV in ("1", "true", "yes", "on", "enabled")
+THINKING_DIMS = frozenset(
+    s.strip().lower()
+    for s in (os.getenv("LLM_THINKING_DIMS", "") or "").split(",")
+    if s.strip()
+)
+_SEND_THINKING_PARAM = bool(_THINKING_ENV or THINKING_DIMS) or "deepseek" in DEEPSEEK_BASE_URL.lower()
+
+
+def thinking_enabled(dim: str) -> bool:
+    """该维度是否使用思考模式：全局开关命中，或维度名在 LLM_THINKING_DIMS 白名单中。
+
+    维度名与调用时传入的 tag 一致（emotion/topics/relationship/habits/profile）。
+    """
+    return THINKING_DEFAULT or (dim or "").strip().lower() in THINKING_DIMS
 
 _call_gate = threading.Lock()
 _next_call_at = [0.0]
@@ -96,6 +148,8 @@ def _is_plan_exhausted(e: Exception) -> bool:
     s = str(e).lower()
     if status in (401, 403) and "quota" in s:
         return True
+    if status == 402 or "insufficient balance" in s:
+        return True   # DeepSeek 官方：余额不足（402 Insufficient Balance）
     return "arrearage" in s or "free allocated quota exceeded" in s
 
 
@@ -169,25 +223,60 @@ def _short_time(time_str: str) -> str:
     return time_str[5:16] if len(time_str) >= 16 else time_str
 
 
-def _conversation_stats(messages: list) -> tuple:
-    """精简统计：最活跃小时 + 回复间隔中位数（秒），喂给模型作参考数据，提升针对性"""
+def _conversation_stats(messages: list, self_uid: str = "") -> dict:
+    """喂给模型作参考的本地事实：最活跃小时、回复间隔中位数、谁更常开启话题。
+
+    这些都能在本地精确算出，直接写进统计头，模型就不必"猜"（也减少幻觉）。
+    """
     hours: Counter = Counter()
     gaps: list[float] = []
     last = None
+    sessions = 0
+    self_opened = 0
     for m in messages:
         hours[datetime.fromtimestamp(m.timestamp / 1000, tz=CST).hour] += 1
-        if last is not None and last.sender_uid != m.sender_uid:
+        if last is None or m.timestamp - last.timestamp > SESSION_GAP_MS:
+            sessions += 1
+            if self_uid and m.sender_uid == self_uid:
+                self_opened += 1
+        elif last.sender_uid != m.sender_uid:
             gap = (m.timestamp - last.timestamp) / 1000
             if 0 < gap <= 3600 * 6:
                 gaps.append(gap)
         last = m
-    peak = hours.most_common(1)[0][0] if hours else None
-    median = sorted(gaps)[len(gaps) // 2] if gaps else None
-    return peak, median
+    return {
+        "peak_hour": hours.most_common(1)[0][0] if hours else None,
+        "median_gap": sorted(gaps)[len(gaps) // 2] if gaps else None,
+        "sessions": sessions,
+        "self_opened": self_opened,
+    }
 
 
-def _message_line(m, name: str) -> str:
-    """单条消息 → 对话行，附带图片/表情/回复标注，便于模型理解非文本内容"""
+# 时间戳只在"新的一段"（间隔超过该分钟数）或换人时打印；段内小间隔用 (+3m) 紧凑标注。
+# 原格式每行固定 18 字符（时间 + 昵称），短句为主的聊天里能占到 60–73% 的字符预算。
+TIME_MARK_MINUTES = 30
+RELATIVE_MARK_MINUTES = 2
+TIME_MARK_MS = TIME_MARK_MINUTES * 60 * 1000
+
+
+def _gap_mark(gap_ms: int) -> str:
+    """把间隔压成 (+3m)/(+2h)/(+1d) 这类紧凑标记"""
+    minutes = gap_ms // 60000
+    if minutes < 60:
+        return f"(+{minutes}m)"
+    if minutes < 60 * 24:
+        return f"(+{minutes // 60}h)"
+    return f"(+{minutes // (60 * 24)}d)"
+
+
+def _message_line(m, name: str, prev_uid: Optional[str] = None,
+                  prev_ts: Optional[int] = None) -> str:
+    """单条消息 → 对话行。
+
+    打印规则（相同信息量、更省字符）：
+    - 首条 / 与上一条间隔 ≥ TIME_MARK_MINUTES / 换人 → 打印 `[01-01 08:00] 昵称:`
+    - 段内同人连发 → 只打印正文；段内换人 → 只打印 `昵称(+间隔):`
+    """
     body = m.text or ""
     marks = []
     if m.has_image:
@@ -196,19 +285,35 @@ def _message_line(m, name: str) -> str:
         marks.append("回复")
     if m.face_names:
         marks.append("表情:" + "、".join(m.face_names[:4]))
-    prefix = f"[{_short_time(m.time_str)}] {name}:"
+
+    first = prev_uid is None or prev_ts is None
+    gap_ms = 0 if first else max(0, m.timestamp - prev_ts)
+    changed = first or m.sender_uid != prev_uid
+
+    if first or gap_ms >= TIME_MARK_MS:
+        prefix = f"[{_short_time(m.time_str)}] {name}:"
+    elif changed:
+        mark = _gap_mark(gap_ms) if gap_ms >= RELATIVE_MARK_MINUTES * 60000 else ""
+        prefix = f"{name}{mark}:"
+    else:
+        prefix = _gap_mark(gap_ms) if gap_ms >= RELATIVE_MARK_MINUTES * 60000 else ""
+        prefix = f"{prefix}:" if prefix else ""
+
     if marks:
         mark = "[" + ", ".join(marks) + "]"
-        return f"{prefix} {body} {mark}".strip() if body else f"{prefix} {mark}"
-    return f"{prefix} {body}".strip() if body else prefix
+        text = f"{body} {mark}".strip() if body else mark
+    else:
+        text = body
+    return f"{prefix} {text}".strip() if prefix and text else (prefix or text)
 
 
 def _build_dialog(messages: list, self_uid: str, self_name: str, other_name: str,
                   max_chars: Optional[int] = MAX_DIALOG_CHARS) -> str:
-    """构建喂给模型的对话内容：统计头 + 带标注的对话行。
+    """构建喂给模型的对话内容：统计头（含本地事实）+ 压缩后的对话行。
 
-    返回形如 "统计：共 N 条消息（我方 a 条 / 对方 b 条，图片 c 张）。\n\n[时间] 昵称: 内容 [标注]\n..."。
-    统计头给模型全貌（即使抽样截断也能知道真实消息量），避免被样本误导。
+    统计头给模型全貌（即使抽样截断也能知道真实消息量），并附上本地精确算出的
+    事实（条数、图片数、最活跃时段、回复中位数、谁更常开启话题、对话段数），
+    避免模型凭样本"数数"。
     """
     valid = [m for m in messages if _has_content(m) and is_statistical(m)]
     if not valid:
@@ -217,29 +322,255 @@ def _build_dialog(messages: list, self_uid: str, self_name: str, other_name: str
     self_n = sum(1 for m in valid if m.sender_uid == self_uid)
     other_n = total - self_n
     images = sum(1 for m in valid if m.has_image)
-    lines = [
-        _message_line(m, self_name if m.sender_uid == self_uid else other_name)
-        for m in valid
-    ]
+
+    lines: list[str] = []
+    prev_uid: Optional[str] = None
+    prev_ts: Optional[int] = None
+    for m in valid:
+        lines.append(_message_line(
+            m, self_name if m.sender_uid == self_uid else other_name, prev_uid, prev_ts))
+        prev_uid, prev_ts = m.sender_uid, m.timestamp
     original_n = len(lines)
     if max_chars:
         lines = _fit_lines(lines, max_chars)
+
     parts = [f"共 {total} 条消息（我方 {self_n} 条 / 对方 {other_n} 条，图片 {images} 张）"]
-    peak, median = _conversation_stats(valid)
-    if peak is not None:
-        parts.append(f"最活跃时段约 {peak} 时")
-    if median is not None:
-        parts.append(f"回复间隔中位数约 {int(median)} 秒")
+    stats = _conversation_stats(valid, self_uid)
+    if stats["peak_hour"] is not None:
+        parts.append(f"最活跃时段约 {stats['peak_hour']} 时")
+    if stats["median_gap"] is not None:
+        parts.append(f"回复间隔中位数约 {int(stats['median_gap'])} 秒")
+    if stats["sessions"]:
+        parts.append(f"共 {stats['sessions']} 段对话"
+                     f"（间隔超 {TIME_MARK_MINUTES} 分钟算新的一段）")
+        if self_uid:
+            ratio = round(stats["self_opened"] / stats["sessions"] * 100)
+            parts.append(f"其中我方先开口 {ratio}%、对方 {100 - ratio}%")
     head = "统计：" + "，".join(parts)
     if len(lines) < original_n:
         head += f"，因篇幅限制展示其中 {len(lines)} 条（等间隔抽样，覆盖整月分布）"
     return f"{head}。\n\n" + "\n".join(lines)
 
 
+def _prompt_fingerprint() -> str:
+    """提示词 + 对话格式的指纹，参与缓存键。
+
+    以前靠手工维护 PROMPT_VERSION：改了 prompt 或抓取/抽样逻辑却忘了 bump，
+    旧缓存就会顶着"新分析"的名义返回旧风格结果。现在把 SYSTEM_PROMPT_* 与所有
+    影响模型输入的格式化函数一起哈希，任何改动都会自动让旧缓存失效。
+    """
+    import analyzer.prompts as _prompts
+    parts = [getattr(_prompts, n) for n in sorted(dir(_prompts))
+             if n.startswith("SYSTEM_PROMPT_")]
+    parts += [inspect.getsource(f) for f in
+              (_build_dialog, _message_line, _fit_lines, _conversation_stats, _short_time)]
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
+PROMPT_FINGERPRINT = _prompt_fingerprint()
+
+# 思考模式的最低输出预算：思维链 token 也计入 max_tokens，低于这个值必然截断
+THINKING_MIN_TOKENS = 4096
+
+
+# ---------------------------------------------------------------------------
+# 月份级缓存（增量分析）
+# ---------------------------------------------------------------------------
+# 维度级缓存以"整份文件哈希"为键：导出文件只要多一个月，历史月份会全部重跑。
+# 月份级缓存改用内容寻址键（模型 + 提示词指纹 + 系统提示词 + 该月对话文本），
+# 于是重新导出同一段对话时历史月份直接命中，只为新增月份付费。
+#
+# 清理：每个聊天文件对应 manifest_{chat_hash}.json，记录它用过哪些月份文件；
+# 该聊天被替换/删除时删掉 manifest，并只回收"没有其他 manifest 引用"的月份文件，
+# 从而保留"不留孤儿敏感数据"的隐私属性。
+_MONTH_CACHE_DIR = ""
+_MONTH_CACHE_LOCK = threading.Lock()
+# 无引用的月份缓存先留一段宽限期：上传新文件时的级联清理不能顺手删掉
+# "同一段对话的历史月份"，否则增量分析就失去意义。孤儿文件由定期清理回收。
+MONTH_CACHE_GRACE_SECONDS = float(os.getenv("LLM_MONTH_CACHE_GRACE_HOURS", "24") or 24) * 3600
+
+
+def configure_month_cache(directory: str) -> None:
+    """由应用层注入缓存目录；传空字符串即关闭月份级缓存"""
+    global _MONTH_CACHE_DIR
+    _MONTH_CACHE_DIR = directory or ""
+
+
+def _month_key(system_prompt: str, user_content: str) -> str:
+    """月份缓存的键：任何影响该月输出的因素（模型/提示词/格式/对话文本）都进哈希"""
+    digest = hashlib.sha256()
+    for part in (DEEPSEEK_MODEL, PROMPT_FINGERPRINT, system_prompt, user_content):
+        digest.update(part.encode("utf-8"))
+        digest.update(b"\x00")
+    return digest.hexdigest()[:20]
+
+
+def month_cache_path(key: str) -> str:
+    return os.path.join(_MONTH_CACHE_DIR, f"month_{key}.json")
+
+
+def _manifest_path(chat_hash: str) -> str:
+    return os.path.join(_MONTH_CACHE_DIR, f"manifest_{chat_hash}.json")
+
+
+def _read_month_cache(key: str) -> Optional[dict]:
+    if not _MONTH_CACHE_DIR:
+        return None
+    path = month_cache_path(key)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    try:
+        os.utime(path, None)      # 命中即续期，避免常用缓存被 30 天 TTL 回收
+    except OSError:
+        pass
+    return data if isinstance(data, dict) else None
+
+
+def _write_month_cache(key: str, result: dict) -> None:
+    if not _MONTH_CACHE_DIR:
+        return
+    path = month_cache_path(key)
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _record_month_usage(chat_hash: str, key: str) -> None:
+    """把用到的月份缓存记进该聊天的 manifest，供级联清理做引用计数"""
+    if not _MONTH_CACHE_DIR or not chat_hash:
+        return
+    path = _manifest_path(chat_hash)
+    with _MONTH_CACHE_LOCK:
+        data: dict = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, json.JSONDecodeError):
+            pass
+        keys = set(data.get("months") or [])
+        keys.add(key)
+        data["months"] = sorted(keys)
+        data["updated"] = time.time()
+        tmp = f"{path}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+
+def purge_month_cache(chat_hash: str) -> int:
+    """删除该聊天的 manifest，并回收不再被任何 manifest 引用的月份缓存。
+
+    这里必须带 **宽限期**：上传新文件时会立刻触发本函数，而"新文件其实是同一段
+    对话又多了几个月"恰恰是最需要复用月份缓存的场景——立刻删除会让增量分析失效。
+    因此只回收"无引用 **且** 已超过 MONTH_CACHE_GRACE_SECONDS 未被动过"的文件；
+    换成完全不同的对话时，旧的月份文件也会在宽限期后被 sweep_orphan_month_cache 收走。
+    """
+    if not _MONTH_CACHE_DIR or not chat_hash:
+        return 0
+    path = _manifest_path(chat_hash)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            mine = set(json.load(f).get("months") or [])
+    except (OSError, json.JSONDecodeError):
+        mine = set()
+
+    removed = 0
+    with _MONTH_CACHE_LOCK:
+        others = _referenced_keys_locked(exclude=os.path.basename(path))
+        now = time.time()
+        for key in mine - others:
+            target = month_cache_path(key)
+            try:
+                if now - os.path.getmtime(target) < MONTH_CACHE_GRACE_SECONDS:
+                    continue                     # 宽限期内：留给增量分析复用
+                os.remove(target)
+                removed += 1
+            except OSError:
+                pass
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return removed
+
+
+def _referenced_keys_locked(exclude: str = "") -> set:
+    """（调用方须持有 _MONTH_CACHE_LOCK）所有 manifest 引用到的月份 key"""
+    keys: set = set()
+    try:
+        names = os.listdir(_MONTH_CACHE_DIR)
+    except OSError:
+        return keys
+    for name in names:
+        if not name.startswith("manifest_") or name == exclude:
+            continue
+        try:
+            with open(os.path.join(_MONTH_CACHE_DIR, name), "r", encoding="utf-8") as f:
+                keys |= set(json.load(f).get("months") or [])
+        except (OSError, json.JSONDecodeError):
+            continue
+    return keys
+
+
+def sweep_orphan_month_cache() -> int:
+    """回收"已无 manifest 引用且超过宽限期"的月份缓存（定期清理时调用）"""
+    if not _MONTH_CACHE_DIR:
+        return 0
+    removed = 0
+    with _MONTH_CACHE_LOCK:
+        referenced = _referenced_keys_locked()
+        now = time.time()
+        try:
+            names = os.listdir(_MONTH_CACHE_DIR)
+        except OSError:
+            return 0
+        for name in names:
+            if not name.startswith("month_") or not name.endswith(".json"):
+                continue
+            key = name[len("month_"):-len(".json")]
+            if key in referenced:
+                continue
+            target = os.path.join(_MONTH_CACHE_DIR, name)
+            try:
+                if now - os.path.getmtime(target) >= MONTH_CACHE_GRACE_SECONDS:
+                    os.remove(target)
+                    removed += 1
+            except OSError:
+                continue
+    return removed
+
+
+def thinking_budget_warnings() -> list[str]:
+    """启动自检：列出"开了思考模式但预算不足"的维度（这类组合会 100% 截断丢结果）"""
+    return [
+        f"{dim}（预算 {budget} < {THINKING_MIN_TOKENS}）"
+        for dim, budget in MAX_TOKENS_BY_DIM.items()
+        if thinking_enabled(dim) and budget < THINKING_MIN_TOKENS
+    ]
+
+
 def _call_api(system_prompt: str, user_content: str, max_tokens: int = 2048,
               retry: int = 2, tpm_wait: Optional[float] = None,
-              tag: str = "unknown") -> Optional[dict]:
+              tag: str = "unknown", dim: Optional[str] = None) -> Optional[dict]:
     """调用 LLM API，返回解析后的 JSON。
+
+    dim：维度名，决定是否使用思考模式（默认取 tag；两者取值同为
+    emotion/topics/relationship/habits/profile）。
 
     错误分类策略：
     - 429（TPM/RPM 每分钟限流，含误导性的 "Allocated quota exceeded/insufficient_quota"
@@ -252,6 +583,11 @@ def _call_api(system_prompt: str, user_content: str, max_tokens: int = 2048,
     if client is None:
         return None
 
+    think = thinking_enabled(dim or tag)
+    if think and max_tokens < THINKING_MIN_TOKENS:
+        logger.warning("%s 开启了思考模式，但输出预算只有 %d tokens（思维链同样占用），"
+                       "结果很可能被截断丢弃；建议把预算提到 %d 以上或关闭该维度的思考模式",
+                       dim or tag, max_tokens, THINKING_MIN_TOKENS)
     tpm_wait = TPM_WAIT_SECONDS if tpm_wait is None else tpm_wait
     tpm_hits = 0
     max_attempts = max(retry, TPM_MAX_ATTEMPTS - 1) + 1
@@ -259,16 +595,23 @@ def _call_api(system_prompt: str, user_content: str, max_tokens: int = 2048,
     for attempt in range(max_attempts):
         try:
             _pace()
-            resp = client.chat.completions.create(
-                model=DEEPSEEK_MODEL,
-                messages=[
+            params = {
+                "model": DEEPSEEK_MODEL,
+                "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
-                temperature=0.3,
-                max_tokens=max_tokens,
-                response_format={"type": "json_object"},
-            )
+                "max_tokens": max_tokens,
+                "response_format": {"type": "json_object"},
+            }
+            if think:
+                params["extra_body"] = {"thinking": {"type": "enabled"}}
+            else:
+                # 非思考模式：temperature 生效，保持原有低随机性以保证 JSON 稳定
+                params["temperature"] = 0.3
+                if _SEND_THINKING_PARAM:
+                    params["extra_body"] = {"thinking": {"type": "disabled"}}
+            resp = client.chat.completions.create(**params)
             choice = resp.choices[0]
             if resp.usage:
                 logger.info("token 用量[%s]: prompt=%s completion=%s finish=%s",
@@ -288,8 +631,8 @@ def _call_api(system_prompt: str, user_content: str, max_tokens: int = 2048,
         except Exception as e:
             if _is_plan_exhausted(e):
                 raise QuotaExhaustedError(
-                    "套餐额度耗尽或账号异常（403/欠费）：请到服务商控制台充值或等待配额周期"
-                    "重置后重试。剩余任务已中止。"
+                    "套餐额度耗尽/账号异常（401/403 配额、402 余额不足、欠费）：请到服务商控制台"
+                    "充值或等待配额周期重置后重试。剩余任务已中止，已完成部分已保留。"
                 ) from e
             if _is_tpm_throttle(e):
                 tpm_hits += 1
@@ -300,9 +643,9 @@ def _call_api(system_prompt: str, user_content: str, max_tokens: int = 2048,
                     time.sleep(tpm_wait)
                     continue
                 raise QuotaExhaustedError(
-                    "每分钟限流（TPM）多次等待后仍未恢复：可能同账号其他程序（如编码 Agent）"
-                    "正在占用配额。可稍后再试、调低 LLM_CONCURRENCY，"
-                    "或在百炼控制台「限流提额」页临时提升 TPM。"
+                    "每分钟限流（TPM/RPM）多次等待后仍未恢复：可能同账号其他程序正在占用配额。"
+                    "可稍后再试，或在 .env 中调低 LLM_CONCURRENCY / LLM_CALL_MIN_INTERVAL，"
+                    "也可到服务商控制台提升该模型的 TPM 限额。"
                 ) from e
             if attempt < retry:
                 delay = 2 ** attempt
@@ -316,27 +659,46 @@ def _analyze_periods(months: dict[str, list], system_prompt: str,
                      make_prompt: Callable[[str, list], str], max_tokens: int,
                      tag: str = "unknown",
                      on_progress: Optional[Callable[[int, int], None]] = None,
-                     should_cancel: Optional[Callable[[], bool]] = None) -> dict[str, Any]:
+                     should_cancel: Optional[Callable[[], bool]] = None,
+                     chat_hash: str = "") -> dict[str, Any]:
     """并发逐月调用 API，返回 {period: result}。
 
     单月失败仅记录日志并跳过，不中断整体分析。
     on_progress(done, total) 每完成一个月回调一次；
     should_cancel() 返回 True 时不再启动新任务并尽快返回已完成部分。
+
+    提交策略是"有界窗口"（最多 CONCURRENCY 个月在跑）：早先一次性 submit
+    全部月份时，线程池队列里的月份已经排队，用户点取消也拦不住，剩余月份
+    照常调用计费——与"可随时取消"的承诺相反。
     """
     results: dict[str, Any] = {}
     total = len(months)
     done = 0
     fatal: dict[str, str] = {}   # 配额耗尽等致命错误：中止剩余月份
 
+    def _cancel_requested() -> bool:
+        return bool(should_cancel and should_cancel())
+
     def _work(period: str, msgs: list) -> tuple[str, Optional[dict]]:
+        # 已被排入线程池但尚未开始执行时取消：直接跳过，不产生 API 调用
+        if _cancel_requested():
+            return period, None
         try:
             prompt = make_prompt(period, msgs)
             if not prompt.strip():
                 return period, None
-            result = _call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag)
+            key = _month_key(system_prompt, prompt)
+            result = _read_month_cache(key)
+            if result is not None:
+                logger.info("%s 命中月份缓存，跳过 API 调用", period)
+            else:
+                result = _call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag, dim=tag)
+                if result:
+                    _write_month_cache(key, result)
             if result:
                 result["period"] = period
                 result["month"] = period
+                _record_month_usage(chat_hash, key)
                 return period, result
         except QuotaExhaustedError as e:
             fatal.setdefault("error", str(e))
@@ -345,25 +707,31 @@ def _analyze_periods(months: dict[str, list], system_prompt: str,
             logger.error("%s 月 AI 分析失败: %s", period, e)
         return period, None
 
-    items = list(months.items())
+    pending = list(months.items())
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = {}
-        for period, msgs in items:
-            if fatal or (should_cancel and should_cancel()):
+        futures: dict[concurrent.futures.Future, str] = {}
+        while pending or futures:
+            # 只补足到并发上限：取消后窗口内的任务跑完即止，剩余月份不再启动
+            while pending and len(futures) < CONCURRENCY and not fatal and not _cancel_requested():
+                period, msgs = pending.pop(0)
+                futures[pool.submit(_work, period, msgs)] = period
+            if not futures:
                 break
-            futures[pool.submit(_work, period, msgs)] = period
-        for fut in concurrent.futures.as_completed(list(futures)):
-            period, result = fut.result()
-            if result:
-                results[period] = result
-            done += 1
-            if on_progress:
-                try:
-                    on_progress(done, total)
-                except Exception:
-                    pass
+            finished, _ = concurrent.futures.wait(
+                list(futures), return_when=concurrent.futures.FIRST_COMPLETED)
+            for fut in finished:
+                futures.pop(fut, None)
+                period, result = fut.result()
+                if result:
+                    results[period] = result
+                done += 1
+                if on_progress:
+                    try:
+                        on_progress(done, total)
+                    except Exception:
+                        pass
             if fatal:
-                # 配额耗尽：取消尚未开始的月份任务
+                # 配额耗尽：取消排队中的月份，尽快收尾
                 for f in futures:
                     f.cancel()
                 break
@@ -431,7 +799,8 @@ def _month_prompt(chat: ChatData, period: str, msgs: list) -> str:
     return f"以下是 {period} 月的对话数据：\n\n{dialog}"
 
 
-def analyze_emotion(chat: ChatData, on_progress=None, should_cancel=None) -> dict[str, Any]:
+def analyze_emotion(chat: ChatData, on_progress=None, should_cancel=None,
+                 chat_hash: str = "") -> dict[str, Any]:
     """逐月情绪分析，返回 {"2024-01": {...}, ...}"""
     months = split_by_month(chat)
     results = _analyze_periods(
@@ -441,6 +810,7 @@ def analyze_emotion(chat: ChatData, on_progress=None, should_cancel=None) -> dic
         max_tokens=MAX_TOKENS_BY_DIM["emotion"],
         tag="emotion",
         on_progress=on_progress, should_cancel=should_cancel,
+        chat_hash=chat_hash,
     )
     # 强度夹紧到 0-10，防御越界/非法值
     for r in results.values():
@@ -449,7 +819,8 @@ def analyze_emotion(chat: ChatData, on_progress=None, should_cancel=None) -> dic
     return results
 
 
-def analyze_topics(chat: ChatData, on_progress=None, should_cancel=None) -> dict[str, Any]:
+def analyze_topics(chat: ChatData, on_progress=None, should_cancel=None,
+                 chat_hash: str = "") -> dict[str, Any]:
     """逐月话题分析"""
     months = split_by_month(chat)
     results = _analyze_periods(
@@ -459,6 +830,7 @@ def analyze_topics(chat: ChatData, on_progress=None, should_cancel=None) -> dict
         max_tokens=MAX_TOKENS_BY_DIM["topics"],
         tag="topics",
         on_progress=on_progress, should_cancel=should_cancel,
+        chat_hash=chat_hash,
     )
     # 权重归一化，保证各月话题占比之和恒为 1.0
     for r in results.values():
@@ -466,7 +838,8 @@ def analyze_topics(chat: ChatData, on_progress=None, should_cancel=None) -> dict
     return results
 
 
-def analyze_relationship(chat: ChatData, on_progress=None, should_cancel=None) -> dict[str, Any]:
+def analyze_relationship(chat: ChatData, on_progress=None, should_cancel=None,
+                 chat_hash: str = "") -> dict[str, Any]:
     """逐月人际关系分析"""
     months = split_by_month(chat)
     results = _analyze_periods(
@@ -476,6 +849,7 @@ def analyze_relationship(chat: ChatData, on_progress=None, should_cancel=None) -
         max_tokens=MAX_TOKENS_BY_DIM["relationship"],
         tag="relationship",
         on_progress=on_progress, should_cancel=should_cancel,
+        chat_hash=chat_hash,
     )
     for r in results.values():
         _clamp_int(r, "closeness_score", 1, 10)
@@ -516,7 +890,7 @@ def _analyze_person(system_prompt: str, sample_size: int, msgs: list,
         if not dialog.strip():
             return None
         result = _call_api(system_prompt, prompt_template.format(display_name=display_name, dialog=dialog),
-                           max_tokens=max_tokens, tag=tag)
+                           max_tokens=max_tokens, tag=tag, dim=tag)
         if result:
             result["name"] = display_name
             result["total_messages"] = len(valid_all)
@@ -528,7 +902,8 @@ def _analyze_person(system_prompt: str, sample_size: int, msgs: list,
     return None
 
 
-def analyze_habits(chat: ChatData, on_progress=None, should_cancel=None) -> dict[str, Any]:
+def analyze_habits(chat: ChatData, on_progress=None, should_cancel=None,
+                 chat_hash: str = "") -> dict[str, Any]:   # chat_hash 保留以统一调用签名
     """分析双方的语言习惯"""
     self_msgs = [m for m in chat.messages if m.sender_uid == chat.self_uid]
     other_msgs = [m for m in chat.messages if m.sender_uid != chat.self_uid]
@@ -556,7 +931,8 @@ def analyze_habits(chat: ChatData, on_progress=None, should_cancel=None) -> dict
     return results
 
 
-def analyze_profile(chat: ChatData, on_progress=None, should_cancel=None) -> dict[str, Any]:
+def analyze_profile(chat: ChatData, on_progress=None, should_cancel=None,
+                 chat_hash: str = "") -> dict[str, Any]:   # chat_hash 保留以统一调用签名
     """AI 人物锐评 — 分析双方的性格画像"""
     self_msgs = [m for m in chat.messages if m.sender_uid == chat.self_uid]
     other_msgs = [m for m in chat.messages if m.sender_uid != chat.self_uid]
@@ -583,17 +959,6 @@ def analyze_profile(chat: ChatData, on_progress=None, should_cancel=None) -> dic
         if on_progress:
             on_progress(done, total)
     return results
-
-
-def analyze_all(chat: ChatData) -> dict:
-    """一次运行所有分析"""
-    return {
-        "emotion": analyze_emotion(chat),
-        "topics": analyze_topics(chat),
-        "relationship": analyze_relationship(chat),
-        "habits": analyze_habits(chat),
-        "profile": analyze_profile(chat),
-    }
 
 
 def is_api_configured() -> bool:

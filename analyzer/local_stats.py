@@ -15,15 +15,22 @@
 #
 #
 """本地统计分析 — 不依赖大模型 API"""
+import logging
 import re
 from collections import Counter, defaultdict
 from datetime import datetime
-from typing import Any
-
+from typing import Optional
 import jieba
 import jieba.analyse
 
-from parser.qq_parser import CST, ChatData, Message
+from parser.qq_parser import CST, ChatData
+
+# jieba 首次分词会往 stderr 打 "Building prefix dict..."，本地工具不需要这行噪音
+jieba.setLogLevel(logging.ERROR)
+
+# 对话段切分阈值：相邻消息间隔超过它就算"新的一段对话"（轮次统计与话题发起判定都用它）
+SESSION_GAP_MINUTES = 30
+SESSION_GAP_MS = SESSION_GAP_MINUTES * 60 * 1000
 
 # 中文停用词（常见虚词、标点、语气词、QQ 专用词汇）
 _STOP_WORDS: set[str] = {
@@ -63,7 +70,8 @@ def calc_word_freq(chat: ChatData, top_n: int = 50) -> dict:
     self_texts: list[str] = []
     other_texts: list[str] = []
 
-    for msg in chat.statistical():
+    msgs, _ = _statistical(chat)
+    for msg in msgs:
         text = msg.text.strip()
         if not text or len(text) < 2:
             continue
@@ -125,39 +133,75 @@ def calc_word_freq(chat: ChatData, top_n: int = 50) -> dict:
     }
 
 
-def calc_daily_counts(chat: ChatData) -> list[dict]:
-    """每日消息量，返回 [{"date": "2024-01-01", "self": 5, "other": 3}]"""
+def _statistical(chat: ChatData) -> tuple[list, list[tuple[str, int, int, str]]]:
+    """统计口径的消息 + 每条的 (日期, 小时, 星期, 月份)，整个 chat 只算一次。
+
+    这些派生字段原本在每个 calc_* 里各算一遍：数万条规模下 6 个函数累计
+    约 300 ms 花在重复的时区转换上，而 statistical() 也会被重建 12 次。
+    结果挂在 chat 实例上（ChatData 不是 frozen dataclass），随请求生命周期存续。
+    """
+    cache = getattr(chat, "_stats_cache", None)
+    if cache is None:
+        msgs = chat.statistical()
+        fields = []
+        for m in msgs:
+            dt = datetime.fromtimestamp(m.timestamp / 1000, tz=CST)
+            fields.append((dt.strftime("%Y-%m-%d"), dt.hour, dt.weekday(),
+                           dt.strftime("%Y-%m")))
+        cache = (msgs, fields)
+        chat._stats_cache = cache  # type: ignore[attr-defined]
+    return cache
+
+
+def _party(msg, self_uid: str) -> str:
+    return "self" if msg.sender_uid == self_uid else "other"
+
+
+def calc_daily_counts(chat: ChatData, fill_gaps: bool = True) -> list[dict]:
+    """每日消息量，返回 [{"date": "2024-01-01", "self": 5, "other": 3}]
+
+    fill_gaps=True 时补齐首末之间的空档日期（计 0）。否则折线图用的是类目轴，
+    中间"没聊天的日子"会被整段抹掉——3 个月没说话可能看起来像天天在聊。
+    """
+    msgs, fields = _statistical(chat)
     daily: dict[str, dict] = {}
-    for msg in chat.statistical():
-        dt = datetime.fromtimestamp(msg.timestamp / 1000, tz=CST)
-        key = dt.strftime("%Y-%m-%d")
-        if key not in daily:
-            daily[key] = {"date": key, "self": 0, "other": 0}
-        k = "self" if msg.sender_uid == chat.self_uid else "other"
-        daily[key][k] += 1
-    return [daily[k] for k in sorted(daily.keys())]
+    for i, msg in enumerate(msgs):
+        key = fields[i][0]
+        entry = daily.get(key)
+        if entry is None:
+            entry = daily[key] = {"date": key, "self": 0, "other": 0}
+        entry[_party(msg, chat.self_uid)] += 1
+    if not daily or not fill_gaps:
+        return [daily[k] for k in sorted(daily)]
+
+    from datetime import date as _date, timedelta as _timedelta
+    first, last = min(daily), max(daily)
+    out: list[dict] = []
+    cur = _date.fromisoformat(first)
+    end = _date.fromisoformat(last)
+    while cur <= end:
+        key = cur.isoformat()
+        out.append(daily.get(key) or {"date": key, "self": 0, "other": 0})
+        cur += _timedelta(days=1)
+    return out
 
 
 def calc_hourly_distribution(chat: ChatData) -> list[dict]:
     """24小时分布，返回 [{"hour": 0, "self": 10, "other": 8}]"""
+    msgs, fields = _statistical(chat)
     hourly = [{"hour": h, "self": 0, "other": 0} for h in range(24)]
-    for msg in chat.statistical():
-        dt = datetime.fromtimestamp(msg.timestamp / 1000, tz=CST)
-        h = dt.hour
-        k = "self" if msg.sender_uid == chat.self_uid else "other"
-        hourly[h][k] += 1
+    for i, msg in enumerate(msgs):
+        hourly[fields[i][1]][_party(msg, chat.self_uid)] += 1
     return hourly
 
 
 def calc_weekly_distribution(chat: ChatData) -> list[dict]:
     """按星期分布（0=周一 … 6=周日）"""
     weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    msgs, fields = _statistical(chat)
     weekly = [{"weekday": i, "self": 0, "other": 0} for i in range(7)]
-    for msg in chat.statistical():
-        dt = datetime.fromtimestamp(msg.timestamp / 1000, tz=CST)
-        w = dt.weekday()
-        k = "self" if msg.sender_uid == chat.self_uid else "other"
-        weekly[w][k] += 1
+    for i, msg in enumerate(msgs):
+        weekly[fields[i][2]][_party(msg, chat.self_uid)] += 1
     for i, w in enumerate(weekly):
         w["weekday_name"] = weekday_names[i]
     return weekly
@@ -166,7 +210,8 @@ def calc_weekly_distribution(chat: ChatData) -> list[dict]:
 def calc_message_length_stats(chat: ChatData) -> dict:
     """发言长度统计"""
     self_lens, other_lens = [], []
-    for msg in chat.statistical():
+    msgs, _ = _statistical(chat)
+    for msg in msgs:
         L = len(msg.text)
         if msg.sender_uid == chat.self_uid:
             self_lens.append(L)
@@ -191,7 +236,8 @@ def calc_face_stats(chat: ChatData) -> dict:
     """表情使用排行，返回 {"self": {"name": count}, "other": {...}}"""
     self_faces: Counter = Counter()
     other_faces: Counter = Counter()
-    for msg in chat.statistical():
+    msgs, _ = _statistical(chat)
+    for msg in msgs:
         names = [n for n in msg.face_names if n]
         if not names:
             # 回退到 face_ids
@@ -207,9 +253,13 @@ def calc_face_stats(chat: ChatData) -> dict:
 
 
 def calc_response_time(chat: ChatData) -> dict:
-    """平均响应时间（秒）—— 只统计对方发来后本方做出的回复间隔"""
+    """回复速度（秒）—— 只统计对方发来后本方做出的回复间隔。
+
+    除均值外给出 P50/P90：均值极易被单次长间隔带偏（实测 19 次 5 秒 + 1 次
+    5 分钟 → 均值 19.8 秒，而中位数只有 5 秒），界面以中位数为主指标更诚实。
+    """
     self_times, other_times = [], []
-    msgs = chat.statistical()
+    msgs, _ = _statistical(chat)
     for i in range(1, len(msgs)):
         prev, curr = msgs[i - 1], msgs[i]
         # 同一人连续发言不是"响应"，跳过，避免拉低/污染平均值
@@ -218,54 +268,117 @@ def calc_response_time(chat: ChatData) -> dict:
         gap = (curr.timestamp - prev.timestamp) / 1000
         if gap > 3600 * 6:          # 超过 6 小时不算同轮
             continue
-        if curr.sender_uid == chat.self_uid:
-            self_times.append(gap)
-        else:
-            other_times.append(gap)
+        (self_times if curr.sender_uid == chat.self_uid else other_times).append(gap)
 
-    def _avg(arr: list[float]) -> float:
-        return round(sum(arr) / len(arr), 1) if arr else 0
+    def _percentile(arr: list[float], q: float) -> float:
+        if not arr:
+            return 0.0
+        s = sorted(arr)
+        idx = min(len(s) - 1, max(0, int(round(q * (len(s) - 1)))))
+        return round(s[idx], 1)
 
+    def _stats(arr: list[float]) -> dict:
+        return {
+            "avg": round(sum(arr) / len(arr), 1) if arr else 0.0,
+            "p50": _percentile(arr, 0.50),
+            "p90": _percentile(arr, 0.90),
+            "count": len(arr),
+        }
+
+    self_stats, other_stats = _stats(self_times), _stats(other_times)
     return {
-        "self_avg_seconds": _avg(self_times),
-        "other_avg_seconds": _avg(other_times),
+        # 兼容旧字段（前端/报告仍在用）
+        "self_avg_seconds": self_stats["avg"],
+        "other_avg_seconds": other_stats["avg"],
+        "self": self_stats,
+        "other": other_stats,
+        "session_gap_minutes": SESSION_GAP_MINUTES,
     }
 
 
 def calc_exchange_rounds(chat: ChatData) -> int:
-    """对话轮次（同一人连续发言算一轮）"""
+    """对话轮次：一次"发言交替"或"间隔超过 SESSION_GAP_MINUTES 的新段"算一轮。
+
+    旧口径只数说话人交替，连珠炮互刷会虚高；现在加入时间约束，
+    长时间中断后的第一条消息重新起一轮，数字更贴近"聊了多少个来回"。
+    """
+    msgs, _ = _statistical(chat)
     rounds = 0
-    last = ""
-    for msg in chat.statistical():
-        if msg.sender_uid != last:
+    last_uid: Optional[str] = None
+    last_ts = 0
+    for msg in msgs:
+        if (last_uid is None or msg.sender_uid != last_uid
+                or msg.timestamp - last_ts > SESSION_GAP_MS):
             rounds += 1
-            last = msg.sender_uid
+        last_uid, last_ts = msg.sender_uid, msg.timestamp
     return rounds
+
+
+def calc_conversation_sessions(chat: ChatData) -> list[dict]:
+    """对话段：间隔超过 SESSION_GAP_MINUTES 就切成新的一段（用于"谁先开口"等判断）"""
+    msgs, fields = _statistical(chat)
+    sessions: list[dict] = []
+    for i, msg in enumerate(msgs):
+        if not sessions or msg.timestamp - sessions[-1]["last_ts"] > SESSION_GAP_MS:
+            sessions.append({"date": fields[i][0], "start_ts": msg.timestamp,
+                             "last_ts": msg.timestamp, "count": 0,
+                             "opener": _party(msg, chat.self_uid),
+                             "opener_uid": msg.sender_uid})
+        sessions[-1]["count"] += 1
+        sessions[-1]["last_ts"] = msg.timestamp
+    return sessions
+
+
+def calc_initiator_stats(chat: ChatData) -> dict:
+    """谁更常"开启话题"：以对话段的第一条消息归属来统计（本地可算，无需模型猜）"""
+    sessions = calc_conversation_sessions(chat)
+    total = len(sessions)
+    self_open = sum(1 for s in sessions if s["opener"] == "self")
+    other_open = total - self_open
+    return {
+        "sessions": total,
+        "self_opened": self_open,
+        "other_opened": other_open,
+        "self_ratio": round(self_open / total, 2) if total else 0.0,
+    }
 
 
 def calc_weekly_activity(chat: ChatData) -> list[dict]:
     """星期×小时热力图 [{"weekday":0,"hour":0,"count":5}]"""
+    msgs, fields = _statistical(chat)
     grid: dict[tuple[int, int], int] = defaultdict(int)
-    for msg in chat.statistical():
-        dt = datetime.fromtimestamp(msg.timestamp / 1000, tz=CST)
-        grid[(dt.weekday(), dt.hour)] += 1
+    for i in range(len(msgs)):
+        grid[(fields[i][2], fields[i][1])] += 1
     return [{"weekday": w, "hour": h, "count": c} for (w, h), c in grid.items()]
 
 
 def calc_overview(chat: ChatData) -> dict:
-    """总览统计（口径：仅计入系统/撤回/转发之外的消息）"""
-    msgs = chat.statistical()
+    """总览统计（口径：仅计入系统/撤回/转发之外的消息）
+
+    total_days 是"记录跨度"（缺 timeRange 时按首末消息算），active_days 是
+    "实际聊过的天数"——两者分开给，避免日均消息的分母口径悄悄变化。
+    """
+    msgs, fields = _statistical(chat)
     self_count = sum(1 for m in msgs if m.sender_uid == chat.self_uid)
-    other_count = sum(1 for m in msgs if m.sender_uid != chat.self_uid)
+    other_count = len(msgs) - self_count
     self_chars = sum(len(m.text) for m in msgs if m.sender_uid == chat.self_uid)
     other_chars = sum(len(m.text) for m in msgs if m.sender_uid != chat.self_uid)
     total_images = sum(1 for m in msgs if m.has_image)
     total_faces = sum(len(m.face_ids) for m in msgs)
-    days = chat.duration_days or max(len(calc_daily_counts(chat)), 1)
+
+    active_days = len({f[0] for f in fields})
+    span_days = 0
+    if fields:
+        from datetime import date as _date
+        span_days = (_date.fromisoformat(max(f[0] for f in fields))
+                     - _date.fromisoformat(min(f[0] for f in fields))).days + 1
+    days = chat.duration_days or span_days or 1
 
     return {
         "total_messages": len(msgs),
-        "total_days": chat.duration_days or days,
+        "total_days": days,
+        "days_basis": "file" if chat.duration_days else "computed",
+        "active_days": active_days,
         "total_images": total_images,
         "total_faces": total_faces,
         "self_name": chat.self_name,
@@ -275,7 +388,7 @@ def calc_overview(chat: ChatData) -> dict:
         "self_chars": self_chars,
         "other_chars": other_chars,
         "exchange_rounds": calc_exchange_rounds(chat),
-        "avg_daily": round(len(msgs) / days, 1),
+        "avg_daily": round(len(msgs) / days, 1) if days else 0.0,
     }
 
 
@@ -295,7 +408,7 @@ def calc_milestones(chat: ChatData) -> dict:
     """
     from datetime import date as _date
 
-    msgs = chat.statistical()
+    msgs, fields = _statistical(chat)
     if not msgs:
         return {}
 
@@ -306,18 +419,16 @@ def calc_milestones(chat: ChatData) -> dict:
     late_by_day: dict[str, set] = {}   # date -> {self/other}
     month_counter: Counter = Counter()
 
-    for m in msgs:
-        dt = datetime.fromtimestamp(m.timestamp / 1000, tz=CST)
-        key = dt.strftime("%Y-%m-%d")
+    for i, m in enumerate(msgs):
+        key, hour, _weekday, month = fields[i]
         day_counter[key] += 1
-        month_counter[dt.strftime("%Y-%m")] += 1
-        if dt.hour < 6:
+        month_counter[month] += 1
+        if hour < 6:
             midnight_msg_count += 1
             midnight_day_set.add(key)
-            if dt.hour >= 2:
+            if hour >= 2:
                 late_night_msgs += 1
-                who = "self" if m.sender_uid == chat.self_uid else "other"
-                late_by_day.setdefault(key, set()).add(who)
+                late_by_day.setdefault(key, set()).add(_party(m, chat.self_uid))
 
     sorted_days = sorted(day_counter)
     first_day, last_day = sorted_days[0], sorted_days[-1]
