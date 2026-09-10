@@ -23,11 +23,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install ruff
+
+      - name: Lint (ruff)
+        run: python -m ruff check .
 
       - name: Syntax check
         run: |
           python -m py_compile app.py config.py
           python -m py_compile parser/*.py analyzer/*.py tests/*.py
 
-      - name: Run unit tests
+      - name: Run unit tests (含逐页冒烟)
         run: python -m unittest discover -s tests -v

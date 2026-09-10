@@ -17,15 +17,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {% extends "base.html" %}
 {% block title %}人物锐评{% endblock %}
 {% block content %}
-<h2 class="mb-4">🎯 AI 人物锐评</h2>
+<h2 class="page-title">人物锐评</h2>
 
 {% if not api_ok %}
-<div class="alert alert-warning">⚠️ 请先在 .env 中配置 API Key 以使用 AI 分析功能</div>
+<div class="alert alert-warning">未配置 API Key，无法运行 AI 分析；本地统计功能不受影响。</div>
 {% endif %}
 
 <div id="profileLoading" class="text-center py-5 d-none">
     <div class="spinner-border text-primary" role="status"></div>
-    <p class="mt-2 text-muted">AI 正在深度分析人物性格，请稍候...</p>
+    <p class="mt-2 text-muted">正在分析，请稍候…</p>
 </div>
 
 <div id="profileContent">
@@ -34,13 +34,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 </div>
 
 <div class="text-center py-5" id="profilePlaceholder">
-    <div style="font-size: 4rem;">🎯</div>
-    <p class="mt-3 text-muted">点击下方按钮，让 AI 对双方进行深度性格锐评</p>
-    <button class="btn btn-lg btn-primary" onclick="runProfile(false)">🚀 开始锐评</button>
+    <div style="font-size: 4rem;"></div>
+    <p class="mt-3 text-muted">对双方各生成一份性格画像；该维度启用思考模式，约需 30 秒。</p>
+    <button class="btn btn-lg btn-primary" onclick="runProfile(false)">开始锐评</button>
 </div>
 
 <div class="text-center mb-3 d-none" id="profileRerun">
-    <button class="btn btn-sm btn-outline-secondary" onclick="runProfile(true)">🔄 重新锐评（忽略缓存，会产生 API 费用）</button>
+    <button class="btn btn-sm btn-outline-secondary" onclick="runProfile(true)">重新锐评（忽略缓存，会产生 API 费用）</button>
 </div>
 
 <script>
@@ -54,7 +54,7 @@ function runProfile(refresh) {
         refresh: !!refresh,
         onProgress: function(done, total) {
             if (done < 0) { $('#profileLoading p').text('正在取消…'); return; }
-            if (total > 0) $('#profileLoading p').text('AI 深度分析中：已完成 ' + done + '/' + total + ' 人');
+            if (total > 0) $('#profileLoading p').text('分析中：已完成 ' + done + '/' + total + '人');
         },
         onDone: function(result) {
             $('#profileLoading').addClass('d-none');
@@ -91,22 +91,22 @@ function renderProfile(data) {
         var sc = d.scoring || {};
 
         html += '<div class="col-lg-6 mb-4"><div class="card h-100">' +
-            '<div class="card-header bg-dark text-white" style="font-size:1.2rem;">' +
-            '🎯 ' + j(d.name) + ' 的锐评画像</div><div class="card-body">';
+            '<div class="card-header">' +
+            j(d.name) + ' 的画像</div><div class="card-body">';
 
         // 第一印象 + 评分
         html += '<div class="d-flex align-items-center justify-content-between mb-3">' +
-            '<div class="alert alert-info mb-0 flex-grow-1"><strong>💡 第一印象：</strong>' + j(d.overall_impression) + '</div>';
+            '<div class="alert alert-info mb-0 flex-grow-1"><strong>第一印象：</strong>' + j(d.overall_impression) + '</div>';
 
         // 最终锐评（小标签）
         if (d.verdict) {
-            html += '<div class="ms-2 badge bg-warning text-dark" style="font-size:0.9rem;white-space:normal;max-width:200px;">🏆 ' + j(d.verdict) + '</div>';
+            html += '<div class="ms-2 badge bg-warning text-dark" style="font-size:0.9rem;white-space:normal;max-width:200px;">' + j(d.verdict) + '</div>';
         }
         html += '</div>';
 
         // 一句话人物小传（v2 新增）
         if (d.one_line_bio) {
-            html += '<p class="text-muted fst-italic">📜 ' + j(d.one_line_bio) + '</p>';
+            html += '<p class="text-muted fst-italic">' + j(d.one_line_bio) + '</p>';
         }
 
         // 评分仪表
@@ -118,54 +118,54 @@ function renderProfile(data) {
                 '<div class="col-3"><div class="border rounded p-1"><small>独特程度</small><br><strong>' + j(sc.uniqueness) + '</strong></div></div>' +
                 '</div>';
             if (sc.logical_ratio) {
-                html += '<div class="text-center small text-muted">🧠 ' + j(sc.logical_ratio) + '</div>';
+                html += '<div class="text-center small text-muted">' + j(sc.logical_ratio) + '</div>';
             }
         }
 
-        // 🧠 性格分析
-        html += '<h5 class="border-bottom pb-2">🧠 性格分析</h5>' +
+        // 性格分析
+        html += '<h5 class="border-bottom pb-2">性格分析</h5>' +
             '<p><span class="badge bg-primary" style="font-size:1rem;">' + j(p.core_type) + '</span>' +
             ' · 思维方式：<strong>' + j(p.thinking_style) + '</strong>' +
             ' · 幽默：<strong>' + j(p.humor_style) + '</strong>' +
             ' · ' + j(p.social_tendency) + '</p>';
 
         if (p.strengths && p.strengths.length) {
-            html += '<p><strong>✅ 优点</strong></p><ul>';
+            html += '<p><strong>优点</strong></p><ul>';
             p.strengths.forEach(function(s) { html += '<li class="small">' + esc(s) + '</li>'; });
             html += '</ul>';
         }
         if (p.weaknesses && p.weaknesses.length) {
-            html += '<p><strong>⚠️ 缺点</strong></p><ul>';
+            html += '<p><strong>缺点</strong></p><ul>';
             p.weaknesses.forEach(function(s) { html += '<li class="small">' + esc(s) + '</li>'; });
             html += '</ul>';
         }
         if (p.quirks && p.quirks.length) {
-            html += '<p><strong>🦄 奇特小习惯</strong></p><ul>';
+            html += '<p><strong>奇特小习惯</strong></p><ul>';
             p.quirks.forEach(function(s) { html += '<li>' + esc(s) + '</li>'; });
             html += '</ul>';
         }
 
-        // 💬 聊天风格
-        html += '<h5 class="border-bottom pb-2 mt-3">💬 聊天风格</h5>' +
+        // 聊天风格
+        html += '<h5 class="border-bottom pb-2 mt-3">聊天风格</h5>' +
             '<div class="row"><div class="col-6"><small class="text-muted">开启对话</small><br>' + j(cs.opener) + '</div>' +
             '<div class="col-6"><small class="text-muted">回应方式</small><br>' + j(cs.responder) + '</div></div>' +
             '<div class="row mt-2"><div class="col-6"><small class="text-muted">标点风格</small><br>' + j(cs.punctuation_style) + '</div>' +
             '<div class="col-6"><small class="text-muted">表情使用</small><br>' + j(cs.emoji_usage) + '</div></div>';
 
         if (cs.signature_phrases && cs.signature_phrases.length) {
-            html += '<p class="mt-2"><strong>🗣️ 标志性用语</strong></p><ul>';
+            html += '<p class="mt-2"><strong>标志性用语</strong></p><ul>';
             cs.signature_phrases.forEach(function(s) { html += '<li><em>' + esc(s) + '</em></li>'; });
             html += '</ul>';
         }
         if (cs.topic_preference && cs.topic_preference.length) {
-            html += '<p><strong>📌 常聊话题：</strong>' + joinEsc(cs.topic_preference) + '</p>';
+            html += '<p><strong>常聊话题：</strong>' + joinEsc(cs.topic_preference) + '</p>';
         }
         if (cs.topic_avoid && cs.topic_avoid.length) {
-            html += '<p><strong>🚫 回避话题：</strong>' + joinEsc(cs.topic_avoid) + '</p>';
+            html += '<p><strong>回避话题：</strong>' + joinEsc(cs.topic_avoid) + '</p>';
         }
 
-        // ❤️ 情绪模式
-        html += '<h5 class="border-bottom pb-2 mt-3">❤️ 情绪模式</h5>' +
+        // 情绪模式
+        html += '<h5 class="border-bottom pb-2 mt-3">情绪模式</h5>' +
             '<div class="row"><div class="col-4"><small class="text-muted">频率</small><br>' +
             '<span class="badge bg-' + (ep.frequency === 'high' ? 'danger' : ep.frequency === 'medium' ? 'warning' : 'success') + '">' + j(ep.frequency) + '</span></div>' +
             '<div class="col-4"><small class="text-muted">恢复速度</small><br><strong>' + j(ep.recovery_speed) + '</strong></div>' +
@@ -173,29 +173,29 @@ function renderProfile(data) {
             '<p class="mt-2"><small class="text-muted">压力反应：</small>' + j(ep.stress_response) + '</p>' +
             '<p><small class="text-muted">安慰方式：</small>' + j(ep.support_style) + '</p>';
         if (ep.trigger_topics && ep.trigger_topics.length) {
-            html += '<p><small class="text-danger">⚡ 情绪触发话题：</small>' + joinEsc(ep.trigger_topics) + '</p>';
+            html += '<p><small class="text-danger">情绪触发话题：</small>' + joinEsc(ep.trigger_topics) + '</p>';
         }
 
-        // 🎓 智力/思维指标
-        html += '<h5 class="border-bottom pb-2 mt-3">🎓 思维特征</h5>' +
+        // 智力/思维指标
+        html += '<h5 class="border-bottom pb-2 mt-3">思维特征</h5>' +
             '<p><strong>思维深度：</strong>' + j(iq.thinking_depth) + '</p>' +
             '<p><strong>学习方式：</strong>' + j(iq.learning_style) + '</p>' +
             '<p>词汇丰富度：<span class="badge bg-' + (iq.language_richness === 'rich' ? 'success' : iq.language_richness === 'medium' ? 'warning' : 'secondary') + '">' + j(iq.language_richness) + '</span>' +
             ' · 逻辑一致性：<span class="badge bg-' + (iq.logic_consistency === 'high' ? 'success' : iq.logic_consistency === 'medium' ? 'warning' : 'secondary') + '">' + j(iq.logic_consistency) + '</span></p>';
 
-        // 🔗 关系动态
-        html += '<h5 class="border-bottom pb-2 mt-3">🔗 关系动态</h5>' +
+        // 关系动态
+        html += '<h5 class="border-bottom pb-2 mt-3">关系动态</h5>' +
             '<div class="alert alert-secondary">' + j(rd.role_in_relationship) + '</div>' +
             '<p><small class="text-muted">话题发起：</small>' + j(rd.initiation_pattern) + '</p>' +
             '<p><small class="text-muted">冲突反应：</small>' + j(rd.response_to_conflict) + '</p>' +
             '<p>自我暴露程度：<span class="badge bg-' + (rd.vulnerability_level === 'high' ? 'warning' : rd.vulnerability_level === 'medium' ? 'info' : 'secondary') + '">' + j(rd.vulnerability_level) + '</span></p>';
         if (rd.what_they_seek && rd.what_they_seek.length) {
-            html += '<p><strong>🎯 寻求什么：</strong>' + joinEsc(rd.what_they_seek) + '</p>';
+            html += '<p><strong>寻求什么：</strong>' + joinEsc(rd.what_they_seek) + '</p>';
         }
 
-        // 📈 成长观察
+        // 成长观察
         if (gr.has_changed) {
-            html += '<h5 class="border-bottom pb-2 mt-3">📈 成长变化</h5>' +
+            html += '<h5 class="border-bottom pb-2 mt-3">成长变化</h5>' +
                 '<p>' + j(gr.change_description) + '</p>';
             if (gr.possible_reasons && gr.possible_reasons.length) {
                 html += '<p><small class="text-muted">可能原因：</small></p><ul>';
@@ -206,19 +206,19 @@ function renderProfile(data) {
 
         // 有趣事实
         if (d.fun_facts && d.fun_facts.length) {
-            html += '<h5 class="border-bottom pb-2 mt-3">🤪 有趣事实</h5><ul>';
+            html += '<h5 class="border-bottom pb-2 mt-3">有趣事实</h5><ul>';
             d.fun_facts.forEach(function(f) { html += '<li>' + esc(f) + '</li>'; });
             html += '</ul>';
         }
 
         // 反例自查 + 自嘲免责声明（v2 客观性字段）
         if (d.counter_evidence && d.counter_evidence.length) {
-            html += '<h5 class="border-bottom pb-2 mt-3">🪞 反例自查</h5><ul class="small text-muted">';
+            html += '<h5 class="border-bottom pb-2 mt-3">反例自查</h5><ul class="small text-muted">';
             d.counter_evidence.forEach(function(c) { html += '<li>' + j(c) + '</li>'; });
             html += '</ul>';
         }
         if (d.roast_note) {
-            html += '<p class="small text-muted fst-italic">️ ' + j(d.roast_note) + '</p>';
+            html += '<p class="small text-muted fst-italic">' + j(d.roast_note) + '</p>';
         }
 
         html += '</div></div></div>';

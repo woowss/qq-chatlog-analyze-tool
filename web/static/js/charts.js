@@ -27,11 +27,124 @@ function esc(s) {
         .replace(/'/g, '&#39;');
 }
 
+// ---------------------------------------------------------------- 主题
+// AList 同款设计语言：主色 #1890ff，深浅两套由 CSS 变量提供。
+// canvas 不认 var()，所以统一在这里读取一次并注入每个图表的 option。
+function themeTokens() {
+    var cs = getComputedStyle(document.documentElement);
+    function v(name, fallback) {
+        var x = (cs.getPropertyValue(name) || '').trim();
+        return x || fallback;
+    }
+    function soft(hex, alpha) {              // #1890ff -> rgba(24,144,255,alpha)
+        var m = /^#?([0-9a-f]{6})$/i.exec(hex);
+        if (!m) return hex;
+        var n = parseInt(m[1], 16);
+        return 'rgba(' + (n >> 16 & 255) + ',' + (n >> 8 & 255) + ',' + (n & 255) + ',' + alpha + ')';
+    }
+    var primary = v('--primary', '#1890ff');
+    var accent2 = v('--chart-2', '#fa8c16');
+    return {
+        primary: primary,
+        accent2: accent2,
+        primarySoft: soft(primary, 0.12),
+        accent2Soft: soft(accent2, 0.12),
+        heat: [v('--chart-heat-low', '#f0f5ff'), v('--chart-heat-mid', '#91d5ff'), v('--chart-heat-high', '#1890ff')],
+        // 饼图 / 词云：antd 分类色，围绕主色取邻近色相
+        palette: [primary, accent2, '#13c2c2', '#722ed1', '#52c41a', '#eb2f96'],
+        wordCloud: ['#1890ff', '#096dd9', '#40a9ff', '#13c2c2', '#5cdbd3', '#69c0ff', '#91d5ff'],
+        axis: v('--chart-axis', 'rgba(0,0,0,.45)'),
+        split: v('--chart-split', '#f0f0f0'),
+        tipBg: v('--chart-tooltip-bg', '#fff'),
+        tipBorder: v('--chart-tooltip-border', '#e8e8e8'),
+        tipText: v('--chart-tooltip-text', 'rgba(0,0,0,.85)'),
+        surface: v('--surface', '#fff'),
+        text: v('--text-secondary', 'rgba(0,0,0,.45)')
+    };
+}
+var T = themeTokens();
+
+// 给 option 补默认主题（只填未显式指定的部分，不覆盖各图表自己的设置）
+function applyChartTheme(option) {
+    var o = $.extend(true, {}, option);
+    if (!o.color) o.color = T.palette;
+
+    var tip = o.tooltip;
+    if (tip) {
+        var list = $.isArray(tip) ? tip : [tip];
+        list.forEach(function (x) {
+            if (!x) return;
+            x.backgroundColor = x.backgroundColor || T.tipBg;
+            x.borderColor = x.borderColor || T.tipBorder;
+            x.borderWidth = x.borderWidth === undefined ? 1 : x.borderWidth;
+            x.textStyle = $.extend({ color: T.tipText, fontSize: 12 }, x.textStyle || {});
+            x.extraCssText = x.extraCssText || 'box-shadow: 0 2px 8px rgba(0,0,0,.16); border-radius: 6px;';
+        });
+    }
+    ['xAxis', 'yAxis'].forEach(function (key) {
+        var axes = o[key];
+        if (!axes) return;
+        ($.isArray(axes) ? axes : [axes]).forEach(function (ax) {
+            if (!ax || ax.type === 'category' && ax.show === false) return;
+            ax.axisLabel = $.extend({ color: T.axis }, ax.axisLabel || {});
+            ax.nameTextStyle = $.extend({ color: T.axis }, ax.nameTextStyle || {});
+            ax.axisLine = $.extend(true, { lineStyle: { color: T.split } }, ax.axisLine || {});
+            ax.axisTick = $.extend(true, { lineStyle: { color: T.split } }, ax.axisTick || {});
+            if (ax.splitLine !== false) {
+                ax.splitLine = $.extend(true, { lineStyle: { color: T.split, type: 'dashed' } }, ax.splitLine || {});
+            }
+        });
+    });
+    if (o.legend) {
+        ($.isArray(o.legend) ? o.legend : [o.legend]).forEach(function (lg) {
+            if (lg) lg.textStyle = $.extend({ color: T.axis }, lg.textStyle || {});
+        });
+    }
+    if (o.title) {
+        ($.isArray(o.title) ? o.title : [o.title]).forEach(function (ti) {
+            if (ti && ti.textStyle) ti.textStyle.color = ti.textStyle.color || T.text;
+            else if (ti) ti.textStyle = { color: T.text };
+        });
+    }
+    // 系列标签（饼图/漏斗等的数值标签）默认是浅色主题的深灰，深色下必须换色
+    (o.series || []).forEach(function (s) {
+        if (!s) return;
+        var labels = $.isArray(s.label) ? s.label : [s.label];
+        labels.forEach(function (lb) {
+            if (lb && lb.show !== false) lb.color = lb.color || T.tipText;
+        });
+        if (s.labelLine) {
+            s.labelLine = $.extend(true, { lineStyle: { color: T.split } }, s.labelLine);
+        }
+    });
+    if (o.visualMap) {
+        ($.isArray(o.visualMap) ? o.visualMap : [o.visualMap]).forEach(function (vm) {
+            if (vm) vm.textStyle = $.extend({ color: T.axis }, vm.textStyle || {});
+        });
+    }
+    return o;
+}
+
+// 所有图表统一走带主题的 setOption：各渲染函数不必重复主题代码
+(function patchECharts() {
+    if (!window.echarts || window.__alistThemePatched) return;
+    window.__alistThemePatched = true;
+    var init = echarts.init;
+    echarts.init = function (dom, theme, opts) {
+        var chart = init.call(echarts, dom, theme, opts);
+        var setOption = chart.setOption.bind(chart);
+        chart.setOption = function (option, notMerge, lazy) {
+            return setOption(applyChartTheme(option), notMerge, lazy);
+        };
+        return chart;
+    };
+})();
+
 function renderPieChart(domId, data, name) {
     const el = document.getElementById(domId);
     if (!el) return;
     const chart = echarts.init(el);
-    const colors = ['#5470c6', '#91cc75', '#fac858', '#ee6666', '#73c0de'];
+    const colors = T.palette;
     chart.setOption({
         tooltip: { trigger: 'item', formatter: function(p) { return esc(p.name) + ': ' + p.value + ' (' + p.percent + '%)'; } },
         legend: { bottom: 0 },
@@ -49,17 +162,54 @@ function renderPieChart(domId, data, name) {
     window.addEventListener('resize', function() { chart.resize(); });
 }
 
+// 日线聚合：消息只出现在少数日子时，类目轴会把空档压平（首末相隔 100 天可能只画 3 个点）。
+// 服务端已补齐空档为 0；这里再按跨度自动聚合，避免 3 年 1000+ 个点挤成一团。
+function aggregateDaily(data, maxPoints) {
+    maxPoints = maxPoints || 200;
+    if (!data || !data.length) return { points: [], note: '' };
+    if (data.length <= maxPoints) {
+        return { points: data.map(function (d) {
+            return { label: d.date, self: d.self, other: d.other };
+        }), note: '' };
+    }
+    var spanDays = data.length;
+    var mode = spanDays > 1100 ? 'month' : 'week';
+    var buckets = {}, order = [];
+    function weekStart(iso) {                       // 该日期所在周的周一（UTC 计算，避免时区漂移）
+        var d = new Date(iso + 'T00:00:00Z');
+        var day = (d.getUTCDay() + 6) % 7;
+        d.setUTCDate(d.getUTCDate() - day);
+        return d.toISOString().slice(0, 10);
+    }
+    data.forEach(function (d) {
+        var key = mode === 'month' ? d.date.slice(0, 7) : weekStart(d.date);
+        if (!buckets[key]) { buckets[key] = { label: key, self: 0, other: 0 }; order.push(key); }
+        buckets[key].self += d.self;
+        buckets[key].other += d.other;
+    });
+    return {
+        points: order.map(function (k) { return buckets[k]; }),
+        note: mode === 'month' ? '按月聚合' : '按周聚合'
+    };
+}
+
 function renderLineChart(domId, data, yName) {
     const el = document.getElementById(domId);
     if (!el) return;
     const chart = echarts.init(el);
+    var view = aggregateDaily(data);
+    var titleEl = document.getElementById(domId + 'Title');
+    if (titleEl && view.note) titleEl.textContent = '消息量（' + view.note + '）';
     chart.setOption({
+        title: view.note ? { text: view.note + '，共 ' + view.points.length + ' 个点',
+                             left: 'center', top: 0,
+                             textStyle: { fontSize: 11, fontWeight: 'normal', color: T.axis } } : undefined,
         tooltip: { trigger: 'axis' },
         legend: { data: ['对方', '自己'], bottom: 0 },
-        grid: { left: '3%', right: '4%', bottom: '15%', containLabel: true },
+        grid: { left: '3%', right: '4%', bottom: '15%', top: view.note ? 28 : 10, containLabel: true },
         xAxis: {
             type: 'category',
-            data: data.map(function(d) { return d.date; }),
+            data: view.points.map(function(p) { return p.label; }),
             axisLabel: { rotate: 45, fontSize: 10 }
         },
         yAxis: { type: 'value', name: yName },
@@ -67,19 +217,19 @@ function renderLineChart(domId, data, yName) {
         series: [
             {
                 name: '对方', type: 'line',
-                data: data.map(function(d) { return d.other; }),
+                data: view.points.map(function(p) { return p.other; }),
                 smooth: true,
-                lineStyle: { color: '#91cc75' },
-                itemStyle: { color: '#91cc75' },
-                areaStyle: { color: 'rgba(145,204,117,0.15)' }
+                lineStyle: { color: T.accent2, width: 2 },
+                itemStyle: { color: T.accent2 },
+                areaStyle: { color: T.accent2Soft }
             },
             {
                 name: '自己', type: 'line',
-                data: data.map(function(d) { return d.self; }),
+                data: view.points.map(function(p) { return p.self; }),
                 smooth: true,
-                lineStyle: { color: '#5470c6' },
-                itemStyle: { color: '#5470c6' },
-                areaStyle: { color: 'rgba(84,112,198,0.15)' }
+                lineStyle: { color: T.primary, width: 2 },
+                itemStyle: { color: T.primary },
+                areaStyle: { color: T.primarySoft }
             }
         ]
     });
@@ -100,12 +250,12 @@ function renderBarChart(domId, data, yName) {
             {
                 name: '对方', type: 'bar',
                 data: data.map(function(d) { return d.other; }),
-                itemStyle: { color: '#91cc75', borderRadius: [4,4,0,0] }
+                itemStyle: { color: T.accent2, borderRadius: [3,3,0,0] }
             },
             {
                 name: '自己', type: 'bar',
                 data: data.map(function(d) { return d.self; }),
-                itemStyle: { color: '#5470c6', borderRadius: [4,4,0,0] }
+                itemStyle: { color: T.primary, borderRadius: [3,3,0,0] }
             }
         ]
     });
@@ -126,12 +276,12 @@ function renderWeeklyChart(domId, data) {
             {
                 name: '对方', type: 'bar',
                 data: data.map(function(d) { return d.other; }),
-                itemStyle: { color: '#91cc75', borderRadius: [4,4,0,0] }
+                itemStyle: { color: T.accent2, borderRadius: [3,3,0,0] }
             },
             {
                 name: '自己', type: 'bar',
                 data: data.map(function(d) { return d.self; }),
-                itemStyle: { color: '#5470c6', borderRadius: [4,4,0,0] }
+                itemStyle: { color: T.primary, borderRadius: [3,3,0,0] }
             }
         ]
     });
@@ -150,8 +300,8 @@ function renderResponseChart(domId, data) {
         series: [{
             type: 'bar',
             data: [
-                { value: data.self, itemStyle: { color: '#5470c6' } },
-                { value: data.other, itemStyle: { color: '#91cc75' } }
+                { value: data.self, itemStyle: { color: T.primary } },
+                { value: data.other, itemStyle: { color: T.accent2 } }
             ],
             barWidth: '40%',
             label: { show: true, formatter: '{c}s', position: 'top' }
@@ -171,12 +321,12 @@ function renderWordCloud(domId, data, title) {
     var maxCount = data[0].count;
     var minCount = data[data.length - 1].count || 1;
 
-    var colors = ['#1a237e','#2e7d32','#bf360c','#4a148c','#01579b','#e65100','#004d40','#b71c1c','#3e2723','#283593','#00695c','#37474f','#0d47a1','#33691e','#5d4037'];
+    var colors = T.wordCloud;
 
     chart.setOption({
         // 标题渲染在 canvas 上（非 DOM），不需要 esc——转义反而会显示字面实体
         title: { text: title, left: 'center', textStyle: { fontSize: 14 } },
-        tooltip: { formatter: function(p) { return esc(p.name) + ': ' + p.value + ' 次'; } },
+        tooltip: { formatter: function(p) { return esc(p.name) + ': ' + p.value + '次'; } },
         series: [{
             type: 'wordCloud',
             shape: 'circle',
@@ -221,7 +371,7 @@ function renderFaceBarChart(domId, data, personName) {
     }
     const chart = echarts.init(el);
     chart.setOption({
-        tooltip: { trigger: 'axis', formatter: function(p) { return esc(p.name) + ': ' + p.value + ' 次'; } },
+        tooltip: { trigger: 'axis', formatter: function(p) { return esc(p.name) + ': ' + p.value + '次'; } },
         grid: { left: '5%', right: '10%', containLabel: true },
         xAxis: { type: 'value', name: '次数' },
         yAxis: {
@@ -232,7 +382,7 @@ function renderFaceBarChart(domId, data, personName) {
         series: [{
             type: 'bar',
             data: entries.map(function(e) { return e[1]; }),
-            itemStyle: { color: '#5470c6', borderRadius: [0,4,4,0] },
+            itemStyle: { color: T.primary, borderRadius: [0,3,3,0] },
             label: { show: true, position: 'right', fontWeight: 'bold' }
         }]
     });
@@ -255,15 +405,35 @@ function renderHeatmapChart(domId, data) {
                 return weekdays[params.value[1]] + ' ' + params.value[0] + '时: ' + params.value[2] + '条';
             }
         },
-        grid: { left: '5%', right: '5%', bottom: '10%', containLabel: true },
-        xAxis: { type: 'category', data: Array.from({length:24}, function(_,i) { return i+'时'; }), splitArea: { show: true } },
-        yAxis: { type: 'category', data: weekdays, splitArea: { show: true } },
-        visualMap: { min: 0, max: maxVal, calculable: true, orient: 'horizontal', left: 'center', bottom: 0 },
+        grid: { left: 8, right: 16, top: 10, bottom: 56, containLabel: true },
+        xAxis: {
+            type: 'category',
+            data: Array.from({length:24}, function(_,i) { return i; }),
+            splitArea: { show: false },
+            axisLabel: { interval: 1, fontSize: 10, color: '#6b7280' },
+            axisTick: { show: false },
+            axisLine: { lineStyle: { color: '#e4e7eb' } }
+        },
+        yAxis: {
+            type: 'category',
+            data: weekdays,
+            splitArea: { show: false },
+            axisLabel: { fontSize: 11, color: '#6b7280' },
+            axisTick: { show: false },
+            axisLine: { lineStyle: { color: '#e4e7eb' } }
+        },
+        visualMap: {
+            min: 0, max: maxVal, calculable: true, orient: 'horizontal',
+            left: 'center', bottom: 0, itemWidth: 12, itemHeight: 90,
+            inRange: { color: T.heat },
+            textStyle: { color: '#6b7280', fontSize: 11 }
+        },
         series: [{
             type: 'heatmap',
             data: heatData,
             label: { show: false },
-            emphasis: { itemStyle: { shadowBlur: 10 } }
+            itemStyle: { borderColor: '#ffffff', borderWidth: 2, borderRadius: 2 },
+            emphasis: { itemStyle: { borderColor: '#1f2328', borderWidth: 1 } }
         }]
     });
     window.addEventListener('resize', function() { chart.resize(); });
@@ -286,12 +456,13 @@ function renderEmotionCharts(data) {
             formatter: function(params) {
                 var idx = params[0].dataIndex;
                 var m = months[idx];
-                var html = '<strong>' + m + '</strong><br>';
+                // 情绪标签来自模型输出（受聊天内容影响），tooltip 按 HTML 渲染，必须转义
+                var html = '<strong>' + esc(m) + '</strong><br>';
                 params.forEach(function(p) {
-                    html += p.marker + ' ' + p.seriesName + ': ' + p.value + '<br>';
+                    html += p.marker + ' ' + esc(p.seriesName) + ': ' + p.value + '<br>';
                 });
-                html += '😊 自己: ' + selfEmotions[idx] + '<br>';
-                html += '😊 对方: ' + otherEmotions[idx];
+                html += '自己: ' + esc(selfEmotions[idx]) + '<br>';
+                html += '对方: ' + esc(otherEmotions[idx]);
                 return html;
             }
         },
@@ -303,16 +474,16 @@ function renderEmotionCharts(data) {
             {
                 name: '自己情绪强度', type: 'line',
                 data: selfIntensity, smooth: true,
-                lineStyle: { color: '#5470c6', width: 3 },
-                itemStyle: { color: '#5470c6' },
-                areaStyle: { color: 'rgba(84,112,198,0.15)' }
+                lineStyle: { color: T.primary, width: 2 },
+                itemStyle: { color: T.primary },
+                areaStyle: { color: T.primarySoft }
             },
             {
                 name: '对方情绪强度', type: 'line',
                 data: otherIntensity, smooth: true,
-                lineStyle: { color: '#91cc75', width: 3 },
-                itemStyle: { color: '#91cc75' },
-                areaStyle: { color: 'rgba(145,204,117,0.15)' }
+                lineStyle: { color: T.accent2, width: 2 },
+                itemStyle: { color: T.accent2 },
+                areaStyle: { color: T.accent2Soft }
             }
         ]
     });
@@ -343,8 +514,8 @@ function renderEmotionCharts(data) {
             '自己关键词: ' + (d.self_keywords || []).map(esc).join('、') + '<br>' +
             '对方关键词: ' + (d.other_keywords || []).map(esc).join('、') +
             '</div>' +
-            (d.month_vibe ? '<div class="mt-1 small">🎬 ' + esc(d.month_vibe) + '</div>' : '') +
-            (d.turning_point ? '<div class="mt-1 small text-warning">⚡ ' + esc(d.turning_point) + '</div>' : '') +
+            (d.month_vibe ? '<div class="mt-1 small">' + esc(d.month_vibe) + '</div>' : '') +
+            (d.turning_point ? '<div class="mt-1 small text-warning">' + esc(d.turning_point) + '</div>' : '') +
             '</div></div></div>';
     });
     $('#emotionDetails').html(html);
