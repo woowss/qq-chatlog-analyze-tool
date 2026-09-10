@@ -29,6 +29,13 @@ from unittest import mock
 # 让测试可以从项目根目录导入包
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# 测试隔离：数据目录指向临时目录，避免测试读写真实的 uploads/ai_cache/session
+import tempfile as _tempfile
+os.environ.setdefault("QQCHAT_DATA_DIR", _tempfile.mkdtemp(prefix="qqchatlog-test-"))
+# 月份缓存会跨用例复用同一份月份内容，使"调用次数"断言失去确定性；
+# 专门验证增量缓存的用例会自行开启并指向临时目录。
+os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
+
 from parser.qq_parser import (CST, ChatData, Message, is_statistical,
                               load_chat, split_by_month)
 from analyzer.deepseek_client import (MAX_DIALOG_CHARS, _build_dialog,
@@ -153,7 +160,7 @@ class TestDialogTruncation(unittest.TestCase):
     def test_fit_lines_within_limit(self):
         lines = [f"第{i}条消息内容" for i in range(500)]
         fitted = _fit_lines(lines, 500)
-        self.assertLessEqual(sum(len(l) + 1 for l in fitted), 500)
+        self.assertLessEqual(sum(len(line) + 1 for line in fitted), 500)
         self.assertTrue(len(fitted) >= 1)
 
     def test_build_dialog_filters_system_and_empty(self):
@@ -209,6 +216,41 @@ class TestCsrfProtection(unittest.TestCase):
         # 通过防护后，因为没带文件，返回"请选择文件"而不是 400 防护错误
         self.assertEqual(r.status_code, 400)
         self.assertIn("请选择文件", r.get_data(as_text=True))
+
+    def test_non_ascii_csrf_token_is_rejected_not_500(self):
+        """token 由请求方构造：非 ASCII 曾让 compare_digest 抛 TypeError → 500"""
+        self._get_csrf()
+        for headers, data in (
+            ({"Origin": "http://localhost:5000"}, {"csrf_token": "中文口令"}),
+            ({"Origin": "http://localhost:5000", "X-CSRF-Token": "中文口令"}, {}),
+        ):
+            r = self.client.post("/upload", data=data, headers=headers)
+            self.assertEqual(r.status_code, 400, f"应返回 400，实际 {r.status_code}")
+        # 对照：普通错误 token 也是 400
+        r = self.client.post("/upload", data={},
+                             headers={"Origin": "http://localhost:5000", "X-CSRF-Token": "wrong"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_origin_equal_to_host_is_not_trusted(self):
+        """Origin == Host 也必须是白名单内的主机，否则 DNS rebinding 可绕过校验"""
+        import app as appmod
+        with appmod.app.test_request_context(
+                "/upload", headers={"Host": "evil.example.com", "Origin": "http://evil.example.com"}):
+            self.assertFalse(appmod._origin_allowed())
+        with appmod.app.test_request_context(
+                "/upload", headers={"Host": "127.0.0.1:5000", "Origin": "http://127.0.0.1:5000"}):
+            self.assertTrue(appmod._origin_allowed())
+
+    def test_allowed_origins_config_is_honored(self):
+        """局域网/自定义域名通过 ALLOWED_ORIGINS 显式放行"""
+        import app as appmod
+        with mock.patch.object(appmod, "ALLOWED_ORIGINS", frozenset({"chat.lan"})):
+            with appmod.app.test_request_context(
+                    "/upload", headers={"Host": "127.0.0.1:5000", "Origin": "http://chat.lan"}):
+                self.assertTrue(appmod._origin_allowed())
+        with appmod.app.test_request_context(
+                "/upload", headers={"Host": "127.0.0.1:5000", "Origin": "http://chat.lan"}):
+            self.assertFalse(appmod._origin_allowed())
 
 
 class TestStatisticalFiltering(unittest.TestCase):
@@ -421,6 +463,75 @@ class TestQuotaAndThrottle(unittest.TestCase):
             with self.assertRaises(self.dc.QuotaExhaustedError):
                 self.dc._call_api("s", "u", retry=2, tpm_wait=0.01)
         self.assertEqual(fake.chat.completions.create.call_count, 1)  # 不重试
+
+    def test_insufficient_balance_fails_fast(self):
+        """DeepSeek 官方余额不足（402 Insufficient Balance）同样属于不可重试的致命错误"""
+        fake = mock.Mock()
+        fake.chat.completions.create.side_effect = self._err(402, "Insufficient Balance")
+        with mock.patch.object(self.dc, "_get_client", return_value=fake):
+            with self.assertRaises(self.dc.QuotaExhaustedError):
+                self.dc._call_api("s", "u", retry=2, tpm_wait=0.01)
+        self.assertEqual(fake.chat.completions.create.call_count, 1)
+
+    def test_thinking_disabled_for_normal_dims(self):
+        """全局关闭 + 白名单只有 profile 时，emotion 走非思考：下发 temperature 与 disabled"""
+        fake = mock.Mock()
+        fake.chat.completions.create.return_value = self._ok_resp()
+        with mock.patch.object(self.dc, "THINKING_DEFAULT", False), \
+             mock.patch.object(self.dc, "THINKING_DIMS", frozenset({"profile"})), \
+             mock.patch.object(self.dc, "_SEND_THINKING_PARAM", True), \
+             mock.patch.object(self.dc, "_get_client", return_value=fake):
+            self.dc._call_api("s", "u", tag="emotion")
+            # 断言必须在 patch 内：thinking_enabled 读的是模块级配置，
+            # 放到 with 外面会依赖本机 .env（CI 无 .env → 白名单为空 → 误报失败）
+            self.assertFalse(self.dc.thinking_enabled("emotion"))
+            self.assertTrue(self.dc.thinking_enabled("profile"))
+        kw = fake.chat.completions.create.call_args.kwargs
+        self.assertEqual(kw["temperature"], 0.3)
+        self.assertEqual(kw["extra_body"], {"thinking": {"type": "disabled"}})
+
+    def test_thinking_enabled_for_whitelisted_profile_only(self):
+        """白名单维度 profile 开思考：不传 temperature（服务端会忽略），传 enabled"""
+        fake = mock.Mock()
+        fake.chat.completions.create.return_value = self._ok_resp()
+        with mock.patch.object(self.dc, "THINKING_DEFAULT", False), \
+             mock.patch.object(self.dc, "THINKING_DIMS", frozenset({"profile"})), \
+             mock.patch.object(self.dc, "_SEND_THINKING_PARAM", True), \
+             mock.patch.object(self.dc, "_get_client", return_value=fake):
+            self.dc._call_api("s", "u", tag="profile")
+            self.assertTrue(self.dc.thinking_enabled("profile"))
+            self.assertFalse(self.dc.thinking_enabled("emotion"))
+            self.assertFalse(self.dc.thinking_enabled("habits"))
+        kw = fake.chat.completions.create.call_args.kwargs
+        self.assertNotIn("temperature", kw)
+        self.assertEqual(kw["extra_body"], {"thinking": {"type": "enabled"}})
+
+    def test_global_thinking_switch_covers_all_dims(self):
+        """LLM_THINKING=enabled 时所有维度都开（白名单为空也不影响）"""
+        with mock.patch.object(self.dc, "THINKING_DEFAULT", True), \
+             mock.patch.object(self.dc, "THINKING_DIMS", frozenset()):
+            for dim in ("emotion", "topics", "relationship", "habits", "profile"):
+                self.assertTrue(self.dc.thinking_enabled(dim))
+        with mock.patch.object(self.dc, "THINKING_DEFAULT", False), \
+             mock.patch.object(self.dc, "THINKING_DIMS", frozenset()):
+            self.assertFalse(self.dc.thinking_enabled("profile"))
+
+    def test_profile_budget_fits_chain_of_thought(self):
+        """锐评预算必须能同时装下思维链与长 JSON（实测思考模式约占 2-4k token）"""
+        self.assertGreaterEqual(self.dc.MAX_TOKENS_BY_DIM["profile"], 16384)
+
+    def test_non_deepseek_gateway_gets_no_thinking_param(self):
+        """百炼等网关未显式配置思考模式时不发送 thinking 字段，避免非法参数"""
+        fake = mock.Mock()
+        fake.chat.completions.create.return_value = self._ok_resp()
+        with mock.patch.object(self.dc, "THINKING_DEFAULT", False), \
+             mock.patch.object(self.dc, "THINKING_DIMS", frozenset()), \
+             mock.patch.object(self.dc, "_SEND_THINKING_PARAM", False), \
+             mock.patch.object(self.dc, "_get_client", return_value=fake):
+            self.dc._call_api("s", "u", tag="profile")
+        kw = fake.chat.completions.create.call_args.kwargs
+        self.assertNotIn("extra_body", kw)
+        self.assertEqual(kw["temperature"], 0.3)
 
     def test_periods_abort_remaining_on_fatal(self):
         fake = mock.Mock()
@@ -638,11 +749,38 @@ class TestPromptContract(unittest.TestCase):
 class TestCacheLifecycle(unittest.TestCase):
     """缓存键含提示词版本；聊天文件删除时派生缓存联动清除"""
 
-    def test_cache_path_includes_prompt_version(self):
+    def test_cache_path_includes_prompt_fingerprint(self):
+        """缓存键用提示词/格式指纹：改 prompt 或对话格式后旧缓存自动失效"""
         import app as appmod
-        from analyzer.prompts import PROMPT_VERSION
+        from analyzer.deepseek_client import PROMPT_FINGERPRINT
         path = appmod._cache_path("emotion", "deadbeef" * 2)
-        self.assertIn(PROMPT_VERSION, path)
+        self.assertIn(PROMPT_FINGERPRINT, path)
+
+    def test_cache_path_separates_thinking_mode(self):
+        """切换思考模式必须换键：否则开/关 thinking 后会命中另一模式的旧结果"""
+        import app as appmod
+        with mock.patch.object(appmod, "thinking_enabled", lambda d: d == "profile"):
+            think_path = appmod._cache_path("profile", "hashX")
+            plain_path = appmod._cache_path("emotion", "hashX")
+        self.assertTrue(think_path.endswith("_think.json"))
+        self.assertFalse(plain_path.endswith("_think.json"))
+        # 未开思考时不加后缀，既有缓存键保持兼容
+        with mock.patch.object(appmod, "thinking_enabled", lambda d: False):
+            self.assertFalse(appmod._cache_path("profile", "hashX").endswith("_think.json"))
+
+    def test_purge_removes_thinking_cache_too(self):
+        """级联删除不看思考模式后缀，思考模式结果同样不会成为孤儿"""
+        import app as appmod
+        with mock.patch.object(appmod, "thinking_enabled", lambda d: True):
+            appmod._write_cache("profile", "hashCCC", {"x": 1})
+            path = appmod._cache_path("profile", "hashCCC")
+            try:
+                self.assertTrue(os.path.exists(path))
+                self.assertEqual(appmod._purge_chat_caches("hashCCC"), 1)
+                self.assertFalse(os.path.exists(path))
+            finally:
+                if os.path.exists(path):
+                    os.remove(path)
 
     def test_purge_chat_caches(self):
         import app as appmod

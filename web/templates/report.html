@@ -25,34 +25,40 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     body { font-size: 12pt; }
     .container { max-width: 100% !important; width: 100% !important; }
 }
-.report-header { text-align: center; padding: 2rem 0; }
-.report-header h1 { font-size: 2rem; font-weight: 700; }
-.report-header .meta { color: #666; font-size: 0.9rem; }
-.section-title { font-size: 1.3rem; font-weight: 700; margin: 1.5rem 0 1rem; padding-bottom: 0.5rem; border-bottom: 2px solid #333; }
+.report-header { text-align: center; padding: 1.6rem 0 1.2rem; }
+.report-header h1 { font-size: 1.7rem; font-weight: 600; }
+.report-header .meta { color: var(--text-secondary); font-size: .875rem; }
+.section-title {
+    font-size: 1.15rem;
+    font-weight: 600;
+    margin: 1.6rem 0 1rem;
+    padding-bottom: .5rem;
+    border-bottom: 1px solid var(--divider);
+}
 .stat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; margin-bottom: 1rem; }
-.stat-item { text-align: center; padding: 12px; background: #f8f9fa; border-radius: 8px; }
-.stat-item .num { font-size: 1.6rem; font-weight: 700; color: #1a1a2e; }
-.stat-item .label { font-size: 0.8rem; color: #666; }
+.stat-item { text-align: center; padding: 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); }
+.stat-item .num { font-size: 1.5rem; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+.stat-item .label { font-size: .8rem; color: var(--text-secondary); }
 table.ai-detail { width: 100%; border-collapse: collapse; margin-bottom: 1rem; }
-table.ai-detail th, table.ai-detail td { padding: 8px 12px; border: 1px solid #dee2e6; text-align: left; vertical-align: top; }
-table.ai-detail th { background: #f0f0f0; font-weight: 600; width: 100px; }
+table.ai-detail th, table.ai-detail td { padding: 8px 12px; border: 1px solid var(--divider); text-align: left; vertical-align: top; }
+table.ai-detail th { background: var(--surface-2); color: var(--text-secondary); font-weight: 500; width: 100px; }
 </style>
 {% endblock %}
 
 {% block content %}
 <div class="report-header">
-    <h1>📊 QQ 聊天记录分析报告</h1>
+    <h1>QQ 聊天记录分析报告</h1>
     <div class="meta">
         <p id="reportMeta">聊天对象：<strong>{{ overview.other_name }}</strong>
         · 统计期间：{{ overview.total_days }} 天 · {{ overview.total_messages }} 条消息</p>
         <p id="reportDate" class="small"></p>
     </div>
-    <button class="btn btn-primary no-print" onclick="window.print()">🖨️ 打印 / 导出 PDF</button>
-    <button class="btn btn-outline-secondary no-print ms-2" onclick="downloadReport()">⬇️ 下载 HTML</button>
+    <button class="btn btn-primary no-print" onclick="window.print()">打印 / 导出 PDF</button>
+    <button class="btn btn-outline-secondary no-print ms-2" onclick="downloadReport()">下载 HTML</button>
 </div>
 
 <!-- ======== 第一部分：基本统计 ======== -->
-<h3 class="section-title">📈 第一部分：基本统计数据</h3>
+<h3 class="section-title">第一部分：基本统计数据</h3>
 
 <div class="stat-grid">
     <div class="stat-item"><div class="num">{{ overview.total_messages }}</div><div class="label">总消息数</div></div>
@@ -62,18 +68,21 @@ table.ai-detail th { background: #f0f0f0; font-weight: 600; width: 100px; }
     <div class="stat-item"><div class="num">{{ overview.exchange_rounds }}</div><div class="label">对话轮次</div></div>
 </div>
 
-<h5 class="mt-3">👤 双方数据对比</h5>
+<h5 class="mt-3">双方数据对比</h5>
 <table class="table table-bordered">
     <thead><tr><th>指标</th><th>{{ overview.self_name }}</th><th>{{ overview.other_name }}</th></tr></thead>
     <tbody>
         <tr><td>消息数</td><td>{{ overview.self_count }}{% if overview.total_messages %}（{{ (overview.self_count / overview.total_messages * 100) | round(1) }}%）{% endif %}</td><td>{{ overview.other_count }}{% if overview.total_messages %}（{{ (overview.other_count / overview.total_messages * 100) | round(1) }}%）{% endif %}</td></tr>
         <tr><td>总字数</td><td>{{ overview.self_chars }} 字</td><td>{{ overview.other_chars }} 字</td></tr>
         <tr><td>平均每句</td><td>{{ length_stats.self.avg }} 字</td><td>{{ length_stats.other.avg }} 字</td></tr>
-        <tr><td>平均回复</td><td>{{ response_time.self_avg_seconds }} 秒</td><td>{{ response_time.other_avg_seconds }} 秒</td></tr>
+        <tr><td>回复速度</td>
+            <td>中位 {{ response_time.self.p50 }} 秒<br><small class="text-muted">均值 {{ response_time.self.avg }} · P90 {{ response_time.self.p90 }} 秒</small></td>
+            <td>中位 {{ response_time.other.p50 }} 秒<br><small class="text-muted">均值 {{ response_time.other.avg }} · P90 {{ response_time.other.p90 }} 秒</small></td></tr>
     </tbody>
 </table>
 
-<h5>😊 表情使用 Top 5</h5>
+{% if (face_stats.self or {}) or (face_stats.other or {}) %}
+<h5>表情使用 Top 5</h5>
 <div class="row">
     <div class="col-md-6">
         <p><strong>{{ overview.self_name }}：</strong></p>
@@ -93,7 +102,10 @@ table.ai-detail th { background: #f0f0f0; font-weight: 600; width: 100px; }
     </div>
 </div>
 
-<h5>📝 高频词 Top 10</h5>
+{% endif %}
+
+{% if (word_freq.self or []) or (word_freq.other or []) %}
+<h5>高频词 Top 10</h5>
 <div class="row">
     <div class="col-md-6">
         <p><strong>{{ overview.self_name }}：</strong></p>
@@ -112,16 +124,17 @@ table.ai-detail th { background: #f0f0f0; font-weight: 600; width: 100px; }
         </ol>
     </div>
 </div>
+{% endif %}
 
-<!-- ======== 第二部分：AI 深度分析（由 JavaScript 填充） ======== -->
-<h3 class="section-title">🤖 第二部分：AI 深度分析</h3>
+<!-- ======== 第二部分：AI 分析（由 JavaScript 填充） ======== -->
+<h3 class="section-title">第二部分：AI 分析</h3>
 
 <div id="reportAiContent">
-    <p class="text-muted">请先在对应页面运行 AI 分析，数据会在此处显示。<br>
+    <p class="text-muted">尚无 AI 分析结果。在仪表盘按维度运行后，结果会汇总到这里。<br>
     需要分析：情绪分析、人际关系、个人习惯、人物锐评、话题趋势。</p>
 </div>
 
-<p class="text-muted small mt-4">📌 报告生成时间：<span id="reportGenTime"></span></p>
+<p class="text-muted small mt-4">报告生成时间：<span id="reportGenTime"></span></p>
 
 <script>
 // HTML 转义（与 charts.js 中保持一致；下载的报告是自包含的，需要本地定义一份）
@@ -146,7 +159,9 @@ function downloadReport() {
                 .replace(/<link[^>]*href="\/static\/[^"]*"[^>]*>/gi, '')
                 .replace(/<button[\s\S]*?<\/button>/g, '')
                 .replace(/no-print/g, '')
-                .replace(/<script src="[^"]*charts\.js[^"]*"><\/script>/gi, '');
+                .replace(/<script src="[^"]*charts\.js[^"]*"><\/script>/gi, '')
+                // 报告是要分享/存档的，剥掉内联脚本里的 CSRF token，别把它一起带出去
+                .replace(/<script(?![^>]*\bsrc=)[^>]*>[\s\S]*?window\.CSRF_TOKEN[\s\S]*?<\/script>/gi, '');
             html = html.replace(/<\/head>/i, inlineCss + '</head>');
             var blob = new Blob(['<!DOCTYPE html>\n' + html], { type: 'text/html;charset=utf-8' });
             var url = URL.createObjectURL(blob);
@@ -183,7 +198,7 @@ $(function() {
         if (results.emotion) {
             data = results.emotion;
             months = Object.keys(data).sort();
-            html = '<h5 class="mt-4">😊 情绪分析</h5><table class="ai-detail"><tr><th>月份</th><th>{{ overview.self_name }}</th><th>{{ overview.other_name }}</th><th>基调</th></tr>';
+            html = '<h5 class="mt-4">情绪分析</h5><table class="ai-detail"><tr><th>月份</th><th>{{ overview.self_name }}</th><th>{{ overview.other_name }}</th><th>基调</th></tr>';
             months.forEach(function(m) {
                 var d = data[m];
                 if (!d) return;
@@ -201,7 +216,7 @@ $(function() {
         if (results.relationship) {
             data = results.relationship;
             months = Object.keys(data).sort();
-            html = '<h5 class="mt-4">👥 人际关系</h5><table class="ai-detail"><tr><th>月份</th><th>亲密</th><th>风格</th><th>角色</th><th>摘要</th></tr>';
+            html = '<h5 class="mt-4">人际关系</h5><table class="ai-detail"><tr><th>月份</th><th>亲密</th><th>风格</th><th>角色</th><th>摘要</th></tr>';
             months.forEach(function(m) {
                 var d = data[m];
                 if (!d) return;
@@ -217,7 +232,7 @@ $(function() {
         // 个人习惯
         if (results.habits) {
             data = results.habits;
-            html = '<h5 class="mt-4">🧑 个人习惯</h5><div class="row">';
+            html = '<h5 class="mt-4">个人习惯</h5><div class="row">';
             ['self', 'other'].forEach(function(key) {
                 var d = data[key];
                 if (!d) return;
@@ -235,7 +250,7 @@ $(function() {
         // 人物锐评
         if (results.profile) {
             data = results.profile;
-            html = '<h5 class="mt-4">🎯 人物锐评</h5><div class="row">';
+            html = '<h5 class="mt-4">人物锐评</h5><div class="row">';
             ['self', 'other'].forEach(function(key) {
                 var d = data[key];
                 if (!d) return;
@@ -246,20 +261,20 @@ $(function() {
                 var sc = d.scoring || {};
                 html += '<div class="col-md-6"><div class="card mb-2"><div class="card-header"><strong>' + esc(d.name) + '</strong></div><div class="card-body">' +
                     '<div class="alert alert-info py-1">' + esc(d.overall_impression) + '</div>' +
-                    '<p><strong>🎯 锐评：</strong>' + esc(d.verdict) + '</p>' +
+                    '<p><strong>锐评：</strong>' + esc(d.verdict) + '</p>' +
                     '<p><strong>核心性格：</strong><span class="badge bg-primary">' + esc(p.core_type) + '</span></p>' +
                     '<p><strong>思维方式：</strong>' + esc(p.thinking_style) + ' · <strong>幽默：</strong>' + esc(p.humor_style) + '</p>' +
-                    '<p><strong>✅ 优点：</strong></p><ul>' + (p.strengths || []).map(function(s) { return '<li>' + esc(s) + '</li>'; }).join('') + '</ul>' +
-                    '<p><strong>⚠️ 缺点：</strong></p><ul>' + (p.weaknesses || []).map(function(s) { return '<li>' + esc(s) + '</li>'; }).join('') + '</ul>' +
-                    '<p><strong>💬 聊天风格：</strong>开启=' + esc(cs.opener) + ' · 回应=' + esc(cs.responder) + '</p>' +
-                    '<p><strong>📌 常聊话题：</strong>' + (joinEsc(cs.topic_preference) || '-') + '</p>' +
-                    '<p><strong>🔗 关系角色：</strong>' + esc(rd.role_in_relationship) + '</p>' +
+                    '<p><strong>优点：</strong></p><ul>' + (p.strengths || []).map(function(s) { return '<li>' + esc(s) + '</li>'; }).join('') + '</ul>' +
+                    '<p><strong>缺点：</strong></p><ul>' + (p.weaknesses || []).map(function(s) { return '<li>' + esc(s) + '</li>'; }).join('') + '</ul>' +
+                    '<p><strong>聊天风格：</strong>开启=' + esc(cs.opener) + ' · 回应=' + esc(cs.responder) + '</p>' +
+                    '<p><strong>常聊话题：</strong>' + (joinEsc(cs.topic_preference) || '-') + '</p>' +
+                    '<p><strong>关系角色：</strong>' + esc(rd.role_in_relationship) + '</p>' +
                     '<p><strong>情绪频率：</strong>' + esc(ep.frequency) + ' · <strong>常见状态：</strong>' + esc(ep.typical_state) + '</p>';
                 if (sc.expressiveness) {
                     html += '<p><strong>评分：</strong>表达' + esc(sc.expressiveness) + '/10 · 情绪' + esc(sc.emotional_richness || '-') + '/10 · 社交' + esc(sc.social_energy || '-') + '/10 · 独特' + esc(sc.uniqueness || '-') + '/10</p>';
                 }
                 if (d.fun_facts && d.fun_facts.length) {
-                    html += '<p><strong>🤪 有趣事实：</strong>' + d.fun_facts.slice(0, 3).map(esc).join('；') + '</p>';
+                    html += '<p><strong>有趣事实：</strong>' + d.fun_facts.slice(0, 3).map(esc).join('；') + '</p>';
                 }
                 html += '</div></div></div>';
             });
@@ -271,7 +286,7 @@ $(function() {
         if (results.topics) {
             data = results.topics;
             months = Object.keys(data).sort();
-            html = '<h5 class="mt-4">📈 话题趋势</h5><table class="ai-detail"><tr><th>月份</th><th>话题</th><th>摘要</th></tr>';
+            html = '<h5 class="mt-4">话题趋势</h5><table class="ai-detail"><tr><th>月份</th><th>话题</th><th>摘要</th></tr>';
             months.forEach(function(m) {
                 var d = data[m];
                 if (!d) return;

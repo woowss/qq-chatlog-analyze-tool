@@ -14,9 +14,15 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 #
-"""日志记录模块 — 统一的项目日志系统"""
+"""日志记录模块 — 统一的项目日志系统
+
+所有模块的 logger 都挂在同一个包级 logger（qqchatlog）下并向上传播，
+handler 只在包级配置一次：早先每个 logger 名各建一套 handler，导致
+"app" 与 "deepseek" 两个 logger 各持一个指向 logs/app.log 的
+RotatingFileHandler，Windows 上轮转时 os.rename 会因另一个句柄占用而
+抛 PermissionError，轮转失效且日志行丢失。
+"""
 import logging
-import os
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -24,6 +30,7 @@ from pathlib import Path
 LOG_DIR = Path(__file__).parent.parent / "logs"
 LOG_FILE = LOG_DIR / "app.log"
 LOG_LEVEL = logging.INFO
+PACKAGE_LOGGER = "qqchatlog"
 
 
 class _ConsoleHandler(logging.StreamHandler):
@@ -51,13 +58,12 @@ class _ConsoleHandler(logging.StreamHandler):
             self.handleError(record)
 
 
-def setup_logger(name: str = "qq_analyzer") -> logging.Logger:
-    """配置并返回项目统一的 logger 实例"""
-    logger = logging.getLogger(name)
-    logger.setLevel(LOG_LEVEL)
-
-    if logger.handlers:
-        return logger
+def _configure(base: logging.Logger) -> None:
+    """给包级 logger 装一次 handler（文件 + 控制台），重复调用无副作用"""
+    if base.handlers:
+        return
+    base.setLevel(LOG_LEVEL)
+    base.propagate = False        # 不再向 root 传播，避免被第三方/默认配置重复输出
 
     # 1) 文件日志 — 按大小轮转，保留 5 份 × 5MB
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -70,7 +76,7 @@ def setup_logger(name: str = "qq_analyzer") -> logging.Logger:
     )
     file_handler.setLevel(LOG_LEVEL)
     file_handler.setFormatter(file_fmt)
-    logger.addHandler(file_handler)
+    base.addHandler(file_handler)
 
     # 2) 控制台日志（兼容 GBK）
     console_fmt = logging.Formatter(
@@ -80,14 +86,23 @@ def setup_logger(name: str = "qq_analyzer") -> logging.Logger:
     console_handler = _ConsoleHandler()
     console_handler.setLevel(LOG_LEVEL)
     console_handler.setFormatter(console_fmt)
-    logger.addHandler(console_handler)
-
-    return logger
+    base.addHandler(console_handler)
 
 
-def get_logger(name: str = "qq_analyzer") -> logging.Logger:
-    """获取已配置的 logger（未配置则自动配置）"""
-    logger = logging.getLogger(name)
-    if not logger.handlers:
-        return setup_logger(name)
-    return logger
+def get_logger(name: str = PACKAGE_LOGGER) -> logging.Logger:
+    """获取子 logger（handler 只挂在包级 logger 上，各子 logger 向上传播）"""
+    base = logging.getLogger(PACKAGE_LOGGER)
+    _configure(base)
+    clean = (name or "").strip()
+    if not clean or clean in (PACKAGE_LOGGER, "qq_analyzer"):
+        return base
+    if clean.startswith(PACKAGE_LOGGER + "."):
+        clean = clean[len(PACKAGE_LOGGER) + 1:]
+    child = logging.getLogger(f"{PACKAGE_LOGGER}.{clean}")
+    child.setLevel(LOG_LEVEL)
+    return child
+
+
+def setup_logger(name: str = "qq_analyzer") -> logging.Logger:
+    """兼容旧调用：等价于 get_logger(name)"""
+    return get_logger(name)

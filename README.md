@@ -24,6 +24,7 @@
 | 📈 **话题趋势** | 提取核心话题及占比、逐月话题变化 |
 | 🎯 **人物锐评** | 深度性格画像（含优缺点、思维特征、情绪模式、关系动态等） |
 | 🚀 **一键全量分析** | 五个维度顺序执行，已缓存自动跳过，实时进度与取消 |
+| ♻️ **增量分析** | 月份级内容寻址缓存：重新导出只多了几个月时，历史月份不再重复付费 |
 | 💰 **用量统计** | 仪表盘展示按天 × 维度的 token 消耗累计（本地统计，仅数字） |
 
 ### 📄 全篇报告导出
@@ -48,7 +49,7 @@ pip install -r requirements.txt
 
 ```env
 DEEPSEEK_API_KEY=你的API_Key
-DEEPSEEK_MODEL=deepseek-chat
+DEEPSEEK_MODEL=deepseek-flash          # DeepSeek-V4.1-Flash（1M 上下文，支持 JSON Output）
 DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
 ```
 
@@ -66,8 +67,11 @@ DEEPSEEK_BASE_URL=https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mod
 # FLASK_DEBUG=false          # 调试模式（默认关闭，调试器可执行任意代码，仅限本机开发）
 # FLASK_HOST=127.0.0.1       # 绑定地址；非回环地址必须同时设置 ACCESS_PASSWORD
 # FLASK_PORT=5000            # 端口被占用时（Windows 5000 常见）可改 5001
-# ACCESS_PASSWORD=           # 访问口令；设置后所有页面需登录
+# ACCESS_PASSWORD=           # 访问口令；设置后所有页面需登录（同一 IP 连错 5 次会临时限流）
+# ALLOWED_ORIGINS=           # 允许的浏览器来源主机（逗号分隔）；用局域网 IP/域名访问时必填，否则 POST 会被 403
 # SECRET_KEY=                # Session 签名密钥；留空自动生成并持久化到 .secret_key
+# LLM_THINKING=disabled      # 思考模式全局开关（仅 DeepSeek V4 系列）；开启会挤占输出预算并忽略 temperature
+# LLM_THINKING_DIMS=profile  # 逐维度开启思考模式（默认仅锐评，其输出预算已提到 16384）
 ```
 
 > 不配置 API Key 也能使用本地统计功能。AI 分析需要任一 OpenAI 兼容服务的 Key（如 [DeepSeek](https://platform.deepseek.com/api_keys) 或阿里云 Token Plan）。
@@ -126,10 +130,15 @@ qqchatlog/
 │           ├── charts.js      # ECharts 图表渲染
 │           └── analyze.js     # AI 分析任务：轮询进度/取消/缓存读取
 ├── tests/
-│   └── test_core.py           # 核心逻辑单元测试
+│   ├── test_core.py           # 核心逻辑单元测试
+│   ├── test_hardening.py      # 健壮性/安全回归测试
+│   ├── test_optimizations.py  # 增量缓存/统计口径回归测试
+│   └── test_smoke.py          # 上传后逐页渲染冒烟测试
+├── pyproject.toml             # ruff 检查配置
 ├── .github/workflows/test.yml # CI：py_compile + unittest
 ├── uploads/                   # 上传文件暂存
-├── ai_cache/                  # AI 结果缓存（敏感，已 gitignore，30 天回收/随源文件联动删除）
+├── ai_cache/                  # AI 结果缓存（敏感，已 gitignore；滑动 30 天 + 绝对 90 天回收）
+├── stats_cache/               # 本地统计缓存（按文件内容哈希复用，重复上传不重算）
 ├── flask_session/             # Session 文件（自动生成）
 ├── logs/                      # 日志文件（自动生成）
 └── docs/                      # 设计文档与计划
@@ -151,8 +160,9 @@ qqchatlog/
 
 - 聊天记录**仅保存在本地**，不上传至任何第三方服务器
 - AI 分析时仅将文本片段发送至所配置的 LLM API，多媒体文件不会被上传
-- 上传文件与 session 数据（`uploads/`、`flask_session/`）超过 24 小时会在启动时自动清理；重新上传时旧文件**及其派生 AI 缓存**即时删除。AI 结果缓存（`ai_cache/`）保留 30 天以便跨会话复用省钱，孤儿缓存最迟 30 天回收。想立即清除：删这三个目录即可
-- 服务默认仅绑定 `127.0.0.1`，POST 请求带 CSRF token 与 Origin 双重校验；绑定非回环地址时必须设置 `ACCESS_PASSWORD` 访问口令，否则拒绝启动
+- 上传文件与 session 数据（`uploads/`、`flask_session/`）超过 24 小时会在启动时自动清理；重新上传时旧文件**及其派生 AI 缓存**即时删除。AI 结果缓存（`ai_cache/`）与统计缓存（`stats_cache/`）采用**滑动 30 天 + 绝对 90 天**双上限：常用的缓存会被续期，但创建超过 90 天一律回收（只看访问时间的话，天天查看的结果永远不会过期）。想立即清除：删这些目录即可；也可用 `QQCHAT_DATA_DIR` 把数据整体放到别处
+- 服务默认仅绑定 `127.0.0.1`，POST 请求带 CSRF token 与 Origin 双重校验；绑定非回环地址时必须设置 `ACCESS_PASSWORD` 访问口令，否则拒绝启动。Origin 白名单**不信任请求自带的 Host**（防 DNS rebinding），经局域网 IP/域名访问时请把主机写入 `ALLOWED_ORIGINS`
+- 导出的 HTML 报告会剥掉页面内的 CSRF token，可直接分享；登录接口对同一 IP 有失败限流
 
 ## 📦 依赖
 

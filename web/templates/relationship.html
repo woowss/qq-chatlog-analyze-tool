@@ -17,10 +17,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {% extends "base.html" %}
 {% block title %}人际关系{% endblock %}
 {% block content %}
-<h2 class="mb-4">👥 人际关系分析</h2>
+<h2 class="page-title">人际关系</h2>
 
 {% if not api_ok %}
-<div class="alert alert-warning">⚠️ 请先在 .env 中配置 API Key 以使用 AI 分析功能</div>
+<div class="alert alert-warning">未配置 API Key，无法运行 AI 分析；本地统计功能不受影响。</div>
 {% endif %}
 
 <div class="row mb-4">
@@ -35,16 +35,18 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     <div class="col-md-4 mb-3">
         <div class="card stat-card text-center h-100">
             <div class="card-body">
-                <div class="stat-value text-primary">{{ response_time.self_avg_seconds }}s</div>
-                <div class="stat-label">{{ overview.self_name }} 平均回复</div>
+                <div class="stat-value text-primary">{{ response_time.self.p50 }}s</div>
+                <div class="stat-label">{{ overview.self_name }} 回复中位数<br>
+                    <small class="text-muted">均值 {{ response_time.self.avg }}s · P90 {{ response_time.self.p90 }}s</small></div>
             </div>
         </div>
     </div>
     <div class="col-md-4 mb-3">
         <div class="card stat-card text-center h-100">
             <div class="card-body">
-                <div class="stat-value text-success">{{ response_time.other_avg_seconds }}s</div>
-                <div class="stat-label">{{ overview.other_name }} 平均回复</div>
+                <div class="stat-value text-success">{{ response_time.other.p50 }}s</div>
+                <div class="stat-label">{{ overview.other_name }} 回复中位数<br>
+                    <small class="text-muted">均值 {{ response_time.other.avg }}s · P90 {{ response_time.other.p90 }}s</small></div>
             </div>
         </div>
     </div>
@@ -53,7 +55,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <div class="row mb-4">
     <div class="col-md-6 mb-3">
         <div class="card">
-            <div class="card-header">📊 消息占比</div>
+            <div class="card-header">消息占比</div>
             <div class="card-body">
                 <div id="relationPieChart" style="height: 300px;"></div>
             </div>
@@ -61,7 +63,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </div>
     <div class="col-md-6 mb-3">
         <div class="card">
-            <div class="card-header">⚡ 平均回复速度对比</div>
+            <div class="card-header">平均回复速度对比</div>
             <div class="card-body">
                 <div id="responseChart" style="height: 300px;"></div>
             </div>
@@ -70,9 +72,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 </div>
 
 <div class="card mb-4">
-    <div class="card-header">🤖 AI 关系洞察</div>
+    <div class="card-header">AI 关系洞察</div>
     <div class="card-body" id="relationshipInsight">
-        <p class="text-muted text-center">请先在仪表盘中点击"人际关系"按钮获取 AI 分析</p>
+        <p class="text-muted text-center">尚无分析结果。回到仪表盘运行「人际关系」后，结果会显示在这里。</p>
     </div>
 </div>
 

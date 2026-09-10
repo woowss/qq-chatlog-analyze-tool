@@ -1,0 +1,15 @@
+[tool.ruff]
+# 代码检查配置：CI 与本地都用 `ruff check .`
+line-length = 110
+target-version = "py310"
+exclude = [".git", "__pycache__", "ai_cache", "stats_cache", "uploads", "flask_session", "logs", ".env"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+# 提示词是长中文文本，按列宽折行只会降低可读性且可能改变模型输入
+"analyzer/prompts.py" = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
