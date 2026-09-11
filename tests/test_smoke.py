@@ -25,10 +25,26 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
-# 测试隔离：数据目录指向临时目录，绝不碰真实 uploads/ai_cache/session
+# 测试隔离：数据目录指向临时目录，绝不碰真实 uploads/ai_cache/session。
+# 只清理"自己创建的"目录——外部显式指定的 QQCHAT_DATA_DIR 一律不动。
 import tempfile as _tempfile
-os.environ.setdefault("QQCHAT_DATA_DIR", _tempfile.mkdtemp(prefix="qqchatlog-test-"))
+import atexit as _atexit
+import shutil as _shutil
+
+
+def _drop_temp_data_dir():
+    """跑完把临时数据目录删掉（先关日志：否则我们的清理先跑，logging 的
+    shutdown 又把 app.log 写回来，留下一堆空目录）"""
+    import logging
+    logging.shutdown()
+    _shutil.rmtree(os.environ["QQCHAT_DATA_DIR"], ignore_errors=True)
+
+
+if "QQCHAT_DATA_DIR" not in os.environ:
+    os.environ["QQCHAT_DATA_DIR"] = _tempfile.mkdtemp(prefix="qqchatlog-test-")
+    _atexit.register(_drop_temp_data_dir)
 os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -112,6 +128,30 @@ class TestPageSmoke(unittest.TestCase):
         fresh.get("/")
         r = fresh.get("/dashboard")
         self.assertEqual(r.status_code, 302)
+
+    def test_login_page_renders(self):
+        """登录页此前没被任何用例覆盖：它不继承 base.html，模板出错不会被发现"""
+        from webapp import security
+        fresh = appmod.app.test_client()
+        with mock.patch.object(security, "ACCESS_PASSWORD", "s3cret"):
+            r = fresh.get("/login")
+            body = r.get_data(as_text=True)
+            self.assertEqual(r.status_code, 200)
+            self.assertIn('name="password"', body)
+            self.assertNotIn("Traceback", body)
+            self.assertEqual(_emoji_count(body), 0, "登录页出现了 emoji")
+        # 未设置口令时登录页直接回首页
+        self.assertEqual(fresh.get("/login").status_code, 302)
+
+    def test_login_page_reports_error_without_traceback(self):
+        from webapp import security
+        fresh = appmod.app.test_client()
+        with mock.patch.object(security, "ACCESS_PASSWORD", "s3cret"):
+            r = fresh.post("/login", data={"password": "wrong"})
+            body = r.get_data(as_text=True)
+            self.assertEqual(r.status_code, 200)
+            self.assertIn("口令错误", body)
+            self.assertNotIn("Traceback", body)
 
 
 if __name__ == "__main__":

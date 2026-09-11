@@ -39,14 +39,12 @@ UPLOAD_FOLDER = os.getenv("UPLOAD_DIR", "").strip() or str(DATA_DIR / "uploads")
 SESSION_FILE_DIR = os.getenv("SESSION_DIR", "").strip() or str(DATA_DIR / "flask_session")
 AI_CACHE_DIR = os.getenv("AI_CACHE_DIR", "").strip() or str(DATA_DIR / "ai_cache")
 STATS_CACHE_DIR = os.getenv("STATS_CACHE_DIR", "").strip() or str(DATA_DIR / "stats_cache")
+# 日志目录此前固定写在项目内（logger.py 自算路径），QQCHAT_DATA_DIR 迁移时会被漏下——
+# 现在统一归入数据目录，测试进程也不再往真实 logs/ 里写。
+LOG_DIR = os.getenv("LOG_DIR", "").strip() or str(DATA_DIR / "logs")
+LOG_FILE = os.path.join(LOG_DIR, "app.log")
 TOKEN_USAGE_FILE = os.getenv("TOKEN_USAGE_FILE", "").strip() or str(DATA_DIR / "logs" / "token_usage.json")
 MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
-
-# 月份级增量缓存开关（默认开）：重新导出同一段对话时只为新增月份付费。
-# 关掉后行为回到"整份文件哈希"的维度级缓存。
-MONTH_CACHE_ENABLED = os.getenv("QQCHAT_MONTH_CACHE", "true").strip().lower() not in (
-    "0", "false", "no", "off")
-
 
 def _env_int(name: str, default: int, low: int, high: int) -> int:
     """读取整型环境变量：非法值不再让应用崩在 import 阶段，而是回退默认值并提示"""
@@ -62,6 +60,65 @@ def _env_int(name: str, default: int, low: int, high: int) -> int:
         print(f"[WARN] {name}={value} 超出范围 [{low}, {high}]，已回退为 {default}", file=sys.stderr)
         return default
     return value
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """布尔环境变量：留空取默认值；任何写法都归约为真/假，不会崩"""
+    raw = (os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+# 日志隐私闭环：按天轮转并只保留 N 天（轮转文件由 handler 自行删除，
+# 历史遗留的 5×5MB 式 app.log.1/.2 由启动/定期清理按时间回收）。
+LOG_RETENTION_DAYS = _env_int("LOG_RETENTION_DAYS", 7, 1, 90)
+# 日志里的昵称/原始文件名默认脱敏：昵称与导出文件名常含真实称呼，属于敏感数据；
+# 本地排查问题时可在 .env 设 LOG_REDACT_NAMES=false 恢复原文。
+LOG_REDACT_NAMES = _env_bool("LOG_REDACT_NAMES", True)
+# 内存任务表条目的存活时间（结果早已落盘缓存，内存只服务轮询）
+JOB_TTL_SECONDS = _env_int("QQCHAT_JOB_TTL_SECONDS", 900, 60, 86400)
+
+# 月份级增量缓存开关（默认开）：重新导出同一段对话时只为新增月份付费。
+# 关掉后行为回到"整份文件哈希"的维度级缓存。
+MONTH_CACHE_ENABLED = os.getenv("QQCHAT_MONTH_CACHE", "true").strip().lower() not in (
+    "0", "false", "no", "off")
+
+# ---------------------------------------------------------------------------
+# 图片理解（视觉）：让模型"看"聊天里的截图/照片/表情包
+# ---------------------------------------------------------------------------
+# 媒体根目录：导出器把图片放在导出的 resources/ 下，而本工具只接收 JSON，
+# 因此需要你告诉它资源在哪（通常就是导出目录本身，url 字段形如 resources/images/xx.jpg）。
+# 留空 = 不做图片理解（其余功能完全不受影响）。
+MEDIA_ROOT = os.getenv("QQCHAT_MEDIA_DIR", "").strip()
+# 视觉开关：默认开（deepseek-flash 原生支持图片输入）。
+# 关掉即完全不上传图片，回到纯文本分析。
+VISION_ENABLED = _env_bool("LLM_VISION", True)
+# 每月最多送几张图：每张最多 1024 tokens（官方按约 1300x1300 折算）。
+# 准确性优先：默认 20 张（约 2 万 tokens/月，成本可忽略），能覆盖更多截图与表情包。
+VISION_MAX_PER_MONTH = _env_int("LLM_VISION_MAX_PER_MONTH", 20, 0, 50)
+# 送图清晰度：high 保留原图（截图里的字才看得清）；low 压到 512x512（更省 token）
+VISION_DETAIL = (os.getenv("LLM_VISION_DETAIL", "high").strip().lower() or "high")
+# 太小的图基本是表情包/缩略图，跳过以省 token（按最长边像素判断）
+VISION_MIN_SIDE = _env_int("LLM_VISION_MIN_SIDE", 200, 0, 4000)
+# 单张图片体积上限（官方 base64 上限 32 MiB，这里留一半余量）
+VISION_MAX_BYTES = _env_int("LLM_VISION_MAX_BYTES", 12 * 1024 * 1024, 65536, 32 * 1024 * 1024)
+# 一次摘要请求的图片总体积上限：官方请求体上限 48 MiB，而 base64 会膨胀约 1/3，
+# 所以原始字节控制在 32 MiB 以内（图片按顺序贪心装入，装不下的留到下次）
+VISION_MAX_TOTAL_BYTES = _env_int("LLM_VISION_MAX_TOTAL_BYTES", 32 * 1024 * 1024,
+                                  1024 * 1024, 32 * 1024 * 1024)
+
+# ---------------------------------------------------------------------------
+# 表情图（可选，默认关）：把 QQ 表情的原始图片缓存到本地，界面直接显示真表情
+# ---------------------------------------------------------------------------
+# 关闭时界面用 Unicode emoji / 表情名渲染（完全离线、零外部请求）。
+# 打开后可手动触发一次抓取：经典黄脸走 Qzone 的公开表情 CDN，商城表情用导出文件
+# 自带的地址；QQ 超级表情（吃糖/大怨种…）没有公开地址，只能靠本地已有的表情包文件。
+FACE_CACHE_DIR = os.getenv("FACE_CACHE_DIR", "").strip() or str(DATA_DIR / "face_cache")
+FACE_IMAGES_ENABLED = _env_bool("QQCHAT_FACE_IMAGES", False)
+# 一次抓取的上限与超时：失败逐条跳过，抓不到就继续用 emoji/文字
+FACE_FETCH_LIMIT = _env_int("QQCHAT_FACE_FETCH_LIMIT", 300, 1, 2000)
+FACE_FETCH_TIMEOUT = _env_int("QQCHAT_FACE_FETCH_TIMEOUT", 6, 1, 60)
 
 
 def _load_or_create_secret() -> str:

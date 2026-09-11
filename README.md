@@ -1,41 +1,49 @@
-# 📊 QQ 聊天记录分析工具
+# QQ 聊天记录分析工具
 
-> 导入 QQChatExporter 导出的 JSON 聊天记录，通过本地统计 + DeepSeek AI 实现多维度聊天分析，以 ECharts 可视化图表呈现。
+导入 [QQChatExporter](https://github.com/shuakami/qq-chat-exporter) 导出的 JSON 聊天记录，先做本地统计，
+再调用 OpenAI 兼容接口做大模型分析，结果用 ECharts 图表呈现。仅支持两人私聊记录。
 
-## ✨ 功能
+不配置 API Key 时，本地统计部分照常可用。
 
-### 📈 本地统计（无需 API Key）
-- **总览仪表盘** — 消息总数、聊天天数、日均消息、图片数量
-- **消息趋势** — 每日消息量折线图
-- **活跃时段** — 24 小时分布柱状图 + 星期分布
-- **双方对比** — 消息数、发言字数、平均句长
-- **表情排行** — 双方表情使用 Top 10
-- **高频词云** — 使用 jieba 分词提取高频词，以词云图展示
-- **对话轮次** — 统计对话来回次数
-- **回复速度** — 双方平均响应时间
-- **🕰️ 时光里程碑** — 连续聊天纪录、最长沉默期、跨零点深夜、单日峰值、最活跃月份（纯本地计算）
+## 功能
 
-### 🤖 AI 深度分析（需 LLM API Key）
-| 功能 | 说明 |
+### 本地统计（不需要 API Key）
+
+| 页面 | 内容 |
 |---|---|
-| 😊 **情绪分析** | 逐月分析双方情绪变化、情绪强度曲线 |
-| 👥 **人际关系** | 分析互动模式、亲密程度、关系角色 |
-| 🧑 **个人习惯** | 说话风格、口头禅、标点习惯、回复模式 |
-| 📈 **话题趋势** | 提取核心话题及占比、逐月话题变化 |
-| 🎯 **人物锐评** | 深度性格画像（含优缺点、思维特征、情绪模式、关系动态等） |
-| 🚀 **一键全量分析** | 五个维度顺序执行，已缓存自动跳过，实时进度与取消 |
-| ♻️ **增量分析** | 月份级内容寻址缓存：重新导出只多了几个月时，历史月份不再重复付费 |
-| 💰 **用量统计** | 仪表盘展示按天 × 维度的 token 消耗累计（本地统计，仅数字） |
+| 仪表盘 | 消息总数、聊天天数（跨度与活跃天数分开）、日均消息、图片数量与体积、视频/文件/转发/表情次数、按 md5 去重后的图片张数、每日消息量、24 小时与星期分布、双方消息数与字数对比、对话轮次、时光里程碑（连续聊天纪录、最长沉默期、跨零点夜晚、单日峰值、最活跃月份） |
+| 习惯 | 双方表情排行、一周活跃热力图、双方高频词云（jieba 分词） |
+| 关系 | 回复速度（均值与 P50/P90，界面以中位数为主）、对话轮次 |
+| 报告 | 汇总以上全部统计，可打印、导出 PDF 或下载 HTML |
 
-### 📄 全篇报告导出
-- 一键生成包含所有统计 + AI 分析的报告
-- 支持浏览器打印 / 导出 PDF / 下载 HTML
+非文本消息同样参与统计与分析。文件、视频、转发卡片、红包、通话记录、小程序卡片、商城大表情会被标注为
+`[文件:示例表.xlsx]`、`[转发:某某的聊天记录（25条）]`、`[通话:未接听]`、`[表情:叉腰]` 这样的标记送进统计与
+AI 分析，而消息正文保持干净（文件名和占位符不会进入词频与平均句长）。图片有尺寸和体积信息时，也会统计
+图片总体积与去重张数。
 
-## 🚀 快速开始
+表情排行的轴标签优先显示 QQ 表情原图，其次 Unicode emoji，最后回退到表情名。原图需要手动获取一次，见下文。
+
+### AI 分析（需要 API Key）
+
+| 维度 | 内容 |
+|---|---|
+| 情绪 | 逐月双方情绪、情绪强度曲线、月度基调、情绪转折点 |
+| 关系 | 互动模式、亲密程度、关系角色、谁更常开启话题 |
+| 习惯 | 说话风格、口头禅、标点与表情习惯、回复模式 |
+| 话题 | 核心话题及权重、逐月话题变化 |
+| 锐评 | 性格画像（优缺点、思维特征、情绪模式、关系动态等） |
+
+五个维度可以单独运行，也可以点「全量分析」按顺序跑完。分析在后台线程里跑，页面实时显示进度，可以随时取消。
+
+结果按「月份 + 内容」缓存，重新导出只多了几个月时，历史月份直接命中缓存，不再重复付费与等待；
+同一个聊天重复分析也是零成本。仪表盘会显示按天、按维度累计的 token 用量与费用估算。
+
+## 快速开始
 
 ### 1. 导出聊天记录
 
-使用 [QQChatExporter](https://github.com/shuakami/qq-chat-exporter) 导出私聊记录为 JSON 文件。
+用 QQChatExporter 导出私聊记录为 JSON。准备使用图片理解时，导出时勾选导出资源文件
+（`includeResourceLinks`），导出目录下会有 `resources/`。
 
 ### 2. 安装依赖
 
@@ -43,17 +51,19 @@
 pip install -r requirements.txt
 ```
 
+需要 Python 3.10 或更高版本。
+
 ### 3. 配置 API Key（可选）
 
-在项目根目录创建 `.env` 文件。任何 **OpenAI 兼容接口**均可使用，例如 DeepSeek：
+在项目根目录创建 `.env`。任何 OpenAI 兼容接口都可以，例如 DeepSeek 官方：
 
 ```env
 DEEPSEEK_API_KEY=你的API_Key
-DEEPSEEK_MODEL=deepseek-flash          # DeepSeek-V4.1-Flash（1M 上下文，支持 JSON Output）
+DEEPSEEK_MODEL=deepseek-flash
 DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
 ```
 
-或阿里云 Token Plan（Qwen）：
+或阿里云百炼的 Qwen：
 
 ```env
 DEEPSEEK_API_KEY=你的Token_Plan_Key
@@ -61,20 +71,7 @@ DEEPSEEK_MODEL=qwen3.8-flash
 DEEPSEEK_BASE_URL=https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
 ```
 
-可选运行 / 安全配置（默认值即安全）：
-
-```env
-# FLASK_DEBUG=false          # 调试模式（默认关闭，调试器可执行任意代码，仅限本机开发）
-# FLASK_HOST=127.0.0.1       # 绑定地址；非回环地址必须同时设置 ACCESS_PASSWORD
-# FLASK_PORT=5000            # 端口被占用时（Windows 5000 常见）可改 5001
-# ACCESS_PASSWORD=           # 访问口令；设置后所有页面需登录（同一 IP 连错 5 次会临时限流）
-# ALLOWED_ORIGINS=           # 允许的浏览器来源主机（逗号分隔）；用局域网 IP/域名访问时必填，否则 POST 会被 403
-# SECRET_KEY=                # Session 签名密钥；留空自动生成并持久化到 .secret_key
-# LLM_THINKING=disabled      # 思考模式全局开关（仅 DeepSeek V4 系列）；开启会挤占输出预算并忽略 temperature
-# LLM_THINKING_DIMS=profile  # 逐维度开启思考模式（默认仅锐评，其输出预算已提到 16384）
-```
-
-> 不配置 API Key 也能使用本地统计功能。AI 分析需要任一 OpenAI 兼容服务的 Key（如 [DeepSeek](https://platform.deepseek.com/api_keys) 或阿里云 Token Plan）。
+完整可配项见下文「配置项」，默认值即可直接使用。
 
 ### 4. 启动
 
@@ -82,103 +79,230 @@ DEEPSEEK_BASE_URL=https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mod
 python app.py
 ```
 
-浏览器打开 http://localhost:5000
+浏览器打开 http://localhost:5000 。默认只监听 `127.0.0.1`，调试模式关闭。
 
-> 默认关闭调试模式（避免调试器暴露风险）。本地开发需要自动重载时，设置环境变量 `FLASK_DEBUG=true` 再启动。
-> 若提示端口被占用（Windows 上 5000 常被 AirPlay/Hyper-V 占用），在 `.env` 中设置 `FLASK_PORT=5001`。
+端口被占用时（Windows 上 5000 常被占用）在 `.env` 里设 `FLASK_PORT=5001`。本地开发需要自动重载时设
+`FLASK_DEBUG=true`，注意调试器可以执行任意代码，只在本机使用。
 
 ### 5. 使用
 
-1. 上传 QQChatExporter 导出的 `.json` 文件
-2. 查看仪表盘获取本地统计数据
-3. 如果配置了 API Key，点击 AI 分析按钮获取深度洞察（后台任务实时显示进度，可随时取消）
-4. 已分析过的结果会缓存在 `ai_cache/`，重开页面/换标签查看**不再重复调用 API**；勾选"强制重新分析"才会重跑
+1. 上传导出的 `.json` 文件，进入仪表盘查看本地统计。
+2. 配置了 API Key 时，按维度运行 AI 分析，或点「全量分析」跑完五个维度。
+3. 已分析的结果缓存在 `ai_cache/`，重开页面不会重复调用接口；需要重跑时勾选「强制重新分析」。
 
-## 📂 项目结构
+### 图片理解（可选）
+
+需要把聊天里的图片也交给模型分析时，用首页的「选择导出目录（含图片）」按钮，选中 QQChatExporter 的导出
+目录即可。流程是：浏览器先上传 JSON，服务端解析后告诉前端这次分析需要哪几十张图片，浏览器只把这些图片传到
+本机服务。
+
+这样不会把整个 `resources/` 目录搬一遍——实测一个 近 1 GB 的导出目录，实际只需要上传几十张图片。图片副本
+放在 `uploads/media/<哈希>/`，随 `uploads/` 的 24 小时策略回收；识别出的图片摘要按图片指纹长期缓存，
+所以重跑分析不需要重新上传图片。
+
+Firefox 等不支持目录选择的环境，可以在 `.env` 里设 `QQCHAT_MEDIA_DIR=导出目录`，由服务端直接读取。
+两种方式可以并存，WebUI 上传的副本优先。
+
+### 获取原始表情图（可选，默认关闭）
+
+在 `.env` 里设 `QQCHAT_FACE_IMAGES=true`，然后到「习惯」页点一次「获取原始表情图」。程序会从 QQ 的公开
+表情 CDN 把经典黄脸和商城表情的原图下载到本地缓存（`face_cache/`），之后离线复用、不再联网。
+
+实测覆盖约 58% 的表情使用次数。QQ 的超级表情（吃糖、大怨种、菜汪之类）没有公开地址，抓不到，会继续用
+emoji 或表情名显示。想要 100% 原样，可以把 `QQCHAT_FACE_DIR` 指向自己准备的表情图目录，文件名支持
+`<编号>.gif`、`e<编号+100>.gif`、`<表情名>.gif`。断网或抓取失败时静默跳过，不影响其它功能。
+
+## 分析质量与费用
+
+默认配置按准确性优先设置：
+
+- 单月对话预算 60 万字符，足以装下绝大多数月份的全部消息，正常情况下不抽样；
+- 官方 DeepSeek 端点默认全维度开启思考模式，各维度输出预算 32k（锐评 49k），不会出现思维链吃满预算导致
+  结果被截断丢弃；
+- 每月最多送 20 张图片做视觉理解，摘要按图片指纹缓存；
+- 输出被截断时自动改用非思考模式重试一次，避免某个月从结果里消失。
+
+实测数据（数万条私聊、约一年）：
+
+| 项目 | 实测 |
+|---|---|
+| 跑一个维度 | 每月一次调用，prompt 数十万 tokens，约 ¥1.2，约 55 秒 |
+| 五个维度全量 | 约 ¥6 |
+| 同一批月份重跑 | 0 成本（命中月份缓存） |
+
+想省钱可以调小 `LLM_MAX_DIALOG_CHARS`（代价是长月份被抽样）、设 `LLM_THINKING=disabled`、
+把 `LLM_VISION_MAX_PER_MONTH` 调低。费用按模型标准价估算，空闲时段大约半价。
+
+## 配置项
+
+以下是全部可配项，都写在 `.env` 里，默认值可直接使用。
+
+### 模型接口
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `DEEPSEEK_API_KEY` | 空 | API Key，留空则只用本地统计 |
+| `DEEPSEEK_MODEL` | `deepseek-flash` | 模型名 |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | 接口地址 |
+| `LLM_CONCURRENCY` | 官方 6 / 其它 2 | 并发月份数 |
+| `LLM_CALL_MIN_INTERVAL` | 官方 0.5 / 其它 3 | 两次调用最小间隔（秒） |
+| `LLM_MAX_DIALOG_CHARS` | 600000 | 单月对话文本上限（字符） |
+| `LLM_THINKING` | 官方端点开启 | `disabled` 关闭思考模式 |
+| `LLM_THINKING_DIMS` | 空 | 只对指定维度开启，逗号分隔 |
+| `LLM_PRICE_IN` / `LLM_PRICE_OUT` | 按模型内置 | 费用估算单价（元/百万 tokens） |
+| `PROMPT_CACHE_SALT` | 空 | 手动强制失效缓存的盐值 |
+| `QQCHAT_MONTH_CACHE` | 开 | 设 `0` 关闭月份级增量缓存 |
+| `LLM_MONTH_CACHE_GRACE_HOURS` | 24 | 无引用的月份缓存宽限期 |
+
+### 图片理解与表情图
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `QQCHAT_MEDIA_DIR` | 空 | 导出目录；留空则不用服务端直接读图 |
+| `LLM_VISION` | `true` | 图片理解总开关，`false` 则完全不上传图片 |
+| `LLM_VISION_MAX_PER_MONTH` | 20 | 每月最多送几张图 |
+| `LLM_VISION_DETAIL` | `high` | 送图清晰度，`low` 会压到 512×512 |
+| `LLM_VISION_MIN_SIDE` | 200 | 小于该像素的图按表情包跳过 |
+| `LLM_VISION_MAX_BYTES` | 12582912 | 单张图片体积上限（字节） |
+| `QQCHAT_FACE_IMAGES` | `false` | 是否允许抓取 QQ 表情原图 |
+| `QQCHAT_FACE_DIR` | 空 | 本地表情包目录，优先级高于联网抓取 |
+| `QQCHAT_FACE_FETCH_LIMIT` | 300 | 一次抓取的表情图数量上限 |
+| `QQCHAT_FACE_FETCH_TIMEOUT` | 6 | 单张表情图下载超时（秒） |
+
+### 运行与安全
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `FLASK_HOST` | `127.0.0.1` | 绑定地址；非回环地址必须同时设置访问口令 |
+| `FLASK_PORT` | 5000 | 端口 |
+| `FLASK_DEBUG` | `false` | 调试模式与自动重载 |
+| `ACCESS_PASSWORD` | 空 | 访问口令，设置后所有页面需登录 |
+| `ALLOWED_ORIGINS` | 空 | 额外允许的浏览器来源主机，用局域网 IP 或域名访问时必填 |
+| `SECRET_KEY` | 自动生成 | Session 签名密钥，留空则生成并持久化到 `.secret_key` |
+| `QQCHAT_JOB_TTL_SECONDS` | 900 | 内存任务记录的存活时间 |
+| `QQCHAT_ALLOW_MULTI_PARTY` | `false` | 设为 `1` 才允许分析多人记录 |
+
+### 数据与日志
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `QQCHAT_DATA_DIR` | 项目目录 | 数据总目录，可整体迁到别处 |
+| `UPLOAD_DIR` / `SESSION_DIR` / `AI_CACHE_DIR` / `STATS_CACHE_DIR` / `LOG_DIR` / `FACE_CACHE_DIR` | 数据目录下各子目录 | 单独覆盖某一类数据的位置 |
+| `TOKEN_USAGE_FILE` | `logs/token_usage.json` | token 用量统计文件位置 |
+| `LOG_RETENTION_DAYS` | 7 | 日志按天轮转保留天数 |
+| `LOG_REDACT_NAMES` | `true` | 日志里的昵称与原始文件名脱敏 |
+
+## 隐私与数据生命周期
+
+聊天记录只保存在本机，不上传任何第三方服务器。前端资源（Bootstrap、jQuery、ECharts）已本地化，
+断网也能正常使用。
+
+AI 分析发送给你自己配置的接口，发送的内容包括：
+
+- 对话文本，以及媒体元数据标记（文件名、转发标题、表情名等）；
+- 开启图片理解时，每月最多 `LLM_VISION_MAX_PER_MONTH` 张图片（按 md5 去重、跳过表情包尺寸与超大文件）。
+  视频和文件本体不会被读取；关掉 `LLM_VISION` 就完全不发送图片。
+
+本地数据的保留策略：
+
+| 目录 | 策略 |
+|---|---|
+| `uploads/`、`flask_session/` | 超过 24 小时回收（启动时一次，之后每小时随请求触发一次） |
+| `ai_cache/`、`stats_cache/` | 滑动 30 天 + 绝对 90 天，两条上限同时生效 |
+| `logs/` | 按天轮转，默认保留 7 天，昵称脱敏 |
+| `face_cache/` | QQ 表情原图，与聊天内容无关，可随时删除 |
+
+重新上传时，旧文件及其派生缓存立即删除；删除聊天记录时，对应的统计缓存、AI 缓存、图片摘要一并回收。
+想立即清除全部数据，删除上述目录即可，或者用 `QQCHAT_DATA_DIR` 把数据整体放到别处。
+
+其它安全措施：服务默认只绑定回环地址，POST 请求同时校验 CSRF token 与 Origin；绑定非回环地址时若未设置
+`ACCESS_PASSWORD` 则拒绝启动，Origin 白名单不信任请求自带的 Host（防 DNS rebinding）；登录接口对同一 IP
+有失败限流。导出的 HTML 报告会剥掉 CSRF token、把第三方资源换回 CDN、自有样式与表情图内联，可以直接分享。
+
+## 项目结构
 
 ```
 qqchatlog/
-├── app.py                     # Flask 主应用 + 路由
+├── app.py                     # 组装入口：Flask 初始化、启动横幅、测试兼容重导出
 ├── config.py                  # 配置读取
-├── requirements.txt           # 依赖清单
-├── .env                       # API Key（不提交到 Git）
-├── .env.example               # 配置模板
-├── .gitignore
-├── parser/
-│   └── qq_parser.py           # QQ JSON → ChatData 解析器
+├── parser/qq_parser.py        # QQ JSON 解析（含多人记录防线）
 ├── analyzer/
-│   ├── __init__.py
-│   ├── prompts.py             # DeepSeek System Prompt 常量
-│   ├── local_stats.py         # 本地统计分析
-│   ├── deepseek_client.py     # DeepSeek API 调用封装
-│   └── logger.py              # 日志记录模块
+│   ├── prompts.py             # 各维度 System Prompt
+│   ├── local_stats.py         # 本地统计
+│   ├── deepseek_client.py     # 接口调用、月份级缓存、图片摘要注入
+│   ├── vision.py              # 图片理解：挑图、摘要、缓存
+│   ├── face_emoji.py          # 表情名到 Unicode emoji
+│   ├── face_images.py         # 表情原图：本地表情包 / 联网抓取 / 缓存
+│   ├── usage.py               # token 用量统计
+│   └── logger.py              # 日志（按天轮转、昵称脱敏）
+├── webapp/                    # 应用层
+│   ├── security.py            # CSRF、Origin 校验、口令登录与限流
+│   ├── store.py               # 哈希、统计缓存、AI 缓存、后台统计任务
+│   ├── jobs.py                # 分析任务表（去重、互斥、TTL）
+│   ├── cleanup.py             # 临时文件与缓存的生命周期回收
+│   ├── views.py               # 页面路由（含上传）
+│   └── api.py                 # /api/* 路由
 ├── web/
-│   ├── templates/             # HTML 模板
-│   │   ├── base.html          # 基础布局
-│   │   ├── index.html         # 首页 / 上传
-│   │   ├── login.html         # 访问口令登录页
-│   │   ├── dashboard.html     # 总览仪表盘
-│   │   ├── emotion.html       # 情绪分析
-│   │   ├── relationship.html  # 人际关系
-│   │   ├── habits.html        # 个人习惯
-│   │   ├── topics.html        # 话题趋势
-│   │   ├── profile.html       # 人物锐评
-│   │   └── report.html        # 全篇报告
+│   ├── templates/             # 页面模板
 │   └── static/
-│       ├── css/style.css      # 自定义样式
-│       └── js/
-│           ├── charts.js      # ECharts 图表渲染
-│           └── analyze.js     # AI 分析任务：轮询进度/取消/缓存读取
-├── tests/
-│   ├── test_core.py           # 核心逻辑单元测试
-│   ├── test_hardening.py      # 健壮性/安全回归测试
-│   ├── test_optimizations.py  # 增量缓存/统计口径回归测试
-│   └── test_smoke.py          # 上传后逐页渲染冒烟测试
-├── pyproject.toml             # ruff 检查配置
-├── .github/workflows/test.yml # CI：py_compile + unittest
-├── uploads/                   # 上传文件暂存
-├── ai_cache/                  # AI 结果缓存（敏感，已 gitignore；滑动 30 天 + 绝对 90 天回收）
-├── stats_cache/               # 本地统计缓存（按文件内容哈希复用，重复上传不重算）
-├── flask_session/             # Session 文件（自动生成）
-├── logs/                      # 日志文件（自动生成）
-└── docs/                      # 设计文档与计划
-    ├── specs/
-    └── plans/
+│       ├── css/style.css      # 样式与日/夜主题
+│       ├── js/                # 图表渲染与任务轮询
+│       └── vendor/            # Bootstrap、jQuery、ECharts（本地化）
+├── tests/                     # unittest：core / hardening / optimizations / review_fixes / smoke
+├── docs/                      # 早期设计文档与界面预览（内容已过时，以本 README 为准）
+├── pyproject.toml             # ruff 配置
+└── .github/workflows/test.yml # CI：ruff + py_compile + unittest
 ```
 
-## 🛠️ 技术栈
+上传目录、缓存目录、日志目录在首次运行时自动创建。
 
-| 层 | 技术 |
-|---|---|
-| 后端 | Python 3.10+, Flask 3.x |
-| 前端 | Bootstrap 5, jQuery, ECharts 5 |
-| 分词 | jieba |
-| AI API | OpenAI 兼容接口（DeepSeek / 阿里云 Token Plan Qwen 等，`.env` 可配） |
-| Session | flask-session（服务端文件存储） |
+## 技术栈
 
-## 🔒 隐私说明
+后端 Python 3.10+ 与 Flask 3，会话用 flask-session 存服务端文件；前端 Bootstrap 5、jQuery、ECharts 5，
+图表与词云都由本地文件提供；中文分词用 jieba；模型调用走 OpenAI SDK 的兼容接口。
 
-- 聊天记录**仅保存在本地**，不上传至任何第三方服务器
-- AI 分析时仅将文本片段发送至所配置的 LLM API，多媒体文件不会被上传
-- 上传文件与 session 数据（`uploads/`、`flask_session/`）超过 24 小时会在启动时自动清理；重新上传时旧文件**及其派生 AI 缓存**即时删除。AI 结果缓存（`ai_cache/`）与统计缓存（`stats_cache/`）采用**滑动 30 天 + 绝对 90 天**双上限：常用的缓存会被续期，但创建超过 90 天一律回收（只看访问时间的话，天天查看的结果永远不会过期）。想立即清除：删这些目录即可；也可用 `QQCHAT_DATA_DIR` 把数据整体放到别处
-- 服务默认仅绑定 `127.0.0.1`，POST 请求带 CSRF token 与 Origin 双重校验；绑定非回环地址时必须设置 `ACCESS_PASSWORD` 访问口令，否则拒绝启动。Origin 白名单**不信任请求自带的 Host**（防 DNS rebinding），经局域网 IP/域名访问时请把主机写入 `ALLOWED_ORIGINS`
-- 导出的 HTML 报告会剥掉页面内的 CSRF token，可直接分享；登录接口对同一 IP 有失败限流
+## 常见问题
 
-## 📦 依赖
+**AI 分析报 429，提示 `Allocated quota exceeded` 或 `insufficient_quota`**
 
-核心依赖：Flask、Flask-Session、OpenAI SDK（DeepSeek 兼容接口）、python-dotenv、jieba。
-完整锁定清单见 `requirements.txt`（`pip install -r requirements.txt` 即可）。
+这是每分钟限流（TPM/RPM），不是套餐额度耗尽——该报错文案有误导性，限流按主账号聚合，通常一分钟内自动恢复。
+程序已经内置应对：全局调用间隔平滑突发，命中 429 后全局冷却等待 25 秒并重试最多 4 次，多次不恢复才中止并
+保留已完成的部分。仍然频繁触发时：
 
-## ❓ 常见问题
+1. 调低请求强度：`LLM_CONCURRENCY=1`、`LLM_CALL_MIN_INTERVAL=5`，或调小 `LLM_MAX_DIALOG_CHARS`；
+2. 到服务商控制台临时提升该模型的 TPM 限额；
+3. 避开同账号其它程序的大量请求时段，所有 Key 共享同一个限流池。
 
-**Q：AI 分析时报 429 "Allocated quota exceeded / insufficient_quota"？**
+**端口被占用**
 
-这是**每分钟限流（TPM/RPM）**，不是套餐额度耗尽（该报错文案有误导性，[官方文档](https://www.alibabacloud.com/help/en/model-studio/rate-limit) 明确限流按主账号聚合、通常 1 分钟内自动恢复）。应用已内置应对：全局 3 秒调用间隔平滑突发、命中 429 自动等待 25s 重试最多 4 次、多次不恢复才中止并保留部分结果。若仍频繁触发：
+Windows 上 5000 端口常被 AirPlay 或 Hyper-V 占用，在 `.env` 里设 `FLASK_PORT=5001`。
 
-1. 在 `.env` 中下调：`LLM_CONCURRENCY=1`、`LLM_CALL_MIN_INTERVAL=5`，或减小 `LLM_MAX_DIALOG_CHARS=30000`（每请求更省 token）
-2. 到百炼控制台「限流提额」页临时提升该模型的 TPM 配额（立即生效）
-3. 避开同账号其他程序（如编码 Agent）的大量请求时段——所有 API Key 共享同一个限流池
+**必须联网吗**
 
-## 📜 许可证
+不必须。页面、图表、样式全部本地化。只有两处涉及网络，而且都是可选的：图片理解（把图片发给你自己配置的
+模型接口）与表情原图抓取。两者都可以关掉。
+
+**怎么彻底清掉数据**
+
+删除 `uploads/`、`flask_session/`、`ai_cache/`、`stats_cache/`、`logs/`、`face_cache/` 即可，或者把
+`QQCHAT_DATA_DIR` 指到一个临时目录后再启动。
+
+**上传群聊记录被拒绝**
+
+工具只支持两人私聊。多人记录里除自己外的所有人都会被并进「对方」，统计与 AI 分析会整体失真，所以默认
+直接拒收。确实要按「我 vs 其他人」分析时，设 `QQCHAT_ALLOW_MULTI_PARTY=1`。
+
+## 已知限制
+
+- 只支持两人私聊记录，多人记录默认拒收。
+- 视频和文件本体不参与分析，只使用文件名与体积等元数据；图片可选做视觉理解。
+- QQ 超级表情的原图没有公开地址，需要自备表情包目录才能显示。
+- 首页的目录选择依赖浏览器的 `webkitdirectory`（Chrome、Edge 支持），其它浏览器请用 `QQCHAT_MEDIA_DIR`。
+- 大月份的分析较慢，实测约一年、数万条记录跑一个维度约 55 秒。
+- 统计与月份划分固定按北京时间（UTC+8）计算，不随系统时区变化。
+- 解析后的聊天数据会在内存中保留最近一份（6 万条约几十 MB），第二次分析直接复用、不再重新解析。
+- `docs/index.html` 是早期的界面预览，内容与当前版本不一致，以本 README 为准。
+
+## 许可证
 
 [GPL v3](LICENSE)

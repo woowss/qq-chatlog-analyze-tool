@@ -364,7 +364,19 @@ def calc_overview(chat: ChatData) -> dict:
     self_chars = sum(len(m.text) for m in msgs if m.sender_uid == chat.self_uid)
     other_chars = sum(len(m.text) for m in msgs if m.sender_uid != chat.self_uid)
     total_images = sum(1 for m in msgs if m.has_image)
-    total_faces = sum(len(m.face_ids) for m in msgs)
+    # 表情计数：商城大表情（type_17）没有数字 id，只有名字，取两者中有的那个
+    total_faces = sum((len(m.face_names) or len(m.face_ids)) for m in msgs)
+    # 媒体体积与去重：导出器的 size/md5 只对媒体本体有效。
+    # 注意图片与非图片媒体分开统计——把两者混成一个"媒体合计"会让用户以为
+    # 图片只占几十 MB（实测图片 2.2 GB、文件/视频 280 MB，混在一起就是误导）。
+    image_msgs = [m for m in msgs if m.has_image]
+    image_bytes = sum(m.media_bytes for m in image_msgs)
+    other_media_bytes = sum(m.media_bytes for m in msgs if m.media_kind)
+    image_ids = {m.media_id for m in image_msgs if m.media_id}
+    unique_images = len(image_ids) if image_ids else None    # 无 md5 的导出器给 None
+    # 非文本媒体（文件/视频/转发/红包/表情气泡/Markdown）：原先完全不统计，
+    # 现在按类型计数，界面上与图片并列展示
+    media = Counter(m.media_kind for m in msgs if m.media_kind)
 
     active_days = len({f[0] for f in fields})
     span_days = 0
@@ -381,6 +393,14 @@ def calc_overview(chat: ChatData) -> dict:
         "active_days": active_days,
         "total_images": total_images,
         "total_faces": total_faces,
+        "total_files": media.get("file", 0),
+        "total_videos": media.get("video", 0),
+        "total_forwards": media.get("forward", 0),
+        "total_other_media": (media.get("wallet", 0) + media.get("face_bubble", 0)
+                              + media.get("markdown", 0)),
+        "image_bytes": image_bytes,
+        "other_media_bytes": other_media_bytes,
+        "unique_images": unique_images,
         "self_name": chat.self_name,
         "other_name": chat.other_name,
         "self_count": self_count,
