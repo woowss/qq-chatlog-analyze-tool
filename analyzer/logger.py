@@ -21,16 +21,38 @@ handler 只在包级配置一次：早先每个 logger 名各建一套 handler�
 "app" 与 "deepseek" 两个 logger 各持一个指向 logs/app.log 的
 RotatingFileHandler，Windows 上轮转时 os.rename 会因另一个句柄占用而
 抛 PermissionError，轮转失效且日志行丢失。
+
+保留策略：按天轮转 + 只留 LOG_RETENTION_DAYS 天（TimedRotatingFileHandler
+在轮转时自行删除超限的旧文件）。此前是 5×5MB 的纯大小轮转——本地工具日志
+量很小，25MB 相当于"无限期"，而日志行里会出现昵称与文件名，无期限留存与
+"不留敏感数据"的承诺相悖。
 """
 import logging
 import sys
-from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-LOG_DIR = Path(__file__).parent.parent / "logs"
-LOG_FILE = LOG_DIR / "app.log"
+from config import LOG_DIR, LOG_FILE, LOG_REDACT_NAMES, LOG_RETENTION_DAYS
+
+LOG_DIR_PATH = Path(LOG_DIR)
 LOG_LEVEL = logging.INFO
 PACKAGE_LOGGER = "qqchatlog"
+
+
+def mask_name(name: str) -> str:
+    """显示名脱敏：保留首字，其余打码（LOG_REDACT_NAMES=false 时原样返回）。
+
+    昵称与导出文件名常含真实称呼；默认脱敏让日志可以整目录留存/贴给别人看，
+    本地排查问题时用 LOG_REDACT_NAMES=false 恢复原文。
+    """
+    if not LOG_REDACT_NAMES:
+        return name or ""
+    n = (name or "").strip()
+    if not n:
+        return "*"
+    if len(n) == 1:
+        return "*"          # 单字昵称留首字等于没脱敏
+    return n[0] + "*" * (len(n) - 1)
 
 
 class _ConsoleHandler(logging.StreamHandler):
@@ -65,14 +87,15 @@ def _configure(base: logging.Logger) -> None:
     base.setLevel(LOG_LEVEL)
     base.propagate = False        # 不再向 root 传播，避免被第三方/默认配置重复输出
 
-    # 1) 文件日志 — 按大小轮转，保留 5 份 × 5MB
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    # 1) 文件日志 — 按天轮转，保留 LOG_RETENTION_DAYS 天
+    LOG_DIR_PATH.mkdir(parents=True, exist_ok=True)
     file_fmt = logging.Formatter(
         "[%(asctime)s] %(levelname)-7s %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    file_handler = RotatingFileHandler(
-        LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    file_handler = TimedRotatingFileHandler(
+        LOG_FILE, when="midnight",
+        backupCount=LOG_RETENTION_DAYS, encoding="utf-8",
     )
     file_handler.setLevel(LOG_LEVEL)
     file_handler.setFormatter(file_fmt)

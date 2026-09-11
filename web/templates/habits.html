@@ -19,6 +19,20 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {% block content %}
 <h2 class="page-title">说话习惯</h2>
 
+{% if face_images_enabled %}
+<div class="d-flex align-items-center gap-2 mb-3 no-print">
+    <button type="button" class="btn btn-sm btn-outline-secondary" id="fetchFacesBtn"
+            title="经典黄脸与商城表情可按公开地址下载并缓存到本地；QQ 超级表情没有公开地址，抓不到">
+        获取原始表情图（需联网，可选）
+    </button>
+    <span class="small text-muted" id="fetchFacesMsg">
+        当前以 {% if face_images %}原始表情图{% else %}emoji / 表情名{% endif %} 渲染
+        {%- if face_images %}（已缓存 {{ face_images | length }} 个）{% endif %}；
+        抓不到的表情会自动回退，不影响其它功能。
+    </span>
+</div>
+{% endif %}
+
 {% if not api_ok %}
 <div class="alert alert-warning">未配置 API Key，无法运行 AI 分析；本地统计功能不受影响。</div>
 {% endif %}
@@ -78,10 +92,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 <script>
 $(function() {
-    // 表情排行
+    // 表情排行（原始表情图 > Unicode emoji > 表情名，三级回退）
+    // 注意用 items()|list 传成二维数组：Flask 的 tojson 默认 sort_keys=True，
+    // 直接传 dict 会按字符编码重排，"排行"就变成了按汉字码点排序（真实现象）。
     {% if face_stats %}
-    renderFaceBarChart('selfFaceChart', {{ face_stats.self | tojson }}, {{ overview.self_name | tojson }});
-    renderFaceBarChart('otherFaceChart', {{ face_stats.other | tojson }}, {{ overview.other_name | tojson }});
+    renderFaceBarChart('selfFaceChart', {{ face_stats.self.items() | list | tojson }}, {{ overview.self_name | tojson }}, {{ (face_emoji or {}) | tojson }}, {{ (face_images or {}) | tojson }});
+    renderFaceBarChart('otherFaceChart', {{ face_stats.other.items() | list | tojson }}, {{ overview.other_name | tojson }}, {{ (face_emoji or {}) | tojson }}, {{ (face_images or {}) | tojson }});
     {% endif %}
 
     // 热力图
@@ -98,6 +114,25 @@ $(function() {
     // AI 分析（服务端缓存优先，回退 sessionStorage）
     loadAnalysis('habits', function(data) {
         if (data) renderHabitsInsight(data);
+    });
+
+    // 可选的原始表情图抓取：只在用户点击时联网；失败也不报错，继续用 emoji/文字
+    $('#fetchFacesBtn').on('click', function() {
+        var btn = $(this).prop('disabled', true).text('抓取中…');
+        $.post('/api/faces/fetch', function(res) {
+            if (res.error) {
+                $('#fetchFacesMsg').text(res.error);
+                btn.prop('disabled', false).text('获取原始表情图（需联网，可选）');
+                return;
+            }
+            $('#fetchFacesMsg').text('已缓存 ' + res.available + ' / ' + res.total +
+                ' 个表情图（本次新增 ' + res.fetched + ' 个），刷新中…');
+            window.location.reload();
+        }).fail(function(xhr) {
+            var msg = (xhr.responseJSON && xhr.responseJSON.error) || '抓取失败（可能没有联网）';
+            $('#fetchFacesMsg').text(msg + '；已回退用 emoji / 表情名渲染');
+            btn.prop('disabled', false).text('获取原始表情图（需联网，可选）');
+        });
     });
 });
 </script>

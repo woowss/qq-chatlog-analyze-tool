@@ -23,6 +23,13 @@
    - 卡片走"纸面 + 轻投影"，导航为带阴影的表面条，右上角提供日/夜切换
    ========================================================================== */
 
+/* 主题切换整页 reload（ECharts 把颜色烤进 canvas，CSS 变量热更新不了）。
+   跨文档 View Transition 让这次 reload 以淡入淡出呈现，支持 Chromium 126+，
+   其他浏览器按普通刷新，功能不受影响。 */
+@view-transition {
+    navigation: auto;
+}
+
 :root {
     color-scheme: light;
 

@@ -16,43 +16,114 @@
 #
 """LLM token 用量统计 — 按「天 × 维度」聚合持久化到 logs/token_usage.json。
 
-只记录数字（调用次数/prompt/completion tokens），不含任何聊天内容；
-线程安全（并发月份分析共享写入），落盘采用临时文件 + 原子替换。
+只记录数字（调用次数/prompt/completion tokens），不含任何聊天内容。
+写入是**合并去抖**的：一次全量分析动辄几十次调用，原先每次调用都全量重写
+JSON（锁内读-改-写，串行化在 API 节奏上）；现在增量先进内存，
+5 秒内的连续调用合并成一次落盘。三个保底：get_usage() 读前冲刷、
+线程在 FLUSH_DELAY 后自动冲刷、进程正常退出时 atexit 冲刷。
 """
+import atexit
 import json
 import os
 import threading
 from datetime import datetime, timedelta, timezone
 
 from config import TOKEN_USAGE_FILE
+from analyzer.logger import get_logger
+
+logger = get_logger("usage")
 
 CST = timezone(timedelta(hours=8))
 
 _LOCK = threading.Lock()
 _EMPTY = {"days": {}, "dims": {}, "total": {"calls": 0, "prompt": 0, "completion": 0}}
 
+# 待落盘的增量（与文件同构的 delta），由 _LOCK 保护
+_PENDING = {"days": {}, "dims": {}, "total": {"calls": 0, "prompt": 0, "completion": 0}}
+_DIRTY = False
+_TIMER = None
+FLUSH_DELAY_SECONDS = 5.0
+
+
+def _accumulate(bucket: dict, key: str, calls: int, prompt: int, completion: int) -> None:
+    """（须持有 _LOCK）把一个聚合条目并入 bucket；全 0 则不创建空条目"""
+    if not (calls or prompt or completion):
+        return
+    entry = bucket.setdefault(key, {"calls": 0, "prompt": 0, "completion": 0})
+    entry["calls"] += calls
+    entry["prompt"] += prompt
+    entry["completion"] += completion
+
 
 def record_call(model: str, dim: str, prompt_tokens: int, completion_tokens: int) -> None:
     """记录一次 API 调用的用量；失败静默（统计不能影响主流程）"""
+    global _DIRTY
     prompt_tokens = int(prompt_tokens or 0)
     completion_tokens = int(completion_tokens or 0)
     day = datetime.now(tz=CST).strftime("%Y-%m-%d")
     dim_key = f"{dim}|{model}"
     try:
         with _LOCK:
-            data = _load()
-            for bucket, key in ((data["days"], day), (data["dims"], dim_key)):
-                entry = bucket.setdefault(key, {"calls": 0, "prompt": 0, "completion": 0})
-                entry["calls"] += 1
-                entry["prompt"] += prompt_tokens
-                entry["completion"] += completion_tokens
-            t = data["total"]
-            t["calls"] += 1
-            t["prompt"] += prompt_tokens
-            t["completion"] += completion_tokens
-            _dump(data)
-    except Exception:
-        pass
+            _pending_add(day, dim_key, prompt_tokens, completion_tokens)
+            _DIRTY = True
+            _schedule_flush()
+    except Exception as e:
+        logger.debug("用量统计记录失败（忽略，不影响分析）: %s", e)
+
+
+def _pending_add(day: str, dim_key: str, prompt: int, completion: int) -> None:
+    """把一次调用并入内存增量（调用方持有 _LOCK）"""
+    for bucket, key in ((_PENDING["days"], day), (_PENDING["dims"], dim_key)):
+        entry = bucket.setdefault(key, {"calls": 0, "prompt": 0, "completion": 0})
+        entry["calls"] += 1
+        entry["prompt"] += prompt
+        entry["completion"] += completion
+    t = _PENDING["total"]
+    t["calls"] += 1
+    t["prompt"] += prompt
+    t["completion"] += completion
+
+
+def _schedule_flush() -> None:
+    """去抖：已有定时任务在飞就不再排（调用方持有 _LOCK）"""
+    global _TIMER
+    if _TIMER is None:
+        _TIMER = threading.Timer(FLUSH_DELAY_SECONDS, _timer_flush)
+        _TIMER.daemon = True
+        _TIMER.start()
+
+
+def _timer_flush() -> None:
+    global _TIMER
+    with _LOCK:
+        _TIMER = None
+        _flush_locked()
+
+
+def flush() -> None:
+    """把内存里的增量并入文件（读接口与进程退出前都会自动调用）"""
+    with _LOCK:
+        _flush_locked()
+
+
+def _flush_locked() -> None:
+    """（须持有 _LOCK）有增量才读写文件：N 次连续调用合并为一次落盘"""
+    global _DIRTY
+    if not _DIRTY:
+        return
+    data = _load()
+    for section in ("days", "dims"):
+        for key, delta in _PENDING[section].items():
+            _accumulate(data[section], key, delta["calls"], delta["prompt"], delta["completion"])
+    t = _PENDING["total"]
+    for k in ("calls", "prompt", "completion"):
+        data["total"][k] = data["total"].get(k, 0) + t[k]
+    _dump(data)
+    _PENDING["days"].clear()
+    _PENDING["dims"].clear()
+    for k in t:
+        t[k] = 0
+    _DIRTY = False
 
 
 # 价格表（元 / 百万 tokens），用于把用量换算成"大概花了多少钱"。
@@ -87,8 +158,12 @@ def estimate_cost(prompt_tokens: int, completion_tokens: int, model: str) -> flo
 
 
 def get_usage() -> dict:
-    """读取聚合用量；附带派生字段 total_tokens 与估算费用"""
+    """读取聚合用量；附带派生字段 total_tokens 与估算费用。
+
+    读前先冲刷增量，保证「调用完立刻看」不会出现数据滞后。
+    """
     with _LOCK:
+        _flush_locked()
         data = _load()
     out = {k: dict(v) if isinstance(v, dict) else v for k, v in data.items()}
     dims = {}
@@ -113,6 +188,9 @@ def _load() -> dict:
         with open(TOKEN_USAGE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict) and "days" in data:
+            data.setdefault("days", {})
+            data.setdefault("dims", {})
+            data.setdefault("total", {"calls": 0, "prompt": 0, "completion": 0})
             return data
     except (OSError, json.JSONDecodeError):
         pass
@@ -125,3 +203,6 @@ def _dump(data: dict) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
     os.replace(tmp, TOKEN_USAGE_FILE)
+
+
+atexit.register(flush)

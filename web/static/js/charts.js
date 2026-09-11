@@ -361,27 +361,66 @@ function renderWordCloud(domId, data, title) {
     window.addEventListener('resize', function() { chart.resize(); });
 }
 
-function renderFaceBarChart(domId, data, personName) {
+function renderFaceBarChart(domId, data, personName, emojiMap, imageMap) {
     const el = document.getElementById(domId);
     if (!el) return;
-    const entries = Object.entries(data).slice(0, 10);
+    // 兼容两种入参：[[名字, 次数], ...]（保序，模板用 items()|list 传来）
+    // 或 {名字: 次数}（旧格式）。顺序即排行，绝不能按名字重排。
+    let entries = Array.isArray(data) ? data.map(function (p) { return [p[0], p[1]]; })
+                                      : Object.entries(data || {});
+    entries = entries.slice(0, 10);
     if (!entries.length) {
         el.innerHTML = '<div class="text-muted text-center py-4">表情数据不足</div>';
         return;
     }
+    emojiMap = emojiMap || {};
+    imageMap = imageMap || {};
+    // 三级回退：有原始表情图就画图（ECharts rich text 的 backgroundImage），
+    // 否则用 Unicode emoji，再否则显示表情名——QQ 专属表情抓不到图时不硬凑。
+    const rich = {};
+    const labels = entries.map(function (e, i) {
+        const name = e[0];
+        if (imageMap[name]) {
+            const style = 'face' + i;
+            rich[style] = { backgroundColor: { image: imageMap[name] },
+                            width: 20, height: 20, align: 'center' };
+            return '{' + style + '|}';
+        }
+        return emojiMap[name] ? emojiMap[name] : name.replace(/^\//, '');
+    });
     const chart = echarts.init(el);
     chart.setOption({
-        tooltip: { trigger: 'axis', formatter: function(p) { return esc(p.name) + ': ' + p.value + '次'; } },
+        tooltip: {
+            trigger: 'axis',
+            formatter: function (p) {
+                const name = entries[p[0].dataIndex][0];
+                const em = emojiMap[name];
+                return esc(em ? em + ' ' + name.replace(/^\//, '') : name) + ': ' + p[0].value + '次';
+            }
+        },
         grid: { left: '5%', right: '10%', containLabel: true },
         xAxis: { type: 'value', name: '次数' },
         yAxis: {
             type: 'category',
-            data: entries.map(function(e) { return e[0]; }),
-            axisLabel: { fontSize: 13, fontWeight: 'bold' }
+            // 排行要"第一名在最上面"：ECharts 类目轴默认自下而上，这里翻转
+            inverse: true,
+            data: labels,
+            axisTick: { alignWithLabel: true },
+            axisLabel: {
+                fontSize: 18,
+                // 关键：emoji 字形（彩色 emoji 字体）与中文字形的度量不同，不指定 lineHeight
+                // 时轴标签会与柱条错位半个行高；固定行高让两者对齐。
+                lineHeight: 18,
+                verticalAlign: 'middle',
+                margin: 10,
+                rich: rich,
+                fontFamily: '"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",'
+                            + '"Microsoft YaHei",sans-serif'
+            }
         },
         series: [{
             type: 'bar',
-            data: entries.map(function(e) { return e[1]; }),
+            data: entries.map(function (e) { return e[1]; }),
             itemStyle: { color: T.primary, borderRadius: [0,3,3,0] },
             label: { show: true, position: 'right', fontWeight: 'bold' }
         }]
@@ -410,30 +449,31 @@ function renderHeatmapChart(domId, data) {
             type: 'category',
             data: Array.from({length:24}, function(_,i) { return i; }),
             splitArea: { show: false },
-            axisLabel: { interval: 1, fontSize: 10, color: '#6b7280' },
+            axisLabel: { interval: 1, fontSize: 10, color: T.axis },
             axisTick: { show: false },
-            axisLine: { lineStyle: { color: '#e4e7eb' } }
+            axisLine: { lineStyle: { color: T.split } }
         },
         yAxis: {
             type: 'category',
             data: weekdays,
             splitArea: { show: false },
-            axisLabel: { fontSize: 11, color: '#6b7280' },
+            axisLabel: { fontSize: 11, color: T.axis },
             axisTick: { show: false },
-            axisLine: { lineStyle: { color: '#e4e7eb' } }
+            axisLine: { lineStyle: { color: T.split } }
         },
         visualMap: {
             min: 0, max: maxVal, calculable: true, orient: 'horizontal',
             left: 'center', bottom: 0, itemWidth: 12, itemHeight: 90,
             inRange: { color: T.heat },
-            textStyle: { color: '#6b7280', fontSize: 11 }
+            textStyle: { color: T.axis, fontSize: 11 }
         },
         series: [{
             type: 'heatmap',
             data: heatData,
             label: { show: false },
-            itemStyle: { borderColor: '#ffffff', borderWidth: 2, borderRadius: 2 },
-            emphasis: { itemStyle: { borderColor: '#1f2328', borderWidth: 1 } }
+            // 格子描边用主题色：写死 #ffffff 会让深色主题下出现一圈白线
+            itemStyle: { borderColor: T.surface, borderWidth: 2, borderRadius: 2 },
+            emphasis: { itemStyle: { borderColor: T.axis, borderWidth: 1 } }
         }]
     });
     window.addEventListener('resize', function() { chart.resize(); });
@@ -442,14 +482,22 @@ function renderHeatmapChart(domId, data) {
 // ========== AI 分析图表 ==========
 
 function renderEmotionCharts(data) {
+    if (!data) return;
     const months = Object.keys(data).sort();
-    var selfIntensity = months.map(function(m) { return data[m].self_intensity; });
-    var otherIntensity = months.map(function(m) { return data[m].other_intensity; });
-    var selfEmotions = months.map(function(m) { return data[m].self_emotion; });
-    var otherEmotions = months.map(function(m) { return data[m].other_emotion; });
+    // 模型偶尔会漏字段：取值统一兜底，别让一个 undefined 把整块图表打断
+    var val = function (m, key, fallback) {
+        var d = data[m] || {};
+        return d[key] === undefined || d[key] === null ? fallback : d[key];
+    };
+    var selfIntensity = months.map(function(m) { return val(m, 'self_intensity', 0); });
+    var otherIntensity = months.map(function(m) { return val(m, 'other_intensity', 0); });
+    var selfEmotions = months.map(function(m) { return val(m, 'self_emotion', '数据不足'); });
+    var otherEmotions = months.map(function(m) { return val(m, 'other_emotion', '数据不足'); });
 
     // 情绪强度折线图
-    var lineChart = echarts.init(document.getElementById('emotionLineChart'));
+    var lineEl = document.getElementById('emotionLineChart');
+    if (!lineEl) return;
+    var lineChart = echarts.init(lineEl);
     lineChart.setOption({
         tooltip: {
             trigger: 'axis',
@@ -522,6 +570,7 @@ function renderEmotionCharts(data) {
 }
 
 function renderRelationshipInsight(data) {
+    if (!data) return;
     var months = Object.keys(data).sort();
     var html = '';
     months.forEach(function(m) {
@@ -541,6 +590,7 @@ function renderRelationshipInsight(data) {
 }
 
 function renderHabitsInsight(data) {
+    if (!data) return;
     var html = '';
     ['self', 'other'].forEach(function(key) {
         var d = data[key];
@@ -564,14 +614,16 @@ function renderHabitsInsight(data) {
 }
 
 function renderTopicsCharts(data) {
+    if (!data) return;
     var topicMap = {};
     var months = Object.keys(data).sort();
 
     months.forEach(function(m) {
         var d = data[m];
-        if (!d || !d.topics) return;
+        if (!d || !Array.isArray(d.topics)) return;
         d.topics.forEach(function(t) {
-            topicMap[t.name] = (topicMap[t.name] || 0) + t.weight;
+            var w = Number(t && t.weight);
+            topicMap[t.name] = (topicMap[t.name] || 0) + (isFinite(w) ? w : 0);
         });
     });
 

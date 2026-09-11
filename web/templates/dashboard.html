@@ -50,6 +50,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             <div class="card-body">
                 <div class="stat-value">{{ overview.total_images }}</div>
                 <div class="stat-label">图片总数</div>
+                <small class="text-muted">
+                    视频 {{ overview.get('total_videos', 0) }} · 文件 {{ overview.get('total_files', 0) }}
+                    · 转发 {{ overview.get('total_forwards', 0) }} · 表情 {{ overview.get('total_faces', 0) }}<br>
+                    图片 {{ overview.get('image_bytes', 0) | filesizeformat }}
+                    · 文件/视频 {{ overview.get('other_media_bytes', 0) | filesizeformat }}
+                    {% if overview.get('unique_images') %}
+                    · 去重后 {{ overview.get('unique_images') }} 张
+                    {% endif %}
+                </small>
             </div>
         </div>
     </div>
@@ -312,7 +321,8 @@ $('#btn-analyze-all').on('click', function() {
 
 <script>
 (function() {
-    const DIM_LABEL = {emotion:'情绪',topics:'话题',relationship:'关系',habits:'习惯',profile:'锐评',unknown:'其他'};
+    const DIM_LABEL = {emotion:'情绪',topics:'话题',relationship:'关系',habits:'习惯',profile:'锐评',
+                       vision:'图片理解',unknown:'其他'};
     function fmt(n) { return (n || 0).toLocaleString(); }
     $.get('/api/usage', function(u) {
         if (!u || !u.total || !u.total.calls) return;
@@ -331,7 +341,7 @@ $('#btn-analyze-all').on('click', function() {
             var model = parts[1] ? ' <span class="text-muted">' + esc(parts[1]) + '</span>' : '';
             return '<tr><td>' + esc(name) + model + '</td><td class="text-end">' + fmt(e.calls) + ' 次</td>' +
                 '<td class="text-end">' + fmt(e.prompt + e.completion) + ' tok</td>' +
-                '<td class="text-end">' + (e.cost ? '¥' + e.cost.toFixed(2) : '—') + '</td></tr>';
+                '<td class="text-end">' + (Number(e.cost) > 0 ? '¥' + Number(e.cost).toFixed(2) : '—') + '</td></tr>';
         });
         var dayRows = Object.entries(u.days || {}).sort(function(a, b) {
             return b[0] < a[0] ? -1 : 1;

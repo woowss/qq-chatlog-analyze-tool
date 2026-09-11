@@ -79,7 +79,9 @@ function cancelAnalyze(opts) {
 }
 
 // loadAnalysis(dim, cb)：优先读服务端磁盘缓存（跨标签页/重启浏览器仍有效），
-// 失败时回退 sessionStorage（兼容旧会话）
+// 失败时回退 sessionStorage（兼容旧会话）。
+// 注意区分"确实还没有分析结果"（404）与"读取失败"（网络/服务异常）：
+// 后者若也显示成"尚无分析结果"，用户会以为没跑过而重复付费分析。
 function loadAnalysis(dim, cb) {
     $.get('/api/analysis/' + dim, function(data) {
         if (data && data.result) {
@@ -88,10 +90,31 @@ function loadAnalysis(dim, cb) {
         } else {
             cb(null);
         }
-    }).fail(function() {
-        var raw = sessionStorage.getItem('ai_' + dim);
+    }).fail(function(xhr) {
+        var status = xhr && xhr.status;
+        var raw = null;
+        try { raw = sessionStorage.getItem('ai_' + dim); } catch (e) { raw = null; }
         var parsed = null;
         try { parsed = raw ? JSON.parse(raw) : null; } catch (e) { parsed = null; }
-        cb(parsed);
+        if (parsed) { cb(parsed); return; }
+        if (status && status !== 404) {
+            showLoadWarning('读取分析结果失败（HTTP ' + status + '），请刷新页面重试；'
+                + '已生成的结果不会丢失，重跑也会命中缓存。');
+        }
+        cb(null);
     });
+}
+
+// 顶部提示条：只在第一次出现时插入，避免刷屏
+function showLoadWarning(message) {
+    var box = document.getElementById('loadWarnBox');
+    if (!box) {
+        box = document.createElement('div');
+        box.id = 'loadWarnBox';
+        box.className = 'alert alert-warning small mb-3';
+        var host = document.querySelector('.container');
+        if (!host) return;
+        host.insertBefore(box, host.firstChild);
+    }
+    if (box.textContent !== message) box.textContent = message;
 }
