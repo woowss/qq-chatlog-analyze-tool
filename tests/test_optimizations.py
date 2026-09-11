@@ -15,9 +15,11 @@
 #
 #
 """优化项回归测试：增量缓存、统计落盘、可选统计口径、配置防呆、指纹失效"""
+import atexit as _atexit
 import io
 import json
 import os
+import shutil as _shutil
 import sys
 import tempfile
 import time
@@ -27,8 +29,16 @@ from pathlib import Path
 from unittest import mock
 
 # 测试隔离：数据目录指向临时目录，避免测试读写真实的 uploads/ai_cache/session
-import tempfile as _tempfile
-os.environ.setdefault("QQCHAT_DATA_DIR", _tempfile.mkdtemp(prefix="qqchatlog-test-"))
+# 测试隔离：数据目录指向临时目录，绝不碰真实 uploads/ai_cache/session。
+# 只清理"自己创建的"目录——外部显式指定的 QQCHAT_DATA_DIR 一律不动。
+import tempfile as _tempfile  # noqa: E402
+if "QQCHAT_DATA_DIR" not in os.environ:
+    os.environ["QQCHAT_DATA_DIR"] = _tempfile.mkdtemp(prefix="qqchatlog-test-")
+    def _drop_temp_data_dir():
+        import logging
+        logging.shutdown()
+        _shutil.rmtree(os.environ["QQCHAT_DATA_DIR"], ignore_errors=True)
+    _atexit.register(_drop_temp_data_dir)
 # 月份缓存会跨用例复用同一份月份内容，使"调用次数"断言失去确定性；
 # 需要它的用例会自行开启并指向临时目录。
 os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
@@ -187,6 +197,7 @@ class TestMonthIncrementalCache(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="qqchatlog-monthcache-")
+        self.addCleanup(_shutil.rmtree, self.tmp, ignore_errors=True)
         self._orig_dir = dc._MONTH_CACHE_DIR
         dc.configure_month_cache(self.tmp)
         self.addCleanup(lambda: dc.configure_month_cache(self._orig_dir))
@@ -281,6 +292,7 @@ class TestStatsCache(unittest.TestCase):
             filepath = sess["filepath"]
             self.assertNotIn("overview", sess, "统计结果不应再塞进 session")
             self.assertNotIn("daily_counts", sess)
+        appmod.wait_for_stats(chat_hash)   # 统计已挪到后台线程，断言前先收口
         try:
             stats = appmod._load_stats(chat_hash)
             self.assertIsNotNone(stats)
@@ -308,14 +320,15 @@ class TestStatsCache(unittest.TestCase):
     def test_word_freq_is_computed_lazily_and_cached(self):
         import app as appmod
         from flask import session as flask_session
+        from webapp import store as storemod
         stats = {"overview": {"total_messages": 1}}
         with appmod.app.test_request_context("/habits"):
             flask_session["filepath"] = __file__         # 存在即可
             flask_session["chat_hash"] = "hashW"
             with mock.patch.object(
-                    appmod, "_load_chat_cached",
+                    storemod, "_load_chat_cached",
                     return_value=_chat([_msg("u1", 1704067200000, "今天加班到十点")])), \
-                 mock.patch.object(appmod, "_save_stats") as saved:
+                 mock.patch.object(storemod, "_save_stats") as saved:
                 out = appmod._stats_with_word_freq(dict(stats), "hashW")
         self.assertIn("word_freq", out)
         self.assertTrue(saved.called)
@@ -343,29 +356,54 @@ class TestConfigHardening(unittest.TestCase):
             self.assertEqual(config._env_int("FLASK_PORT", 5000, 1, 65535), 5001)
 
     def test_thinking_budget_conflict_is_reported(self):
+        """开了思考模式但预算不足时必须告警（这类组合会 100% 截断丢结果）"""
         with mock.patch.object(dc, "THINKING_DEFAULT", True), \
-             mock.patch.object(dc, "THINKING_DIMS", frozenset()):
+             mock.patch.object(dc, "THINKING_DIMS", frozenset()), \
+             mock.patch.object(dc, "MAX_TOKENS_BY_DIM", {"emotion": 1024, "profile": 16384}):
             warnings = dc.thinking_budget_warnings()
         self.assertTrue(any("emotion" in w for w in warnings))
         self.assertFalse(any("profile" in w for w in warnings))   # profile 预算充足
 
+    def test_shipped_defaults_are_conflict_free(self):
+        """出厂设置（准确性优先）不该再出现"开思考但预算不足"的组合"""
+        self.assertEqual(dc.thinking_budget_warnings(), [])
+        for dim, budget in dc.MAX_TOKENS_BY_DIM.items():
+            self.assertGreaterEqual(budget, dc.THINKING_MIN_TOKENS,
+                                    f"{dim} 的预算装不下思维链 + 结果")
+
 
 class TestPromptFingerprint(unittest.TestCase):
-    """指纹必须随提示词/格式变化——这是"忘记 bump 版本号"那个坑的根治办法"""
+    """指纹必须随提示词/格式/输入预算变化——这是"忘记 bump 版本号"那个坑的根治办法"""
 
     def test_fingerprint_is_stable_and_content_addressed(self):
-        import hashlib
-        import inspect
-        import analyzer.prompts as prompts
-        from analyzer.deepseek_client import _build_dialog, _message_line, _fit_lines, \
-            _conversation_stats, _short_time
-        parts = [getattr(prompts, n) for n in sorted(dir(prompts))
-                 if n.startswith("SYSTEM_PROMPT_")]
-        parts += [inspect.getsource(f) for f in
-                  (_build_dialog, _message_line, _fit_lines, _conversation_stats, _short_time)]
-        expect = hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
-        self.assertEqual(dc.PROMPT_FINGERPRINT, expect)
+        import analyzer.deepseek_client as dc
+        fp1 = dc._prompt_fingerprint()
+        fp2 = dc._prompt_fingerprint()
+        self.assertEqual(fp1, fp2, "同一份代码算出的指纹必须稳定")
         self.assertEqual(len(dc.PROMPT_FINGERPRINT), 12)
+
+    def test_prompt_change_changes_fingerprint(self):
+        import analyzer.deepseek_client as dc
+        base = dc._prompt_fingerprint()
+        with mock.patch("analyzer.prompts.SYSTEM_PROMPT_EMOTION",
+                        "完全不同的提示词"):
+            self.assertNotEqual(base, dc._prompt_fingerprint(),
+                                "改了系统提示词必须换指纹")
+
+    def test_input_budget_change_changes_fingerprint(self):
+        """对话预算/时间标记口径会改变喂给模型的输入，必须反映在指纹里。
+
+        曾经只哈希函数源码：把 MAX_DIALOG_CHARS 从 5 万调到 1 万后，
+        输入内容变了但指纹没变，旧缓存会继续以"新分析"的名义返回旧结果。
+        """
+        import analyzer.deepseek_client as dc
+        base = dc._prompt_fingerprint()
+        with mock.patch.object(dc, "MAX_DIALOG_CHARS", 10_000):
+            self.assertNotEqual(base, dc._prompt_fingerprint(),
+                                "改了对话字符预算必须换指纹")
+        with mock.patch.object(dc, "TIME_MARK_MINUTES", 5):
+            self.assertNotEqual(base, dc._prompt_fingerprint(),
+                                "改了时间标记口径必须换指纹")
 
     def test_cache_key_uses_fingerprint_not_manual_version(self):
         import app as appmod
@@ -377,15 +415,38 @@ class TestPromptFingerprint(unittest.TestCase):
 class TestCacheRetention(unittest.TestCase):
     """缓存保留：滑动 30 天 + 绝对 90 天（只看 mtime 会让常用缓存永不回收）"""
 
+    def _patch_dirs(self, tmp):
+        """把 store 与 cleanup 两个命名空间的目录都指向临时目录后返回上下文列表"""
+        from webapp import cleanup as cleanupmod
+        from webapp import store as storemod
+        stats = os.path.join(tmp, "stats")
+        up = os.path.join(tmp, "up")
+        sess = os.path.join(tmp, "sess")
+        for d in (stats, up, sess):
+            os.makedirs(d, exist_ok=True)
+        return [
+            mock.patch.object(storemod, "AI_CACHE_DIR", tmp),
+            mock.patch.object(storemod, "STATS_CACHE_DIR", stats),
+            mock.patch.object(cleanupmod, "AI_CACHE_DIR", tmp),
+            mock.patch.object(cleanupmod, "STATS_CACHE_DIR", stats),
+            mock.patch.object(cleanupmod, "UPLOAD_FOLDER", up),
+            mock.patch.object(cleanupmod, "SESSION_FILE_DIR", sess),
+        ]
+
+    def _start(self, patches):
+        for p in patches:
+            p.start()
+
+    def _stop(self, patches):
+        for p in reversed(patches):
+            p.stop()
+
     def test_absolute_cap_removes_frequently_read_cache(self):
         import app as appmod
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(appmod, "AI_CACHE_DIR", tmp), \
-                 mock.patch.object(appmod, "STATS_CACHE_DIR", os.path.join(tmp, "stats")), \
-                 mock.patch.object(appmod, "UPLOAD_FOLDER", os.path.join(tmp, "up")), \
-                 mock.patch.object(appmod, "SESSION_FILE_DIR", os.path.join(tmp, "sess")):
-                for d in ("stats", "up", "sess"):
-                    os.makedirs(os.path.join(tmp, d), exist_ok=True)
+            patches = self._patch_dirs(tmp)
+            self._start(patches)
+            try:
                 appmod._write_cache("emotion", "hashOld", {"a": 1})
                 path = appmod._cache_path("emotion", "hashOld")
                 # 模拟"创建于 100 天前、但昨天刚被读过"（mtime 新，_created 很老）
@@ -397,19 +458,38 @@ class TestCacheRetention(unittest.TestCase):
                 os.utime(path, None)
                 appmod._cleanup_old_files()
                 self.assertFalse(os.path.exists(path), "超过绝对上限的缓存必须删除")
+            finally:
+                self._stop(patches)
 
     def test_sliding_window_keeps_active_cache(self):
         import app as appmod
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(appmod, "AI_CACHE_DIR", tmp), \
-                 mock.patch.object(appmod, "STATS_CACHE_DIR", os.path.join(tmp, "stats")), \
-                 mock.patch.object(appmod, "UPLOAD_FOLDER", os.path.join(tmp, "up")), \
-                 mock.patch.object(appmod, "SESSION_FILE_DIR", os.path.join(tmp, "sess")):
-                for d in ("stats", "up", "sess"):
-                    os.makedirs(os.path.join(tmp, d), exist_ok=True)
+            patches = self._patch_dirs(tmp)
+            self._start(patches)
+            try:
                 appmod._write_cache("emotion", "hashNew", {"a": 1})
                 appmod._cleanup_old_files()
                 self.assertTrue(os.path.exists(appmod._cache_path("emotion", "hashNew")))
+            finally:
+                self._stop(patches)
+
+    def test_legacy_size_rotated_logs_are_purged(self):
+        """换按天轮转后，遗留的 app.log.1/.2 也要按保留天数回收；token_usage.json 不动"""
+        from webapp import cleanup as cleanupmod
+        with tempfile.TemporaryDirectory() as tmp:
+            old_log = os.path.join(tmp, "app.log.1")
+            with open(old_log, "w", encoding="utf-8") as f:
+                f.write("legacy rotated line\n")
+            keep = os.path.join(tmp, "token_usage.json")
+            with open(keep, "w", encoding="utf-8") as f:
+                f.write("{}")
+            old = time.time() - 30 * 86400
+            os.utime(old_log, (old, old))
+            os.utime(keep, (old, old))
+            with mock.patch.object(cleanupmod, "LOG_DIR", tmp):
+                cleanupmod.cleanup_old_files()
+            self.assertFalse(os.path.exists(old_log), "过期旧日志必须删除")
+            self.assertTrue(os.path.exists(keep), "用量统计文件不属于日志轮转产物，不能误删")
 
 
 if __name__ == "__main__":

@@ -34,7 +34,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # 测试隔离：数据目录指向临时目录，避免测试读写真实的 uploads/ai_cache/session
 import tempfile as _tempfile
-os.environ.setdefault("QQCHAT_DATA_DIR", _tempfile.mkdtemp(prefix="qqchatlog-test-"))
+# 测试隔离：数据目录指向临时目录，绝不碰真实 uploads/ai_cache/session。
+# 只清理"自己创建的"目录——外部显式指定的 QQCHAT_DATA_DIR 一律不动。
+import atexit as _atexit
+import shutil as _shutil
+
+
+def _drop_temp_data_dir():
+    """跑完把临时数据目录删掉（先关日志：否则我们的清理先跑，logging 的
+    shutdown 又把 app.log 写回来，留下一堆空目录）"""
+    import logging
+    logging.shutdown()
+    _shutil.rmtree(os.environ["QQCHAT_DATA_DIR"], ignore_errors=True)
+
+
+if "QQCHAT_DATA_DIR" not in os.environ:
+    os.environ["QQCHAT_DATA_DIR"] = _tempfile.mkdtemp(prefix="qqchatlog-test-")
+    _atexit.register(_drop_temp_data_dir)
 # 月份缓存会跨用例复用同一份月份内容，使"调用次数"断言失去确定性；
 # 专门验证增量缓存的用例会自行开启并指向临时目录。
 os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
@@ -185,7 +201,7 @@ class TestJobOverlapGuard(unittest.TestCase):
         # 这些用例只关心任务编排，不能依赖本机 .env 是否配了 API Key（CI 没有 .env）
         self._patches = [
             mock.patch("analyzer.deepseek_client.is_api_configured", return_value=True),
-            mock.patch("app.is_api_configured", return_value=True),
+            mock.patch("webapp.api.is_api_configured", return_value=True),
         ]
         for p in self._patches:
             p.start()
@@ -254,7 +270,7 @@ class TestJobOverlapGuard(unittest.TestCase):
         with mock.patch("analyzer.deepseek_client._call_api",
                         return_value={"self_emotion": "平静", "other_emotion": "平静"}), \
              mock.patch("analyzer.deepseek_client.is_api_configured", return_value=True), \
-             mock.patch("app.is_api_configured", return_value=True):
+             mock.patch("webapp.api.is_api_configured", return_value=True):
             job = self.client.post("/api/analyze/emotion",
                                    headers=self._headers()).get_json()["job"]
             deadline = time.time() + 15
@@ -315,7 +331,8 @@ class TestLoginThrottle(unittest.TestCase):
 
     def test_repeated_failures_are_throttled(self):
         import app as appmod
-        with mock.patch.object(appmod, "ACCESS_PASSWORD", "s3cret"):
+        from webapp import security as securitymod
+        with mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"):
             for _ in range(appmod.LOGIN_MAX_ATTEMPTS):
                 r = self.client.post("/login", data={"password": "wrong"})
                 self.assertEqual(r.status_code, 200)      # 正常渲染错误提示
@@ -327,7 +344,8 @@ class TestLoginThrottle(unittest.TestCase):
 
     def test_success_clears_failures(self):
         import app as appmod
-        with mock.patch.object(appmod, "ACCESS_PASSWORD", "s3cret"):
+        from webapp import security as securitymod
+        with mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"):
             self.client.post("/login", data={"password": "wrong"})
             r = self.client.post("/login", data={"password": "s3cret"})
             self.assertEqual(r.status_code, 302)

@@ -33,15 +33,30 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                 </div>
                 {% endif %}
 
+                {% if stats_error %}
+                <div class="alert alert-danger">
+                    <strong>上次上传的本地统计计算失败</strong><br>
+                    <span class="small">原因：{{ stats_error }}<br>
+                    请重新上传该文件；若反复出现，请查看 <code>logs/app.log</code> 并在 Issue 中附上该文件的统计口径信息。</span>
+                </div>
+                {% endif %}
+
                 <form action="/upload" method="post" enctype="multipart/form-data" id="uploadForm">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                     <div class="upload-zone mb-3" id="dropZone">
                         <div class="upload-hint">拖拽 JSON 文件到此处，或点击下方按钮选择</div>
                         <input type="file" name="file" id="fileInput" accept=".json" class="d-none">
+                        <!-- 选中导出目录：服务端解析 JSON 后告诉前端要哪几十张图，
+                             浏览器只上传这些（不搬整个 resources/，也不用填路径配置） -->
+                        <input type="file" id="dirInput" webkitdirectory directory multiple class="d-none">
                         <button type="button" class="btn btn-outline-primary" onclick="$('#fileInput').click()">
                             选择文件
                         </button>
+                        <button type="button" class="btn btn-outline-secondary ms-2" id="dirBtn">
+                            选择导出目录（含图片）
+                        </button>
                         <div id="fileName" class="mt-3 small text-success d-none"></div>
+                        <div id="uploadHint" class="mt-2 small text-muted d-none"></div>
                     </div>
                     <button type="submit" class="btn btn-primary" id="submitBtn" disabled>
                         上传并分析
@@ -59,7 +74,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                     </ol>
                     <div class="mb-1 fw-semibold text-body">隐私</div>
                     <p class="mb-0">
-                        数据仅保存在本机；仅 AI 分析时会把文本片段发送给你配置的 LLM 接口，图片等多媒体不会上传。
+                        数据仅保存在本机；AI 分析时把文本片段（以及可选的图片摘要素材）发送给你自己配置的 LLM 接口。
+                        选了「导出目录」时，浏览器只会挑出看图所需的少量图片上传到本机服务，视频与文件不会被读取。
                     </p>
                 </div>
             </div>
@@ -69,12 +85,44 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 <script>
 $(function() {
-    $('#fileInput').on('change', function() {
-        const file = this.files[0];
+    var pickedJson = null;      // 待上传的 JSON（单文件选择或从目录里挑出来）
+    var pickedDir = [];         // 从导出目录里拿到的全部文件（用于按需上传图片）
+
+    function setJsonFile(file, note) {
+        pickedJson = file;
         if (file) {
-            $('#fileName').text('已选择: ' + file.name).removeClass('d-none');
+            $('#fileName').text('已选择: ' + file.name + (note ? '（' + note + '）' : '')).removeClass('d-none');
             $('#submitBtn').prop('disabled', false);
         }
+    }
+
+    $('#fileInput').on('change', function() {
+        pickedDir = [];
+        setJsonFile(this.files[0]);
+    });
+
+    $('#dirBtn').on('click', function() { $('#dirInput').click(); });
+
+    // 目录选择依赖 webkitdirectory（Chrome/Edge 支持）：不支持的浏览器上直接禁用，
+    // 别让按钮看起来能用却选不出东西
+    if (!('webkitdirectory' in document.createElement('input'))) {
+        $('#dirBtn').prop('disabled', true)
+            .attr('title', '当前浏览器不支持目录选择；可在 .env 里设置 QQCHAT_MEDIA_DIR 指定导出目录');
+    }
+
+    $('#dirInput').on('change', function() {
+        var files = Array.prototype.slice.call(this.files || []);
+        var jsons = files.filter(function(f) { return /\.json$/i.test(f.name); });
+        if (!jsons.length) {
+            $('#uploadHint').text('该目录里没有找到 .json 导出文件').removeClass('d-none');
+            return;
+        }
+        // 优先取名字像聊天导出的那个（含 friend_/group_ 或时间戳最长者）
+        jsons.sort(function(a, b) { return (b.name.length - a.name.length); });
+        pickedDir = files;
+        setJsonFile(jsons[0], '目录内共 ' + files.length + ' 个文件');
+        $('#uploadHint').removeClass('d-none').text(
+            '将按需上传看图所需的图片（视频与文件不会被读取）');
     });
 
     const dropZone = $('#dropZone');
@@ -85,17 +133,91 @@ $(function() {
         $(this).removeClass('drag-over');
         const files = e.originalEvent.dataTransfer.files;
         if (files.length) {
+            pickedDir = [];
             $('#fileInput')[0].files = files;
-            $('#fileName').text('已选择: ' + files[0].name).removeClass('d-none');
-            $('#submitBtn').prop('disabled', false);
+            setJsonFile(files[0]);
         }
     });
 
-    $('#uploadForm').on('submit', function() {
+    function csrf() { return window.CSRF_TOKEN || ''; }
+
+    // 从选中的目录里取出服务端要的那几张图片并按批上传（每批 40 个文件）
+    function uploadWanted(dirFiles, wanted, done) {
+        var byName = {};
+        dirFiles.forEach(function(f) {
+            var p = (f.webkitRelativePath || f.name).replace(/\\/g, '/');
+            byName[p.split('/').pop()] = f;
+        });
+        var queue = wanted.map(function(rel) {
+            return byName[rel.replace(/\\/g, '/').split('/').pop()];
+        }).filter(Boolean);
+        if (!queue.length) { done(0, 0); return; }
+        var sent = 0, savedTotal = 0, skippedTotal = 0;
+        function next() {
+            var batch = queue.slice(sent, sent + 40);
+            if (!batch.length) { done(savedTotal, skippedTotal); return; }
+            var fd = new FormData();
+            batch.forEach(function(f) { fd.append('files', f, f.name); });
+            $.ajax({
+                url: '/api/media', method: 'POST', data: fd,
+                processData: false, contentType: false,
+                headers: { 'X-CSRF-Token': csrf() }
+            }).done(function(res) {
+                savedTotal += (res.saved || 0);
+                skippedTotal += (res.skipped || 0);
+                sent += batch.length;
+                $('#uploadHint').removeClass('d-none').text(
+                    '已上传图片 ' + savedTotal + ' / ' + queue.length + ' …');
+                next();
+            }).fail(function(xhr) {
+                // 中途失败：不要把失败说成成功，也不要静默丢掉剩余批次
+                done(savedTotal, skippedTotal, (xhr && xhr.status) || '网络错误');
+            });
+        }
+        next();
+    }
+
+    $('#uploadForm').on('submit', function(e) {
+        if (!pickedJson) { return; }
+        e.preventDefault();
         $('#submitBtn').prop('disabled', true).text('上传中…');
         // 上传新聊天记录时清掉上一次的 AI 分析结果，避免在新聊天页面展示旧数据
         ['emotion', 'relationship', 'habits', 'topics', 'profile'].forEach(function(k) {
             sessionStorage.removeItem('ai_' + k);
+        });
+        var fd = new FormData();
+        fd.append('csrf_token', csrf());
+        fd.append('file', pickedJson, pickedJson.name);
+        $.ajax({
+            url: '/upload', method: 'POST', data: fd,
+            processData: false, contentType: false,
+            headers: { 'X-CSRF-Token': csrf(), 'X-Requested-With': 'fetch' }
+        }).done(function(res) {
+            if (!res || !res.ok) {
+                $('#submitBtn').prop('disabled', false).text('上传并分析');
+                $('#uploadHint').removeClass('d-none').text((res && res.error) || '上传失败');
+                return;
+            }
+            var wanted = res.wanted_media || [];
+            if (pickedDir.length && wanted.length) {
+                $('#submitBtn').text('上传图片…');
+                uploadWanted(pickedDir, wanted, function(saved, skipped, error) {
+                    // 如实小结：上传了几张、服务端跳过了几张、是否中途失败
+                    var parts = ['已上传图片 ' + saved + ' 张'];
+                    if (skipped) parts.push('服务端跳过 ' + skipped + ' 张');
+                    if (error) parts.push('中途失败（' + error + '），可刷新页面重新选择目录');
+                    parts.push('开始分析…');
+                    $('#uploadHint').removeClass('d-none').text(parts.join('，'));
+                    setTimeout(function() { window.location.href = res.next || '/dashboard'; },
+                               error ? 2500 : 400);
+                });
+            } else {
+                window.location.href = res.next || '/dashboard';
+            }
+        }).fail(function(xhr) {
+            $('#submitBtn').prop('disabled', false).text('上传并分析');
+            var msg = (xhr.responseJSON && xhr.responseJSON.error) || xhr.responseText || '上传失败';
+            $('#uploadHint').removeClass('d-none').text(String(msg).slice(0, 120));
         });
     });
 });

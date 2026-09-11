@@ -31,16 +31,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # 测试隔离：数据目录指向临时目录，避免测试读写真实的 uploads/ai_cache/session
 import tempfile as _tempfile
-os.environ.setdefault("QQCHAT_DATA_DIR", _tempfile.mkdtemp(prefix="qqchatlog-test-"))
+# 测试隔离：数据目录指向临时目录，绝不碰真实 uploads/ai_cache/session。
+# 只清理"自己创建的"目录——外部显式指定的 QQCHAT_DATA_DIR 一律不动。
+import atexit as _atexit
+import shutil as _shutil
+
+
+def _drop_temp_data_dir():
+    """跑完把临时数据目录删掉（先关日志：否则我们的清理先跑，logging 的
+    shutdown 又把 app.log 写回来，留下一堆空目录）"""
+    import logging
+    logging.shutdown()
+    _shutil.rmtree(os.environ["QQCHAT_DATA_DIR"], ignore_errors=True)
+
+
+if "QQCHAT_DATA_DIR" not in os.environ:
+    os.environ["QQCHAT_DATA_DIR"] = _tempfile.mkdtemp(prefix="qqchatlog-test-")
+    _atexit.register(_drop_temp_data_dir)
 # 月份缓存会跨用例复用同一份月份内容，使"调用次数"断言失去确定性；
 # 专门验证增量缓存的用例会自行开启并指向临时目录。
 os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
 
-from parser.qq_parser import (CST, ChatData, Message, is_statistical,
+# 数据目录/路径准备必须在导入项目模块之前完成，故下面的导入带 noqa: E402
+from parser.qq_parser import (CST, ChatData, Message, is_statistical,  # noqa: E402
                               load_chat, split_by_month)
-from analyzer.deepseek_client import (MAX_DIALOG_CHARS, _build_dialog,
+from analyzer.deepseek_client import (MAX_DIALOG_CHARS, _build_dialog,  # noqa: E402
                                       _fit_lines)
-from analyzer.local_stats import calc_milestones, calc_overview, calc_response_time
+from analyzer.local_stats import calc_milestones, calc_overview, calc_response_time  # noqa: E402
 
 
 def _write_chat(data: dict) -> str:
@@ -244,7 +261,8 @@ class TestCsrfProtection(unittest.TestCase):
     def test_allowed_origins_config_is_honored(self):
         """局域网/自定义域名通过 ALLOWED_ORIGINS 显式放行"""
         import app as appmod
-        with mock.patch.object(appmod, "ALLOWED_ORIGINS", frozenset({"chat.lan"})):
+        from webapp import security as securitymod
+        with mock.patch.object(securitymod, "ALLOWED_ORIGINS", frozenset({"chat.lan"})):
             with appmod.app.test_request_context(
                     "/upload", headers={"Host": "127.0.0.1:5000", "Origin": "http://chat.lan"}):
                 self.assertTrue(appmod._origin_allowed())
@@ -367,7 +385,7 @@ class TestAiCache(unittest.TestCase):
         try:
             with mock.patch("analyzer.deepseek_client._call_api", return_value=fake_result) as m:
                 with mock.patch("analyzer.deepseek_client.is_api_configured", return_value=True), \
-                     mock.patch("app.is_api_configured", return_value=True):
+                     mock.patch("webapp.api.is_api_configured", return_value=True):
                     r = client.post("/api/analyze/emotion",
                                     headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
                     body = r.get_json()
@@ -520,6 +538,34 @@ class TestQuotaAndThrottle(unittest.TestCase):
         """锐评预算必须能同时装下思维链与长 JSON（实测思考模式约占 2-4k token）"""
         self.assertGreaterEqual(self.dc.MAX_TOKENS_BY_DIM["profile"], 16384)
 
+    def test_all_budgets_leave_room_for_thinking(self):
+        """准确性优先：每月一调的维度也要留足思维链空间（官方 max output 384K）"""
+        for dim, budget in self.dc.MAX_TOKENS_BY_DIM.items():
+            self.assertGreaterEqual(budget, 16384, f"{dim} 预算过小，思考模式易被截断")
+            self.assertLessEqual(budget, 384_000, f"{dim} 超过官方 max output")
+
+    def test_truncated_output_retries_without_thinking(self):
+        """被截断时降级重试：宁可精度略降，也不让这个月从结果里消失"""
+        truncated = mock.Mock()
+        truncated.choices = [mock.Mock(finish_reason="length",
+                                       message=mock.Mock(content='{"a": 1}'))]
+        truncated.usage = None
+        ok = self._ok_resp()
+        ok.choices[0].message.content = '{"self_emotion": "平静"}'
+        fake = mock.Mock()
+        fake.chat.completions.create.side_effect = [truncated, ok]
+        with mock.patch.object(self.dc, "THINKING_DEFAULT", True), \
+             mock.patch.object(self.dc, "THINKING_DIMS", frozenset()), \
+             mock.patch.object(self.dc, "_SEND_THINKING_PARAM", True), \
+             mock.patch.object(self.dc, "_get_client", return_value=fake):
+            out = self.dc._call_api("s", "u", tag="emotion", retry=0)
+        self.assertEqual(out, {"self_emotion": "平静"}, "降级重试应拿到结果")
+        calls = fake.chat.completions.create.call_args_list
+        self.assertEqual(calls[0].kwargs["extra_body"], {"thinking": {"type": "enabled"}})
+        self.assertEqual(calls[1].kwargs["extra_body"], {"thinking": {"type": "disabled"}},
+                         "第二次必须关掉思考模式")
+        self.assertIn("temperature", calls[1].kwargs)
+
     def test_non_deepseek_gateway_gets_no_thinking_param(self):
         """百炼等网关未显式配置思考模式时不发送 thinking 字段，避免非法参数"""
         fake = mock.Mock()
@@ -669,7 +715,7 @@ class TestAnalyzeAll(unittest.TestCase):
         cache_before = set(cache_dir.glob("*"))
         try:
             with mock.patch("analyzer.deepseek_client._call_api", return_value=fake) as m, \
-                 mock.patch("app.is_api_configured", return_value=True):
+                 mock.patch("webapp.api.is_api_configured", return_value=True):
                 r = client.post("/api/analyze-all",
                                 headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
                 body = r.get_json()
@@ -759,19 +805,21 @@ class TestCacheLifecycle(unittest.TestCase):
     def test_cache_path_separates_thinking_mode(self):
         """切换思考模式必须换键：否则开/关 thinking 后会命中另一模式的旧结果"""
         import app as appmod
-        with mock.patch.object(appmod, "thinking_enabled", lambda d: d == "profile"):
+        from webapp import store as storemod
+        with mock.patch.object(storemod, "thinking_enabled", lambda d: d == "profile"):
             think_path = appmod._cache_path("profile", "hashX")
             plain_path = appmod._cache_path("emotion", "hashX")
         self.assertTrue(think_path.endswith("_think.json"))
         self.assertFalse(plain_path.endswith("_think.json"))
         # 未开思考时不加后缀，既有缓存键保持兼容
-        with mock.patch.object(appmod, "thinking_enabled", lambda d: False):
+        with mock.patch.object(storemod, "thinking_enabled", lambda d: False):
             self.assertFalse(appmod._cache_path("profile", "hashX").endswith("_think.json"))
 
     def test_purge_removes_thinking_cache_too(self):
         """级联删除不看思考模式后缀，思考模式结果同样不会成为孤儿"""
         import app as appmod
-        with mock.patch.object(appmod, "thinking_enabled", lambda d: True):
+        from webapp import store as storemod
+        with mock.patch.object(storemod, "thinking_enabled", lambda d: True):
             appmod._write_cache("profile", "hashCCC", {"x": 1})
             path = appmod._cache_path("profile", "hashCCC")
             try:
@@ -834,7 +882,7 @@ class TestJobDedup(unittest.TestCase):
         cache_before = set(cache_dir.glob("*"))
         try:
             with mock.patch("analyzer.deepseek_client._call_api", side_effect=blocking), \
-                 mock.patch("app.is_api_configured", return_value=True):
+                 mock.patch("webapp.api.is_api_configured", return_value=True):
                 h = {"Origin": "http://localhost:5000", "X-CSRF-Token": token}
                 b1 = client.post("/api/analyze/emotion", headers=h).get_json()
                 b2 = client.post("/api/analyze/emotion", headers=h).get_json()
@@ -864,9 +912,12 @@ class TestStratifiedProfileSample(unittest.TestCase):
     """锐评样本必须覆盖整个时间轴（growth_observation 的前提），而非只取最近"""
 
     def test_profile_sample_spans_timeline(self):
+        """样本量已按"准确性优先"上调（800 条），这里用 1600 条构造 stride=2 的场景"""
         import analyzer.deepseek_client as dc
+        sample_size = 800
+        total = sample_size * 2          # 正好触发 stride=2 的抽稀
         msgs = []
-        for i in range(400):   # 每天一条，跨 ~13 个月
+        for i in range(total):   # 每天一条
             m = _msg("self", 1735689600000 + i * 86400000, text=f"消息{i}")
             m.time_str = datetime.fromtimestamp(m.timestamp / 1000, tz=CST) \
                             .strftime("%Y-%m-%d %H:%M:%S")
@@ -885,9 +936,9 @@ class TestStratifiedProfileSample(unittest.TestCase):
         self.assertEqual(len(captured), 1)   # other 一方无发言
         prompt = captured[0]
         self.assertIn("按时间均匀抽样覆盖整个时段", prompt)
-        self.assertIn("消息0", prompt)       # 最早
-        self.assertIn("消息398", prompt)     # 最晚（stride=2 时最后一个偶数下标）
-        self.assertNotIn("消息1\n", prompt)  # 中间奇数条目被抽稀
+        self.assertIn("消息0", prompt)                    # 最早
+        self.assertIn(f"消息{total - 2}", prompt)         # 最晚（stride=2 的最后一个偶数下标）
+        self.assertNotIn("消息1\n", prompt)               # 奇数条目被抽稀
 
 
 class TestReuploadCacheLifecycle(unittest.TestCase):
