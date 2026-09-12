@@ -278,7 +278,10 @@ class TestCacheWriteFailuresAreLoud(unittest.TestCase):
             with open(missing, "w", encoding="utf-8") as f:
                 f.write("占位：同名文件存在时，目录创建/写入必然失败")
             dc.configure_month_cache(missing)
-            dc._last_write_warning[0] = 0.0
+            # 去抖比较的是 time.monotonic()（Linux 上即开机时长）。把它当成 0.0 时，
+            # 刚启动不到去抖窗口（300s）的机器上 now - 0 < 300 会成立、警告被吞掉，
+            # 用例就在 GitHub runner 上偶发失败。用 -inf 表示"从未告警过"，与开机时长无关。
+            dc._last_write_warning[0] = float("-inf")
             try:
                 with self.assertLogs("qqchatlog.deepseek", level="WARNING") as logs:
                     dc._write_month_cache("key1", {"a": 1})
