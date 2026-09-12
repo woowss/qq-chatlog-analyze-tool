@@ -23,6 +23,7 @@
 - 图片本体只从本地 `QQCHAT_MEDIA_DIR` 读取，只发给用户自己配置的 LLM 端点；
   关掉 LLM_VISION 就完全回到纯文本。
 """
+
 import base64
 import hashlib
 import json
@@ -60,16 +61,19 @@ VISION_SYSTEM = (
 )
 
 _SUPPORTED = {
-    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-    ".gif": "image/gif", ".webp": "image/webp",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
 }
-SUPPORTED_EXT = frozenset(_SUPPORTED)          # 供上传接口做扩展名白名单
+SUPPORTED_EXT = frozenset(_SUPPORTED)  # 供上传接口做扩展名白名单
 
 # WebUI 上传图片副本的容量上限：一次最多接收多少张 / 多少字节
 MEDIA_UPLOAD_MAX_FILES = 400
 MEDIA_UPLOAD_MAX_BYTES = 256 * 1024 * 1024
 
-_MEMO: dict[str, str] = {}          # 进程内摘要缓存：key -> 摘要文本
+_MEMO: dict[str, str] = {}  # 进程内摘要缓存：key -> 摘要文本
 _MEMO_LOCK = threading.Lock()
 _MEMO_MAX = 64
 
@@ -100,8 +104,7 @@ def purge_session_media(chat_hash: str) -> int:
     if not os.path.isdir(target):
         return 0
     try:
-        count = sum(1 for name in os.listdir(target)
-                    if os.path.isfile(os.path.join(target, name)))
+        count = sum(1 for name in os.listdir(target) if os.path.isfile(os.path.join(target, name)))
     except OSError:
         count = 0
     shutil.rmtree(target, ignore_errors=True)
@@ -113,7 +116,7 @@ def _within(root: str, path: str) -> bool:
     try:
         root_abs = os.path.abspath(root)
         return os.path.commonpath([root_abs, os.path.abspath(path)]) == root_abs
-    except ValueError:                      # 不同盘符等
+    except ValueError:  # 不同盘符等
         return False
 
 
@@ -139,7 +142,7 @@ def resolve(media_path: str, chat_hash: str = ""):
         return None
     candidates = [os.path.join(MEDIA_ROOT, rel)]
     if rel.startswith("resources/"):
-        candidates.append(os.path.join(MEDIA_ROOT, rel[len("resources/"):]))
+        candidates.append(os.path.join(MEDIA_ROOT, rel[len("resources/") :]))
     else:
         candidates.append(os.path.join(MEDIA_ROOT, "resources", rel))
     for cand in candidates:
@@ -156,10 +159,10 @@ def _sample(msgs: list, limit: int) -> list:
         if not m.has_image:
             continue
         if m.media_w and m.media_h and max(m.media_w, m.media_h) < VISION_MIN_SIDE:
-            continue                                  # 小图基本是表情包/缩略图，不值得花 token
+            continue  # 小图基本是表情包/缩略图，不值得花 token
         key = m.media_id or m.media_path
         if not key or key in seen:
-            continue                                  # 同一张图反复发只算一次
+            continue  # 同一张图反复发只算一次
         if not m.media_path:
             continue
         seen.add(key)
@@ -214,18 +217,26 @@ def pick_images(msgs: list, limit: int = None, chat_hash: str = "") -> list[dict
         if size > VISION_MAX_BYTES or size == 0:
             continue
         if picked and total + size > VISION_MAX_TOTAL_BYTES:
-            logger.info("图片摘要已达单次体积上限（%.1f MB），本月其余图片留到下次",
-                        total / 1048576)
+            logger.info("图片摘要已达单次体积上限（%.1f MB），本月其余图片留到下次", total / 1048576)
             break
         total += size
-        picked.append({"path": path, "key": m.media_id or m.media_path, "size": size,
-                       "mime": _SUPPORTED[ext], "time": m.time_str, "sender": m.sender_name})
+        picked.append(
+            {
+                "path": path,
+                "key": m.media_id or m.media_path,
+                "size": size,
+                "mime": _SUPPORTED[ext],
+                "time": m.time_str,
+                "sender": m.sender_name,
+            }
+        )
     return picked
 
 
 def _images_key(images: list[dict]) -> str:
     """摘要缓存键：图片指纹（md5）+ 顺序 + 模型/系统提示词/清晰度都要进哈希"""
-    from analyzer import deepseek_client as dc          # 延迟导入，避免循环依赖
+    from analyzer import deepseek_client as dc  # 延迟导入，避免循环依赖
+
     digest = hashlib.sha256()
     for part in (dc.DEEPSEEK_MODEL, dc.PROMPT_FINGERPRINT, VISION_SYSTEM, VISION_DETAIL):
         digest.update(str(part).encode("utf-8"))
@@ -252,7 +263,7 @@ def _read_cache(path: str):
         return None
     if isinstance(data, dict) and isinstance(data.get("digest"), str):
         try:
-            os.utime(path, None)                        # 命中续期，配合 30 天滑动窗口
+            os.utime(path, None)  # 命中续期，配合 30 天滑动窗口
         except OSError:
             pass
         return data["digest"]
@@ -300,7 +311,8 @@ def digest(msgs: list, chat_hash: str = "", label: str = "") -> str:
             _MEMO[key] = cached
         return cached
 
-    from analyzer import deepseek_client as dc          # 延迟导入，避免循环依赖
+    from analyzer import deepseek_client as dc  # 延迟导入，避免循环依赖
+
     text = dc._call_vision(VISION_SYSTEM, _build_user_text(images, label), images)
     if not text:
         return ""
@@ -314,8 +326,11 @@ def digest(msgs: list, chat_hash: str = "", label: str = "") -> str:
 
 
 def _build_user_text(images: list[dict], label: str) -> str:
-    head = f"以下是{label}出现的 {len(images)} 张图片（已按时间顺序排列）：" if label \
+    head = (
+        f"以下是{label}出现的 {len(images)} 张图片（已按时间顺序排列）："
+        if label
         else f"以下是对话中出现的 {len(images)} 张图片（已按时间顺序排列）："
+    )
     return head + "\n请逐条概括。"
 
 

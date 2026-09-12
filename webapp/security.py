@@ -20,6 +20,7 @@
 ACCESS_PASSWORD / ALLOWED_ORIGINS / FLASK_HOST——测试打桩请打在
 webapp.security 上，而不是 app 的重导出别名上。
 """
+
 import hmac
 import secrets
 import threading
@@ -65,7 +66,7 @@ def _check_csrf() -> bool:
     而 token 来自请求方（可被任意构造），必须先落到 bytes 再比较，
     否则一个中文 token 就能把 POST 打成 500。
     """
-    provided = (request.headers.get("X-CSRF-Token") or request.form.get("csrf_token") or "")
+    provided = request.headers.get("X-CSRF-Token") or request.form.get("csrf_token") or ""
     expected = session.get("csrf_token", "")
     if not expected or not provided:
         return False
@@ -148,10 +149,9 @@ def _login_throttle_ok(ip: str) -> bool:
 def _record_login_failure(ip: str) -> None:
     with _login_lock:
         _login_failures.setdefault(ip, []).append(time.time())
-        if len(_login_failures) > 1000:      # 防止字典随扫描流量无限增长
+        if len(_login_failures) > 1000:  # 防止字典随扫描流量无限增长
             now = time.time()
-            for key in [k for k, v in _login_failures.items()
-                        if not v or now - v[-1] > LOGIN_WINDOW_SECONDS]:
+            for key in [k for k, v in _login_failures.items() if not v or now - v[-1] > LOGIN_WINDOW_SECONDS]:
                 _login_failures.pop(key, None)
 
 

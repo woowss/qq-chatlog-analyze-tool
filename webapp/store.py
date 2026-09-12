@@ -20,6 +20,7 @@
 thinking_enabled / _save_stats ...）——测试打桩请打在 webapp.store 上。
 所有落盘都走"临时文件 + os.replace"，进程中断不会留下半截 JSON。
 """
+
 import hashlib
 import json
 import os
@@ -32,13 +33,19 @@ from flask import session
 from config import AI_CACHE_DIR, DEEPSEEK_MODEL, STATS_CACHE_DIR
 from parser.qq_parser import load_chat
 from analyzer.local_stats import (
-    calc_overview, calc_daily_counts, calc_hourly_distribution,
-    calc_weekly_distribution, calc_message_length_stats, calc_face_stats,
-    calc_response_time, calc_exchange_rounds, calc_weekly_activity,
-    calc_word_freq, calc_milestones,
+    calc_overview,
+    calc_daily_counts,
+    calc_hourly_distribution,
+    calc_weekly_distribution,
+    calc_message_length_stats,
+    calc_face_stats,
+    calc_response_time,
+    calc_exchange_rounds,
+    calc_weekly_activity,
+    calc_word_freq,
+    calc_milestones,
 )
-from analyzer.deepseek_client import (
-    PROMPT_FINGERPRINT, purge_month_cache, thinking_enabled)
+from analyzer.deepseek_client import PROMPT_FINGERPRINT, purge_month_cache, thinking_enabled
 from analyzer.logger import get_logger
 
 logger = get_logger("app")
@@ -89,7 +96,7 @@ def save_and_hash(file_storage, dest_path: str) -> tuple[int, str]:
         file_storage.save(dest_path)
         size = os.path.getsize(dest_path)
         return size, _chat_hash(dest_path)
-    if not size:                      # 空流（防御：让旧路径兜底而非静默哈希空串）
+    if not size:  # 空流（防御：让旧路径兜底而非静默哈希空串）
         return size, _chat_hash(dest_path)
     return size, h.hexdigest()[:16]
 
@@ -154,7 +161,7 @@ def stats_error(chat_hash: str) -> str:
 def _record_stats_error(chat_hash: str, message: str) -> None:
     with _META_LOCK:
         _STATS_ERRORS[chat_hash] = message
-        while len(_STATS_ERRORS) > 64:          # 只留最近的失败记录
+        while len(_STATS_ERRORS) > 64:  # 只留最近的失败记录
             _STATS_ERRORS.pop(next(iter(_STATS_ERRORS)), None)
 
 
@@ -188,6 +195,7 @@ def vision_enabled() -> bool:
     延迟到调用点判断，避免 store→vision 的模块级循环依赖。
     """
     from analyzer import vision
+
     return vision.VISION_ENABLED and vision.VISION_MAX_PER_MONTH > 0
 
 
@@ -203,8 +211,7 @@ def _load_stats(chat_hash: str):
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
-    if (not isinstance(data, dict) or "overview" not in data
-            or data.get("_v") != STATS_SCHEMA_VERSION):
+    if not isinstance(data, dict) or "overview" not in data or data.get("_v") != STATS_SCHEMA_VERSION:
         return None
     try:
         os.utime(_stats_path(chat_hash), None)
@@ -286,8 +293,7 @@ def start_stats_job(chat, chat_hash: str) -> None:
                 return
             _save_stats(chat_hash, stats)
             _clear_stats_error(chat_hash)
-            logger.info("本地统计完成（%.0f ms，后台线程），已落盘复用",
-                        (time.time() - t0) * 1000)
+            logger.info("本地统计完成（%.0f ms，后台线程），已落盘复用", (time.time() - t0) * 1000)
         except Exception as e:
             # 异步之后没有 HTTP 响应能承载这个错误：记在案，首页会提示用户
             _record_stats_error(chat_hash, f"{type(e).__name__}: {e}")
@@ -334,7 +340,7 @@ def _stats_with_word_freq(stats: dict, chat_hash: str):
         chat = _load_chat_cached(filepath)
         stats["word_freq"] = calc_word_freq(chat, top_n=80)
         _save_stats(chat_hash, stats)
-    except Exception as e:                      # 词频失败不该拖垮页面
+    except Exception as e:  # 词频失败不该拖垮页面
         logger.error("词频统计失败: %s", e)
         stats.setdefault("word_freq", {"self": [], "other": []})
     return stats
@@ -352,8 +358,9 @@ def _cache_path(dimension: str, chat_hash: str) -> str:
     # 否则切换 LLM_THINKING(_DIMS) 后会命中另一种模式的旧结果（看起来"没区别"）。
     # 非思考模式不加后缀，保持既有缓存键兼容。
     suffix = "_think" if thinking_enabled(dimension) else ""
-    return os.path.join(AI_CACHE_DIR,
-                        f"{dimension}_{chat_hash}_{DEEPSEEK_MODEL}_{PROMPT_FINGERPRINT}{suffix}.json")
+    return os.path.join(
+        AI_CACHE_DIR, f"{dimension}_{chat_hash}_{DEEPSEEK_MODEL}_{PROMPT_FINGERPRINT}{suffix}.json"
+    )
 
 
 def _purge_chat_caches(chat_hash: str) -> int:
@@ -385,9 +392,10 @@ def _purge_chat_caches(chat_hash: str) -> int:
     # 派生出来的图片本体必须一起走，否则它只受"24 小时 mtime 回收"约束，
     # 而在那之前一直是盘上最敏感的一批数据。
     try:
-        from analyzer import vision              # 延迟导入，避免 store→vision 模块级依赖
+        from analyzer import vision  # 延迟导入，避免 store→vision 模块级依赖
+
         removed += vision.purge_session_media(chat_hash)
-    except Exception as e:                       # 回收失败不影响主流程
+    except Exception as e:  # 回收失败不影响主流程
         logger.warning("图片副本回收失败: %s", e)
     # 记下这次清理：若该哈希的后台统计线程还在跑，落盘前会检查这里并放弃写入，
     # 避免把刚清掉的缓存"复活"成没人认领的孤儿。

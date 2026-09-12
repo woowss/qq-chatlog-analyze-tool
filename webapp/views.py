@@ -15,6 +15,7 @@
 #
 #
 """页面路由：首页/上传/仪表盘/各分析页/报告导出"""
+
 import os
 import uuid
 
@@ -32,7 +33,7 @@ logger = get_logger("app")
 def log_request():
     """记录每个请求的方法/路径/来源IP"""
     if request.path.startswith("/static/"):
-        return          # 静态资源逐条记录只会淹没真正有用的日志
+        return  # 静态资源逐条记录只会淹没真正有用的日志
     ip = request.remote_addr or "127.0.0.1"
     logger.info("%s %s [%s]", request.method, request.path, ip)
 
@@ -46,7 +47,7 @@ def log_response(response):
 
 def inject_stats_flag():
     """导航栏需要知道"当前是否有数据"，但统计已移出 session，这里统一注入"""
-    if "overview" in session:      # 兼容旧会话
+    if "overview" in session:  # 兼容旧会话
         return {"overview": session["overview"], "has_stats": True}
     return {"has_stats": bool(session.get("chat_hash"))}
 
@@ -57,8 +58,9 @@ def index():
     stats_error：上次上传的统计若在后台线程里失败，这里如实告诉用户
     （异步化之后没有 HTTP 响应能承载它，不说的话用户只会看到"上传成功却回首页"）。
     """
-    return render_template("index.html", api_ok=is_api_configured(),
-                           stats_error=store.stats_error(session.get("chat_hash", "")))
+    return render_template(
+        "index.html", api_ok=is_api_configured(), stats_error=store.stats_error(session.get("chat_hash", ""))
+    )
 
 
 def upload():
@@ -106,9 +108,13 @@ def upload():
 
     try:
         chat = store._load_chat_cached(filepath)
-        logger.info("解析成功: %s <-> %s, %d 条消息, %d 天",
-                    mask_name(chat.self_name), mask_name(chat.other_name),
-                    len(chat.messages), chat.duration_days)
+        logger.info(
+            "解析成功: %s <-> %s, %d 条消息, %d 天",
+            mask_name(chat.self_name),
+            mask_name(chat.other_name),
+            len(chat.messages),
+            chat.duration_days,
+        )
         if chat.dropped_messages:
             # 这些消息的时间戳无法解析（缺失/null/非数值），已跳过而不是塞进 1970-01
             logger.warning("跳过 %d 条时间戳无效的消息（未计入统计与分析）", chat.dropped_messages)
@@ -154,17 +160,25 @@ def upload():
     if store.vision_enabled():
         from parser.qq_parser import split_by_month
         from analyzer import vision
+
         wanted = vision.plan_wanted(split_by_month(chat))
     if _wants_json():
-        return jsonify({"ok": True, "next": url_for("dashboard"),
-                        "wanted_media": wanted, "total_messages": len(chat.messages)})
+        return jsonify(
+            {
+                "ok": True,
+                "next": url_for("dashboard"),
+                "wanted_media": wanted,
+                "total_messages": len(chat.messages),
+            }
+        )
     return redirect(url_for("dashboard"))
 
 
 def _wants_json() -> bool:
     """AJAX 上传（带选中的导出目录）走 JSON 响应，普通表单提交仍走 302 跳转"""
-    return (request.headers.get("X-Requested-With") == "fetch"
-            or "application/json" in (request.headers.get("Accept") or ""))
+    return request.headers.get("X-Requested-With") == "fetch" or "application/json" in (
+        request.headers.get("Accept") or ""
+    )
 
 
 def upload_too_large(error):
@@ -175,8 +189,10 @@ def upload_too_large(error):
     也没说怎么调——用户只看到"上传失败"，无从下手。
     """
     limit_mb = MAX_CONTENT_LENGTH // 1048576
-    message = (f"上传文件超过 {limit_mb} MB 上限：可在 .env 中调大 QQCHAT_MAX_UPLOAD_MB 后重启，"
-               "或在 QQChatExporter 里缩小导出范围（例如按月分批导出）")
+    message = (
+        f"上传文件超过 {limit_mb} MB 上限：可在 .env 中调大 QQCHAT_MAX_UPLOAD_MB 后重启，"
+        "或在 QQChatExporter 里缩小导出范围（例如按月分批导出）"
+    )
     logger.warning("上传被拒：超过 %d MB 上限（QQCHAT_MAX_UPLOAD_MB 可调）", limit_mb)
     if _wants_json():
         return jsonify({"error": message}), 413
@@ -216,8 +232,7 @@ def emotion():
     stats, redir = _require_stats()
     if redir:
         return redir
-    return render_template("emotion.html", api_ok=is_api_configured(),
-                           overview=stats["overview"])
+    return render_template("emotion.html", api_ok=is_api_configured(), overview=stats["overview"])
 
 
 def relationship():
@@ -225,10 +240,13 @@ def relationship():
     stats, redir = _require_stats()
     if redir:
         return redir
-    return render_template("relationship.html", api_ok=is_api_configured(),
-                           overview=stats["overview"],
-                           response_time=stats.get("response_time"),
-                           exchange_rounds=stats.get("exchange_rounds"))
+    return render_template(
+        "relationship.html",
+        api_ok=is_api_configured(),
+        overview=stats["overview"],
+        response_time=stats.get("response_time"),
+        exchange_rounds=stats.get("exchange_rounds"),
+    )
 
 
 def _face_assets(stats: dict, chat_hash: str) -> tuple[dict, dict, bool]:
@@ -238,6 +256,7 @@ def _face_assets(stats: dict, chat_hash: str) -> tuple[dict, dict, bool]:
     """
     from analyzer.face_emoji import emoji_map
     from analyzer import face_images as fi
+
     face_stats = stats.get("face_stats") or {}
     names = list((face_stats.get("self") or {}).keys()) + list((face_stats.get("other") or {}).keys())
     emojis = emoji_map(names)
@@ -248,9 +267,9 @@ def _face_assets(stats: dict, chat_hash: str) -> tuple[dict, dict, bool]:
             try:
                 chat = store._load_chat_cached(filepath)
                 faces = fi.collect_cached(chat, chat_hash)
-                have = fi.ensure(faces, allow_network=False)   # 只用已有缓存
+                have = fi.ensure(faces, allow_network=False)  # 只用已有缓存
                 images = fi.url_map(have)
-            except Exception as e:              # 表情图是锦上添花，失败不能拖垮页面
+            except Exception as e:  # 表情图是锦上添花，失败不能拖垮页面
                 logger.warning("表情图映射失败（回退 emoji）: %s", e)
     return emojis, images, fi.enabled()
 
@@ -263,15 +282,18 @@ def habits():
     chat_hash = session.get("chat_hash", "")
     stats = store._stats_with_word_freq(stats, chat_hash)
     emojis, images, faces_on = _face_assets(stats, chat_hash)
-    return render_template("habits.html", api_ok=is_api_configured(),
-                           overview=stats["overview"],
-                           face_stats=stats.get("face_stats") or {},
-                           face_emoji=emojis,
-                           face_images=images,
-                           face_images_enabled=faces_on,
-                           length_stats=stats.get("length_stats"),
-                           weekly_activity=stats.get("weekly_activity"),
-                           word_freq=stats.get("word_freq"))
+    return render_template(
+        "habits.html",
+        api_ok=is_api_configured(),
+        overview=stats["overview"],
+        face_stats=stats.get("face_stats") or {},
+        face_emoji=emojis,
+        face_images=images,
+        face_images_enabled=faces_on,
+        length_stats=stats.get("length_stats"),
+        weekly_activity=stats.get("weekly_activity"),
+        word_freq=stats.get("word_freq"),
+    )
 
 
 def topics():
@@ -279,8 +301,7 @@ def topics():
     stats, redir = _require_stats()
     if redir:
         return redir
-    return render_template("topics.html", api_ok=is_api_configured(),
-                           overview=stats["overview"])
+    return render_template("topics.html", api_ok=is_api_configured(), overview=stats["overview"])
 
 
 def profile():
@@ -288,8 +309,7 @@ def profile():
     stats, redir = _require_stats()
     if redir:
         return redir
-    return render_template("profile.html", api_ok=is_api_configured(),
-                           overview=stats["overview"])
+    return render_template("profile.html", api_ok=is_api_configured(), overview=stats["overview"])
 
 
 def report():
@@ -299,24 +319,28 @@ def report():
         return redir
     stats = store._stats_with_word_freq(stats, session.get("chat_hash", ""))
     emojis, images, _faces_on = _face_assets(stats, session.get("chat_hash", ""))
-    return render_template("report.html", api_ok=is_api_configured(),
-                           overview=stats["overview"],
-                           daily_counts=stats.get("daily_counts"),
-                           hourly_dist=stats.get("hourly_dist"),
-                           weekly_dist=stats.get("weekly_dist"),
-                           length_stats=stats.get("length_stats"),
-                           face_stats=stats.get("face_stats") or {},
-                           face_emoji=emojis,
-                           face_images=images,
-                           response_time=stats.get("response_time"),
-                           exchange_rounds=stats.get("exchange_rounds"),
-                           weekly_activity=stats.get("weekly_activity"),
-                           word_freq=stats.get("word_freq"))
+    return render_template(
+        "report.html",
+        api_ok=is_api_configured(),
+        overview=stats["overview"],
+        daily_counts=stats.get("daily_counts"),
+        hourly_dist=stats.get("hourly_dist"),
+        weekly_dist=stats.get("weekly_dist"),
+        length_stats=stats.get("length_stats"),
+        face_stats=stats.get("face_stats") or {},
+        face_emoji=emojis,
+        face_images=images,
+        response_time=stats.get("response_time"),
+        exchange_rounds=stats.get("exchange_rounds"),
+        weekly_activity=stats.get("weekly_activity"),
+        word_freq=stats.get("word_freq"),
+    )
 
 
 def face_image(key: str):
     """提供缓存里的表情原图（键是受控格式，路径穿越无从谈起）"""
     from analyzer import face_images
+
     path = face_images.serve_path(key)
     if not path:
         return "未缓存该表情图", 404

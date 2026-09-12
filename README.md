@@ -350,8 +350,13 @@ OpenAI SDK 的兼容接口。
 ```bash
 pip install -e ".[dev]"                      # 或 pip install -r requirements.txt
 python -m ruff check .                       # 代码检查（CI 同款）
-python -m unittest discover -s tests -v      # 全量单测（当前 230 个用例，含逐页冒烟）
+python -m ruff format .                      # 统一风格；CI 用 --check 卡住
+python -m unittest discover -s tests -v      # 全量单测（当前 237 个用例，含逐页冒烟、打包自检、会话后端自检）
 ```
+
+`ruff format` 有意排除了两处（见 `pyproject.toml` 的 `[tool.ruff.format] exclude`）：
+`analyzer/prompts.py`（提示词按"一段一行"手工排版，格式化只会把它改成括号 + 链）与 `docs/`
+（早期设计文档，里面的示例代码不值得再动）。
 
 打包相关的自检（CI 的 package job 跑的就是这两步）：
 
@@ -362,7 +367,7 @@ python tools/verify_wheel.py .tmp_dist/*.whl      # 拆包核对：代码 + temp
 
 CI（`.github/workflows/test.yml`）分两条：
 
-- **test**：Python 3.10 / 3.12 / 3.13 矩阵，ruff → `py_compile` → 全量单测；
+- **test**：Python 3.10 / 3.12 / 3.13 矩阵，`ruff check` → `ruff format --check` → `py_compile` → 全量单测；
 - **package**：真实构建 wheel、拆包核对，再装进干净 venv 跑一次 `qqchatlog --version`，并从仓库外的工作目录
   装配应用、渲染一次模板（证明模板与静态资源确实进了包）。
 

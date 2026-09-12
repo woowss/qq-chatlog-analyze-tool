@@ -22,6 +22,7 @@ TTL 默认 15 分钟（QQCHAT_JOB_TTL_SECONDS 可调），另设条目数上限�
 完成即过期——此前 TTL 1 小时且只在"新任务启动"时修剪，
 没人再发起分析的话，profile 那种几十 KB 的结果会一直躺在内存里。
 """
+
 import os
 import threading
 import time
@@ -32,8 +33,11 @@ from flask import session
 from config import JOB_TTL_SECONDS
 from analyzer.deepseek_client import (
     QuotaExhaustedError,
-    analyze_emotion, analyze_topics, analyze_relationship,
-    analyze_habits, analyze_profile,
+    analyze_emotion,
+    analyze_topics,
+    analyze_relationship,
+    analyze_habits,
+    analyze_profile,
 )
 from analyzer.logger import get_logger
 from webapp import store
@@ -59,7 +63,7 @@ ANALYZE_FUNCS = {
 # 内存任务表：job_id -> 状态字典
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
-MAX_JOBS_KEPT = 256          # 表长上限：超限按完成时间先淘汰已结束的条目
+MAX_JOBS_KEPT = 256  # 表长上限：超限按完成时间先淘汰已结束的条目
 
 
 def _prune_jobs():
@@ -70,21 +74,24 @@ def _prune_jobs():
             JOBS.pop(jid, None)
         if len(JOBS) > MAX_JOBS_KEPT:
             finished = sorted(
-                ((v.get("finished_at", 0), k) for k, v in JOBS.items()
-                 if v.get("status") != "running"))
-            for _, jid in finished[:len(JOBS) - MAX_JOBS_KEPT]:
+                ((v.get("finished_at", 0), k) for k, v in JOBS.items() if v.get("status") != "running")
+            )
+            for _, jid in finished[: len(JOBS) - MAX_JOBS_KEPT]:
                 JOBS.pop(jid, None)
 
 
 def _running_jobs_locked(sid: str, chat_hash: str) -> list[tuple[str, str]]:
     """（调用方须持有 JOBS_LOCK）返回该 session+文件的 running 任务 [(job_id, dim)]"""
-    return [(jid, j.get("dim", "")) for jid, j in JOBS.items()
-            if j["status"] == "running" and j.get("sid") == sid
-            and j.get("chat_hash") == chat_hash]
+    return [
+        (jid, j.get("dim", ""))
+        for jid, j in JOBS.items()
+        if j["status"] == "running" and j.get("sid") == sid and j.get("chat_hash") == chat_hash
+    ]
 
 
-def _get_or_create_job(sid: str, dimension: str, chat_hash: str, total: int,
-                       conflict_dimension: str | None = None):
+def _get_or_create_job(
+    sid: str, dimension: str, chat_hash: str, total: int, conflict_dimension: str | None = None
+):
     """在**同一把锁内**完成"查重复用 → 建任务"，避免 check-then-act 之间插进第二个任务。
 
     conflict_dimension：与之互斥的维度名；传 "*" 表示"任意其他维度"。
@@ -98,9 +105,16 @@ def _get_or_create_job(sid: str, dimension: str, chat_hash: str, total: int,
             if conflict_dimension == "*" or dim == conflict_dimension:
                 return None, False, dim
         job_id = uuid.uuid4().hex
-        job = {"status": "running", "dim": dimension, "done": 0, "total": total,
-               "cancel": False, "chat_hash": chat_hash, "sid": sid,
-               "created": time.time()}
+        job = {
+            "status": "running",
+            "dim": dimension,
+            "done": 0,
+            "total": total,
+            "cancel": False,
+            "chat_hash": chat_hash,
+            "sid": sid,
+            "created": time.time(),
+        }
         if dimension == "all":
             job["detail"] = ""
         JOBS[job_id] = job
@@ -139,8 +153,7 @@ def _run_job(job_id: str, dimension: str, filepath: str, chat_hash: str) -> None
                 return bool(JOBS.get(job_id, {}).get("cancel"))
 
         logger.info("开始 %s ...（后台任务 %s）", dim_name, job_id[:8])
-        result = func(chat, on_progress=on_progress, should_cancel=should_cancel,
-                      chat_hash=chat_hash)
+        result = func(chat, on_progress=on_progress, should_cancel=should_cancel, chat_hash=chat_hash)
         cancelled = should_cancel()
         # 先落盘缓存，再对外置 done：否则前端轮询到 done 立刻请求
         # /api/analysis/<dim> 时可能读不到缓存，反而重新发起一次付费分析
@@ -153,9 +166,11 @@ def _run_job(job_id: str, dimension: str, filepath: str, chat_hash: str) -> None
             if cancelled:
                 j.update(status="cancelled", finished_at=time.time())
             elif not result:
-                j.update(status="error",
-                         error="分析未产生结果：可能全部月份失败，请查看日志",
-                         finished_at=time.time())
+                j.update(
+                    status="error",
+                    error="分析未产生结果：可能全部月份失败，请查看日志",
+                    finished_at=time.time(),
+                )
             else:
                 j.update(status="done", result=result, finished_at=time.time())
         if result and not cancelled:
@@ -192,15 +207,17 @@ def _run_analyze_all(job_id: str, filepath: str, chat_hash: str, refresh: bool) 
             if not refresh and store._read_cache(dim, chat_hash) is not None:
                 summary[dim] = "cached"
             else:
+
                 def on_inner(done: int, tot: int, _dim=dim_name, _idx=idx):
                     with JOBS_LOCK:
                         j = JOBS.get(job_id)
                         if j:
                             j["detail"] = f"{_idx}/{total} {_dim}（{_done_str(done, tot)}）"
+
                 try:
-                    result = ANALYZE_FUNCS[dim](chat, on_progress=on_inner,
-                                                should_cancel=should_cancel,
-                                                chat_hash=chat_hash)
+                    result = ANALYZE_FUNCS[dim](
+                        chat, on_progress=on_inner, should_cancel=should_cancel, chat_hash=chat_hash
+                    )
                     if result:
                         store._write_cache(dim, chat_hash, result)
                         summary[dim] = "done"
@@ -212,9 +229,11 @@ def _run_analyze_all(job_id: str, filepath: str, chat_hash: str, refresh: bool) 
                     with JOBS_LOCK:
                         j = JOBS.get(job_id)
                         if j:
-                            j.update(status="error",
-                                     error=f"{e}（已完成维度：{len(summary)}，其结果已缓存）",
-                                     finished_at=time.time())
+                            j.update(
+                                status="error",
+                                error=f"{e}（已完成维度：{len(summary)}，其结果已缓存）",
+                                finished_at=time.time(),
+                            )
                     return
                 except Exception as e:
                     logger.error("一键全量分析 %s 失败: %s", dim_name, e)

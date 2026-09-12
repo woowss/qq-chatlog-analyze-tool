@@ -15,6 +15,7 @@
 #
 #
 """AI 分析 API：发起/轮询/取消、结果缓存读取、用量与状态"""
+
 import os
 import threading
 
@@ -25,8 +26,14 @@ from analyzer.logger import get_logger
 from analyzer.usage import get_usage
 from webapp import store
 from webapp.jobs import (
-    ANALYZE_FUNCS, DIMENSION_NAMES, JOBS, JOBS_LOCK,
-    _get_or_create_job, _prune_jobs, _run_analyze_all, _run_job,
+    ANALYZE_FUNCS,
+    DIMENSION_NAMES,
+    JOBS,
+    JOBS_LOCK,
+    _get_or_create_job,
+    _prune_jobs,
+    _run_analyze_all,
+    _run_job,
     _session_chat_file,
 )
 from webapp.security import _guard_post
@@ -65,7 +72,8 @@ def api_analyze(dimension: str):
     _prune_jobs()
     # 全量任务已覆盖本维度：拒绝而不是另起一个任务（否则同一维度会被分析两遍、双倍计费）
     job_id, reused, conflict = _get_or_create_job(
-        session.sid, dimension, chat_hash, total=0, conflict_dimension="all")
+        session.sid, dimension, chat_hash, total=0, conflict_dimension="all"
+    )
     if conflict:
         logger.info("已有全量任务在运行，拒绝重复启动 %s", dimension)
         return jsonify({"error": "一键全量分析正在运行，请等它完成或先取消（避免重复调用 API）"}), 409
@@ -73,8 +81,7 @@ def api_analyze(dimension: str):
         logger.info("复用进行中的 %s 任务 %s", dimension, job_id[:8])
         return jsonify({"job": job_id, "reused": True})
 
-    threading.Thread(target=_run_job, args=(job_id, dimension, filepath, chat_hash),
-                     daemon=True).start()
+    threading.Thread(target=_run_job, args=(job_id, dimension, filepath, chat_hash), daemon=True).start()
     return jsonify({"job": job_id})
 
 
@@ -141,18 +148,24 @@ def api_analyze_all():
 
     _prune_jobs()
     job_id, reused, conflict = _get_or_create_job(
-        session.sid, "all", chat_hash, total=len(ANALYZE_FUNCS), conflict_dimension="*")
+        session.sid, "all", chat_hash, total=len(ANALYZE_FUNCS), conflict_dimension="*"
+    )
     if reused:
         logger.info("复用进行中的一键全量任务 %s", job_id[:8])
         return jsonify({"job": job_id, "reused": True})
     if conflict:
         # 已有单维度任务在跑：全量任务会把这些维度再跑一遍（重复计费），先拒绝
         logger.info("已有 %s 任务在运行，拒绝启动全量分析", conflict)
-        return jsonify({"error": f"已有「{DIMENSION_NAMES.get(conflict, conflict)}」任务在运行，"
-                                 "请等它完成或先取消（避免重复调用 API）"}), 409
+        return jsonify(
+            {
+                "error": f"已有「{DIMENSION_NAMES.get(conflict, conflict)}」任务在运行，"
+                "请等它完成或先取消（避免重复调用 API）"
+            }
+        ), 409
 
-    threading.Thread(target=_run_analyze_all,
-                     args=(job_id, filepath, chat_hash, refresh), daemon=True).start()
+    threading.Thread(
+        target=_run_analyze_all, args=(job_id, filepath, chat_hash, refresh), daemon=True
+    ).start()
     return jsonify({"job": job_id})
 
 
@@ -167,6 +180,7 @@ def api_faces_fetch():
         return jsonify({"error": guard[0]}), guard[1]
 
     from analyzer import face_images
+
     if not face_images.enabled():
         return jsonify({"error": "表情图功能未开启：请在 .env 中设置 QQCHAT_FACE_IMAGES=true"}), 403
 
@@ -182,14 +196,18 @@ def api_faces_fetch():
         total = len(faces)
         before = len(face_images.url_map(face_images.ensure(faces, allow_network=False)))
         # 带上时长上限：抓取同步跑在请求线程里，不设预算时 300 张 × 6s 超时能挂住半小时
-        have = face_images.ensure(faces, allow_network=True,
-                                  max_seconds=face_images.FETCH_BUDGET_SECONDS)
+        have = face_images.ensure(faces, allow_network=True, max_seconds=face_images.FETCH_BUDGET_SECONDS)
         after = len(face_images.url_map(have))
-        return jsonify({"total": total, "available": after,
-                        "fetched": max(0, after - before),
-                        # 仍未拿到图的（超级表情 + 本次没抓完的），前端据此如实提示
-                        "pending": max(0, total - after),
-                        "budget_seconds": face_images.FETCH_BUDGET_SECONDS})
+        return jsonify(
+            {
+                "total": total,
+                "available": after,
+                "fetched": max(0, after - before),
+                # 仍未拿到图的（超级表情 + 本次没抓完的），前端据此如实提示
+                "pending": max(0, total - after),
+                "budget_seconds": face_images.FETCH_BUDGET_SECONDS,
+            }
+        )
     finally:
         _FACE_FETCH_LOCK.release()
 
@@ -223,7 +241,7 @@ def api_media_upload():
     os.makedirs(target_dir, exist_ok=True)
     saved = skipped = 0
     total_bytes = 0
-    for fs in files[:vision.MEDIA_UPLOAD_MAX_FILES]:
+    for fs in files[: vision.MEDIA_UPLOAD_MAX_FILES]:
         name = os.path.basename((fs.filename or "").replace("\\", "/"))
         ext = os.path.splitext(name)[1].lower()
         if not name or ext not in vision.SUPPORTED_EXT:
@@ -247,10 +265,8 @@ def api_media_upload():
         total_bytes += len(data)
         saved += 1
     if saved:
-        logger.info("已接收 %d 张图片副本（%.1f MB），供图片理解使用",
-                    saved, total_bytes / 1048576)
-    return jsonify({"saved": saved, "skipped": skipped,
-                    "bytes": total_bytes})
+        logger.info("已接收 %d 张图片副本（%.1f MB），供图片理解使用", saved, total_bytes / 1048576)
+    return jsonify({"saved": saved, "skipped": skipped, "bytes": total_bytes})
 
 
 def api_usage():
@@ -269,8 +285,9 @@ def register(app):
     """API 路由注册（端点名与旧 app.py 一致）"""
     app.add_url_rule("/api/analyze/<dimension>", "api_analyze", api_analyze, methods=["POST"])
     app.add_url_rule("/api/analyze-job/<job_id>", "api_analyze_job", api_analyze_job)
-    app.add_url_rule("/api/analyze-job/<job_id>/cancel", "api_analyze_cancel",
-                     api_analyze_cancel, methods=["POST"])
+    app.add_url_rule(
+        "/api/analyze-job/<job_id>/cancel", "api_analyze_cancel", api_analyze_cancel, methods=["POST"]
+    )
     app.add_url_rule("/api/analysis/<dimension>", "api_analysis_result", api_analysis_result)
     app.add_url_rule("/api/analyze-all", "api_analyze_all", api_analyze_all, methods=["POST"])
     app.add_url_rule("/api/media", "api_media_upload", api_media_upload, methods=["POST"])

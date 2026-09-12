@@ -15,6 +15,7 @@
 #
 #
 """DeepSeek API 调用封装"""
+
 import concurrent.futures
 import hashlib
 import inspect
@@ -117,8 +118,7 @@ def _max_tokens(dim: str, default: int) -> int:
     return value
 
 
-MAX_TOKENS_BY_DIM = {dim: _max_tokens(dim, default)
-                     for dim, default in _DEFAULT_MAX_TOKENS.items()}
+MAX_TOKENS_BY_DIM = {dim: _max_tokens(dim, default) for dim, default in _DEFAULT_MAX_TOKENS.items()}
 
 # 思考模式：准确性优先——官方 DeepSeek 端点默认**全维度开启**（思维链能显著提升
 # 证据引用与推断质量），并且各维度输出预算已提到 8192 以上，不会再出现
@@ -126,12 +126,9 @@ MAX_TOKENS_BY_DIM = {dim: _max_tokens(dim, default)
 # - LLM_THINKING=disabled 可整体关掉；LLM_THINKING_DIMS=a,b 可只给指定维度开；
 # - 非官方网关（如百炼）不认识该字段：未显式配置时不发送，避免被严格网关判为非法参数。
 _THINKING_ENV = (os.getenv("LLM_THINKING", "") or "").strip().lower()
-THINKING_DEFAULT = (_THINKING_ENV in ("1", "true", "yes", "on", "enabled") if _THINKING_ENV
-                    else _OFFICIAL)
+THINKING_DEFAULT = _THINKING_ENV in ("1", "true", "yes", "on", "enabled") if _THINKING_ENV else _OFFICIAL
 THINKING_DIMS = frozenset(
-    s.strip().lower()
-    for s in (os.getenv("LLM_THINKING_DIMS", "") or "").split(",")
-    if s.strip()
+    s.strip().lower() for s in (os.getenv("LLM_THINKING_DIMS", "") or "").split(",") if s.strip()
 )
 _SEND_THINKING_PARAM = bool(_THINKING_ENV or THINKING_DIMS) or "deepseek" in DEEPSEEK_BASE_URL.lower()
 
@@ -143,9 +140,10 @@ def thinking_enabled(dim: str) -> bool:
     """
     return THINKING_DEFAULT or (dim or "").strip().lower() in THINKING_DIMS
 
+
 _call_gate = threading.Lock()
 _next_call_at = [0.0]
-_cooldown_until = [0.0]   # 全局冷却：任一请求吃到 429 后，所有线程共同退避
+_cooldown_until = [0.0]  # 全局冷却：任一请求吃到 429 后，所有线程共同退避
 
 
 def _pace() -> None:
@@ -176,7 +174,7 @@ def _is_plan_exhausted(e: Exception) -> bool:
     if status in (401, 403) and "quota" in s:
         return True
     if status == 402 or "insufficient balance" in s:
-        return True   # DeepSeek 官方：余额不足（402 Insufficient Balance）
+        return True  # DeepSeek 官方：余额不足（402 Insufficient Balance）
     return "arrearage" in s or "free allocated quota exceeded" in s
 
 
@@ -187,8 +185,15 @@ def _is_tpm_throttle(e: Exception) -> bool:
     if getattr(e, "status_code", None) == 429:
         return True
     s = str(e).lower()
-    return any(m in s for m in ("allocated quota exceeded", "you exceeded your current quota",
-                                "insufficient_quota", "rate limit"))
+    return any(
+        m in s
+        for m in (
+            "allocated quota exceeded",
+            "you exceeded your current quota",
+            "insufficient_quota",
+            "rate limit",
+        )
+    )
 
 
 # .env 模板中的占位符值，视为"未配置"
@@ -254,8 +259,14 @@ def _fit_lines(lines: list[str], max_chars: int) -> list[str]:
 
 def _has_content(m) -> bool:
     """消息是否有可喂给模型的内容（正文或图片/表情/文件/转发/回复等信号）"""
-    return (bool(m.text) or m.has_image or m.is_reply or bool(m.media_kind)
-            or bool(m.face_names) or bool(m.face_ids))
+    return (
+        bool(m.text)
+        or m.has_image
+        or m.is_reply
+        or bool(m.media_kind)
+        or bool(m.face_names)
+        or bool(m.face_ids)
+    )
 
 
 def _short_time(time_str: str) -> str:
@@ -309,8 +320,7 @@ def _gap_mark(gap_ms: int) -> str:
     return f"(+{minutes // (60 * 24)}d)"
 
 
-def _message_line(m, name: str, prev_uid: Optional[str] = None,
-                  prev_ts: Optional[int] = None) -> str:
+def _message_line(m, name: str, prev_uid: Optional[str] = None, prev_ts: Optional[int] = None) -> str:
     """单条消息 → 对话行。
 
     打印规则（相同信息量、更省字符）：
@@ -351,9 +361,15 @@ def _message_line(m, name: str, prev_uid: Optional[str] = None,
     return f"{prefix} {text}".strip() if prefix and text else (prefix or text)
 
 
-def _build_dialog(messages: list, self_uid: str, self_name: str, other_name: str,
-                  max_chars: Optional[int] = MAX_DIALOG_CHARS, chat_hash: str = "",
-                  vision_label: str = "") -> str:
+def _build_dialog(
+    messages: list,
+    self_uid: str,
+    self_name: str,
+    other_name: str,
+    max_chars: Optional[int] = MAX_DIALOG_CHARS,
+    chat_hash: str = "",
+    vision_label: str = "",
+) -> str:
     """构建喂给模型的对话内容：统计头（含本地事实）+ 压缩后的对话行 + 图片摘要。
 
     统计头给模型全貌（即使抽样截断也能知道真实消息量），并附上本地精确算出的
@@ -375,8 +391,9 @@ def _build_dialog(messages: list, self_uid: str, self_name: str, other_name: str
     prev_uid: Optional[str] = None
     prev_ts: Optional[int] = None
     for m in valid:
-        lines.append(_message_line(
-            m, self_name if m.sender_uid == self_uid else other_name, prev_uid, prev_ts))
+        lines.append(
+            _message_line(m, self_name if m.sender_uid == self_uid else other_name, prev_uid, prev_ts)
+        )
         prev_uid, prev_ts = m.sender_uid, m.timestamp
     original_n = len(lines)
     if max_chars:
@@ -389,8 +406,7 @@ def _build_dialog(messages: list, self_uid: str, self_name: str, other_name: str
     if stats["median_gap"] is not None:
         parts.append(f"回复间隔中位数约 {int(stats['median_gap'])} 秒")
     if stats["sessions"]:
-        parts.append(f"共 {stats['sessions']} 段对话"
-                     f"（间隔超 {TIME_MARK_MINUTES} 分钟算新的一段）")
+        parts.append(f"共 {stats['sessions']} 段对话（间隔超 {TIME_MARK_MINUTES} 分钟算新的一段）")
         if self_uid:
             ratio = round(stats["self_opened"] / stats["sessions"] * 100)
             parts.append(f"其中我方先开口 {ratio}%、对方 {100 - ratio}%")
@@ -411,9 +427,10 @@ def _vision_digest(messages: list, chat_hash: str, label: str) -> str:
         return ""
     try:
         from analyzer import vision
+
         return vision.digest(messages, chat_hash=chat_hash, label=label)
     except QuotaExhaustedError:
-        raise                       # 额度耗尽要中止整体任务，不能悄悄吞掉
+        raise  # 额度耗尽要中止整体任务，不能悄悄吞掉
     except Exception as e:
         logger.warning("图片摘要失败（继续纯文本分析）: %s", e)
         return ""
@@ -431,31 +448,46 @@ def _prompt_fingerprint(salt: "str | None" = None) -> str:
     因此打一条警告并支持 PROMPT_CACHE_SALT 手动换键。
     """
     import analyzer.prompts as _prompts
+
     if salt is None:
         salt = (os.getenv("PROMPT_CACHE_SALT", "") or "").strip()
-    parts = [getattr(_prompts, n) for n in sorted(dir(_prompts))
-             if n.startswith("SYSTEM_PROMPT_")]
+    parts = [getattr(_prompts, n) for n in sorted(dir(_prompts)) if n.startswith("SYSTEM_PROMPT_")]
     # 影响模型输入的模块级常量也要进指纹：getsource 只覆盖函数体，函数引用的
     # MAX_DIALOG_CHARS / 时间标记阈值 等常量改了源码也不变——只哈希函数会让
     # "调小了对话预算"或"改了时间标记口径"之后继续命中旧缓存（输入其实变了）。
     from analyzer import vision
-    parts.append("consts:%s" % repr((
-        MAX_DIALOG_CHARS, TIME_MARK_MINUTES, RELATIVE_MARK_MINUTES,
-        MAX_TOKENS_BY_DIM.get("emotion"), MAX_TOKENS_BY_DIM.get("topics"),
-        MAX_TOKENS_BY_DIM.get("relationship"), MAX_TOKENS_BY_DIM.get("habits"),
-        MAX_TOKENS_BY_DIM.get("profile"), int(SESSION_GAP_MS),
-        # 视觉参数同样改变输入（图片摘要是 prompt 的一部分）
-        vision.VISION_SYSTEM, vision.VISION_DETAIL, vision.VISION_MAX_PER_MONTH,
-        vision.VISION_MIN_SIDE,
-    )))
+
+    parts.append(
+        "consts:%s"
+        % repr(
+            (
+                MAX_DIALOG_CHARS,
+                TIME_MARK_MINUTES,
+                RELATIVE_MARK_MINUTES,
+                MAX_TOKENS_BY_DIM.get("emotion"),
+                MAX_TOKENS_BY_DIM.get("topics"),
+                MAX_TOKENS_BY_DIM.get("relationship"),
+                MAX_TOKENS_BY_DIM.get("habits"),
+                MAX_TOKENS_BY_DIM.get("profile"),
+                int(SESSION_GAP_MS),
+                # 视觉参数同样改变输入（图片摘要是 prompt 的一部分）
+                vision.VISION_SYSTEM,
+                vision.VISION_DETAIL,
+                vision.VISION_MAX_PER_MONTH,
+                vision.VISION_MIN_SIDE,
+            )
+        )
+    )
     fmt_funcs = (_build_dialog, _message_line, _fit_lines, _conversation_stats, _short_time)
     try:
         parts += [inspect.getsource(f) for f in fmt_funcs]
     except (OSError, TypeError):
         parts += [f"<source-unavailable:{f.__name__}>" for f in fmt_funcs]
-        logger.warning("无法读取格式化函数源码（编译/打包环境），指纹降级为函数名级——"
-                       "改动对话格式不会自动失效旧缓存；改过格式后请设 PROMPT_CACHE_SALT"
-                       " 为任意新值手动换键")
+        logger.warning(
+            "无法读取格式化函数源码（编译/打包环境），指纹降级为函数名级——"
+            "改动对话格式不会自动失效旧缓存；改过格式后请设 PROMPT_CACHE_SALT"
+            " 为任意新值手动换键"
+        )
     if salt:
         parts.append(f"salt:{salt}")
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
@@ -520,7 +552,7 @@ def _read_month_cache(key: str) -> Optional[dict]:
     except (OSError, json.JSONDecodeError):
         return None
     try:
-        os.utime(path, None)      # 命中即续期，避免常用缓存被 30 天 TTL 回收
+        os.utime(path, None)  # 命中即续期，避免常用缓存被 30 天 TTL 回收
     except OSError:
         pass
     return data if isinstance(data, dict) else None
@@ -611,7 +643,7 @@ def purge_month_cache(chat_hash: str) -> int:
             target = month_cache_path(key)
             try:
                 if now - os.path.getmtime(target) < MONTH_CACHE_GRACE_SECONDS:
-                    continue                     # 宽限期内：留给增量分析复用
+                    continue  # 宽限期内：留给增量分析复用
                 os.remove(target)
                 removed += 1
             except OSError:
@@ -656,7 +688,7 @@ def sweep_orphan_month_cache() -> int:
         for name in names:
             if not name.startswith("month_") or not name.endswith(".json"):
                 continue
-            key = name[len("month_"):-len(".json")]
+            key = name[len("month_") : -len(".json")]
             if key in referenced:
                 continue
             target = os.path.join(_MONTH_CACHE_DIR, name)
@@ -678,9 +710,15 @@ def thinking_budget_warnings() -> list[str]:
     ]
 
 
-def _call_api(system_prompt: str, user_content: str, max_tokens: int = 2048,
-              retry: int = 2, tpm_wait: Optional[float] = None,
-              tag: str = "unknown", dim: Optional[str] = None) -> Optional[dict]:
+def _call_api(
+    system_prompt: str,
+    user_content: str,
+    max_tokens: int = 2048,
+    retry: int = 2,
+    tpm_wait: Optional[float] = None,
+    tag: str = "unknown",
+    dim: Optional[str] = None,
+) -> Optional[dict]:
     """调用 LLM API，返回解析后的 JSON。
 
     dim：维度名，决定是否使用思考模式（默认取 tag；两者取值同为
@@ -699,9 +737,13 @@ def _call_api(system_prompt: str, user_content: str, max_tokens: int = 2048,
 
     think = thinking_enabled(dim or tag)
     if think and max_tokens < THINKING_MIN_TOKENS:
-        logger.warning("%s 开启了思考模式，但输出预算只有 %d tokens（思维链同样占用），"
-                       "结果很可能被截断丢弃；建议把预算提到 %d 以上或关闭该维度的思考模式",
-                       dim or tag, max_tokens, THINKING_MIN_TOKENS)
+        logger.warning(
+            "%s 开启了思考模式，但输出预算只有 %d tokens（思维链同样占用），"
+            "结果很可能被截断丢弃；建议把预算提到 %d 以上或关闭该维度的思考模式",
+            dim or tag,
+            max_tokens,
+            THINKING_MIN_TOKENS,
+        )
     tpm_wait = TPM_WAIT_SECONDS if tpm_wait is None else tpm_wait
     tpm_hits = 0
     max_attempts = max(retry, TPM_MAX_ATTEMPTS - 1) + 1
@@ -728,19 +770,24 @@ def _call_api(system_prompt: str, user_content: str, max_tokens: int = 2048,
             resp = client.chat.completions.create(**params)
             choice = resp.choices[0]
             if resp.usage:
-                logger.info("token 用量[%s]: prompt=%s completion=%s finish=%s",
-                            tag, resp.usage.prompt_tokens, resp.usage.completion_tokens,
-                            choice.finish_reason)
-                record_call(DEEPSEEK_MODEL, tag,
-                            resp.usage.prompt_tokens or 0,
-                            resp.usage.completion_tokens or 0)
+                logger.info(
+                    "token 用量[%s]: prompt=%s completion=%s finish=%s",
+                    tag,
+                    resp.usage.prompt_tokens,
+                    resp.usage.completion_tokens,
+                    choice.finish_reason,
+                )
+                record_call(
+                    DEEPSEEK_MODEL, tag, resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0
+                )
             if choice.finish_reason == "length":
                 # 思考模式下思维链也占 max_tokens：大月份偶发被吃满。
                 # 结果被截断=该月白跑，所以先降级为"关思考"重试一次——宁可精度略降，
                 # 也不让这个月从结果里消失（真实数据踩过：最大月份整月丢失）。
                 if think:
-                    logger.warning("输出被 max_tokens=%s 截断，改用非思考模式重试一次（保住这个月的结果）",
-                                   max_tokens)
+                    logger.warning(
+                        "输出被 max_tokens=%s 截断，改用非思考模式重试一次（保住这个月的结果）", max_tokens
+                    )
                     think = False
                     continue
                 logger.error("模型输出被 max_tokens=%s 截断，放弃本次结果（不重试）", max_tokens)
@@ -759,9 +806,13 @@ def _call_api(system_prompt: str, user_content: str, max_tokens: int = 2048,
             if _is_tpm_throttle(e):
                 tpm_hits += 1
                 if tpm_hits < TPM_MAX_ATTEMPTS:
-                    logger.warning("触发每分钟限流（TPM/RPM），全局冷却 %.0fs 后重试（%d/%d）",
-                                   tpm_wait, tpm_hits, TPM_MAX_ATTEMPTS)
-                    _set_cooldown(tpm_wait)   # 让所有并发线程一起退避，而非各自撞
+                    logger.warning(
+                        "触发每分钟限流（TPM/RPM），全局冷却 %.0fs 后重试（%d/%d）",
+                        tpm_wait,
+                        tpm_hits,
+                        TPM_MAX_ATTEMPTS,
+                    )
+                    _set_cooldown(tpm_wait)  # 让所有并发线程一起退避，而非各自撞
                     time.sleep(tpm_wait)
                     continue
                 raise QuotaExhaustedError(
@@ -770,7 +821,7 @@ def _call_api(system_prompt: str, user_content: str, max_tokens: int = 2048,
                     "也可到服务商控制台提升该模型的 TPM 限额。"
                 ) from e
             if attempt < retry:
-                delay = 2 ** attempt
+                delay = 2**attempt
                 logger.warning("API 调用失败（第 %s 次，%ss 后重试）: %s", attempt + 1, delay, e)
                 time.sleep(delay)
                 continue
@@ -796,8 +847,7 @@ def _call_vision(system_prompt: str, user_text: str, images: list) -> str:
         except OSError as e:
             logger.warning("读取图片失败，跳过该图: %s", e)
             continue
-        content.append({"type": "image_url",
-                        "image_url": {"url": url, "detail": vision.VISION_DETAIL}})
+        content.append({"type": "image_url", "image_url": {"url": url, "detail": vision.VISION_DETAIL}})
     if len(content) == 1:
         return ""
 
@@ -823,12 +873,15 @@ def _call_vision(system_prompt: str, user_text: str, images: list) -> str:
             resp = client.chat.completions.create(**params)
             choice = resp.choices[0]
             if resp.usage:
-                logger.info("token 用量[vision]: prompt=%s completion=%s finish=%s",
-                            resp.usage.prompt_tokens, resp.usage.completion_tokens,
-                            choice.finish_reason)
-                record_call(DEEPSEEK_MODEL, "vision",
-                            resp.usage.prompt_tokens or 0,
-                            resp.usage.completion_tokens or 0)
+                logger.info(
+                    "token 用量[vision]: prompt=%s completion=%s finish=%s",
+                    resp.usage.prompt_tokens,
+                    resp.usage.completion_tokens,
+                    choice.finish_reason,
+                )
+                record_call(
+                    DEEPSEEK_MODEL, "vision", resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0
+                )
             if choice.finish_reason == "length":
                 logger.warning("图片摘要被 max_tokens 截断，已按截断内容使用")
             return (choice.message.content or "").strip()
@@ -846,19 +899,23 @@ def _call_vision(system_prompt: str, user_text: str, images: list) -> str:
                 logger.warning("图片摘要因限流放弃（文本分析继续）: %s", e)
                 return ""
             if attempt < 2:
-                time.sleep(2 ** attempt)
+                time.sleep(2**attempt)
                 continue
             logger.warning("图片摘要失败（文本分析继续）: %s", e)
             return ""
     return ""
 
 
-def _analyze_periods(months: dict[str, list], system_prompt: str,
-                     make_prompt: Callable[[str, list], str], max_tokens: int,
-                     tag: str = "unknown",
-                     on_progress: Optional[Callable[[int, int], None]] = None,
-                     should_cancel: Optional[Callable[[], bool]] = None,
-                     chat_hash: str = "") -> dict[str, Any]:
+def _analyze_periods(
+    months: dict[str, list],
+    system_prompt: str,
+    make_prompt: Callable[[str, list], str],
+    max_tokens: int,
+    tag: str = "unknown",
+    on_progress: Optional[Callable[[int, int], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    chat_hash: str = "",
+) -> dict[str, Any]:
     """并发逐月调用 API，返回 {period: result}。
 
     单月失败仅记录日志并跳过，不中断整体分析。
@@ -872,7 +929,7 @@ def _analyze_periods(months: dict[str, list], system_prompt: str,
     results: dict[str, Any] = {}
     total = len(months)
     done = 0
-    fatal: dict[str, str] = {}   # 配额耗尽等致命错误：中止剩余月份
+    fatal: dict[str, str] = {}  # 配额耗尽等致命错误：中止剩余月份
 
     def _cancel_requested() -> bool:
         return bool(should_cancel and should_cancel())
@@ -916,7 +973,8 @@ def _analyze_periods(months: dict[str, list], system_prompt: str,
             if not futures:
                 break
             finished, _ = concurrent.futures.wait(
-                list(futures), return_when=concurrent.futures.FIRST_COMPLETED)
+                list(futures), return_when=concurrent.futures.FIRST_COMPLETED
+            )
             for fut in finished:
                 futures.pop(fut, None)
                 period, result = fut.result()
@@ -992,15 +1050,17 @@ def _normalize_topic_weights(obj: dict) -> None:
 def _month_prompt(chat: ChatData, period: str, msgs: list, chat_hash: str = "") -> str:
     """构建单月 prompt；该月经过滤（系统/撤回/转发/空文本）后无有效消息时返回空串，
     由 _analyze_periods 跳过，避免为空月份白白消耗一次 API 调用。"""
-    dialog = _build_dialog(msgs, chat.self_uid, chat.self_name, chat.other_name,
-                           chat_hash=chat_hash, vision_label=f"{period} 月")
+    dialog = _build_dialog(
+        msgs, chat.self_uid, chat.self_name, chat.other_name, chat_hash=chat_hash, vision_label=f"{period} 月"
+    )
     if not dialog.strip():
         return ""
     return f"以下是 {period} 月的对话数据：\n\n{dialog}"
 
 
-def analyze_emotion(chat: ChatData, on_progress=None, should_cancel=None,
-                 chat_hash: str = "") -> dict[str, Any]:
+def analyze_emotion(
+    chat: ChatData, on_progress=None, should_cancel=None, chat_hash: str = ""
+) -> dict[str, Any]:
     """逐月情绪分析，返回 {"2025-09": {...}, ...}"""
     months = split_by_month(chat)
     results = _analyze_periods(
@@ -1009,7 +1069,8 @@ def analyze_emotion(chat: ChatData, on_progress=None, should_cancel=None,
         lambda p, msgs: _month_prompt(chat, p, msgs, chat_hash=chat_hash),
         max_tokens=MAX_TOKENS_BY_DIM["emotion"],
         tag="emotion",
-        on_progress=on_progress, should_cancel=should_cancel,
+        on_progress=on_progress,
+        should_cancel=should_cancel,
         chat_hash=chat_hash,
     )
     # 强度夹紧到 0-10，防御越界/非法值
@@ -1019,8 +1080,9 @@ def analyze_emotion(chat: ChatData, on_progress=None, should_cancel=None,
     return results
 
 
-def analyze_topics(chat: ChatData, on_progress=None, should_cancel=None,
-                 chat_hash: str = "") -> dict[str, Any]:
+def analyze_topics(
+    chat: ChatData, on_progress=None, should_cancel=None, chat_hash: str = ""
+) -> dict[str, Any]:
     """逐月话题分析"""
     months = split_by_month(chat)
     results = _analyze_periods(
@@ -1029,7 +1091,8 @@ def analyze_topics(chat: ChatData, on_progress=None, should_cancel=None,
         lambda p, msgs: _month_prompt(chat, p, msgs, chat_hash=chat_hash),
         max_tokens=MAX_TOKENS_BY_DIM["topics"],
         tag="topics",
-        on_progress=on_progress, should_cancel=should_cancel,
+        on_progress=on_progress,
+        should_cancel=should_cancel,
         chat_hash=chat_hash,
     )
     # 权重归一化，保证各月话题占比之和恒为 1.0
@@ -1038,8 +1101,9 @@ def analyze_topics(chat: ChatData, on_progress=None, should_cancel=None,
     return results
 
 
-def analyze_relationship(chat: ChatData, on_progress=None, should_cancel=None,
-                 chat_hash: str = "") -> dict[str, Any]:
+def analyze_relationship(
+    chat: ChatData, on_progress=None, should_cancel=None, chat_hash: str = ""
+) -> dict[str, Any]:
     """逐月人际关系分析"""
     months = split_by_month(chat)
     results = _analyze_periods(
@@ -1048,7 +1112,8 @@ def analyze_relationship(chat: ChatData, on_progress=None, should_cancel=None,
         lambda p, msgs: _month_prompt(chat, p, msgs, chat_hash=chat_hash),
         max_tokens=MAX_TOKENS_BY_DIM["relationship"],
         tag="relationship",
-        on_progress=on_progress, should_cancel=should_cancel,
+        on_progress=on_progress,
+        should_cancel=should_cancel,
         chat_hash=chat_hash,
     )
     for r in results.values():
@@ -1057,10 +1122,17 @@ def analyze_relationship(chat: ChatData, on_progress=None, should_cancel=None,
     return results
 
 
-def _analyze_person(system_prompt: str, sample_size: int, msgs: list,
-                    display_name: str, prompt_template: str, max_tokens: int,
-                    tag: str = "unknown", stratified: bool = False,
-                    chat_hash: str = "") -> Optional[dict]:
+def _analyze_person(
+    system_prompt: str,
+    sample_size: int,
+    msgs: list,
+    display_name: str,
+    prompt_template: str,
+    max_tokens: int,
+    tag: str = "unknown",
+    stratified: bool = False,
+    chat_hash: str = "",
+) -> Optional[dict]:
     """单人的习惯/锐评分析：先过滤再取样本，失败仅记日志。
 
     stratified=False（习惯）：取最近 sample_size 条 —— 语言习惯看当下。
@@ -1094,8 +1166,13 @@ def _analyze_person(system_prompt: str, sample_size: int, msgs: list,
             dialog += f"\n\n图片内容摘要（由视觉模型识别，供参考）：\n{digest}"
         if not dialog.strip():
             return None
-        result = _call_api(system_prompt, prompt_template.format(display_name=display_name, dialog=dialog),
-                           max_tokens=max_tokens, tag=tag, dim=tag)
+        result = _call_api(
+            system_prompt,
+            prompt_template.format(display_name=display_name, dialog=dialog),
+            max_tokens=max_tokens,
+            tag=tag,
+            dim=tag,
+        )
         if result:
             result["name"] = display_name
             result["total_messages"] = len(valid_all)
@@ -1107,8 +1184,9 @@ def _analyze_person(system_prompt: str, sample_size: int, msgs: list,
     return None
 
 
-def analyze_habits(chat: ChatData, on_progress=None, should_cancel=None,
-                 chat_hash: str = "") -> dict[str, Any]:   # chat_hash 保留以统一调用签名
+def analyze_habits(
+    chat: ChatData, on_progress=None, should_cancel=None, chat_hash: str = ""
+) -> dict[str, Any]:  # chat_hash 保留以统一调用签名
     """分析双方的语言习惯"""
     self_msgs = [m for m in chat.messages if m.sender_uid == chat.self_uid]
     other_msgs = [m for m in chat.messages if m.sender_uid != chat.self_uid]
@@ -1121,9 +1199,16 @@ def analyze_habits(chat: ChatData, on_progress=None, should_cancel=None,
             break
         display_name = chat.self_name if person_key == "self" else chat.other_name
         try:
-            result = _analyze_person(SYSTEM_PROMPT_HABITS, 500, msgs, display_name, template,
-                                     max_tokens=MAX_TOKENS_BY_DIM["habits"], tag="habits",
-                                     chat_hash=chat_hash)
+            result = _analyze_person(
+                SYSTEM_PROMPT_HABITS,
+                500,
+                msgs,
+                display_name,
+                template,
+                max_tokens=MAX_TOKENS_BY_DIM["habits"],
+                tag="habits",
+                chat_hash=chat_hash,
+            )
         except QuotaExhaustedError:
             if results:  # 已有部分结果：保留已完成者，向上报告配额问题
                 logger.error("配额耗尽，剩余对象未分析（已完成 %d/2）", len(results))
@@ -1137,8 +1222,9 @@ def analyze_habits(chat: ChatData, on_progress=None, should_cancel=None,
     return results
 
 
-def analyze_profile(chat: ChatData, on_progress=None, should_cancel=None,
-                 chat_hash: str = "") -> dict[str, Any]:   # chat_hash 保留以统一调用签名
+def analyze_profile(
+    chat: ChatData, on_progress=None, should_cancel=None, chat_hash: str = ""
+) -> dict[str, Any]:  # chat_hash 保留以统一调用签名
     """AI 人物锐评 — 分析双方的性格画像"""
     self_msgs = [m for m in chat.messages if m.sender_uid == chat.self_uid]
     other_msgs = [m for m in chat.messages if m.sender_uid != chat.self_uid]
@@ -1151,9 +1237,17 @@ def analyze_profile(chat: ChatData, on_progress=None, should_cancel=None,
             break
         display_name = chat.self_name if person_key == "self" else chat.other_name
         try:
-            result = _analyze_person(SYSTEM_PROMPT_PROFILE, 800, msgs, display_name, template,
-                                     max_tokens=MAX_TOKENS_BY_DIM["profile"], tag="profile",
-                                     stratified=True, chat_hash=chat_hash)
+            result = _analyze_person(
+                SYSTEM_PROMPT_PROFILE,
+                800,
+                msgs,
+                display_name,
+                template,
+                max_tokens=MAX_TOKENS_BY_DIM["profile"],
+                tag="profile",
+                stratified=True,
+                chat_hash=chat_hash,
+            )
         except QuotaExhaustedError:
             if results:
                 logger.error("配额耗尽，剩余对象未分析（已完成 %d/2）", len(results))
@@ -1177,12 +1271,13 @@ def is_insecure_base_url() -> bool:
     url = (DEEPSEEK_BASE_URL or "").strip().lower()
     if not url.startswith("http://"):
         return False
-    host = url[len("http://"):].split("/", 1)[0]
-    host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host      # 去掉端口
+    host = url[len("http://") :].split("/", 1)[0]
+    host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host  # 去掉端口
     return host not in ("localhost", "127.0.0.1", "::1", "[::1]")
 
 
 # 启动即检查一次：明文 http 的非本机端点会让 API Key 与聊天内容裸奔，值得每次都提醒
 if is_insecure_base_url():
-    logger.warning("DEEPSEEK_BASE_URL 使用明文 http 且不是本机地址："
-                   "API Key 与聊天内容会以明文过网，请改用 https 端点")
+    logger.warning(
+        "DEEPSEEK_BASE_URL 使用明文 http 且不是本机地址：API Key 与聊天内容会以明文过网，请改用 https 端点"
+    )
