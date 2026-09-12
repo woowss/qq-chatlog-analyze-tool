@@ -19,6 +19,7 @@
 覆盖：时间戳解析兜底、双方身份校验、取消真正生效、任务重叠拒绝、
 缓存原子写与续期、登录限流、会话 Cookie、日志 handler 唯一性。
 """
+
 import io
 import json
 import os
@@ -34,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # 测试隔离：数据目录指向临时目录，避免测试读写真实的 uploads/ai_cache/session
 import tempfile as _tempfile
+
 # 测试隔离：数据目录指向临时目录，绝不碰真实 uploads/ai_cache/session。
 # 只清理"自己创建的"目录——外部显式指定的 QQCHAT_DATA_DIR 一律不动。
 import atexit as _atexit
@@ -44,6 +46,7 @@ def _drop_temp_data_dir():
     """跑完把临时数据目录删掉（先关日志：否则我们的清理先跑，logging 的
     shutdown 又把 app.log 写回来，留下一堆空目录）"""
     import logging
+
     logging.shutdown()
     _shutil.rmtree(os.environ["QQCHAT_DATA_DIR"], ignore_errors=True)
 
@@ -80,30 +83,43 @@ def _write_chat(data: dict) -> str:
 
 
 def _msg(uid: str, ts: int, text: str = "hello") -> Message:
-    return Message(id="", timestamp=ts, time_str="2025-01-01 00:00:00",
-                   sender_name="x", sender_uid=uid, text=text, raw_text=text,
-                   msg_type="type_1", has_image=False, is_reply=False)
+    return Message(
+        id="",
+        timestamp=ts,
+        time_str="2025-01-01 00:00:00",
+        sender_name="x",
+        sender_uid=uid,
+        text=text,
+        raw_text=text,
+        msg_type="type_1",
+        has_image=False,
+        is_reply=False,
+    )
 
 
 class TestParserTimestampRobustness(unittest.TestCase):
     """时间戳缺失/null/非数值：既不能崩溃，也不能把消息塞进 1970-01"""
 
-    GOOD = {"id": "1", "timestamp": 1758031009000, "time": "2025-09-16 21:56:49",
-            "sender": {"uid": "u_self", "name": "我"}, "content": "正常"}
+    GOOD = {
+        "id": "1",
+        "timestamp": 1758031009000,
+        "time": "2025-09-16 21:56:49",
+        "sender": {"uid": "u_self", "name": "我"},
+        "content": "正常",
+    }
 
     @staticmethod
     def _load(msgs, info=None):
         data = {
             "chatInfo": info or {"name": "对方", "selfUid": "u_self", "selfName": "我"},
-            "statistics": {"senders": [{"uid": "u_self", "name": "我"},
-                                       {"uid": "u_other", "name": "对方"}]},
+            "statistics": {"senders": [{"uid": "u_self", "name": "我"}, {"uid": "u_other", "name": "对方"}]},
             "messages": msgs,
         }
         return load_chat(_write_chat(data))
 
     def test_null_timestamp_does_not_crash(self):
         chat = self._load([self.GOOD, {**self.GOOD, "id": "2", "timestamp": None}])
-        self.assertEqual(len(chat.messages), 2)      # 用 time 字符串回退成功
+        self.assertEqual(len(chat.messages), 2)  # 用 time 字符串回退成功
         self.assertEqual(set(split_by_month(chat)), {"2025-09"})
 
     def test_string_timestamp_is_coerced(self):
@@ -117,8 +133,13 @@ class TestParserTimestampRobustness(unittest.TestCase):
         self.assertEqual(list(split_by_month(chat)), ["2025-10"])
 
     def test_unusable_timestamp_is_dropped_not_1970(self):
-        bad = {"id": "9", "timestamp": None, "time": "not-a-date",
-               "sender": {"uid": "u_other", "name": "对方"}, "content": "坏时间戳"}
+        bad = {
+            "id": "9",
+            "timestamp": None,
+            "time": "not-a-date",
+            "sender": {"uid": "u_other", "name": "对方"},
+            "content": "坏时间戳",
+        }
         chat = self._load([self.GOOD, bad])
         self.assertEqual(len(chat.messages), 1)
         self.assertEqual(chat.dropped_messages, 1)
@@ -139,9 +160,8 @@ class TestParserTimestampRobustness(unittest.TestCase):
     def test_other_name_not_polluted_when_self_is_first_sender(self):
         """senders 里自己排第一时，不能把自己当成「对方」"""
         data = {
-            "chatInfo": {"name": "会话", "selfName": "我"},   # 故意缺 selfUid
-            "statistics": {"senders": [{"uid": "u_self", "name": "我"},
-                                       {"uid": "u_other", "name": "对方"}]},
+            "chatInfo": {"name": "会话", "selfName": "我"},  # 故意缺 selfUid
+            "statistics": {"senders": [{"uid": "u_self", "name": "我"}, {"uid": "u_other", "name": "对方"}]},
             "messages": [self.GOOD],
         }
         chat = load_chat(_write_chat(data))
@@ -153,12 +173,16 @@ class TestCancelActuallyStops(unittest.TestCase):
 
     @staticmethod
     def _months(n):
-        return {f"2025-{m:02d}": [_msg("self", 1735689600000 + (m - 1) * 2678400000 + i * 60000)
-                                  for i in range(3)]
-                for m in range(1, n + 1)}
+        return {
+            f"2025-{m:02d}": [
+                _msg("self", 1735689600000 + (m - 1) * 2678400000 + i * 60000) for i in range(3)
+            ]
+            for m in range(1, n + 1)
+        }
 
     def test_cancel_after_first_month_stops_remaining(self):
         import analyzer.deepseek_client as dc
+
         calls = []
         flag = {"cancel": False}
 
@@ -171,36 +195,53 @@ class TestCancelActuallyStops(unittest.TestCase):
             if done >= 1:
                 flag["cancel"] = True
 
-        with mock.patch.object(dc, "_call_api", side_effect=fake_api), \
-             mock.patch.object(dc, "CALL_MIN_INTERVAL", 0.0):
-            res = dc._analyze_periods(self._months(8), "sys", lambda p, m: "prompt",
-                                      max_tokens=1024, tag="emotion",
-                                      on_progress=on_progress,
-                                      should_cancel=lambda: flag["cancel"])
+        with (
+            mock.patch.object(dc, "_call_api", side_effect=fake_api),
+            mock.patch.object(dc, "CALL_MIN_INTERVAL", 0.0),
+        ):
+            res = dc._analyze_periods(
+                self._months(8),
+                "sys",
+                lambda p, m: "prompt",
+                max_tokens=1024,
+                tag="emotion",
+                on_progress=on_progress,
+                should_cancel=lambda: flag["cancel"],
+            )
         self.assertLess(len(calls), 8, "取消后不应继续调用剩余月份")
         self.assertLessEqual(len(calls), dc.CONCURRENCY, "只应跑完并发窗口内的任务")
         self.assertLess(len(res), 8)
 
     def test_cancel_before_start_makes_no_calls(self):
         import analyzer.deepseek_client as dc
+
         calls = []
-        with mock.patch.object(dc, "_call_api",
-                               side_effect=lambda *a, **kw: calls.append(1)), \
-             mock.patch.object(dc, "CALL_MIN_INTERVAL", 0.0):
-            res = dc._analyze_periods(self._months(5), "sys", lambda p, m: "prompt",
-                                      max_tokens=1024, tag="emotion",
-                                      should_cancel=lambda: True)
+        with (
+            mock.patch.object(dc, "_call_api", side_effect=lambda *a, **kw: calls.append(1)),
+            mock.patch.object(dc, "CALL_MIN_INTERVAL", 0.0),
+        ):
+            res = dc._analyze_periods(
+                self._months(5),
+                "sys",
+                lambda p, m: "prompt",
+                max_tokens=1024,
+                tag="emotion",
+                should_cancel=lambda: True,
+            )
         self.assertEqual(calls, [])
         self.assertEqual(res, {})
 
     def test_without_cancel_all_months_run(self):
         import analyzer.deepseek_client as dc
+
         calls = []
-        with mock.patch.object(dc, "_call_api",
-                               side_effect=lambda *a, **kw: calls.append(1) or {"x": 1}), \
-             mock.patch.object(dc, "CALL_MIN_INTERVAL", 0.0):
-            res = dc._analyze_periods(self._months(4), "sys", lambda p, m: "prompt",
-                                      max_tokens=1024, tag="emotion")
+        with (
+            mock.patch.object(dc, "_call_api", side_effect=lambda *a, **kw: calls.append(1) or {"x": 1}),
+            mock.patch.object(dc, "CALL_MIN_INTERVAL", 0.0),
+        ):
+            res = dc._analyze_periods(
+                self._months(4), "sys", lambda p, m: "prompt", max_tokens=1024, tag="emotion"
+            )
         self.assertEqual(len(calls), 4)
         self.assertEqual(len(res), 4)
 
@@ -210,6 +251,7 @@ class TestJobOverlapGuard(unittest.TestCase):
 
     def setUp(self):
         import app as appmod
+
         # 这些用例只关心任务编排，不能依赖本机 .env 是否配了 API Key（CI 没有 .env）
         self._patches = [
             mock.patch("analyzer.deepseek_client.is_api_configured", return_value=True),
@@ -221,19 +263,32 @@ class TestJobOverlapGuard(unittest.TestCase):
         self.client.get("/")
         with self.client.session_transaction() as sess:
             self.token = sess["csrf_token"]
-        payload = json.dumps({
-            "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
-            "statistics": {"senders": [{"uid": "u_self", "name": "我"},
-                                       {"uid": "u_other", "name": "对方"}]},
-            "messages": [
-                {"id": "1", "timestamp": 1758031009000, "time": "2025-09-16 21:56:49",
-                 "sender": {"uid": "u_self", "name": "我"}, "content": "在吗"},
-                {"id": "2", "timestamp": 1758031069000, "time": "2025-09-16 21:57:49",
-                 "sender": {"uid": "u_other", "name": "对方"}, "content": "在的"},
-            ],
-        }, ensure_ascii=False).encode("utf-8")
-        self.client.post("/upload", data={"file": (io.BytesIO(payload), "c.json")},
-                         headers=self._headers())
+        payload = json.dumps(
+            {
+                "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
+                "statistics": {
+                    "senders": [{"uid": "u_self", "name": "我"}, {"uid": "u_other", "name": "对方"}]
+                },
+                "messages": [
+                    {
+                        "id": "1",
+                        "timestamp": 1758031009000,
+                        "time": "2025-09-16 21:56:49",
+                        "sender": {"uid": "u_self", "name": "我"},
+                        "content": "在吗",
+                    },
+                    {
+                        "id": "2",
+                        "timestamp": 1758031069000,
+                        "time": "2025-09-16 21:57:49",
+                        "sender": {"uid": "u_other", "name": "对方"},
+                        "content": "在的",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        self.client.post("/upload", data={"file": (io.BytesIO(payload), "c.json")}, headers=self._headers())
 
     def tearDown(self):
         for p in self._patches:
@@ -255,8 +310,14 @@ class TestJobOverlapGuard(unittest.TestCase):
             sid, chash = sess.sid, sess.get("chat_hash")
         with jobsmod.JOBS_LOCK:
             jobsmod.JOBS["testjob"] = {
-                "status": "running", "dim": dim, "done": 0, "total": 0, "cancel": False,
-                "chat_hash": chash, "sid": sid, "created": time.time(),
+                "status": "running",
+                "dim": dim,
+                "done": 0,
+                "total": 0,
+                "cancel": False,
+                "chat_hash": chash,
+                "sid": sid,
+                "created": time.time(),
             }
 
     def test_single_dimension_rejected_while_all_running(self):
@@ -279,12 +340,15 @@ class TestJobOverlapGuard(unittest.TestCase):
 
     def test_cache_is_readable_right_after_job_reports_done(self):
         """缓存必须先落盘再置 done，否则前端随后读缓存落空会重新付费分析"""
-        with mock.patch("analyzer.deepseek_client._call_api",
-                        return_value={"self_emotion": "平静", "other_emotion": "平静"}), \
-             mock.patch("analyzer.deepseek_client.is_api_configured", return_value=True), \
-             mock.patch("webapp.api.is_api_configured", return_value=True):
-            job = self.client.post("/api/analyze/emotion",
-                                   headers=self._headers()).get_json()["job"]
+        with (
+            mock.patch(
+                "analyzer.deepseek_client._call_api",
+                return_value={"self_emotion": "平静", "other_emotion": "平静"},
+            ),
+            mock.patch("analyzer.deepseek_client.is_api_configured", return_value=True),
+            mock.patch("webapp.api.is_api_configured", return_value=True),
+        ):
+            job = self.client.post("/api/analyze/emotion", headers=self._headers()).get_json()["job"]
             deadline = time.time() + 15
             status = None
             while time.time() < deadline:
@@ -330,6 +394,7 @@ class TestLoginThrottle(unittest.TestCase):
 
     def setUp(self):
         import app as appmod
+
         self.client = appmod.app.test_client()
         with securitymod._login_lock:
             securitymod._login_failures.clear()
@@ -340,10 +405,11 @@ class TestLoginThrottle(unittest.TestCase):
 
     def test_repeated_failures_are_throttled(self):
         from webapp import security as securitymod
+
         with mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"):
             for _ in range(securitymod.LOGIN_MAX_ATTEMPTS):
                 r = self.client.post("/login", data={"password": "wrong"})
-                self.assertEqual(r.status_code, 200)      # 正常渲染错误提示
+                self.assertEqual(r.status_code, 200)  # 正常渲染错误提示
             r = self.client.post("/login", data={"password": "wrong"})
             self.assertEqual(r.status_code, 429)
             # 即使口令正确，窗口内也照样拒绝（避免爆破成功）
@@ -352,6 +418,7 @@ class TestLoginThrottle(unittest.TestCase):
 
     def test_success_clears_failures(self):
         from webapp import security as securitymod
+
         with mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"):
             self.client.post("/login", data={"password": "wrong"})
             r = self.client.post("/login", data={"password": "s3cret"})
@@ -363,11 +430,14 @@ class TestLoginThrottle(unittest.TestCase):
 class TestHardeningMisc(unittest.TestCase):
     def test_session_cookie_flags(self):
         import app as appmod
+
         self.assertTrue(appmod.app.config["SESSION_COOKIE_HTTPONLY"])
         self.assertEqual(appmod.app.config["SESSION_COOKIE_SAMESITE"], "Lax")
+
     def test_logger_handlers_configured_once(self):
         """handler 只挂包级 logger：多个 logger 抢同一文件会让轮转在 Windows 上失败"""
         import analyzer.logger as L
+
         base = L.get_logger()
         app_logger = L.get_logger("app")
         ds_logger = L.get_logger("deepseek")
@@ -383,6 +453,7 @@ class TestTemplatesCompile(unittest.TestCase):
 
     def test_all_templates_compile(self):
         import app as appmod
+
         tpl_dir = Path(appmod.app.template_folder)
         if not tpl_dir.is_absolute():
             tpl_dir = Path(appmod.app.root_path) / tpl_dir
