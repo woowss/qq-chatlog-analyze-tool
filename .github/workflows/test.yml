@@ -25,6 +25,8 @@ jobs:
           pip install -r requirements.txt
           # 固定版本：否则 ruff 一发新版就可能让 CI 因新规则变红
           pip install ruff==0.16.6
+          # tests/test_packaging.py 要读 pyproject.toml：3.10 没有标准库 tomllib
+          pip install "tomli>=2; python_version < '3.11'"
 
       - name: Lint (ruff)
         run: python -m ruff check .
@@ -32,7 +34,54 @@ jobs:
       - name: Syntax check
         run: |
           python -m py_compile app.py config.py
-          python -m py_compile parser/*.py analyzer/*.py webapp/*.py tests/*.py
+          python -m py_compile parser/*.py analyzer/*.py webapp/*.py web/*.py tests/*.py tools/*.py
 
       - name: Run unit tests (含逐页冒烟)
         run: python -m unittest discover -s tests -v
+
+  package:
+    # 真正构建 wheel 并拆包核对：源码侧的 glob 模拟（tests/test_packaging.py）证明不了
+    # "打出来的包里有 templates/static"，所以这一层必须跑真实构建 + 真实安装。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel --outdir .tmp_dist
+
+      - name: Verify wheel contents (code + templates/static + entry point)
+        run: python tools/verify_wheel.py .tmp_dist/*.whl
+
+      - name: Install the wheel in a clean venv and run `qqchatlog`
+        run: |
+          python -m venv "$RUNNER_TEMP/qqchatlog-venv"
+          "$RUNNER_TEMP/qqchatlog-venv/bin/python" -m pip install --upgrade --quiet pip
+          "$RUNNER_TEMP/qqchatlog-venv/bin/python" -m pip install --quiet "$GITHUB_WORKSPACE"/.tmp_dist/*.whl
+          # console_scripts 真的落地了才算数
+          "$RUNNER_TEMP/qqchatlog-venv/bin/qqchatlog" --version
+          # 从仓库外的工作目录装配应用：模板/静态必须走包内绝对路径，数据目录不许落进 site-packages
+          cd "$RUNNER_TEMP"
+          QQCHAT_DATA_DIR="$RUNNER_TEMP/qqchatlog-data" \
+            "$RUNNER_TEMP/qqchatlog-venv/bin/python" - <<'PY'
+          from pathlib import Path
+
+          import app
+          import config
+          import web
+
+          installed = Path(web.__file__).resolve().parent
+          assert "site-packages" in installed.as_posix(), installed
+          assert app.app.template_folder.startswith(str(installed)), app.app.template_folder
+          assert app.app.static_folder.startswith(str(installed)), app.app.static_folder
+          app.app.jinja_env.get_template("base.html")          # 模板真在包里
+          assert Path(app.app.static_folder, "js", "charts.js").is_file()   # 静态资源也真在
+          assert "site-packages" not in config.DEFAULT_DATA_DIR.as_posix(), config.DEFAULT_DATA_DIR
+          print("installed OK:", installed)
+          PY
