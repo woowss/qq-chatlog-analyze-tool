@@ -121,7 +121,8 @@ $(function() {
     var MEMBERS = {{ member_activity | tojson }};
     var INTERACTION = {{ interaction | tojson }};
     renderMemberBar('memberBar', MEMBERS);
-    renderRelationGraph('relationGraph', INTERACTION, MEMBERS);
+    // 报告是"发出去给别人看"的静态件：导出会把所有 button 摘掉，交互控件留着只有残骸
+    renderRelationGraph('relationGraph', INTERACTION, MEMBERS, { controls: false });
     renderInteractionHeatmap('interactionHeat', INTERACTION);
     renderMemberHourlyArea('memberHourly', {{ member_hourly | tojson }});
 
