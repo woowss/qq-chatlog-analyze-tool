@@ -31,7 +31,7 @@ from collections import deque
 from flask import session
 
 from config import AI_CACHE_DIR, DEEPSEEK_MODEL, STATS_CACHE_DIR
-from parser.qq_parser import load_chat
+from parser.qq_parser import group_chat_mode, load_chat
 from analyzer.local_stats import (
     calc_overview,
     calc_daily_counts,
@@ -40,12 +40,12 @@ from analyzer.local_stats import (
     calc_message_length_stats,
     calc_face_stats,
     calc_response_time,
-    calc_exchange_rounds,
     calc_weekly_activity,
     calc_word_freq,
     calc_milestones,
 )
-from analyzer.deepseek_client import PROMPT_FINGERPRINT, purge_month_cache, thinking_enabled
+from analyzer.group_stats import compute_group_stats
+from analyzer.deepseek_client import fingerprint_for_dimension, purge_month_cache, thinking_enabled
 from analyzer.logger import get_logger
 
 logger = get_logger("app")
@@ -65,55 +65,86 @@ def _chat_hash(filepath: str) -> str:
     return h.hexdigest()[:16]
 
 
+def _rewind(stream) -> bool:
+    """把上传流拨回起点；不可回退时返回 False"""
+    try:
+        stream.seek(0)
+    except (OSError, ValueError, AttributeError):
+        return False
+    return True
+
+
 def save_and_hash(file_storage, dest_path: str) -> tuple[int, str]:
     """保存上传文件的同时增量算哈希：50MB 文件少一趟完整重读。
 
-    返回 (字节数, 内容哈希[:16])；流不可回退时降级为落盘后 _chat_hash。
+    返回 (字节数, 内容哈希[:16])。
+
+    两条路径都必须先把流拨回起点：Werkzeug 的 save() 与本函数都从流的**当前**
+    位置开始拷贝，而中途失败的自定义拷贝可能已经把位置推到一半——不回绕就会
+    写出一份"从中间开始"的半截 JSON，而它在 HTTP 层看起来是上传成功的
+    （要到解析阶段才报错，用户只会以为自己的导出文件坏了）。
     """
-    h = hashlib.sha256()
-    size = 0
-    try:
-        stream = file_storage.stream
+    stream = getattr(file_storage, "stream", None)
+
+    # 快路径：自己流式拷贝，边读边算哈希
+    if stream is not None and _rewind(stream):
+        h = hashlib.sha256()
+        size = 0
+        ok = True
         try:
-            stream.seek(0)
-        except (OSError, ValueError):
-            pass
-        with open(dest_path, "wb") as out:
-            while True:
-                chunk = stream.read(1 << 20)
-                if not chunk:
-                    break
-                out.write(chunk)
-                h.update(chunk)
-                size += len(chunk)
-    except OSError:
-        # 流式读写中途出错：回退到标准保存。注意先把流拨回起点——
-        # save() 是从流当前位置复制的，不回拨会落下一个"半截 JSON"。
-        try:
-            file_storage.stream.seek(0)
-        except (OSError, ValueError, AttributeError):
-            pass
+            with open(dest_path, "wb") as out:
+                while True:
+                    chunk = stream.read(1 << 20)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    h.update(chunk)
+                    size += len(chunk)
+        except OSError:
+            # 拷贝中途失败：半截文件作废。这里**不能**用已累计的 size/哈希充数，
+            # 否则会把"从中间截断的 JSON"当成上传成功的完整文件返回。
+            ok = False
+        if ok:
+            # 空流也在这里收口：文件已落成空文件，直接哈希它即可，
+            # 不必为一个空文件再走一次 save()。
+            return size, (h.hexdigest()[:16] if size else _chat_hash(dest_path))
+
+    # 兜底：自定义拷贝失败（或根本没有 stream），交给 Werkzeug 的 save()。
+    # 代价是落盘后要把文件整读一遍算哈希——这是出错路径，一次额外 I/O 换
+    # "文件一定完整"是值得的。
+    if stream is None or _rewind(stream):
         file_storage.save(dest_path)
         size = os.path.getsize(dest_path)
         return size, _chat_hash(dest_path)
-    if not size:  # 空流（防御：让旧路径兜底而非静默哈希空串）
-        return size, _chat_hash(dest_path)
-    return size, h.hexdigest()[:16]
+
+    # 流既不可回绕、自定义拷贝也没成功：宁可报错，也不交出"可能是半个文件"的结果
+    raise OSError("上传流不可回退，无法保证写入完整文件")
 
 
 # ---------------------------------------------------------------------------
 # 已解析聊天数据的进程内复用（一次全量分析原本要为每个维度重新解析一遍）
 # ---------------------------------------------------------------------------
 
+#: 统计缓存里记录"这份结果是用哪种口径算出来的"。定义在这里是因为进程内 ChatData
+#: 缓存与统计缓存都要用；两处都必须能区分私聊/群聊口径，否则会串味。
+STATS_MODE_PRIVATE = "private"
+STATS_MODE_GROUP = "group"
+
 _CHAT_CACHE: dict[tuple, object] = {}
 _CHAT_CACHE_LOCK = threading.Lock()
 
 
 def _load_chat_cached(filepath: str):
-    """按 (路径, mtime, 大小) 复用已解析的 ChatData；只保留最近一份，避免大文件堆积"""
+    """按 (路径, mtime, 大小, 当前模式) 复用已解析的 ChatData；只保留最近一份。
+
+    键里带上模式是必要的：同一份文件在 QQCHAT_GROUP_CHAT 改动前后会被解析成不同
+    对象（私聊 / 群聊 / 两方归并），只按文件属性做键会把上一次的模式结果复用出去。
+    取的是**配置**模式而不是"这份文件实际被判成什么"——后者必须先解析才知道，
+    那正好是我们要避免的开销；而配置模式一变，键就变，语义上已经足够。
+    """
     try:
         st = os.stat(filepath)
-        key = (os.path.abspath(filepath), st.st_mtime_ns, st.st_size)
+        key = (os.path.abspath(filepath), st.st_mtime_ns, st.st_size, group_chat_mode())
     except OSError:
         return load_chat(filepath)
     with _CHAT_CACHE_LOCK:
@@ -135,6 +166,11 @@ def _load_chat_cached(filepath: str):
 # v3：overview 增加 total_files / total_videos / total_forwards / total_other_media
 # v4：overview 增加 image_bytes / media_bytes / unique_images（媒体体积与去重）
 STATS_SCHEMA_VERSION = 4
+# 群聊统计是**另一套形状**，因此用独立的版本号与 mode 字段，而不是把私聊的 v4 往上顶：
+# 顶版本号会让所有既有私聊统计缓存立刻失效（升级后第一次打开页面白等一次计算），
+# 而私聊缓存的形状其实一个字都没变。mode 是权威判别字段，_v 只在同 mode 内有意义。
+# g1 → g2：interaction 增加 explicit_/mention_ 矩阵与覆盖率计数（群聊轨尚未对外，无影响）
+GROUP_STATS_SCHEMA_VERSION = 2
 
 # 统计计算挪出请求线程后的在跑任务：chat_hash -> Thread
 _STATS_THREADS: dict[str, threading.Thread] = {}
@@ -203,7 +239,17 @@ def _stats_path(chat_hash: str) -> str:
     return os.path.join(STATS_CACHE_DIR, f"stats_{chat_hash}.json")
 
 
-def _load_stats(chat_hash: str):
+def _load_stats(chat_hash: str, expect_mode: str = STATS_MODE_PRIVATE):
+    """读统计缓存。expect_mode 决定接受哪一套形状：
+
+    - private（默认，兼容既有调用点）：`_v == STATS_SCHEMA_VERSION` 且没有 mode 字段
+      （**旧缓存就是这种**）或 mode == "private"；
+    - group：`_v == GROUP_STATS_SCHEMA_VERSION` 且 mode == "group"。
+
+    两份不同口径的结果不会互相命中：同一份文件在两种模式下 chat_hash 相同，若只按
+    哈希取用，切换模式后会拿到另一种口径的统计（数字看着正常、含义已变），属于最难
+    发现的那类错。
+    """
     if not chat_hash:
         return None
     try:
@@ -211,7 +257,13 @@ def _load_stats(chat_hash: str):
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
-    if not isinstance(data, dict) or "overview" not in data or data.get("_v") != STATS_SCHEMA_VERSION:
+    if not isinstance(data, dict) or "overview" not in data:
+        return None
+    mode = data.get("mode") or STATS_MODE_PRIVATE
+    if mode != expect_mode:
+        return None
+    want_v = GROUP_STATS_SCHEMA_VERSION if expect_mode == STATS_MODE_GROUP else STATS_SCHEMA_VERSION
+    if data.get("_v") != want_v:
         return None
     try:
         os.utime(_stats_path(chat_hash), None)
@@ -220,14 +272,15 @@ def _load_stats(chat_hash: str):
     return data
 
 
-def _save_stats(chat_hash: str, stats: dict) -> None:
+def _save_stats(chat_hash: str, stats: dict, mode: str = STATS_MODE_PRIVATE) -> None:
     if not chat_hash:
         return
     os.makedirs(STATS_CACHE_DIR, exist_ok=True)
     path = _stats_path(chat_hash)
     tmp = f"{path}.tmp"
     payload = dict(stats)
-    payload["_v"] = STATS_SCHEMA_VERSION
+    payload["mode"] = mode
+    payload["_v"] = GROUP_STATS_SCHEMA_VERSION if mode == STATS_MODE_GROUP else STATS_SCHEMA_VERSION
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
@@ -249,17 +302,30 @@ def _delete_stats(chat_hash: str) -> None:
         pass
 
 
+def stats_mode_of(chat) -> str:
+    """该 ChatData 该走哪套统计口径（群聊轨未就绪时永远不会有群聊 ChatData）"""
+    return STATS_MODE_GROUP if getattr(chat, "is_group_chat", False) else STATS_MODE_PRIVATE
+
+
 def compute_stats(chat) -> dict:
-    """十项本地统计（词频除外：jieba 是耗时大头，由 habits 页懒算）"""
+    """本地统计。群聊走独立分支，私聊分支与它的形状**一个字都没改**。
+
+    词频两条轨都不在这里算：jieba 是耗时大头（数万条约 0.9 秒），由页面懒算。
+    """
+    if getattr(chat, "is_group_chat", False):
+        return compute_group_stats(chat)
+    overview = calc_overview(chat)
     return {
-        "overview": calc_overview(chat),
+        "overview": overview,
         "daily_counts": calc_daily_counts(chat),
         "hourly_dist": calc_hourly_distribution(chat),
         "weekly_dist": calc_weekly_distribution(chat),
         "length_stats": calc_message_length_stats(chat),
         "face_stats": calc_face_stats(chat),
         "response_time": calc_response_time(chat),
-        "exchange_rounds": calc_exchange_rounds(chat),
+        # 复用 overview 里已经算出的轮次：calc_overview 内部就调过一次
+        # calc_exchange_rounds，再单独调一遍等于把 数万条消息白遍历一次。
+        "exchange_rounds": overview["exchange_rounds"],
         "weekly_activity": calc_weekly_activity(chat),
         "milestones": calc_milestones(chat),
     }
@@ -282,8 +348,9 @@ def start_stats_job(chat, chat_hash: str) -> None:
 
     def _work():
         t0 = time.time()
+        mode = stats_mode_of(chat)
         try:
-            if _load_stats(chat_hash) is not None:
+            if _load_stats(chat_hash, expect_mode=mode) is not None:
                 return
             stats = compute_stats(chat)
             # 守卫必须放在计算之后、落盘之前复查：计算期间用户可能已清理该聊天，
@@ -291,7 +358,7 @@ def start_stats_job(chat, chat_hash: str) -> None:
             if _is_recently_purged(chat_hash):
                 logger.info("该聊天的缓存已被清理，放弃写入后台统计结果（避免孤儿）")
                 return
-            _save_stats(chat_hash, stats)
+            _save_stats(chat_hash, stats, mode=mode)
             _clear_stats_error(chat_hash)
             logger.info("本地统计完成（%.0f ms，后台线程），已落盘复用", (time.time() - t0) * 1000)
         except Exception as e:
@@ -317,20 +384,29 @@ def wait_for_stats(chat_hash: str, timeout: float = STATS_WAIT_SECONDS) -> None:
 
 
 def _current_stats():
-    """当前会话的统计数据（磁盘缓存；后台还在算则短暂等待），没有则返回 None"""
+    """当前会话的统计数据（磁盘缓存；后台还在算则短暂等待），没有则返回 None
+
+    期望口径取自会话里记下的 chat_mode：写成脚本改过环境变量、或同一份文件在两种
+    模式下都用过时，也不会把另一种口径的结果当成自己的（见 _load_stats）。
+    """
     chat_hash = session.get("chat_hash", "")
-    stats = _load_stats(chat_hash)
+    expect = STATS_MODE_GROUP if session.get("chat_mode") == STATS_MODE_GROUP else STATS_MODE_PRIVATE
+    stats = _load_stats(chat_hash, expect_mode=expect)
     if stats is None and chat_hash:
         with _STATS_LOCK:
             busy = chat_hash in _STATS_THREADS
         if busy:
             wait_for_stats(chat_hash)
-            stats = _load_stats(chat_hash)
+            stats = _load_stats(chat_hash, expect_mode=expect)
     return stats
 
 
 def _stats_with_word_freq(stats: dict, chat_hash: str):
-    """词频按需计算并写回统计缓存：jieba 分词占统计耗时的大头（数万条约 0.9 秒）"""
+    """词频按需计算并写回统计缓存：jieba 分词占统计耗时的大头（数万条约 0.9 秒）
+
+    群聊目前只做群整体词频（与私聊同形：self=我、other=其他所有成员），
+    按成员拆分的词频等群聊页面成型后再加，避免先造一批没人用的数据结构。
+    """
     if stats is None or stats.get("word_freq"):
         return stats
     filepath = session.get("filepath")
@@ -339,7 +415,7 @@ def _stats_with_word_freq(stats: dict, chat_hash: str):
     try:
         chat = _load_chat_cached(filepath)
         stats["word_freq"] = calc_word_freq(chat, top_n=80)
-        _save_stats(chat_hash, stats)
+        _save_stats(chat_hash, stats, mode=stats_mode_of(chat))
     except Exception as e:  # 词频失败不该拖垮页面
         logger.error("词频统计失败: %s", e)
         stats.setdefault("word_freq", {"self": [], "other": []})
@@ -352,15 +428,16 @@ def _stats_with_word_freq(stats: dict, chat_hash: str):
 
 
 def _cache_path(dimension: str, chat_hash: str) -> str:
-    # 键含提示词/格式指纹：PROMPT_FINGERPRINT 由 SYSTEM_PROMPT_* 与对话格式化函数
-    # 自动哈希而来，改了提示词或输入格式后旧缓存自动失效（不再依赖人工 bump 版本号）。
+    # 键含提示词/格式指纹：由 SYSTEM_PROMPT_* 与对话格式化函数自动哈希而来，改了提示词或
+    # 输入格式后旧缓存自动失效（不再依赖人工 bump 版本号）。**按维度取**：群聊维度用群聊
+    # 指纹，私聊维度用私聊指纹——这样新增/修改群聊提示词不会让私聊缓存文件名发生变化
+    # （文件名一变，用户就得为同样的分析重新付费）。
     # 键含思考模式：同一模型开关 thinking 前后的结果差异很大，必须分开存放，
     # 否则切换 LLM_THINKING(_DIMS) 后会命中另一种模式的旧结果（看起来"没区别"）。
     # 非思考模式不加后缀，保持既有缓存键兼容。
     suffix = "_think" if thinking_enabled(dimension) else ""
-    return os.path.join(
-        AI_CACHE_DIR, f"{dimension}_{chat_hash}_{DEEPSEEK_MODEL}_{PROMPT_FINGERPRINT}{suffix}.json"
-    )
+    fingerprint = fingerprint_for_dimension(dimension)
+    return os.path.join(AI_CACHE_DIR, f"{dimension}_{chat_hash}_{DEEPSEEK_MODEL}_{fingerprint}{suffix}.json")
 
 
 def _purge_chat_caches(chat_hash: str) -> int:
@@ -368,6 +445,11 @@ def _purge_chat_caches(chat_hash: str) -> int:
     避免派生的分析结果（含聊天内容摘要）成为孤儿残留。"""
     if not chat_hash:
         return 0
+    # 进程内已解析的 ChatData 也一并丢弃。它的键是 (路径, mtime, size)，而这次
+    # 清理只动派生缓存、**不动源文件**——所以"源文件被同名同大小重建"时会命中
+    # 残留的旧对象，把上一条聊天的内容当成新的喂下去。宁可多解析一次。
+    with _CHAT_CACHE_LOCK:
+        _CHAT_CACHE.clear()
     removed = 0
     try:
         entries = os.listdir(AI_CACHE_DIR)
@@ -378,14 +460,18 @@ def _purge_chat_caches(chat_hash: str) -> int:
             try:
                 os.remove(os.path.join(AI_CACHE_DIR, name))
                 removed += 1
-            except OSError:
-                pass
+            except OSError as e:
+                # 静默吞掉会让用户以为隐私数据已经清干净，实际磁盘上还留着
+                # （Windows 上文件被占用尤其常见），所以这里必须出声。
+                logger.warning("缓存文件删除失败（可能仍残留敏感内容）: %s (%s)", name, e)
     # 本地统计缓存
     try:
         os.remove(_stats_path(chat_hash))
         removed += 1
-    except OSError:
-        pass
+    except FileNotFoundError:
+        pass  # 本来就没有，属正常情形，不必报
+    except OSError as e:
+        logger.warning("统计缓存删除失败（可能仍残留敏感内容）: %s (%s)", _stats_path(chat_hash), e)
     # 月份级缓存：删 manifest，并回收不再被其他聊天引用的月份文件
     removed += purge_month_cache(chat_hash)
     # 看图用的图片副本（uploads/media/<chat_hash>/）：源文件都换了/没了，

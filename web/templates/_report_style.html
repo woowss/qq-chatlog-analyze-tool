@@ -1,0 +1,46 @@
+{#
+Copyright (C) 2026 woowss
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+本文件是 partial：私聊报告与群聊报告共用的打印/排版样式
+单独成文件是为了让私聊报告与群聊报告共用同一份实现——两处各存一份，升级 vendor 时
+必然会漏改一处，而 SRI 对不上时浏览器是静默拦掉资源（样式没了、图表没了），没人会报错。
+注释结束标记紧贴内容、内容末尾保留换行：模板里的换行会进 HTML，多一个空行就会让
+"私聊报告渲染逐字节不变"的对照失败。
+#}<style>
+@media print {
+    .navbar, .footer, .no-print { display: none !important; }
+    .card { break-inside: avoid; box-shadow: none !important; border: 1px solid #ddd !important; }
+    body { font-size: 12pt; }
+    .container { max-width: 100% !important; width: 100% !important; }
+}
+.report-header { text-align: center; padding: 1.6rem 0 1.2rem; }
+.report-header h1 { font-size: 1.7rem; font-weight: 600; }
+.report-header .meta { color: var(--text-secondary); font-size: .875rem; }
+.section-title {
+    font-size: 1.15rem;
+    font-weight: 600;
+    margin: 1.6rem 0 1rem;
+    padding-bottom: .5rem;
+    border-bottom: 1px solid var(--divider);
+}
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; margin-bottom: 1rem; }
+.stat-item { text-align: center; padding: 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); }
+.stat-item .num { font-size: 1.5rem; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+.stat-item .label { font-size: .8rem; color: var(--text-secondary); }
+table.ai-detail { width: 100%; border-collapse: collapse; margin-bottom: 1rem; }
+table.ai-detail th, table.ai-detail td { padding: 8px 12px; border: 1px solid var(--divider); text-align: left; vertical-align: top; }
+table.ai-detail th { background: var(--surface-2); color: var(--text-secondary); font-weight: 500; width: 100px; }
+</style>

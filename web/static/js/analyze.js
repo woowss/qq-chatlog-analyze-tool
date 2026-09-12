@@ -98,6 +98,22 @@ function pollAnalyzeJob(jobId, opts) {
                 });
                 return;
             }
+            // status === 0：请求根本没拿到响应（服务已停止/被重启、断网、连接被重置）。
+            // 这种情况与 404 一样不能当"分析失败"报——后台任务可能还在跑，结果也已落盘。
+            // 先回读磁盘缓存；读不到就如实说明"连接中断、结果不会丢"，让用户刷新页面而不是重跑。
+            if (xhr && xhr.status === 0) {
+                var offline = '与服务的连接中断（服务可能已停止或重启）。已完成的维度结果已保存，'
+                    + '刷新页面后即可查看；重启服务后重新发起也只会命中缓存，不会重复付费。';
+                if (!opts.dim) {                 // 一键全量：没有单一维度可回读，只能如实提示
+                    opts.onError(offline);
+                    return;
+                }
+                loadAnalysis(opts.dim, function(result) {
+                    if (result) opts.onDone(result);
+                    else opts.onError(offline);
+                });
+                return;
+            }
             opts.onError((xhr.responseJSON && xhr.responseJSON.error) || '任务状态查询失败');
         });
     }

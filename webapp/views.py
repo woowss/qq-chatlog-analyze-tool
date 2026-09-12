@@ -21,11 +21,13 @@ import uuid
 
 from flask import jsonify, redirect, render_template, request, send_file, session, url_for
 
+import config
 from config import LOG_REDACT_NAMES, MAX_CONTENT_LENGTH, UPLOAD_FOLDER
 from analyzer.deepseek_client import is_api_configured
 from analyzer.logger import get_logger, mask_name
 from webapp import store
-from webapp.security import _guard_post
+from webapp.security import BYPASS_ENDPOINTS, _guard_post
+from web import ASSET_VERSION
 
 logger = get_logger("app")
 
@@ -34,6 +36,8 @@ def log_request():
     """记录每个请求的方法/路径/来源IP"""
     if request.path.startswith("/static/"):
         return  # 静态资源逐条记录只会淹没真正有用的日志
+    if request.endpoint in BYPASS_ENDPOINTS:
+        return  # 存活探针可能每秒被调一次，逐条记日志只会把日志刷爆
     ip = request.remote_addr or "127.0.0.1"
     logger.info("%s %s [%s]", request.method, request.path, ip)
 
@@ -46,10 +50,31 @@ def log_response(response):
 
 
 def inject_stats_flag():
-    """导航栏需要知道"当前是否有数据"，但统计已移出 session，这里统一注入"""
+    """导航栏需要的全局量在这里统一注入。
+
+    - has_stats：当前是否有数据（统计已移出 session，不能在模板里直接判断）
+    - api_ok：API Key 是否配好。原先由 7 个视图各自调一遍 is_api_configured()
+      再传进模板，值完全相同；新增页面时漏传就会显示成"未配置 API Key"，
+      属于看得见却想不到去查的误导。
+    - asset_v：自有 JS/CSS 的版本号，模板用它破浏览器缓存（详见 web/__init__.py）
+    """
+    # is_group_chat：导航栏按模式切换文案与链接。取自 session（上传时写好的解析口径），
+    # 不在这里重新解析文件——那意味着每个请求都要把几十 MB 的导出再读一遍。
+    is_group = session.get("chat_mode") == "group"
     if "overview" in session:  # 兼容旧会话
-        return {"overview": session["overview"], "has_stats": True}
-    return {"has_stats": bool(session.get("chat_hash"))}
+        return {
+            "overview": session["overview"],
+            "has_stats": True,
+            "api_ok": is_api_configured(),
+            "asset_v": ASSET_VERSION,
+            "is_group_chat": is_group,
+        }
+    return {
+        "has_stats": bool(session.get("chat_hash")),
+        "api_ok": is_api_configured(),
+        "asset_v": ASSET_VERSION,
+        "is_group_chat": is_group,
+    }
 
 
 def index():
@@ -58,9 +83,19 @@ def index():
     stats_error：上次上传的统计若在后台线程里失败，这里如实告诉用户
     （异步化之后没有 HTTP 响应能承载它，不说的话用户只会看到"上传成功却回首页"）。
     """
-    return render_template(
-        "index.html", api_ok=is_api_configured(), stats_error=store.stats_error(session.get("chat_hash", ""))
-    )
+    return render_template("index.html", stats_error=store.stats_error(session.get("chat_hash", "")))
+
+
+def health():
+    """存活探针：只回一行 ok，不碰会话 / 日志 / 登录 / 清理链路。
+
+    给反向代理与容器编排用。三条约束缺一不可：
+    - 不能走 require_login：设了口令时探针会被 302 到登录页，永远判为不健康；
+    - 不能建会话：探针可能每秒一次，每次都写一个 session 文件纯属浪费磁盘；
+    - 不能写日志、不能触发清理：同上，高频调用会把日志刷爆。
+    具体豁免见 webapp.security.BYPASS_ENDPOINTS。
+    """
+    return "ok", 200
 
 
 def upload():
@@ -108,13 +143,23 @@ def upload():
 
     try:
         chat = store._load_chat_cached(filepath)
-        logger.info(
-            "解析成功: %s <-> %s, %d 条消息, %d 天",
-            mask_name(chat.self_name),
-            mask_name(chat.other_name),
-            len(chat.messages),
-            chat.duration_days,
-        )
+        if chat.is_group_chat:
+            # 群聊没有单一"对方"：日志按"群名 + 成员数"记，避免把群名当成某个人
+            logger.info(
+                "解析成功（群聊）: %s, %d 位成员, %d 条消息, %d 天",
+                mask_name(chat.chat_name),
+                len(chat.participants()),
+                len(chat.messages),
+                chat.duration_days,
+            )
+        else:
+            logger.info(
+                "解析成功: %s <-> %s, %d 条消息, %d 天",
+                mask_name(chat.self_name),
+                mask_name(chat.other_name),
+                len(chat.messages),
+                chat.duration_days,
+            )
         if chat.dropped_messages:
             # 这些消息的时间戳无法解析（缺失/null/非数值），已跳过而不是塞进 1970-01
             logger.warning("跳过 %d 条时间戳无效的消息（未计入统计与分析）", chat.dropped_messages)
@@ -144,11 +189,14 @@ def upload():
     session["filepath"] = filepath
     session["chat_hash"] = new_hash
     session["total_messages"] = len(chat.messages)
+    # 本次解析用的口径（private/group/two_party）：页面与统计缓存都靠它判断走哪条轨，
+    # 不能在请求里重新判定——那意味着每个请求都重新解析一次大文件。
+    session["chat_mode"] = chat.mode
     if old_hash and old_hash != new_hash:
         logger.info("同一会话上传了新文件，旧文件（%s…）的派生缓存已清理", old_hash[:8])
 
     # 本地统计：内容相同的文件直接复用上次结果（统计是确定性的，重算纯属浪费）
-    if store._load_stats(new_hash) is None:
+    if store._load_stats(new_hash, expect_mode=store.stats_mode_of(chat)) is None:
         logger.info("开始计算本地统计（后台线程）...")
         store.start_stats_job(chat, new_hash)
     else:
@@ -208,11 +256,57 @@ def _require_stats():
     return stats, None
 
 
+def _is_group() -> bool:
+    """当前会话是不是群聊记录（口径来自上传时写入的 chat_mode）"""
+    return session.get("chat_mode") == "group"
+
+
+def _group_ai_plan(stats: dict) -> dict:
+    """群聊 AI 全量的调用计划：给用户一个"点下去要花多少次调用"的明确预期。
+
+    群聊维度的成本结构与私聊不同：3 个群级维度**按月份**计费，成员画像**按人数**计费，
+    所以只报"4 个维度"是不诚实的（4 个月 57 人的群实际是 12 + 10 = 22 次调用）。
+    """
+    # 月份数 = 出现过的 "YYYY-MM" 个数。原先写成一串 and/or 短路求值，
+    # 依赖"空列表为假"来兜 0，读的人得在脑子里跑一遍才知道结果是不是数字。
+    daily = stats.get("daily_counts") or []
+    months = len({d["date"][:7] for d in daily}) if daily else 0
+    members = min(
+        stats["overview"].get("member_count", 0),
+        int(getattr(config, "GROUP_AI_MAX_MEMBERS", 10) or 10),
+    )
+    return {"months": months, "members": members, "calls": months * 3 + members}
+
+
+def _group_context(stats: dict) -> dict:
+    """群聊页面共用的模板上下文。
+
+    只放页面真正要用的键：群聊没有"对方"，因此不放 other_name 之类会让模板误用的字段。
+    """
+    return {
+        "overview": stats["overview"],
+        "member_activity": stats.get("member_activity") or [],
+        "interaction": stats.get("interaction") or {},
+        "member_hourly": stats.get("member_hourly") or {},
+        "daily_counts": stats.get("daily_counts"),
+        "hourly_dist": stats.get("hourly_dist"),
+        "weekly_dist": stats.get("weekly_dist"),
+        "weekly_activity": stats.get("weekly_activity"),
+        "length_stats": stats.get("length_stats"),
+        "face_stats": stats.get("face_stats") or {},
+        "milestones": stats.get("milestones") or {},
+        "ai_plan": _group_ai_plan(stats),
+        "chat_name": session.get("chat_name"),
+    }
+
+
 def dashboard():
     """总览仪表盘"""
     stats, redir = _require_stats()
     if redir:
         return redir
+    if _is_group():
+        return render_template("group_dashboard.html", **_group_context(stats))
     return render_template(
         "dashboard.html",
         overview=stats["overview"],
@@ -222,8 +316,10 @@ def dashboard():
         length_stats=stats.get("length_stats"),
         exchange_rounds=stats.get("exchange_rounds"),
         milestones=stats.get("milestones"),
-        api_ok=is_api_configured(),
         chat_name=session.get("chat_name"),
+        # 只在 two_party（旧逃生阀）下渲染一条如实提示；正常私聊时模板不会输出任何东西，
+        # 因此私聊页面渲染结果逐字节不变（tests/test_group_foundation.py 有对照用例）。
+        chat_mode=session.get("chat_mode", "private"),
     )
 
 
@@ -232,7 +328,9 @@ def emotion():
     stats, redir = _require_stats()
     if redir:
         return redir
-    return render_template("emotion.html", api_ok=is_api_configured(), overview=stats["overview"])
+    if _is_group():
+        return render_template("group_emotion.html", **_group_context(stats))
+    return render_template("emotion.html", overview=stats["overview"])
 
 
 def relationship():
@@ -240,9 +338,10 @@ def relationship():
     stats, redir = _require_stats()
     if redir:
         return redir
+    if _is_group():
+        return render_template("group_relations.html", **_group_context(stats))
     return render_template(
         "relationship.html",
-        api_ok=is_api_configured(),
         overview=stats["overview"],
         response_time=stats.get("response_time"),
         exchange_rounds=stats.get("exchange_rounds"),
@@ -279,12 +378,14 @@ def habits():
     stats, redir = _require_stats()
     if redir:
         return redir
+    if _is_group():
+        # 群聊不做表情原图映射：那一套是"我和对方"的两人对比视图，群里用成员活跃度表达
+        return render_template("group_activity.html", **_group_context(stats))
     chat_hash = session.get("chat_hash", "")
     stats = store._stats_with_word_freq(stats, chat_hash)
     emojis, images, faces_on = _face_assets(stats, chat_hash)
     return render_template(
         "habits.html",
-        api_ok=is_api_configured(),
         overview=stats["overview"],
         face_stats=stats.get("face_stats") or {},
         face_emoji=emojis,
@@ -301,7 +402,9 @@ def topics():
     stats, redir = _require_stats()
     if redir:
         return redir
-    return render_template("topics.html", api_ok=is_api_configured(), overview=stats["overview"])
+    if _is_group():
+        return render_template("group_topics.html", **_group_context(stats))
+    return render_template("topics.html", overview=stats["overview"])
 
 
 def profile():
@@ -309,7 +412,9 @@ def profile():
     stats, redir = _require_stats()
     if redir:
         return redir
-    return render_template("profile.html", api_ok=is_api_configured(), overview=stats["overview"])
+    if _is_group():
+        return render_template("group_profiles.html", **_group_context(stats))
+    return render_template("profile.html", overview=stats["overview"])
 
 
 def report():
@@ -317,11 +422,12 @@ def report():
     stats, redir = _require_stats()
     if redir:
         return redir
+    if _is_group():
+        return render_template("group_report.html", **_group_context(stats))
     stats = store._stats_with_word_freq(stats, session.get("chat_hash", ""))
     emojis, images, _faces_on = _face_assets(stats, session.get("chat_hash", ""))
     return render_template(
         "report.html",
-        api_ok=is_api_configured(),
         overview=stats["overview"],
         daily_counts=stats.get("daily_counts"),
         hourly_dist=stats.get("hourly_dist"),
@@ -365,3 +471,4 @@ def register(app):
     app.add_url_rule("/profile", "profile", profile)
     app.add_url_rule("/report", "report", report)
     app.add_url_rule("/face/<key>", "face_image", face_image)
+    app.add_url_rule("/health", "health", health)

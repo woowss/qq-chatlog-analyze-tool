@@ -19,6 +19,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 {% block content %}
 <h2 class="page-title">总览仪表盘 <span class="sub">{{ chat_name }}</span></h2>
+{%- if chat_mode == 'two_party' %}
+{# 如实告知：只有在显式启用旧逃生阀（QQCHAT_GROUP_CHAT=two_party /
+   QQCHAT_ALLOW_MULTI_PARTY=1）时才渲染。条件为假时整段不输出任何字符——连空行都不留，
+   因此正常私聊页面的渲染结果与加这段之前逐字节一致（有对照脚本与用例钉住）。 #}
+
+<div class="alert alert-warning small">
+    这份记录检测到多位有实质发言的参与者，当前按「我 vs 其他人」两分类归并分析：
+    除我之外的所有人都计入「对方」，因此条数对比、回复速度与关系类结论都会失真。
+    如需按成员分别统计，请改用 <code>QQCHAT_GROUP_CHAT=auto</code>（群聊分析就绪后生效）。
+</div>
+{%- endif %}
 
 <div class="row mb-4">
     <div class="col-md-3 mb-3">

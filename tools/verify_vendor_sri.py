@@ -13,7 +13,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
-"""SRI 复核：本地 vendor 文件 / jsDelivr 实际字节 / report.html 内联常量，三者对齐
+"""SRI 复核：本地 vendor 文件 / jsDelivr 实际字节 / _report_assets.html 内联常量，三者对齐
 
 tests/test_sri.py 只能证明"内联常量 == 本地文件"；"本地文件 == CDN 实际提供的字节"
 这件事必须联网才证得了，所以单独放这里（升级 vendor 文件后跑一次）：
@@ -36,7 +36,10 @@ import urllib.request
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-REPORT_HTML = REPO_ROOT / "web" / "templates" / "report.html"
+#: VENDOR_CDN 表与导出代码所在的模板。2026-09-12 起它们被抽到 partial：
+#: 私聊报告与群聊报告共用同一份导出机制（两处各存一份必然会漏改一处，而 SRI 对不上时
+#: 浏览器是静默拦掉资源）。校验对象因此指向 partial 本身。
+REPORT_HTML = REPO_ROOT / "web" / "templates" / "_report_assets.html"
 BASE_HTML = REPO_ROOT / "web" / "templates" / "base.html"
 VENDOR_DIR = REPO_ROOT / "web" / "static" / "vendor"
 TIMEOUT_SECONDS = 30
@@ -159,7 +162,7 @@ def cdn_issues(table: dict) -> list:
 
 
 def render_table(table: dict) -> str:
-    """按本地文件重算哈希，打印可直接粘回 report.html 的 VENDOR_CDN 表"""
+    """按本地文件重算哈希，打印可直接粘回 _report_assets.html 的 VENDOR_CDN 表"""
     lines = ["var VENDOR_CDN = {"]
     items = list(table.items())
     for index, (name, entry) in enumerate(items):

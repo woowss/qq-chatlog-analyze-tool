@@ -19,6 +19,7 @@
 import logging
 import re
 from collections import Counter, defaultdict
+from datetime import date as _date
 from datetime import datetime
 from typing import Optional
 import jieba
@@ -228,6 +229,56 @@ _STOP_WORDS: set[str] = {
 # 纯标点符号正则（用于过滤）
 _RE_PUNCT = re.compile(r"""^[/*《》「」『』【】〔〕（）——……·、，。！？：；""''～~.+=@#$%^|`<>&\s\d\-]+$""")
 
+# 技术性过滤词（QQ 协议 / UID / XML 残留 / 消息格式标记）。
+# 放在模块级而不是 calc_word_freq 内部：原先每次调用都要重建一遍这个集合。
+_TECH_STOP: set[str] = {
+    "jpg",
+    "png",
+    "gif",
+    "bmp",
+    "jpeg",
+    "webp",
+    "uid",
+    "xml",
+    "version",
+    "encoding",
+    "utf",
+    "serviceID",
+    "templateID",
+    "action",
+    "brief",
+    "m_resid",
+    "tSum",
+    "flag",
+    "title",
+    "color",
+    "size",
+    "hr",
+    "summary",
+    "source",
+    "senderName",
+    "referencedMessageId",
+    "msg",
+    "item",
+    "layout",
+    "nickname",
+    "remark",
+    "selfUid",
+    "selfUin",
+    "selfName",
+    "chatInfo",
+    "statistics",
+    "totalMessages",
+    "timeRange",
+    "messageTypes",
+    "senders",
+    "resources",
+    "图片",
+    "表情",
+    "回复",
+    "合并转发",
+}
+
 
 def calc_word_freq(chat: ChatData, top_n: int = 50) -> dict:
     """高频词统计，返回 {"self": [{"word":"...","count":N}, ...], "other": [...]}"""
@@ -244,84 +295,36 @@ def calc_word_freq(chat: ChatData, top_n: int = 50) -> dict:
         else:
             other_texts.append(text)
 
-    # 技术性过滤词（QQ 协议 / UID / XML 残留 / 消息格式标记）
-    _TECH_STOP = {
-        "jpg",
-        "png",
-        "gif",
-        "bmp",
-        "jpeg",
-        "webp",
-        "uid",
-        "xml",
-        "version",
-        "encoding",
-        "utf",
-        "serviceID",
-        "templateID",
-        "action",
-        "brief",
-        "m_resid",
-        "tSum",
-        "flag",
-        "title",
-        "color",
-        "size",
-        "hr",
-        "summary",
-        "source",
-        "senderName",
-        "referencedMessageId",
-        "msg",
-        "item",
-        "layout",
-        "nickname",
-        "remark",
-        "selfUid",
-        "selfUin",
-        "selfName",
-        "chatInfo",
-        "statistics",
-        "totalMessages",
-        "timeRange",
-        "messageTypes",
-        "senders",
-        "resources",
-        "图片",
-        "表情",
-        "回复",
-        "合并转发",
-    }
-
     # UID 正则：16 位以上字母数字下划线组合
     _RE_UID = re.compile(r"^[a-zA-Z0-9_]{16,}$")
     # 单词+数字混合（如 "1W2g", "3bcc2a8b5d9b8f30171ee1fba56fb201"）
     _RE_MIXED = re.compile(r"^(?:\d+[a-zA-Z]+|[a-zA-Z]+\d+)[a-zA-Z0-9]*$")
 
     def _count(texts: list[str]) -> list[dict]:
-        if not texts:
-            return []
-        merged = " ".join(texts)
-        words = jieba.lcut(merged)
+        # 逐条送进 jieba，而不是把整份发言 join 成一个可能上百万字符的大字符串：
+        # 内存峰值从 O(全部文本) 降到 O(最长一条)，同一条消息的分词结果不变。
+        # 逐条切分也避免了"跨消息把两个词粘成一个词"（原先靠 join 里的空格挡着，
+        # 而 jieba 对空格边界的处理并不保证）。
         counter: Counter = Counter()
-        for w in words:
-            w = w.strip()
-            if len(w) < 2:
-                continue
-            if w.lower() in _STOP_WORDS:
-                continue
-            if w.lower() in _TECH_STOP:
-                continue
-            if _RE_PUNCT.match(w):
-                continue
-            if _RE_UID.match(w):
-                continue
-            if _RE_MIXED.match(w):
-                continue
-            # 合并不同长度的 "emmm" → "emmm"
-            if re.fullmatch(r"[Ee]m{2,}", w):
-                w = "emmm"
-            counter[w] += 1
+        for text in texts:
+            for w in jieba.lcut(text):
+                w = w.strip()
+                if len(w) < 2:
+                    continue
+                if w.lower() in _STOP_WORDS:
+                    continue
+                if w.lower() in _TECH_STOP:
+                    continue
+                if _RE_PUNCT.match(w):
+                    continue
+                if _RE_UID.match(w):
+                    continue
+                if _RE_MIXED.match(w):
+                    continue
+                # 合并不同长度的 "emmm" → "emmm"
+                if re.fullmatch(r"[Ee]m{2,}", w):
+                    w = "emmm"
+                counter[w] += 1
         return [{"word": w, "count": c} for w, c in counter.most_common(top_n)]
 
     return {
@@ -335,9 +338,9 @@ def _statistical(chat: ChatData) -> tuple[list, list[tuple[str, int, int, str]]]
 
     这些派生字段原本在每个 calc_* 里各算一遍：数万条规模下 6 个函数累计
     约 300 ms 花在重复的时区转换上，而 statistical() 也会被重建 12 次。
-    结果挂在 chat 实例上（ChatData 不是 frozen dataclass），随请求生命周期存续。
+    结果挂在 chat 的 _stats_cache 字段上（见 ChatData 的字段声明），随请求生命周期存续。
     """
-    cache = getattr(chat, "_stats_cache", None)
+    cache = chat._stats_cache
     if cache is None:
         msgs = chat.statistical()
         fields = []
@@ -345,7 +348,7 @@ def _statistical(chat: ChatData) -> tuple[list, list[tuple[str, int, int, str]]]
             dt = datetime.fromtimestamp(m.timestamp / 1000, tz=CST)
             fields.append((dt.strftime("%Y-%m-%d"), dt.hour, dt.weekday(), dt.strftime("%Y-%m")))
         cache = (msgs, fields)
-        chat._stats_cache = cache  # type: ignore[attr-defined]
+        chat._stats_cache = cache
     return cache
 
 
@@ -370,16 +373,13 @@ def calc_daily_counts(chat: ChatData, fill_gaps: bool = True) -> list[dict]:
     if not daily or not fill_gaps:
         return [daily[k] for k in sorted(daily)]
 
-    from datetime import date as _date, timedelta as _timedelta
-
+    # 逐日补齐：按 date 的序数递增（3 年记录 ≈ 1100 天，比每次 date + timedelta
+    # 造一个中间对象少一轮分配；结果与 while cur <= end 完全一致）。
     first, last = min(daily), max(daily)
     out: list[dict] = []
-    cur = _date.fromisoformat(first)
-    end = _date.fromisoformat(last)
-    while cur <= end:
-        key = cur.isoformat()
+    for ordinal in range(_date.fromisoformat(first).toordinal(), _date.fromisoformat(last).toordinal() + 1):
+        key = _date.fromordinal(ordinal).isoformat()
         out.append(daily.get(key) or {"date": key, "self": 0, "other": 0})
-        cur += _timedelta(days=1)
     return out
 
 
@@ -564,30 +564,47 @@ def calc_overview(chat: ChatData) -> dict:
     "实际聊过的天数"——两者分开给，避免日均消息的分母口径悄悄变化。
     """
     msgs, fields = _statistical(chat)
-    self_count = sum(1 for m in msgs if m.sender_uid == chat.self_uid)
-    other_count = len(msgs) - self_count
-    self_chars = sum(len(m.text) for m in msgs if m.sender_uid == chat.self_uid)
-    other_chars = sum(len(m.text) for m in msgs if m.sender_uid != chat.self_uid)
-    total_images = sum(1 for m in msgs if m.has_image)
-    # 表情计数：商城大表情（type_17）没有数字 id，只有名字，取两者中有的那个
-    total_faces = sum((len(m.face_names) or len(m.face_ids)) for m in msgs)
-    # 媒体体积与去重：导出器的 size/md5 只对媒体本体有效。
-    # 注意图片与非图片媒体分开统计——把两者混成一个"媒体合计"会让用户以为
-    # 图片只占几十 MB（图片与文件/视频的体积能差一两个数量级，混在一起就是误导）。
-    image_msgs = [m for m in msgs if m.has_image]
-    image_bytes = sum(m.media_bytes for m in image_msgs)
-    other_media_bytes = sum(m.media_bytes for m in msgs if m.media_kind)
-    image_ids = {m.media_id for m in image_msgs if m.media_id}
-    unique_images = len(image_ids) if image_ids else None  # 无 md5 的导出器给 None
-    # 非文本媒体（文件/视频/转发/红包/表情气泡/Markdown）：原先完全不统计，
-    # 现在按类型计数，界面上与图片并列展示
-    media = Counter(m.media_kind for m in msgs if m.media_kind)
+    self_uid = chat.self_uid
+    self_count = 0
+    other_count = 0
+    self_chars = 0
+    other_chars = 0
+    total_images = 0
+    total_faces = 0
+    image_bytes = 0
+    other_media_bytes = 0
+    unique_image_ids: set[str] = set()
+    media: Counter = Counter()
+    # 单次遍历：这段原本是 7 个独立的推导式（3 个 sum 计数、2 个 sum 求字数和、
+    # 1 个 Counter、1 个 set），每个都完整扫一遍 msgs——数万条规模下累计数百毫秒。
+    # 合并到同一个循环里累加，字段口径逐条对齐原实现，结果完全不变。
+    for m in msgs:
+        if m.sender_uid == self_uid:
+            self_count += 1
+            self_chars += len(m.text)
+        else:
+            other_count += 1
+            other_chars += len(m.text)
+        if m.has_image:
+            total_images += 1
+            image_bytes += m.media_bytes
+            if m.media_id:
+                unique_image_ids.add(m.media_id)
+        # 表情计数：商城大表情（type_17）没有数字 id，只有名字，取两者中有的那个
+        total_faces += len(m.face_names) or len(m.face_ids)
+        # 媒体体积与去重：导出器的 size/md5 只对媒体本体有效。
+        # 注意图片与非图片媒体分开统计——把两者混成一个"媒体合计"会让用户以为
+        # 图片只占几十 MB（图片与文件/视频的体积能差一两个数量级，混在一起就是误导）。
+        # 非文本媒体（文件/视频/转发/红包/表情气泡/Markdown）按类型计数，
+        # 原先完全不统计，现在界面上与图片并列展示。
+        if m.media_kind:
+            other_media_bytes += m.media_bytes
+            media[m.media_kind] += 1
+    unique_images = len(unique_image_ids) if unique_image_ids else None  # 无 md5 的导出器给 None
 
     active_days = len({f[0] for f in fields})
     span_days = 0
     if fields:
-        from datetime import date as _date
-
         span_days = (
             _date.fromisoformat(max(f[0] for f in fields)) - _date.fromisoformat(min(f[0] for f in fields))
         ).days + 1
@@ -634,8 +651,6 @@ def calc_milestones(chat: ChatData) -> dict:
     - busiest_month: 最活跃月份 {month, count}
     - mutual_nights: 双方都熬到凌晨 2-5 点的天数（互相陪伴的深夜）
     """
-    from datetime import date as _date
-
     msgs, fields = _statistical(chat)
     if not msgs:
         return {}
