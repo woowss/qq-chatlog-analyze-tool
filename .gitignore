@@ -38,3 +38,8 @@ face_cache/
 dist/
 build/
 *.egg-info/
+
+# 本地审计/核对产物（2026-09 隐私审计留下：一份上游克隆与一份审计报告）。
+# 它们不是项目内容，但也不该被 git add -A 顺手收进仓库。
+privacy-audit-report.md
+analysis-repo/

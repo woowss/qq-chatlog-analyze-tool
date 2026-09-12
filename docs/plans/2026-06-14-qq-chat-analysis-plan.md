@@ -1,5 +1,10 @@
 # QQ 聊天记录分析工具 — 实现计划
 
+> **历史文档（2026-06-14）**：本文是当时的实现计划，保留原样作为记录。
+> 请注意其中界面 mockup 的隐私措辞（"所有数据仅在本地处理"）**已不准确**：实际实现是
+> 「聊天记录只留在本机；AI 分析会把聊天文本片段发送到**你自己配置**的接口」，
+> 以 README「隐私与数据生命周期」与 `web/templates/index.html` 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use subagent-driven-development to implement plan task-by-task.
 
 **Goal:** 构建一个 Flask Web 应用，可导入 QQChatExporter JSON、执行本地统计 + DeepSeek API 分析、以 ECharts 可视化展示
