@@ -43,6 +43,7 @@ from unittest import mock
 # 禁止一切真实 LLM 调用。两者都必须在 import 项目模块（config / analyzer.*）之前完成，
 # 否则 config 会把数据目录读成真实目录。实现与理由见 tests/_bootstrap.py。
 from _bootstrap import bootstrap  # noqa: E402
+from _stats import ensure_stats  # noqa: E402
 
 bootstrap()
 os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
@@ -537,9 +538,13 @@ class TestUploadPathUnchanged(unittest.TestCase):
         self.assertEqual(r.status_code, 302)
         with fresh.session_transaction() as sess:
             chat_hash, mode = sess.get("chat_hash"), sess.get("chat_mode")
+            filepath = sess.get("filepath")
         try:
             self.assertEqual(mode, "group")
-            storemod.wait_for_stats(chat_hash)
+            # 共享 fixture 的统计缓存会被别的用例清掉，裸 wait_for_stats 在没有线程在跑时
+            # 会直接返回，于是 /dashboard 因为"没有统计数据"跳回首页。ensure_stats 把
+            # "统计可用"变成同步保证。详见 tests/_stats.py。
+            ensure_stats(filepath, chat_hash)
             body = fresh.get("/dashboard").get_data(as_text=True)
             self.assertIn("群仪表盘", body)
             self.assertIn("同时在线高峰", body)

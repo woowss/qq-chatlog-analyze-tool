@@ -44,6 +44,7 @@ from unittest import mock
 # 否则 config 会把数据目录读成真实目录。实现与理由见 tests/_bootstrap.py。
 from _bootstrap import api_configured_patcher  # noqa: E402
 from _bootstrap import bootstrap  # noqa: E402
+from _stats import ensure_stats  # noqa: E402
 
 bootstrap()
 os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
@@ -136,7 +137,9 @@ class TestRealExport(unittest.TestCase):
         with cls.client.session_transaction() as sess:
             cls.chat_hash = sess.get("chat_hash")
         store.wait_for_stats(cls.chat_hash)
-        cls.stats = store._load_stats(cls.chat_hash, expect_mode=store.STATS_MODE_GROUP)
+        # 同步保证统计已落盘：等不到后台线程（缓存被别的用例清掉等）就当场补算，
+        # 否则整类用例会一起因为"没有统计数据"而红。详见 tests/_stats.py。
+        cls.stats = ensure_stats(sess["filepath"], cls.chat_hash)
         cls.chat = store._load_chat_cached(sess["filepath"])
         cls.payload = json.loads(payload.decode("utf-8"))
 

@@ -40,6 +40,7 @@ from unittest import mock
 # 否则 config 会把数据目录读成真实目录。实现与理由见 tests/_bootstrap.py。
 from _bootstrap import api_configured_patcher  # noqa: E402
 from _bootstrap import bootstrap  # noqa: E402
+from _stats import ensure_stats  # noqa: E402
 
 bootstrap()
 os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
@@ -110,7 +111,11 @@ class GroupClientMixin:
         assert resp.status_code == 302, resp.status_code
         with client.session_transaction() as sess:
             chat_hash = sess.get("chat_hash")
-        store.wait_for_stats(chat_hash)
+            filepath = sess.get("filepath")
+        # 页面渲染要求统计已落盘。后台线程是异步的，而 wait_for_stats 在没有线程在跑时
+        # 会直接返回（同一份 fixture 的缓存可能刚被别的用例清掉），所以这里用 ensure_stats
+        # 把"统计可用"变成同步保证，不赌线程时序。详见 tests/_stats.py。
+        ensure_stats(filepath, chat_hash)
         return client, headers, chat_hash
 
 

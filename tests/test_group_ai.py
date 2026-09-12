@@ -49,6 +49,7 @@ import shutil as _shutil
 # 禁止一切真实 LLM 调用。两者都必须在 import 项目模块（config / analyzer.*）之前完成，
 # 否则 config 会把数据目录读成真实目录。实现与理由见 tests/_bootstrap.py。
 from _bootstrap import bootstrap  # noqa: E402
+from _stats import ensure_stats  # noqa: E402
 
 bootstrap()
 os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
@@ -406,8 +407,12 @@ class TestGroupUploadRendersWithoutCrash(unittest.TestCase):
         self.assertEqual(resp.status_code, 302)
         with client.session_transaction() as sess:
             chat_hash, mode = sess.get("chat_hash"), sess.get("chat_mode")
+            filepath = sess.get("filepath")
         self.assertEqual(mode, "group")
-        store.wait_for_stats(chat_hash)
+        # 用 ensure_stats 而不是裸 wait_for_stats：共享 fixture 的缓存会被别的用例清掉，
+        # 后台线程的结果可能因此被丢弃（生产上是刻意的 fail-safe），页面就会因为"没有统计
+        # 数据"而 302。详见 tests/_stats.py。
+        ensure_stats(filepath, chat_hash)
         self.assertEqual(store.stats_error(chat_hash), "", "群聊统计不应失败")
         self.assertIsNotNone(store._load_stats(chat_hash, expect_mode=store.STATS_MODE_GROUP))
         pages = ("/", "/dashboard", "/emotion", "/relationship", "/habits", "/topics", "/profile", "/report")
