@@ -413,6 +413,47 @@ li { margin-bottom: .15rem; }
 ::-webkit-scrollbar-thumb { background: var(--text-disabled); border-radius: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
 
+/* ------------------------------------------------------ 互动关系图外壳 */
+/* 工具条 + HTML 图例。图例用 DOM 而不是 ECharts 的 legend：只有 DOM 才能如实画出
+   "实线 / 虚线 / 粗细"，而这张图的全部信息都在线型与粗细里（见 group_charts.js）。 */
+.rel-shell { position: relative; }
+.rel-toolbar { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: .6rem; }
+.rel-btn {
+    font-size: .78rem;
+    line-height: 1.5;
+    padding: .18rem .6rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all .15s ease;
+}
+.rel-btn:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
+.rel-btn[aria-pressed="true"] {
+    background: var(--primary-weak);
+    border-color: var(--primary-border);
+    color: var(--primary);
+    font-weight: 500;
+}
+.rel-btn:disabled { opacity: .45; cursor: not-allowed; }
+
+.rel-legend {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: .3rem 1rem;
+    margin-top: .55rem;
+    font-size: .78rem;
+    color: var(--text-secondary);
+}
+.rel-key { display: inline-flex; align-items: center; gap: .35rem; }
+.rel-swatch { display: inline-block; width: 22px; height: 0; border-top: 3px solid currentColor; }
+.rel-swatch-dash { border-top-style: dashed; border-top-width: 2px; }
+.rel-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; box-shadow: 0 0 0 2px var(--surface); }
+.rel-hint { color: var(--text-disabled); }
+.rel-count { margin-left: auto; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+
 @media (max-width: 768px) {
     .stat-value { font-size: 1.4rem; }
     .page-title { font-size: 1.15rem; }
