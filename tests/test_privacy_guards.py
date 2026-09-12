@@ -1,0 +1,166 @@
+# Copyright (C) 2026 woowss
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+#
+"""隐私护栏：三条"文档承诺了、实现曾经没做到"的规则，各配一条回归用例。
+
+它们守的不是"某个函数返回什么"，而是**以后别再漏**：
+
+1. 日志落盘前人名必须过 `mask_name`（源码级扫 analyzer/ 的 logger 调用）；
+2. 缓存必须带 `_created`，且读取时不把它漏给调用方
+   （否则"绝对 90 天"退化成可被命中无限续期的 mtime）；
+3. 非回环绑定 + 未设口令必须**拒绝服务**，而不是放行——
+   CLI 路径由启动检查拦住，这条兜住绕过 main() 的 WSGI 入口。
+
+第 1 条是源码级静态检查（不是运行时断言）：它按"日志调用附近是否出现 mask_name"
+判断，多行调用按 3 行窗口一起看，避免把续行上的人名漏掉。
+"""
+
+import io
+import json
+import os
+import re
+import tempfile
+import unittest
+from unittest import mock
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+#: 视为"人名"的表达式：出现在 logger 调用里就必须先过 mask_name
+_NAMEISH = re.compile(r"\b(member\.name|display_name|chat_name|self_name|other_name)\b")
+
+
+class TestLogRedactionGuard(unittest.TestCase):
+    """analyzer/ 里往日志写人名，必须先 mask_name（与 webapp 层同一口径）"""
+
+    def test_analyzer_logger_calls_mask_names(self):
+        analyzer = os.path.join(ROOT, "analyzer")
+        bad = []
+        for fn in sorted(os.listdir(analyzer)):
+            if not fn.endswith(".py"):
+                continue
+            path = os.path.join(analyzer, fn)
+            lines = io.open(path, encoding="utf-8", errors="ignore").read().splitlines()
+            for i, line in enumerate(lines):
+                if "logger." not in line:
+                    continue
+                # 多行调用：把本条起连续 3 行当一个语句看（续行上的人名不能漏）
+                window = " ".join(lines[i : i + 3])
+                if not _NAMEISH.search(window):
+                    continue
+                if "mask_name" in window:
+                    continue
+                bad.append("%s:%d %s" % (fn, i + 1, line.strip()[:90]))
+        self.assertEqual(
+            bad,
+            [],
+            "日志里的人名必须经 mask_name 脱敏（LOG_REDACT_NAMES=true 的承诺）：\n" + "\n".join(bad),
+        )
+
+    def test_mask_name_still_masks(self):
+        """护栏的前提：mask_name 本身没被改坏（清单里其余用例只查调用点）"""
+        from analyzer.deepseek_client import mask_name
+
+        self.assertNotIn("甜", mask_name("阿甜"))
+
+
+class TestCacheCreatedGuard(unittest.TestCase):
+    """缓存的"绝对 90 天"硬上限依赖 _created；写入方漏写就会退化成 mtime"""
+
+    def test_month_cache_writes_created_and_hides_it_from_callers(self):
+        from analyzer import deepseek_client as dc
+
+        with tempfile.TemporaryDirectory() as d:
+            dc.configure_month_cache(d)
+            try:
+                key = "guardtest0001"
+                result = {"emotion": {"summary": "x"}}
+                dc._write_month_cache(key, result)
+
+                raw = json.load(io.open(dc.month_cache_path(key), encoding="utf-8"))
+                self.assertIn("_created", raw, "month 缓存必须写 _created，否则硬上限形同虚设")
+
+                self.assertEqual(
+                    dc._read_month_cache(key),
+                    result,
+                    "读取时必须把 _created 摘掉：调用方拿到的结果要与此前完全一致",
+                )
+            finally:
+                dc.configure_month_cache("")
+
+    def test_manifest_created_is_set_once(self):
+        from analyzer import deepseek_client as dc
+
+        with tempfile.TemporaryDirectory() as d:
+            dc.configure_month_cache(d)
+            try:
+                dc._record_month_usage("chathash0001", ["m1"])
+                p = dc._manifest_path("chathash0001")
+                first = json.load(io.open(p, encoding="utf-8"))
+                self.assertIn("_created", first)
+                created = first["_created"]
+
+                dc._record_month_usage("chathash0001", ["m2"])
+                second = json.load(io.open(p, encoding="utf-8"))
+                self.assertEqual(
+                    second["_created"],
+                    created,
+                    "绝对上限看的是首次创建，重写 manifest 不该把它续期",
+                )
+                self.assertEqual(second["months"], ["m1", "m2"])
+            finally:
+                dc.configure_month_cache("")
+
+
+class TestNonLoopbackFailClosed(unittest.TestCase):
+    """非回环绑定又没设口令 = 零认证：必须拒绝服务，绝不敞开放行"""
+
+    def test_serves_503_when_non_loopback_without_password(self):
+        from webapp import security
+
+        import app as appmod
+
+        client = appmod.app.test_client()
+        with (
+            mock.patch.object(security, "ACCESS_PASSWORD", ""),
+            mock.patch.object(security, "FLASK_HOST", "0.0.0.0"),
+        ):
+            resp = client.get("/report")
+        self.assertEqual(
+            resp.status_code,
+            503,
+            "非回环 + 未设口令时必须 503（失败关闭），否则 WSGI 部署等于零认证",
+        )
+
+    def test_loopback_without_password_still_serves(self):
+        from webapp import security
+
+        import app as appmod
+
+        client = appmod.app.test_client()
+        with (
+            mock.patch.object(security, "ACCESS_PASSWORD", ""),
+            mock.patch.object(security, "FLASK_HOST", "127.0.0.1"),
+        ):
+            resp = client.get("/")
+        self.assertNotEqual(
+            resp.status_code,
+            503,
+            "回环绑定下不设口令是既有的正常用法，不能被这条护栏误伤",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
