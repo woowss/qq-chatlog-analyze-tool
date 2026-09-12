@@ -2,6 +2,10 @@
 # 靠人工定期 `pip list --outdated` 很容易忘。这里让 Dependabot 每周开 PR，
 # 小版本合并成一个 PR（噪音低），大版本单独开（要逐个验证 API 变化）。
 #
+# pip 生态会同时读 requirements.txt 与 pyproject.toml 的 [project] dependencies，
+# 两处都要跟着改（范围写 pyproject、精确锁定写 requirements.txt）；
+# tests/test_packaging.py 会核对"声明的运行期依赖都被 requirements.txt 钉住"。
+#
 # 注意：web/static/vendor/ 里的 Bootstrap / jQuery / ECharts 是手工本地化的静态快照，
 # Dependabot 没有对应的包清单可跟踪——升级它们要手动替换文件并同步
 # web/templates/report.html 里的 VENDOR_CDN 版本号（见 test_review_fixes 的映射表用例）。

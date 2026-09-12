@@ -1,5 +1,8 @@
 # 直接依赖：openai（OpenAI 兼容接口）、jieba（中文分词）、python-dotenv（读 .env）、
 # Flask + Flask-Session（Web 层与服务端会话）。
+# 权威声明在 pyproject.toml 的 [project] dependencies（pip install . 装的就是那一份，
+# 带 >=,< 范围）；本文件是给 CI 与源码开发用的**精确锁定**，两处的包集合必须一致——
+# tests/test_packaging.py 会核对这一点。
 Flask==3.1.3
 Flask-Session==0.8.0
 openai==1.61.0

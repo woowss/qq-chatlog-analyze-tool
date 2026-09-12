@@ -34,3 +34,7 @@ face_cache/
 .tmp_*
 *.bak
 *.orig
+# 打包产物（python -m build 的默认输出目录；本地核对用 .tmp_dist/）
+dist/
+build/
+*.egg-info/

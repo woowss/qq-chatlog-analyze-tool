@@ -1,5 +1,69 @@
-[tool.ruff]
+# ===========================================================================
+# 构建与打包：`pip install .` 装好后可直接用 `qqchatlog` 命令启动
+# ===========================================================================
+[build-system]
+# setuptools>=77 才能用 PEP 639 的 license 表达式与 license-files
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qqchatlog"
+version = "1.0.0"
+description = "QQ 聊天记录分析工具：本地统计 + OpenAI 兼容接口的对话分析（仅支持两人私聊导出）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "woowss" }]
+keywords = ["qq", "chatlog", "analysis", "flask", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Framework :: Flask",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Text Processing :: Linguistic",
+]
+# 运行期依赖：与 requirements.txt 同一批包。那边是给 CI/开发用的精确锁定（含传递依赖），
+# 这里是给 pip 解析用的范围；上下限调整时两处都要动。
+dependencies = [
+    "Flask>=3.1,<4",
+    "Flask-Session>=0.8,<0.9",
+    "openai>=1.61,<2",
+    "jieba>=0.42,<0.43",
+    "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+# 开发/CI 用：`pip install -e ".[dev]"`
+dev = ["ruff==0.16.6"]
+
+[project.scripts]
+# 命令行入口。app:main 只负责启动横幅 + 校验 + app.run，
+# 真正的组装在 create_app()，`python app.py` 与 `flask --app app run` 仍然可用。
+qqchatlog = "app:main"
+
+[tool.setuptools]
+# 扁平布局：顶层两个单文件模块 + 三个代码包 + web（只承载模板与静态资源的数据包）
+py-modules = ["app", "config"]
+packages = ["analyzer", "parser", "webapp", "web"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+# 模板与前端静态资源必须进 wheel：它们不在 .py 里，setuptools 默认不收。
+# 少了这段，安装后 Flask 找不到 templates/static，页面直接 500。
+# web/static 里有本地化的 Bootstrap/jQuery/ECharts（vendor/），必须 ** 递归。
+# 覆盖范围由 tests/test_packaging.py 逐个文件核对（含"新增文件忘了改这里"的防线）。
+web = ["templates/**/*.html", "static/**/*"]
+
+# ===========================================================================
 # 代码检查配置：CI 与本地都用 `ruff check .`
+# ===========================================================================
+[tool.ruff]
 line-length = 110
 target-version = "py310"
 exclude = [".git", "__pycache__", "ai_cache", "stats_cache", "uploads", "flask_session", "logs", ".env"]
