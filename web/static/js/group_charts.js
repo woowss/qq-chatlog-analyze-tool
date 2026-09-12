@@ -115,82 +115,496 @@ function renderInteractionHeatmap(domId, interaction) {
     }));
 }
 
-// 关系图：实线 = 精确回复/@（事实），虚线 = 相邻接话（推断）；节点大小 = 发言量
-function renderRelationGraph(domId, interaction, activity) {
-    var chart = mountChart(domId);
-    if (!chart) return;
+// ---------------------------------------------------------------- 互动关系图
+//
+// 这张图真正难的不是"画出来"，而是"画出来能看"。30 位成员的群，相邻接话边能到
+// 270 条（接近完全图），按老画法得到的是画布正中一团灰网 + 一堆叠在一起的昵称，
+// 而四周大片空白——信息量为零。所以下面每个默认值都只为可读性服务：
+//
+//   1. 事实与推断分层：精确回复/@ 走实线并向上弯，接话走虚线并向下弯。老画法两层
+//      都是直线，同一对成员的两条边完全重叠，看起来只有一条；
+//   2. 推断边默认只留最强的几十条——弱边满图都是，等于没有信息。图例旁如实报出
+//      "画了多少 / 一共多少"，不许悄悄丢数据；
+//   3. 布局钉死：力导向只负责算坐标（force.layoutAnimation=false 让它一次算到收敛），
+//      算完换成 layout:'none' 把坐标写死。老画法整个交给力导向，节点能撑到画布外
+//      （实测老画法能把节点撑到画布外，而画布只有几百像素高），两端节点与昵称被裁掉，左右却空着；
+//      钉死之后位置完全可控，也顺带解决了"每次 setOption 力导向都重排一次"的抖动；
+//   4. labelLayout.hideOverlap：ECharts 5 自带的标签防重叠，重叠的昵称自动不画；
+//   5. 昵称按发言量发"常驻名额"（前 N 位），其余悬停才显示——标签总量才是乱的根源；
+//   6. 老图例是错的：三个 category 没有任何节点真的挂上去，色块也与线型对不上。
+//      改成 HTML 图例（见 relLegendHtml），线型、粗细、颜色都按真实画法呈现。
+
+// 推断边的三档强度。用"最多画几条"而不是"次数 ≥ k"：不同群的消息密度能差一个
+// 数量级，固定次数门槛在小群里把边全滤光、在大群里一条都滤不掉。
+var REL_LEVELS = [
+    { name: '强', maxEdges: 45, minValue: 2 },
+    { name: '中', maxEdges: 90, minValue: 2 },
+    { name: '全', maxEdges: 0, minValue: 1 }        // 0 = 不限
+];
+
+var REL_DEFAULTS = {
+    controls: true,      // 报告导出页传 false：导出的 HTML 会摘掉所有 button，留着只有残骸
+    exact: true,         // 事实层：精确回复 / @点名（实线）
+    infer: true,         // 推断层：相邻接话（虚线）
+    level: 1,            // REL_LEVELS 下标
+    memberLimit: 0,      // 0 = 全部进图的成员
+    maxExactEdges: 120,  // 事实边同样封顶：极端群里回复也能到几百条
+    maxLabels: 18,       // 常驻昵称名额（按发言量取前 N）
+    labelMaxChars: 11    // 昵称截断长度（从中间截，见 label.formatter）
+};
+
+//: 成员数量档位（0 = 不限）。比成员总数还大的档位会自动跳过：5 人群不该出现"前 12"。
+var REL_MEMBER_LIMITS = [0, 20, 12];
+
+//: 布局拉伸上限（见 relStretchLayout）。力导向各向同性，宽卡片上要铺满得横向拉很多；
+//: 拉到 2.6 倍还在"看得出是个关系网"的范围里，再大就明显像被擀面杖擀过。
+var REL_STRETCH_MAX = 2.6;
+
+//: 每个画布的重绘状态。工具条改的是它，不必重新回模板取数。
+var _REL_STATE = {};
+
+function relClampIndex(i, n) {
+    i = Number(i) || 0;
+    return Math.min(Math.max(i, 0), Math.max(0, n - 1));
+}
+
+function relNum(v) {
+    return Number(v) || 0;
+}
+
+function relOpts(opts) {
+    var o = {}, k;
+    for (k in REL_DEFAULTS) {
+        if (Object.prototype.hasOwnProperty.call(REL_DEFAULTS, k)) o[k] = REL_DEFAULTS[k];
+    }
+    opts = opts || {};
+    for (k in opts) {
+        if (Object.prototype.hasOwnProperty.call(opts, k) && opts[k] !== undefined) o[k] = opts[k];
+    }
+    return o;
+}
+
+// 矩阵取值：矩阵是二维数组，缺行/缺列都按 0 算（asList 兜住"某行不是数组"的脏数据）
+function relAt(matrix, i, j) {
+    return relNum(asList(matrix[i])[j]);
+}
+
+// 把服务端三个矩阵重组成"每对成员一份"的记录。
+// 服务端按信号分了三个矩阵，前端却必须按"一对人"聚合：同一对成员各画一条线会互相
+// 压住，看不出谁跟谁到底多铁。方向语义照服务端约定——X[i][j] = j 对 i 的动作。
+//
+// 两个退路都为了"别悄悄少画一层"：推断层缺 undirected 时用 edges 边表重建；
+// 只有无向的回复矩阵时，边照画但不画箭头（不知道方向就别瞎指）。
+function relPairs(interaction, opts) {
     interaction = interaction || {};
     var members = asList(interaction.members);
-    var vols = {};
-    asList(activity).forEach(function (a) { vols[a.uid] = a.msg_count || 0; });
-    var maxVol = 1;
-    members.forEach(function (m) { maxVol = Math.max(maxVol, vols[m.uid] || 0); });
+    if (opts.memberLimit > 0) members = members.slice(0, opts.memberLimit);
+    var n = members.length;
+
+    var inferM = asList(interaction.undirected);
+    if (!inferM.length) {
+        asList(interaction.edges).forEach(function (e) {
+            var i = Number(e && e.source), j = Number(e && e.target), v = relNum(e && e.value);
+            if (!(i >= 0) || !(j >= 0) || !v) return;
+            if (!inferM[i]) inferM[i] = [];
+            if (!inferM[j]) inferM[j] = [];
+            inferM[i][j] = inferM[j][i] = v;
+        });
+    }
+    var replyDir = asList(interaction.explicit_directed);
+    var replyFlat = asList(interaction.explicit_undirected);
+    var mentionM = asList(interaction.mention_directed);
+
+    var pairs = [];
+    for (var i = 0; i < n; i++) {
+        for (var j = i + 1; j < n; j++) {
+            var p = {
+                source: members[i].uid, target: members[j].uid,
+                infer: relAt(inferM, i, j),                      // 无向合计（服务端已算好）
+                replyIJ: relAt(replyDir, j, i), replyJI: relAt(replyDir, i, j),
+                mentionIJ: relAt(mentionM, j, i), mentionJI: relAt(mentionM, i, j)
+            };
+            p.reply = p.replyIJ + p.replyJI || relAt(replyFlat, i, j);
+            p.mention = p.mentionIJ + p.mentionJI;
+            p.exact = p.reply + p.mention;
+            // 精确信号的方向：fwd = i→j，back = j→i。只有无向矩阵时两者都是 0，
+            // 于是下面不会画箭头 —— 这正是"不知道方向就别指"想要的效果。
+            p.fwd = p.replyIJ + p.mentionIJ;
+            p.back = p.replyJI + p.mentionJI;
+            if (p.exact || p.infer) pairs.push(p);
+        }
+    }
+    return { members: members, pairs: pairs };
+}
+
+// 边的悬停明细：两层分开列，且只列非零项——罗列一堆 0 反而看不清重点
+function relEdgeTip(nameOf, p) {
+    var a = nameOf[p.source] || '', b = nameOf[p.target] || '';
+    var rows = [];
+    function dir(label, ij, ji) {
+        var parts = [];
+        if (ij) parts.push(esc(a) + ' → ' + esc(b) + ' ' + ij);
+        if (ji) parts.push(esc(b) + ' → ' + esc(a) + ' ' + ji);
+        if (parts.length) rows.push(label + '：' + parts.join(' · '));
+    }
+    dir('精确回复', p.replyIJ, p.replyJI);
+    dir('@点名', p.mentionIJ, p.mentionJI);
+    if (p.infer) rows.push('相邻接话 ' + p.infer + ' 次（推断）');
+    return '<b>' + esc(a) + ' ↔ ' + esc(b) + '</b>' + (rows.length ? '<br/>' + rows.join('<br/>') : '');
+}
+
+// 节点的悬停明细：口径与页面下方"谁最常和谁互动"表一致，两处读数必须对得上
+function relNodeTip(m, vol, act, t) {
+    var rows = ['<b>' + esc(m.name) + '</b>' + (m.is_self ? '（我）' : '')];
+    rows.push('发言 ' + vol + ' 条' + (act && act.share ? ' · 占 ' + pct(act.share) : ''));
+    rows.push('精确回复 别人 ' + relNum(t.explicit_replies_to) + ' · 被回复 ' + relNum(t.explicit_replied_by));
+    rows.push('@别人 ' + relNum(t.mentions_sent) + ' · 被@ ' + relNum(t.mentions_received));
+    rows.push('接话 ' + relNum(t.replies_to) + ' · 被接话 ' + relNum(t.replied_by) + '（推断）');
+    return rows.join('<br/>');
+}
+
+// HTML 图例：线样、粗细、颜色都按 canvas 里的真实画法画出来。
+// ECharts 的 legend 只能画色块，表达不了"实线 vs 虚线"，而这张图的全部信息都在
+// 线型与粗细里——所以这里必须用 DOM，不能用 legend。
+function relLegendHtml() {
+    function key(cls, label, style) {
+        return '<span class="rel-key"><i class="' + cls + '" style="' + style + '"></i>' + label + '</span>';
+    }
+    return key('rel-swatch', '精确回复（事实）', 'border-color:' + T.primary) +
+        key('rel-swatch', '@点名（事实）', 'border-color:' + T.palette[2]) +
+        key('rel-swatch rel-swatch-dash', '相邻接话（推断）', 'border-color:' + T.axis) +
+        key('rel-dot', '成员（大小 = 发言量）', 'background:' + T.primary) +
+        key('rel-dot', '我', 'background:' + T.accent2) +
+        '<span class="rel-key rel-hint">可拖拽节点 · 滚轮缩放 · 悬停看明细</span>';
+}
+
+// 组装力导向图的数据：节点（成员）+ 两层边（事实/推断）+ 图例旁的对账文字
+function relSeriesData(interaction, activity, opts) {
+    var built = relPairs(interaction, opts);
+    var members = built.members;
+    var nameOf = {}, totals = {}, acts = {}, vols = {}, maxVol = 1;
+    members.forEach(function (m) { nameOf[m.uid] = m.name; });
+    asList(interaction && interaction.totals).forEach(function (t) { totals[t.uid] = t; });
+    asList(activity).forEach(function (a) { acts[a.uid] = a; });
+    members.forEach(function (m) {
+        vols[m.uid] = relNum(acts[m.uid] && acts[m.uid].msg_count);
+        maxVol = Math.max(maxVol, vols[m.uid]);
+    });
+
+    var level = REL_LEVELS[relClampIndex(opts.level, REL_LEVELS.length)];
+    function byValue(a, b) { return b.v - a.v; }
+
+    // —— 事实层（实线）：精确回复 + @点名 ——
+    var exactAll = built.pairs.filter(function (p) { return p.exact > 0; })
+        .map(function (p) { return { p: p, v: p.exact }; }).sort(byValue);
+    var exact = opts.exact ? exactAll.slice(0, Math.max(1, opts.maxExactEdges)) : [];
+
+    // —— 推断层（虚线）：相邻接话 ——
+    var inferAll = built.pairs.filter(function (p) { return p.infer > 0; })
+        .map(function (p) { return { p: p, v: p.infer }; }).sort(byValue);
+    var infer = opts.infer ? inferAll.filter(function (r) { return r.v >= level.minValue; }) : [];
+    if (opts.infer && level.maxEdges > 0) infer = infer.slice(0, level.maxEdges);
+
+    var maxExact = exact.length ? exact[0].v : 1;
+    var maxInfer = infer.length ? infer[0].v : 1;
+    var edges = [];
+    var linked = {};
+
+    exact.forEach(function (r) {
+        var p = r.p;
+        var t = Math.sqrt(r.v / maxExact);           // 开方压缩量级差，否则细边根本看不见
+        var onlyMention = !p.reply && p.mention > 0;
+        var e = {
+            source: p.source, target: p.target,
+            lineStyle: {
+                color: onlyMention ? T.palette[2] : T.primary,
+                width: 1 + 4 * t,
+                opacity: 0.5 + 0.4 * t,
+                curveness: 0.16,                     // 与推断层反向弯，两层不再叠成一条
+                type: 'solid'
+            },
+            tip: relEdgeTip(nameOf, p)
+        };
+        // 方向只在"明显一边倒"时画箭头：双向对等的互动画箭头等于撒谎
+        if (p.fwd >= 3 * p.back && p.fwd > 0) e.symbol = ['none', 'arrow'];
+        else if (p.back >= 3 * p.fwd && p.back > 0) e.symbol = ['arrow', 'none'];
+        edges.push(e);
+        linked[p.source] = linked[p.target] = true;
+    });
+
+    infer.forEach(function (r) {
+        var p = r.p;
+        var t = Math.sqrt(r.v / maxInfer);
+        edges.push({
+            source: p.source, target: p.target,
+            lineStyle: {
+                color: T.axis, width: 0.8 + 2.4 * t, opacity: 0.16 + 0.34 * t,
+                curveness: -0.16, type: 'dashed'
+            },
+            tip: relEdgeTip(nameOf, p)
+        });
+        linked[p.source] = linked[p.target] = true;
+    });
+
+    // —— 节点 ——
+    // 常驻昵称按发言量发名额：糊成一团的根源是标签总量，不是字号不够小
+    var labelled = {};
+    members.slice().sort(function (a, b) { return vols[b.uid] - vols[a.uid]; })
+        .slice(0, Math.max(0, opts.maxLabels))
+        .forEach(function (m) { labelled[m.uid] = true; });
+
     var nodes = members.map(function (m) {
-        var vol = vols[m.uid] || 0;
+        var vol = vols[m.uid];
+        var size = 13 + 38 * Math.sqrt(vol / maxVol);
         return {
-            id: m.uid, name: m.name,
-            symbolSize: 12 + 34 * Math.sqrt(vol / maxVol),
-            itemStyle: { color: m.is_self ? T.accent2 : T.primary },
-            value: vol
+            id: m.uid, name: m.name, value: vol,
+            symbolSize: size,
+            itemStyle: {
+                color: m.is_self ? T.accent2 : T.primary,
+                borderColor: T.surface, borderWidth: 2,
+                shadowBlur: 8, shadowColor: 'rgba(0,0,0,.18)',
+                // 被门槛滤光所有边的节点压暗：它还在矩阵里，但不该抢注意力
+                opacity: linked[m.uid] ? 1 : 0.35
+            },
+            label: { show: !!labelled[m.uid] },
+            tip: relNodeTip(m, vol, acts[m.uid], totals[m.uid] || {})
         };
     });
-    var known = {};
-    members.forEach(function (m) { known[m.uid] = true; });
-    function edgesOf(list, dashed) {
-        return asList(list).map(function (e) {
-            var a = members[e.source], b = members[e.target];
-            return {
-                source: a ? a.uid : '', target: b ? b.uid : '',
-                value: e.value,
-                lineStyle: { width: 1 + Math.min(6, Math.sqrt(e.value)), type: dashed ? 'dashed' : 'solid', opacity: dashed ? 0.45 : 0.8 }
-            };
-        }).filter(function (e) { return e.source && e.target && known[e.source] && known[e.target]; });
-    }
-    var solid = edgesOf(interaction.explicit_edges);
-    var mentions = edgesOf(
-        (function () {
-            // @点名没有现成的无向边表：从 directed 生成（双向合计）
-            var m = asList(interaction.mention_directed), out = [];
-            for (var i = 0; i < m.length; i++) {
-                for (var j = i + 1; j < (m[i] || []).length; j++) {
-                    var v = (m[i][j] || 0) + (m[j][i] || 0);
-                    if (v) out.push({ source: i, target: j, value: v });
-                }
-            }
-            return out;
-        })()
-    );
-    var dashed = edgesOf(interaction.edges, true);
-    chart.setOption(applyChartTheme({
+
+    var n = Math.max(1, nodes.length);
+    var option = applyChartTheme({
+        animation: false,
         tooltip: {
-            formatter: function (p) {
-                if (p.dataType === 'edge') return '互动 ' + p.data.value + ' 次';
-                return esc(p.data.name) + '<br/>发言 ' + (p.data.value || 0) + ' 条';
-            }
+            trigger: 'item', confine: true,
+            formatter: function (p) { return (p.data && p.data.tip) || ''; }
         },
-        legend: { data: ['精确回复（事实）', '@点名（事实）', '接话（推断）'], bottom: 0, textStyle: { color: T.text } },
+        // 关掉 ECharts 图例：它只能画色块，画不出实线/虚线/粗细（详见 relLegendHtml）
+        legend: { show: false },
         series: [{
             type: 'graph', layout: 'force', roam: true, draggable: true,
-            force: { repulsion: 260, edgeLength: [50, 130], gravity: 0.08 },
-            label: { show: true, position: 'right', color: T.text, fontSize: 11 },
-            emphasis: { focus: 'adjacency' },
+            force: {
+                initLayout: 'circular',                    // 先落在圆周上，再让力导向收拢
+                repulsion: Math.max(420, 30 * n),          // 人越多越要撑开，否则挤成一小块
+                edgeLength: [55, 150],
+                gravity: 0.05,
+                friction: 0.55,
+                layoutAnimation: false                     // 一次算到收敛再上屏（见文件头注释 3）
+            },
+            label: {
+                position: 'right', color: T.text, fontSize: 11,
+                // 昵称压在线和点上就读不出来了：垫一圈卡片底色的描边当底衬
+                textBorderColor: T.surface, textBorderWidth: 3,
+                // 群里 15+ 字的昵称很常见，整串画出来等于给邻居糊上一条色带。
+                // 从中间截断而不是砍尾巴：群里大量昵称是"部门 编号 姓名"，
+                // 真正能把人区分开的是尾巴（编辑部 25-13 张罩 / 编辑部 25-6 张乐水）。
+                formatter: function (p) {
+                    var nm = String((p.data && p.data.name) || '');
+                    var max = Math.max(4, opts.labelMaxChars);
+                    if (nm.length <= max) return nm;
+                    var head = Math.ceil((max - 1) / 2), tail = max - 1 - head;
+                    return nm.slice(0, head) + '…' + (tail > 0 ? nm.slice(-tail) : '');
+                }
+            },
+            labelLayout: { hideOverlap: true },
+            edgeSymbolSize: 6,
+            emphasis: { focus: 'adjacency', scale: 1.12, label: { show: true, fontWeight: 'bold' } },
+            blur: { itemStyle: { opacity: 0.12 }, lineStyle: { opacity: 0.05 }, label: { opacity: 0.2 } },
             data: nodes,
-            edges: solid.concat(mentions).concat(dashed),
-            categories: [
-                { name: '精确回复（事实）', itemStyle: { color: T.primary } },
-                { name: '@点名（事实）', itemStyle: { color: T.heat[1] } },
-                { name: '接话（推断）', itemStyle: { color: T.axis } }
-            ]
-        }]
-    }));
-    // 图例分组：给三类边各自着色（ECharts 的 graph 边不分 category，这里按线型+颜色区分）
-    chart.setOption({
-        series: [{
-            edges: solid.map(function (e) { return Object.assign({}, e, { lineStyle: Object.assign({}, e.lineStyle, { type: 'solid' }) }); })
-                .concat(mentions.map(function (e) { return Object.assign({}, e, { lineStyle: Object.assign({}, e.lineStyle, { type: 'solid' }) }); }))
-                .concat(dashed)
+            edges: edges
         }]
     });
+
+    var note = '已画 ' + (opts.exact ? '事实 ' + exact.length + '/' + exactAll.length + ' 条' : '事实已隐藏');
+    note += opts.infer ? ' · 推断 ' + infer.length + '/' + inferAll.length + ' 条' : ' · 推断已隐藏';
+    if (opts.memberLimit > 0) note += ' · 成员前 ' + members.length + ' 位';
+
+    return { nodes: nodes, edges: edges, option: option, note: note };
+}
+
+// 可用的成员档位：比成员总数还大的档位没有意义（5 人群不该出现"前 12"）
+function relMemberLimits(st) {
+    var n = asList(st.interaction && st.interaction.members).length;
+    var out = [0];
+    REL_MEMBER_LIMITS.forEach(function (k) { if (k > 0 && k < n) out.push(k); });
+    return out;
+}
+
+// 给画布套一层外壳（工具条 + 图例）。做成"包一层"而不是改四个模板：群概况/话题/
+// 关系/报告共用同一个渲染函数，工具条在模板里各写一份迟早会漂移。
+function relShell(domId, st) {
+    var el = document.getElementById(domId);
+    if (!el || !el.parentNode) return;
+    var box = document.createElement('div');
+    box.className = 'rel-shell';
+    el.parentNode.insertBefore(box, el);
+    box.appendChild(el);
+
+    if (st.opts.controls !== false) {
+        var bar = document.createElement('div');
+        bar.className = 'rel-toolbar no-print';
+        bar.id = domId + 'Toolbar';
+        box.insertBefore(bar, el);
+    }
+    var lg = document.createElement('div');
+    lg.className = 'rel-legend';
+    lg.innerHTML = relLegendHtml() + '<span class="rel-count" id="' + domId + 'Note"></span>';
+    box.appendChild(lg);
+}
+
+// 工具条：两个开关（事实 / 推断）+ 两个档位（推断强度 / 成员数量）。
+// 全部用 button：报告导出会摘掉所有 button，所以报告页干脆传 controls:false 不生成。
+function relToolbar(domId, st) {
+    var bar = document.getElementById(domId + 'Toolbar');
+    if (!bar) return;
+    var o = st.opts;
+    bar.innerHTML = '';
+
+    function add(label, title, pressed, disabled, onClick) {
+        var b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'rel-btn';
+        b.textContent = label;
+        if (title) b.title = title;
+        b.setAttribute('aria-pressed', pressed ? 'true' : 'false');
+        if (disabled) b.disabled = true;
+        else b.onclick = onClick;
+        bar.appendChild(b);
+    }
+
+    add('精确回复/@', '导出器记录的回复与 @点名（事实），实线', o.exact, false, function () {
+        o.exact = !o.exact;
+        relRefresh(domId, st);
+    });
+    add('相邻接话', '30 分钟内的相邻换人发言（推断），虚线', o.infer, false, function () {
+        o.infer = !o.infer;
+        relRefresh(domId, st);
+    });
+
+    var lv = relClampIndex(o.level, REL_LEVELS.length);
+    add('推断强度：' + REL_LEVELS[lv].name, '接话边只画最强的若干条：强 / 中 / 全（点一下换一档）',
+        o.infer && lv > 0, !o.infer, function () {
+            o.level = (relClampIndex(o.level, REL_LEVELS.length) + 1) % REL_LEVELS.length;
+            relRefresh(domId, st);
+        });
+
+    var limits = relMemberLimits(st);
+    if (limits.length > 1) {
+        var at = Math.max(0, limits.indexOf(o.memberLimit));
+        add(o.memberLimit > 0 ? '成员：前 ' + o.memberLimit + ' 位' : '成员：全部',
+            '只画发言最多的这几位（点一下换一档）', o.memberLimit > 0, false, function () {
+                o.memberLimit = limits[(at + 1) % limits.length];
+                relRefresh(domId, st);
+            });
+    } else {
+        o.memberLimit = 0;
+    }
+}
+
+function relRefresh(domId, st) {
+    relToolbar(domId, st);
+    relDraw(domId, st);
+}
+
+// 力导向只用来"算位置"，算完就把坐标钉死，改用 layout:'none' 重画一遍。
+// 两个理由都是实测出来的：
+//   1. 力导向不会自己收边：30 个节点在 460px 高的画布里能撑到 y ∈ [-80, 565]，
+//      两端的节点与昵称被直接裁掉，而左右两半是空的；
+//   2. 每次 setOption 都会重跑一遍力导向（没有已保存坐标时用 Math.random 撒初始点），
+//      位置每次都变——"先画一遍、再补一个 zoom 去适配"必然落空：补的那一版立刻被重排，
+//      而且 ECharts 会把 zoom 归一化，算好的比例根本落不到实处。
+//
+// layout:'none' 的摆法在 ECharts 源码里是确定的：把数据包围盒**等比**装进一个
+// "画布四周各缩进 10%" 的框并居中（createCoordinateSystem：setBoundingRect = 数据
+// 包围盒，setViewRect = 按 aspect 求出的框）。于是：
+//   · 裁切问题自动消失——给什么范围就缩放到框里；
+//   · 能控制的只有包围盒的宽高比：想让它铺满宽卡片，就得先把坐标横向拉开；
+//   · 那 10% 的缩进正好是给昵称留的余量（正是它让右端节点的标签不再被画布切掉）。
+// 拉伸上限 REL_STRETCH_MAX 是必要的：力导向本身各向同性，宽卡片上要铺满得横向拉
+// 2 倍以上，再大节点群就明显"被擀扁"了。
+function relStretchLayout(chart, el, nodes) {
+    var s = chart.getModel().getSeriesByIndex(0);
+    var data = s.getData();
+    var cs = s.coordinateSystem;
+    if (!cs || !cs.dataToPoint) return null;
+
+    var w = el.clientWidth, h = el.clientHeight;
+    if (!w || !h) return null;
+
+    // dataToPoint 给出的已经是像素坐标，节点半径也是像素，两者单位一致
+    var pts = [], x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, i, p, r;
+    for (i = 0; i < data.count() && i < nodes.length; i++) {
+        p = cs.dataToPoint(data.getItemLayout(i));
+        if (!p || !isFinite(p[0]) || !isFinite(p[1])) return null;
+        r = (relNum(nodes[i].symbolSize) / 2) || 6;
+        pts.push(p);
+        x0 = Math.min(x0, p[0] - r); x1 = Math.max(x1, p[0] + r);
+        y0 = Math.min(y0, p[1] - r); y1 = Math.max(y1, p[1] + r);
+    }
+    if (!pts.length || !isFinite(x0) || x1 <= x0 || y1 <= y0) return null;
+
+    // 目标宽高比 = 画布宽高比（那个框是四周等比缩进 10%，比例与画布相同）
+    var k = (w / h) / ((x1 - x0) / (y1 - y0));
+    k = Math.min(Math.max(k, 1 / REL_STRETCH_MAX), REL_STRETCH_MAX);
+    var sx = k > 1 ? k : 1, sy = k < 1 ? 1 / k : 1;
+    var bcx = (x0 + x1) / 2, bcy = (y0 + y1) / 2;
+    return pts.map(function (q) {
+        return [bcx + (q[0] - bcx) * sx, bcy + (q[1] - bcy) * sy];
+    });
+}
+
+function relDraw(domId, st) {
+    var el = document.getElementById(domId);
+    if (!el) return;
+    var built = relSeriesData(st.interaction, st.activity, st.opts);
+    var note = document.getElementById(domId + 'Note');
+    // 复用已有实例：换档位只是重画数据，dispose + init 会让整块画布闪一下
+    var chart = _CHARTS[domId];
+    if (!chart || chart.isDisposed() || chart.getDom() !== el) chart = mountChart(domId);
+    if (!chart) return;
+    // clear 之后再画：不 clear 的话力导向会拿上一轮的坐标当起点，同一个档位每次
+    // 点出来的布局都不一样（"为什么我点一下接话，人就全跑位了"）
+    chart.clear();
+    if (!built.nodes.length) {
+        if (note) note.textContent = '没有可画的成员（群里还没有能归属到人的发言）';
+        return;
+    }
+    chart.setOption(built.option, true);
+
+    // 第二遍：把算好的坐标钉进数据里，让位置完全由我们决定。
+    // 取不到坐标就退回纯力导向——宁可不好看，也不能让图整块消失。
+    var pinned = relStretchLayout(chart, el, built.nodes);
+    if (pinned) {
+        chart.setOption({
+            series: [{
+                layout: 'none',
+                data: built.nodes.map(function (nd, k) {
+                    var p = $.extend({}, nd);
+                    p.x = pinned[k][0];
+                    p.y = pinned[k][1];
+                    return p;
+                })
+            }]
+        });
+    }
+    if (note) note.textContent = built.note;
+}
+
+// 互动关系图：节点大小 = 发言量；实线 = 精确回复/@（事实），虚线 = 相邻接话（推断）
+// opts 见 REL_DEFAULTS；报告页传 { controls: false } 关掉交互控件
+function renderRelationGraph(domId, interaction, activity, opts) {
+    var el = document.getElementById(domId);
+    if (!el) return;
+    var st = _REL_STATE[domId];
+    if (!st) {
+        st = _REL_STATE[domId] = { opts: relOpts(opts) };
+        relShell(domId, st);
+    } else {
+        // 重复渲染时只覆盖显式传进来的项，别把控件调好的档位重置回默认值
+        st.opts = relOpts(opts ? $.extend({}, st.opts, opts) : st.opts);
+    }
+    st.interaction = interaction || {};
+    st.activity = activity;
+    relRefresh(domId, st);
 }
 
 // 成员活跃时段堆叠面积图：X = 24 小时，Y = 消息数，按成员堆叠（只画前 N 位）
