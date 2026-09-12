@@ -11,6 +11,8 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](pyproject.toml)
 
 - **本地优先**：不联网也能看统计；前端资源（Bootstrap、jQuery、ECharts）已本地化，没有 CDN 依赖。
+- **私聊与群聊都支持**：两人记录按「我 vs 对方」分析；群聊自动切换成成员视角——互动矩阵、成员画像、
+  同时在聊高峰，并区分"精确回复/@（事实）"与"相邻接话（推断）"。
 - **零成本起步**：不填 API Key 就是一个纯本地统计工具，填了才走模型。
 - **只为新增内容付费**：结果按「月份 + 内容」缓存，重跑同一段对话、或重导出只多了几个月时，历史月份不再重复调用。
 - **一行安装**：Release 里有 wheel，`pip install` 后直接用 `qqchatlog` 启动。
@@ -41,6 +43,10 @@
 | 关系 | 回复速度（均值与 P50/P90，界面以中位数为主）、对话轮次 |
 | 报告 | 汇总以上全部统计，可打印、导出 PDF 或下载 HTML |
 
+**群聊记录**（导出文件里 `chatInfo.type` 为 `group`，或有 3 位以上有实质发言的参与者）会自动切换到群聊视图：
+成员分别统计、互动矩阵区分"精确回复/@（事实）"与"相邻接话（推断）"、成员画像还会带上该成员在群里的
+互动数字（被谁回复、@过谁）。页面与维度见下方"群聊分析"。
+
 非文本消息同样参与统计与分析。文件、视频、转发卡片、红包、通话记录、小程序卡片、商城大表情会被标注为
 `[文件:示例表.xlsx]`、`[转发:某某的聊天记录（25条）]`、`[通话:未接听]`、`[表情:叉腰]` 这样的标记送进统计与
 AI 分析，而消息正文保持干净（文件名和占位符不会进入词频与平均句长）。图片有尺寸和体积信息时，也会统计
@@ -60,6 +66,22 @@ AI 分析，而消息正文保持干净（文件名和占位符不会进入词�
 | 锐评 | 性格画像（优缺点、思维特征、情绪模式、关系动态等） |
 
 五个维度可以单独运行，也可以点「全量分析」按顺序跑完。分析在后台线程里跑，页面实时显示进度，可以随时取消。
+
+### 群聊分析（同一套页面，按记录类型自动切换）
+
+| 页面 | 内容 |
+|---|---|
+| 群仪表盘 | 成员数、记录天数、日均、同时在线高峰（滑动窗口内不同发言者数的峰值）、成员发言量排行、互动热力矩阵、成员活跃时段堆叠、互动关系图、群里程碑 |
+| 群关系 | 力导向关系图（实线=精确回复/@，虚线=相邻接话）、互动矩阵、每位成员的"被回复/回复别人/被@/@别人"明细 |
+| 成员活跃 | 发言量与占比、互动雷达、按成员拆分的 24 小时分布、活跃度明细表 |
+| 群话题 | @点名矩阵、互动图，以及 AI 给出的逐月话题与"每个话题是谁在聊" |
+| 群情绪 | 群情绪强度走势（逐月）、成员情绪对比、情绪转折点 |
+| 成员画像 | 每位成员一张卡片：群内角色、互动模式、语言指纹、关键证据（默认前 10 位，自己必定入选） |
+| 群报告 | 汇总以上全部，可打印 / 导出 PDF / 下载 HTML（与私聊报告共用同一套导出机制与 SRI 校验） |
+
+群聊 AI 维度同样按「月份 + 内容」缓存：3 个群级维度按月计费、成员画像按人计费，
+分析按钮上方会显示**本次预计调用次数**（例如 6 个月 × 3 维 + 10 位成员 = 22 次，示例）。
+想让多人记录回到升级前的"直接拒收"，设 `QQCHAT_GROUP_CHAT=off`（见[配置项](#配置项)）。
 
 结果按「月份 + 内容」缓存：同一个聊天重复分析零成本，重新导出后只有新增月份需要付费。仪表盘会显示按天、
 按维度累计的 token 用量与费用估算。
@@ -139,6 +161,11 @@ python app.py      # 方式 C，等价入口
 
 两者跑的是同一个 `app:main`：先打印启动横幅与自检结果（API Key、数据目录、上传上限、口令与 Origin 提醒），
 再交给 Flask 起服务；也可以用 `flask --app app run`（只跳过横幅，其余一致）。按 `Ctrl+C` 停止。
+
+`Ctrl+C`／`SIGTERM` 是**优雅停止**：收到信号后不再派发新的月份调用，最多等 5 秒让进行中的那个月收尾，
+已完成月份的结果照常落盘（默认行为见 `QQCHAT_SHUTDOWN_GRACE_SECONDS`），随后退出。
+
+探活/编排用 `/health`：只回一行 `ok`，不建会话、不要求登录、不写日志，可以放心让反代每秒探一次。
 
 浏览器打开 http://localhost:5000 。默认只监听 `127.0.0.1`，调试模式关闭。
 
@@ -226,10 +253,17 @@ QQ 的超级表情（吃糖、大怨种、菜汪之类）没有公开地址，�
 | `FLASK_DEBUG` | `false` | 调试模式与自动重载 |
 | `ACCESS_PASSWORD` | 空 | 访问口令，设置后所有页面需登录 |
 | `ALLOWED_ORIGINS` | 空 | 额外允许的浏览器来源主机，用局域网 IP 或域名访问时必填 |
+| `QQCHAT_COOKIE_SECURE` | `auto` | 会话 cookie 的 `Secure` 标志；`auto` = 非回环绑定时自动开启（此时需 https 才能保持登录态），明文 http 局域网访问需设为 `false` |
 | `SECRET_KEY` | 自动生成 | Session 签名密钥，留空则生成并持久化到数据目录下的 `.secret_key` |
 | `QQCHAT_MAX_UPLOAD_MB` | 50 | 单次上传体积上限；超长聊天的 JSON 逼近该值时可调大 |
 | `QQCHAT_JOB_TTL_SECONDS` | 900 | 内存任务记录的存活时间 |
-| `QQCHAT_ALLOW_MULTI_PARTY` | `false` | 设为 `1` 才允许分析多人记录 |
+| `QQCHAT_SHUTDOWN_GRACE_SECONDS` | 5 | `Ctrl+C` 后留给进行中月份的收尾秒数；设 `0` 恢复"按下就退出" |
+| `QQCHAT_GROUP_CHAT` | `auto` | 多人记录的处置：`auto` 按群聊分析（默认）、`off` 回到"直接拒收"、`two_party` 按「我 vs 其他人」两分类归并 |
+| `QQCHAT_ALLOW_MULTI_PARTY` | `false` | 旧开关，等价于 `QQCHAT_GROUP_CHAT=two_party`（优先级低于新变量） |
+| `QQCHAT_GROUP_AI_MAX_MEMBERS` | 10 | 成员画像最多分析几位（按发言量取前 N，自己必定入选） |
+| `QQCHAT_GROUP_MATRIX_MEMBERS` | 30 | 互动矩阵保留的成员上限（超出只影响矩阵，不影响成员活跃度与总览） |
+| `QQCHAT_GROUP_PEAK_WINDOW_MINUTES` | 10 | "同时在线高峰"的判定窗口（分钟） |
+| `LLM_GROUP_MAX_DIALOG_CHARS` | 600000 | 单个群聊月的对话文本上限（抽样对低频成员有保底） |
 
 ### 数据与日志
 
@@ -289,6 +323,8 @@ AI 分析发送给**你自己配置的**接口，发送的内容包括：
 其它安全措施：
 
 - 服务默认只绑定回环地址；绑定非回环地址时若未设置 `ACCESS_PASSWORD` 则拒绝启动；
+- 登录成功后轮换服务端 session id，旧 id 立即失效（防会话固定）；会话 cookie 带 `HttpOnly`、
+  `SameSite=Lax`，并在非回环绑定时自动加 `Secure`（见 `QQCHAT_COOKIE_SECURE`）；
 - POST 请求同时校验 CSRF token 与 Origin，Origin 白名单不信任请求自带的 Host（防 DNS rebinding）；
 - 登录后的 `next=` 跳转只接受站内路径（含 `/\host` 这类反斜杠变体），登录接口对同一 IP 有失败限流；
 - 所有响应都带 `X-Content-Type-Options`、`X-Frame-Options`、`Referrer-Policy` 与同源 CSP，即便某处渲染漏了
@@ -303,10 +339,15 @@ AI 分析发送给**你自己配置的**接口，发送的内容包括：
 qq-chatlog-analyze-tool/
 ├── app.py                     # 组装入口：Flask 初始化 + 命令行 main()（qqchatlog 命令）
 ├── config.py                  # 配置读取（.env / 环境变量、数据目录、密钥）
-├── parser/qq_parser.py        # QQ JSON 解析（含多人记录防线）
+├── parser/
+│   ├── qq_parser.py           # QQ JSON 解析（含群聊判定与安全阀）
+│   └── group_identity.py      # 群成员身份：参与者名单、同名成员唯一化、占位 sender 识别
 ├── analyzer/
-│   ├── prompts.py             # 各维度 System Prompt
-│   ├── local_stats.py         # 本地统计
+│   ├── prompts.py             # 各维度 System Prompt（私聊）
+│   ├── group_prompts.py       # 群聊维度 System Prompt（独立模块 → 不影响私聊缓存指纹）
+│   ├── local_stats.py         # 本地统计（私聊）
+│   ├── group_stats.py         # 群聊本地统计：成员活跃度、三张互动矩阵、群里程碑
+│   ├── group_client.py        # 群聊 AI：对话构建、成员感知抽样、四个群聊维度
 │   ├── deepseek_client.py     # 接口调用、月份级缓存、图片摘要注入
 │   ├── vision.py              # 图片理解：挑图、摘要、缓存
 │   ├── face_emoji.py          # 表情名到 Unicode emoji
@@ -325,9 +366,12 @@ qq-chatlog-analyze-tool/
 │   ├── templates/             # 页面模板
 │   └── static/
 │       ├── css/style.css      # 样式与日/夜主题
-│       ├── js/                # 图表渲染与任务轮询
+│       ├── js/                # 图表渲染与任务轮询（group_charts.js = 群聊图表与结果渲染）
 │       └── vendor/            # Bootstrap、jQuery、ECharts（本地化，版本见该目录 README）
-├── tests/                     # unittest：core / hardening / optimizations / packaging / review_fixes / review_round2 / smoke / sri
+├── tests/                     # unittest：core / hardening / optimizations / packaging / review_fixes /
+│                              #   review_round2..5 / smoke / sri / group_*（地基·统计·AI·前端·真实格式）
+├── tools/inspect_chat.py      # 导出文件体检（只读、默认脱敏，判断格式漂移与统计对账）
+└── CHANGELOG.md               # 行为变更记录（含回滚方式）
 ├── tools/verify_vendor_sri.py # 导出报告用的 SRI 哈希：联网复核 本地 <-> CDN <-> 内联常量
 ├── tools/verify_wheel.py      # 拆 wheel 核对：代码、templates/static、qqchatlog 入口点、依赖元数据
 ├── docs/                      # 早期设计文档与界面预览（内容已过时，以本 README 为准）
@@ -367,7 +411,7 @@ python tools/verify_wheel.py .tmp_dist/*.whl      # 拆包核对：代码 + temp
 
 CI（`.github/workflows/test.yml`）分两条：
 
-- **test**：Python 3.10 / 3.12 / 3.13 矩阵，`ruff check` → `ruff format --check` → `py_compile` → 全量单测；
+- **test**：Python 3.10 / 3.12 / 3.13 / 3.14 矩阵，`ruff check` → `ruff format --check` → `py_compile` → 全量单测；
 - **package**：真实构建 wheel、拆包核对，再装进干净 venv 跑一次 `qqchatlog --version`，并从仓库外的工作目录
   装配应用、渲染一次模板（证明模板与静态资源确实进了包）。
 
@@ -423,14 +467,21 @@ pip install https://github.com/woowss/qq-chatlog-analyze-tool/releases/download/
 删除数据目录下的 `uploads/`、`flask_session/`、`ai_cache/`、`stats_cache/`、`logs/`、`face_cache/` 即可，
 或者把 `QQCHAT_DATA_DIR` 指到一个临时目录后再启动。
 
-**上传群聊记录被拒绝**
+**上传群聊记录的处理方式**
 
-工具只支持两人私聊。多人记录里除自己外的所有人都会被并进「对方」，统计与 AI 分析会整体失真，所以默认
-直接拒收。确实要按「我 vs 其他人」分析时，设 `QQCHAT_ALLOW_MULTI_PARTY=1`。
+默认（`QQCHAT_GROUP_CHAT=auto`）会把它**当群聊分析**：每位成员分别统计，互动矩阵区分
+"精确回复/@（事实）"与"相邻接话（推断）"，成员画像还会带上该成员在群里的互动数字。
+如果你更希望回到升级前的行为（多人记录直接拒收，避免"其他人"被并进「对方」），
+设 `QQCHAT_GROUP_CHAT=off`；确要按「我 vs 其他人」两分类归并，设 `two_party`
+（等价于旧的 `QQCHAT_ALLOW_MULTI_PARTY=1`）。
 
 ## 已知限制
 
-- 只支持两人私聊记录，多人记录默认拒收。
+- 群聊与两人私聊都支持：群聊按成员分别统计（含互动矩阵、成员画像），私聊按「我 vs 对方」分析。
+- 群聊的成员画像默认只分析发言最多的 10 位（`QQCHAT_GROUP_AI_MAX_MEMBERS` 可调）；
+  互动矩阵默认只保留前 30 位成员的格子，其余成员的活跃度与群总览仍然完整。
+- 群聊维度按"月 × 维度 + 人数"计费（例如 6 个月 × 3 个群级维度 + 10 位成员 = 28 次调用（示例），示例），
+  分析前页面上会给出预计调用次数。
 - 视频和文件本体不参与分析，只使用文件名与体积等元数据；图片可选做视觉理解。
 - QQ 超级表情的原图没有公开地址，需要自备表情包目录才能显示。
 - 首页的目录选择依赖浏览器的 `webkitdirectory`（Chrome、Edge 支持），其它浏览器请用 `QQCHAT_MEDIA_DIR`。

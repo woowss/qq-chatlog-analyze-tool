@@ -1,0 +1,174 @@
+{#
+Copyright (C) 2026 woowss
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+本文件是 partial：分享版报告的导出机制（VENDOR_CDN 表与 SRI 校验对象都在这里）
+单独成文件是为了让私聊报告与群聊报告共用同一份实现——两处各存一份，升级 vendor 时
+必然会漏改一处，而 SRI 对不上时浏览器是静默拦掉资源（样式没了、图表没了），没人会报错。
+注释结束标记紧贴内容、内容末尾保留换行：模板里的换行会进 HTML，多一个空行就会让
+"私聊报告渲染逐字节不变"的对照失败。
+#}<script>
+// HTML 转义（与 charts.js 中保持一致；下载的报告是自包含的，需要本地定义一份）
+function esc(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// 导出的报告是要发给别人的：应用里 vendor 资源已本地化（离线可用），
+// 分享出的 HTML 必须把 /static/vendor/* 换回 CDN，否则别人打开就没了
+// Bootstrap 样式与 jQuery。映射表与 base.html 的本地文件一一对应。
+//
+// integrity 是 SRI（sha384），哈希对象是"CDN 真正返回的字节"：本地 vendor 文件与
+// cdn.jsdelivr.net 上的字节已于 2026-09-12 逐字节核对（sha256 也与 data.jsdelivr.com
+// 公布的一致），下面这些常量因此就是 CDN 的常量。升级 vendor 文件时：
+//   1) 按 web/static/vendor/README.md 重新下载（并核对版本）；
+//   2) 跑 python tools/verify_vendor_sri.py 联网复核，按 --print 输出更新下面这张表；
+//   3) 跑测试——tests/test_sri.py 会拿本地文件把这张表钉死，改漏一条就红。
+// 注意：哈希对不上时浏览器是"静默拦掉"（样式没了、图表没了），不会报错，
+// 所以这层校验必须靠测试，而不是靠肉眼。
+var VENDOR_CDN = {
+    'bootstrap.min.css': {
+        url: 'https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css',
+        integrity: 'sha384-T3c6CoIi6uLrA9TneNEoa7RxnatzjcDSCmG1MXxSR1GAsXEV/Dwwykc2MPK8M2HN'
+    },
+    'bootstrap.bundle.min.js': {
+        url: 'https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js',
+        integrity: 'sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL'
+    },
+    'jquery.min.js': {
+        url: 'https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js',
+        integrity: 'sha384-1H217gwSVyLSIfaLxHbE7dRb3v4mYCKbpQvzx0cegeju1MVsGrX5xXxAvs/HgeFs'
+    },
+    'echarts.min.js': {
+        url: 'https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js',
+        integrity: 'sha384-pPi0zxBAoDu6+JXW/C68UZLvBUUtU+7zonhif43rqj7pxsGyqyqzcian2Rj37Rss'
+    },
+    'echarts-wordcloud.min.js': {
+        url: 'https://cdn.jsdelivr.net/npm/echarts-wordcloud@2.1.0/dist/echarts-wordcloud.min.js',
+        integrity: 'sha384-U1KEY0DDCF4Dq6Yx1J+EZ5Hnj8X5bMn52OAcJB8C4OiAWeU4iJhJ/Tv5KhTqu8zZ'
+    }
+};
+
+// '/static/vendor/x.js?v=1' → 'x.js'：带查询串/锚点时也能对上映射表，
+// 否则分享出去的 HTML 会留着只有本机才有的 /static 路径
+function vendorName(path) {
+    return String(path || '').split('/').pop().split('?')[0].split('#')[0];
+}
+
+// 换 CDN 地址必须连 integrity 一起写，并且带 crossorigin：SRI 对跨源资源有硬性要求，
+// 少了 crossorigin 浏览器会直接跳过校验，只改 URL 等于没加 SRI。
+// （jsDelivr 对这几个文件都返回 Access-Control-Allow-Origin: *）
+function markSri(el, integrity) {
+    el.setAttribute('integrity', integrity);
+    el.setAttribute('crossorigin', 'anonymous');
+}
+
+// 表情图来自本地缓存（/face/xxx）：报告分享出去后没有这个服务端，会变成裂图。
+// 导出时把它们内联成 data URL；确实取不到的，就把 <img> 换成表情名文字，
+// 免得到别人机器上显示成一排裂图。直接在 DOM 节点上改，不再对着 HTML 字符串做正则。
+async function inlineFaceImages(root) {
+    var imgs = Array.prototype.slice.call(root.querySelectorAll('img[src^="/face/"]'));
+    for (var i = 0; i < imgs.length; i++) {
+        var img = imgs[i];
+        try {
+            var resp = await fetch(img.getAttribute('src'));
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            var blob = await resp.blob();
+            var dataUrl = await new Promise(function (resolve, reject) {
+                var fr = new FileReader();
+                fr.onload = function () { resolve(fr.result); };
+                fr.onerror = function () { reject(new Error('read failed')); };
+                fr.readAsDataURL(blob);
+            });
+            img.setAttribute('src', dataUrl);
+        } catch (e) {
+            img.parentNode.replaceChild(
+                document.createTextNode(img.getAttribute('alt') || ''), img);
+        }
+    }
+}
+
+// 导出用的 DOM 快照：在克隆体上删节点、改属性，最后整体序列化。
+// 早先是对 document.documentElement.outerHTML 做正则手术（删 <button>、删含 CSRF 的
+// <script>），贪婪与非贪婪差一点就能从 <head> 一路吞到页脚——"导出的报告只剩两百多字节"
+// 那次事故正是这么来的；正则也分不清"HTML 标签"和"脚本字符串里的同名文本"。
+// 节点操作没有"匹配到一半"这类失败模式。
+async function buildReportSnapshot() {
+    var clone = document.documentElement.cloneNode(true);
+
+    Array.prototype.slice.call(clone.querySelectorAll('script')).forEach(function (s) {
+        var src = s.getAttribute('src') || '';
+        if (!src) {
+            // 只删服务端注入的 CSRF 脚本（分享出去没有服务端，token 也不该外流）；
+            // 其余内联脚本（报告渲染、主题初始化）必须留着，否则导出版是空白壳
+            if (/window\.CSRF_TOKEN/.test(s.textContent || '')) s.remove();
+            return;
+        }
+        if (src.indexOf('/static/js/') >= 0) { s.remove(); return; }   // 自有脚本依赖本机服务
+        var asset = VENDOR_CDN[vendorName(src)];
+        if (asset && src.indexOf('/static/vendor/') >= 0) {
+            s.setAttribute('src', asset.url);
+            markSri(s, asset.integrity);
+        }
+    });
+
+    // 打印/下载按钮不该出现在分享版里；no-print 只是本页打印开关，一并摘掉
+    Array.prototype.slice.call(clone.querySelectorAll('button')).forEach(function (b) { b.remove(); });
+    Array.prototype.slice.call(clone.querySelectorAll('.no-print')).forEach(function (el) {
+        el.classList.remove('no-print');
+        if (!el.getAttribute('class')) el.removeAttribute('class');
+    });
+
+    // 自有样式内联：分享版不依赖本机 /static（取不到就保留原链接，别让报告裸奔）
+    var cssText = '';
+    try {
+        var resp = await fetch('/static/css/style.css');
+        if (resp.ok) cssText = await resp.text();
+    } catch (e) { /* 忽略：下面按 cssText 是否为空决定要不要动样式表链接 */ }
+    if (cssText) {
+        Array.prototype.slice.call(clone.querySelectorAll('link[href^="/static/css/"]'))
+            .forEach(function (l) { l.remove(); });
+        var style = document.createElement('style');
+        style.textContent = cssText;
+        clone.querySelector('head').appendChild(style);
+    }
+
+    // vendor 已本地化（离线可用），分享出去的 HTML 得换回 CDN（并带上 integrity）
+    Array.prototype.slice.call(clone.querySelectorAll('link[href*="/static/vendor/"]'))
+        .forEach(function (l) {
+            var asset = VENDOR_CDN[vendorName(l.getAttribute('href'))];
+            if (!asset) return;
+            l.setAttribute('href', asset.url);
+            markSri(l, asset.integrity);
+        });
+
+    await inlineFaceImages(clone);
+    return '<!DOCTYPE html>\n' + clone.outerHTML;
+}
+
+async function downloadReport() {
+    var html = await buildReportSnapshot();
+    var blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = {{ report_download_name | tojson }};
+    a.click();
+    URL.revokeObjectURL(url);
+}

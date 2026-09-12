@@ -105,6 +105,17 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def _env_choice(name: str, default: str, allowed: tuple) -> str:
+    """枚举型环境变量：非法值回退默认并提示（避免拼错时静默按默认值生效）"""
+    raw = (os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return default
+    if raw not in allowed:
+        print(f"[WARN] {name}={raw!r} 不是 {'/'.join(allowed)} 之一，已回退为 {default}", file=sys.stderr)
+        return default
+    return raw
+
+
 # 单次上传体积上限（MB）：超长聊天（实测 数万条私聊）导出的 JSON 会逼近 50MB，
 # 撞上限制时 Flask 直接回 413，用户只看到"上传失败"却不知为何，所以留一个可调口子。
 MAX_CONTENT_LENGTH = _env_int("QQCHAT_MAX_UPLOAD_MB", 50, 1, 4096) * 1024 * 1024
@@ -118,6 +129,20 @@ LOG_RETENTION_DAYS = _env_int("LOG_RETENTION_DAYS", 7, 1, 90)
 LOG_REDACT_NAMES = _env_bool("LOG_REDACT_NAMES", True)
 # 内存任务表条目的存活时间（结果早已落盘缓存，内存只服务轮询）
 JOB_TTL_SECONDS = _env_int("QQCHAT_JOB_TTL_SECONDS", 900, 60, 86400)
+
+# ---------------------------------------------------------------------------
+# 群聊（多人记录）—— 默认"暗发布"：群聊轨就绪前，多人导出仍按升级前的行为拒收
+# ---------------------------------------------------------------------------
+# 互动矩阵的成员上限：矩阵是成员数×成员数的二维数组，100 人就是 1 万个格子，
+# 落盘缓存、模板渲染与前端图表都会跟着膨胀。超出时只保留发言最多的前 N 位
+# （其余成员的发言仍计入活跃度与群总览，只是不进矩阵）。
+GROUP_MATRIX_MEMBERS = _env_int("QQCHAT_GROUP_MATRIX_MEMBERS", 30, 3, 200)
+# "同时在线聊天"的判定窗口（分钟）：窗口内出现过的不同发言者数的峰值，
+# 用来近似"群里同时有几个人在聊"。窗口太大失去意义，太小会把接力聊天拆散。
+GROUP_PEAK_WINDOW_MINUTES = _env_int("QQCHAT_GROUP_PEAK_WINDOW_MINUTES", 10, 1, 120)
+# 成员画像最多分析几位（按发言量取前 N，自己必定入选）。群越大成本越高：
+# 每位成员一次调用、独立 prompt，所以默认只取前 10 位，其余成员仍计入本地统计与群级分析。
+GROUP_AI_MAX_MEMBERS = _env_int("QQCHAT_GROUP_AI_MAX_MEMBERS", 10, 1, 50)
 
 # 月份级增量缓存开关（默认开）：重新导出同一段对话时只为新增月份付费。
 # 关掉后行为回到"整份文件哈希"的维度级缓存。
@@ -209,6 +234,13 @@ FLASK_PORT = _env_int("FLASK_PORT", 5000, 1, 65535)
 
 # 访问口令：设置后所有页面需先登录；绑定非回环地址时强制要求（否则拒绝启动）
 ACCESS_PASSWORD = os.getenv("ACCESS_PASSWORD", "").strip()
+
+# 会话 cookie 的 Secure 标志：auto / true / false（大小写不敏感）。
+# auto（默认）= 非回环绑定时开启：明文 http 下 cookie 会裸奔过网，中间人拿到
+# session id 等于拿到登录态。之所以留 auto 而不是恒 true：本工具明确支持
+# "局域网明文 http + ALLOWED_ORIGINS"的用法，而 Secure cookie 在 http 下根本
+# 不会被浏览器回传，恒 true 会让那类部署"登录成功却立刻被弹回登录页"。
+COOKIE_SECURE = _env_choice("QQCHAT_COOKIE_SECURE", "auto", ("auto", "true", "false"))
 
 # 额外允许的浏览器来源主机名（逗号分隔），用于局域网/自定义域名访问。
 # POST 的 Origin 校验默认只放行回环地址与 FLASK_HOST（不再信任请求自带的 Host，

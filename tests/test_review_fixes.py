@@ -118,16 +118,40 @@ class TestGroupChatGuard(unittest.TestCase):
     早期版本因此把正常私聊误判成群聊直接拒收——这里用真实形态回归。
     """
 
-    def test_three_participant_upload_is_rejected(self):
+    def test_three_participant_export_is_detected_as_group(self):
+        """3 位有实质发言者 = 群聊：2026-09-12 起按群聊分析（不再是拒收）
+
+        这是本项目**唯一一次有意的行为变更**，因此在这里写清两件事：
+        - 默认（QQCHAT_GROUP_CHAT=auto）识别为群聊，各自统计；
+        - 设为 off 时完全回到升级前的拒收行为（下一条用例钉住它）。
+        """
         msgs = _bulk("uA", "我", 20) + _bulk("uB", "对方", 20, start=20) + _bulk("uC", "第三人", 6, start=40)
         path = _write_tmp(_wrap(msgs, {"uA": "我", "uB": "对方", "uC": "第三人"}))
         try:
             from parser.qq_parser import load_chat
 
-            with self.assertRaises(ValueError) as ctx:
-                load_chat(path)
+            with mock.patch.dict(os.environ, {"QQCHAT_GROUP_CHAT": "auto"}):
+                chat = load_chat(path)
+            self.assertTrue(chat.is_group_chat)
+            self.assertEqual(chat.mode, "group")
+            self.assertEqual(len(chat.participants()), 3)
+            self.assertEqual(chat.other_uid, "", "群聊没有单一「对方」")
+        finally:
+            os.remove(path)
+
+    def test_group_export_rejected_when_switched_off(self):
+        """QQCHAT_GROUP_CHAT=off：回到升级前的拒收（文案仍说明原因与两条出路）"""
+        msgs = _bulk("uA", "我", 20) + _bulk("uB", "对方", 20, start=20) + _bulk("uC", "第三人", 6, start=40)
+        path = _write_tmp(_wrap(msgs, {"uA": "我", "uB": "对方", "uC": "第三人"}))
+        try:
+            from parser.qq_parser import load_chat
+
+            with mock.patch.dict(os.environ, {"QQCHAT_GROUP_CHAT": "off"}):
+                with self.assertRaises(ValueError) as ctx:
+                    load_chat(path)
             self.assertIn("群聊", str(ctx.exception))
             self.assertIn("3 位有实质发言", str(ctx.exception))
+            self.assertIn("QQCHAT_GROUP_CHAT", str(ctx.exception), "文案要指向新开关")
         finally:
             os.remove(path)
 
@@ -331,6 +355,40 @@ class TestJobsHygiene(unittest.TestCase):
         self.assertLessEqual(len(jobsmod.JOBS), jobsmod.MAX_JOBS_KEPT)
         jobsmod.JOBS.clear()
 
+    def test_running_job_survives_ttl_prune(self):
+        """长任务不能在自己的轮询里把自己删掉。
+
+        _prune_jobs 就在 api_analyze_job 入口调用，而一键全量分析（5 维度 × 多月 ×
+        思考模式）跑过默认 15 分钟是常态：曾经 running 也按 created 走 TTL，于是
+        任务把自己删掉，之后每次轮询都 404，用户看到"任务不存在（服务可能已重启）"。
+        注意 created 取的是**过去**的时间——旧用例把 running 的 created 设成 now，
+        恰好绕开了这个场景。
+        """
+        from webapp import jobs as jobsmod
+
+        jobsmod.JOBS.clear()
+        started_long_ago = time.time() - (jobsmod.JOB_TTL_SECONDS + 60)
+        self._mk(2, "running", started_long_ago)
+        jobsmod._prune_jobs()
+        statuses = [v["status"] for v in jobsmod.JOBS.values()]
+        self.assertEqual(statuses.count("running"), 2, "running 条目不能按 TTL 淘汰")
+        jobsmod.JOBS.clear()
+
+    def test_stale_running_entry_has_hard_cap(self):
+        """线程异常死亡没来得及写 finished_at 时，running 条目靠硬上限兜底，不会永久滞留"""
+        from webapp import jobs as jobsmod
+
+        jobsmod.JOBS.clear()
+        self.assertGreater(
+            jobsmod.JOB_RUNNING_MAX_SECONDS,
+            jobsmod.JOB_TTL_SECONDS,
+            "running 的硬上限必须显著长于 TTL，否则等于没修",
+        )
+        self._mk(2, "running", time.time() - (jobsmod.JOB_RUNNING_MAX_SECONDS + 60))
+        jobsmod._prune_jobs()
+        self.assertEqual(jobsmod.JOBS, {}, "超过硬上限的滞留 running 条目必须被回收")
+        jobsmod.JOBS.clear()
+
     def test_poll_prunes_even_without_new_jobs(self):
         import app as appmod
         from webapp import jobs as jobsmod
@@ -525,7 +583,7 @@ class TestLocalizedAssets(unittest.TestCase):
             self.assertNotIn("cdn.jsdelivr", src, f"{name} 仍在运行时拉 CDN")
 
     def test_exported_report_rewrites_vendor_to_cdn(self):
-        src = (ROOT / "web" / "templates" / "report.html").read_text(encoding="utf-8")
+        src = (ROOT / "web" / "templates" / "_report_assets.html").read_text(encoding="utf-8")
         self.assertIn("VENDOR_CDN", src, "导出必须把 vendor 路径换回 CDN，否则分享出去的报告没了样式")
         for name in ("bootstrap.min.css", "jquery.min.js", "echarts.min.js"):
             self.assertIn(name, src)
@@ -543,12 +601,14 @@ class TestLocalizedAssets(unittest.TestCase):
         import re
 
         base = (ROOT / "web" / "templates" / "base.html").read_text(encoding="utf-8")
-        report = (ROOT / "web" / "templates" / "report.html").read_text(encoding="utf-8")
+        report = (ROOT / "web" / "templates" / "_report_assets.html").read_text(encoding="utf-8")
         refs = set(re.findall(r"filename='vendor/([\w.-]+)'", base))
         self.assertTrue(refs, "base.html 应引用本地化的 vendor 资源")
         for name in sorted(refs):
             self.assertIn(
-                "'%s'" % name, report, f"{name} 不在 report.html 的 VENDOR_CDN 映射里，导出的报告会 404"
+                "'%s'" % name,
+                report,
+                f"{name} 不在 _report_assets.html 的 VENDOR_CDN 映射里，导出的报告会 404",
             )
 
 
@@ -1413,7 +1473,7 @@ class TestFaceImagesOptional(unittest.TestCase):
         （实测导出的 HTML 只剩 205 字节）。这里守住"按节点处理"的写法：
         跨脚本的贪婪正则不许再出现，CSRF 脚本仍要按内容精确剔除。
         """
-        src = (ROOT / "web" / "templates" / "report.html").read_text(encoding="utf-8")
+        src = (ROOT / "web" / "templates" / "_report_assets.html").read_text(encoding="utf-8")
         # 注释里会引用旧写法作为反面教材，所以只检查真正的代码行
         code = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("//"))
         self.assertNotIn("[\\s\\S]*?window\\.CSRF_TOKEN", code, "不许再用跨脚本的贪婪正则删 CSRF 脚本")
@@ -1426,7 +1486,7 @@ class TestFaceImagesOptional(unittest.TestCase):
 
     def test_report_export_inlines_face_images(self):
         """导出的报告要自带表情图（内联成 data URL），否则分享出去就是裂图"""
-        src = (ROOT / "web" / "templates" / "report.html").read_text(encoding="utf-8")
+        src = (ROOT / "web" / "templates" / "_report_assets.html").read_text(encoding="utf-8")
         self.assertIn("inlineFaceImages", src)
         self.assertIn("readAsDataURL", src)
 
@@ -1525,7 +1585,10 @@ class TestFrontendRegressionGuards(unittest.TestCase):
     """前端踩过的坑：用静态断言守住，避免改回去"""
 
     JS = ROOT / "web" / "static" / "js" / "charts.js"
-    REPORT = ROOT / "web" / "templates" / "report.html"
+    # 导出分享版报告的代码（VENDOR_CDN 表、CDN 重写、表情图内联、快照构建）2026-09-12 起
+    # 抽到 partial：私聊报告与群聊报告共用同一份实现（两处各存一份必然漏改一处，
+    # 而 SRI 对不上时浏览器是静默拦掉资源）。断言与语义不变，只是校验对象跟着代码走。
+    REPORT = ROOT / "web" / "templates" / "_report_assets.html"
     INDEX = ROOT / "web" / "templates" / "index.html"
 
     def test_heatmap_uses_theme_tokens_not_hardcoded_colors(self):
@@ -1554,7 +1617,10 @@ class TestFrontendRegressionGuards(unittest.TestCase):
 
     def test_report_keeps_style_link_when_inlining_failed(self):
         """样式没取到时不能把 <link> 也删掉，否则导出的报告只剩 Bootstrap"""
-        src = self.REPORT.read_text(encoding="utf-8")
+        # 导出机制在 partial（_report_assets.html），而 asList 这类"渲染期兜底"仍在
+        # report.html 的渲染脚本里——两处都要看，才覆盖这条用例原本想守的东西。
+        report_tpl = ROOT / "web" / "templates" / "report.html"
+        src = self.REPORT.read_text(encoding="utf-8") + report_tpl.read_text(encoding="utf-8")
         self.assertIn("if (cssText) {", src)
         # 删 <link> 必须发生在这个守卫之内：取不到样式就保留原链接，别让报告裸奔
         self.assertLess(

@@ -34,3 +34,35 @@ ROOT = Path(__file__).resolve().parent
 TEMPLATES_DIR = ROOT / "templates"
 #: 静态资源目录（Flask 的 static_folder，URL 前缀固定 /static）
 STATIC_DIR = ROOT / "static"
+
+
+def _compute_asset_version() -> str:
+    """自有 JS/CSS 的版本号 = 这些文件里最新的 mtime（秒）。
+
+    用途是给 <script>/<link> 加 ?v=... 破浏览器缓存：Flask 对 static 默认发
+    Cache-Control: no-cache（会带 ETag 回源校验），但反向代理与浏览器仍可能按
+    URL 长期缓存——改了前端却还在跑旧 JS 时，症状是"新模板配旧脚本"，页面直接
+    不可用，而用户完全看不出该强刷。带上版本参数后，任一文件改动都会让 URL 变化。
+
+    只扫自有的 js/ 与 css/：vendor/ 是固定版本的第三方文件（Bootstrap/jQuery/
+    ECharts），按文件名本身就带版本，不必每次启动重算它们的 mtime。
+    每次启动算一次即可——开发时改前端需要重启服务，与 Flask 模板自动重载的
+    预期一致（Flask 的模板是每次请求重读，静态资源不是）。
+    """
+    newest = 0.0
+    for sub in ("js", "css"):
+        directory = STATIC_DIR / sub
+        try:
+            entries = list(directory.glob("*"))
+        except OSError:  # 目录缺失（异常安装）：退化成固定版本号，不影响启动
+            continue
+        for path in entries:
+            try:
+                newest = max(newest, path.stat().st_mtime)
+            except OSError:
+                continue
+    return str(int(newest))
+
+
+#: 模板里用 {{ asset_v }} 追加到自有 JS/CSS 的 URL 上
+ASSET_VERSION = _compute_asset_version()

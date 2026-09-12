@@ -27,7 +27,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     <div class="col-md-4 mb-3">
         <div class="card stat-card text-center h-100">
             <div class="card-body">
-                <div class="stat-value">{{ exchange_rounds }}</div>
+                <div class="stat-value">{{ exchange_rounds if exchange_rounds is not none else '—' }}</div>
                 <div class="stat-label">对话轮次</div>
             </div>
         </div>
@@ -35,18 +35,18 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     <div class="col-md-4 mb-3">
         <div class="card stat-card text-center h-100">
             <div class="card-body">
-                <div class="stat-value text-primary">{{ response_time.self.p50 }}s</div>
+                <div class="stat-value text-primary">{{ response_time.self.p50 ~ 's' if response_time else '—' }}</div>
                 <div class="stat-label">{{ overview.self_name }} 回复中位数<br>
-                    <small class="text-muted">均值 {{ response_time.self.avg }}s · P90 {{ response_time.self.p90 }}s</small></div>
+                    <small class="text-muted">均值 {{ response_time.self.avg ~ 's' if response_time else '—' }} · P90 {{ response_time.self.p90 ~ 's' if response_time else '—' }}</small></div>
             </div>
         </div>
     </div>
     <div class="col-md-4 mb-3">
         <div class="card stat-card text-center h-100">
             <div class="card-body">
-                <div class="stat-value text-success">{{ response_time.other.p50 }}s</div>
+                <div class="stat-value text-success">{{ response_time.other.p50 ~ 's' if response_time else '—' }}</div>
                 <div class="stat-label">{{ overview.other_name }} 回复中位数<br>
-                    <small class="text-muted">均值 {{ response_time.other.avg }}s · P90 {{ response_time.other.p90 }}s</small></div>
+                    <small class="text-muted">均值 {{ response_time.other.avg ~ 's' if response_time else '—' }} · P90 {{ response_time.other.p90 ~ 's' if response_time else '—' }}</small></div>
             </div>
         </div>
     </div>
@@ -86,8 +86,8 @@ $(function() {
     ], '消息数');
 
     renderResponseChart('responseChart', {
-        self: {{ response_time.self_avg_seconds }},
-        other: {{ response_time.other_avg_seconds }},
+        self: {{ response_time.self_avg_seconds if response_time else 0 }},
+        other: {{ response_time.other_avg_seconds if response_time else 0 }},
         selfName: {{ overview.self_name | tojson }},
         otherName: {{ overview.other_name | tojson }}
     });

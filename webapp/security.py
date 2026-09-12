@@ -27,7 +27,7 @@ import threading
 import time
 from urllib.parse import urlparse
 
-from flask import redirect, render_template, request, session, url_for
+from flask import current_app, redirect, render_template, request, session, url_for
 
 from config import ACCESS_PASSWORD, ALLOWED_ORIGINS, FLASK_HOST
 from analyzer.logger import get_logger
@@ -35,6 +35,12 @@ from analyzer.logger import get_logger
 logger = get_logger("app")
 
 PUBLIC_ENDPOINTS = {"login", "static"}
+
+#: 完全不参与中间件链路的端点（存活探针）。它会被反代/容器编排高频调用：
+#: 不该建会话（每次探针都写一个 session 文件纯属浪费）、不该要求登录（设了口令后
+#: 探针永远被 302 到登录页，等于没有探针）、也不该写日志与触发清理。
+#: 消费点：ensure_csrf_token / require_login / views.log_request / cleanup.register。
+BYPASS_ENDPOINTS = frozenset({"health"})
 
 # 登录失败限流：同一 IP 在滑动窗口内失败达到上限后暂时拒绝，避免绑定局域网时被爆破
 LOGIN_MAX_ATTEMPTS = 5
@@ -50,6 +56,8 @@ _login_lock = threading.Lock()
 
 def ensure_csrf_token():
     """确保会话中存在 CSRF token（session 服务端存储，攻击者无法读取）"""
+    if request.endpoint in BYPASS_ENDPOINTS:
+        return None  # 探针不建会话：否则每次健康检查都在磁盘上留一个 session 文件
     if "csrf_token" not in session:
         session["csrf_token"] = secrets.token_hex(32)
 
@@ -186,9 +194,33 @@ def require_login():
     """未登录时重定向到登录页；未设置口令则不启用"""
     if not ACCESS_PASSWORD:
         return None
-    if request.endpoint in PUBLIC_ENDPOINTS or session.get("auth_ok"):
+    if request.endpoint in PUBLIC_ENDPOINTS or request.endpoint in BYPASS_ENDPOINTS:
+        return None
+    if session.get("auth_ok"):
         return None
     return redirect(url_for("login", next=request.path or "/"))
+
+
+def _regenerate_session_id() -> None:
+    """认证状态升级后轮换服务端 session id（防御会话固定）。
+
+    调用时机有硬要求：必须**在会话已经写入内容之后**。flask-session 的
+    ``regenerate()`` 内部用 ``if session:`` 做前置判断，而只剩 ``_permanent``
+    的空会话在 ``ServerSideSession.__bool__`` 下是 falsy——放在 session.clear()
+    之后、写入 auth_ok 之前调用会被静默跳过，看起来"轮换过了"其实没有。
+
+    为什么必须轮换：``session.clear()`` 只清空服务端**内容**，浏览器 cookie 里的
+    sid 原样不变。攻击者若能预先固定住受害者的 sid（明文 HTTP 嗅探、或诱导受害者
+    点击带 Set-Cookie 的响应），该 sid 一旦登录就直接是已认证状态。
+    ``regenerate()`` 会删掉旧 sid 的存储、生成新 sid 并置 ``modified=True``，
+    于是响应会重下 cookie——旧 sid 随即失效。
+    """
+    try:
+        current_app.session_interface.regenerate(session)
+    except AttributeError:
+        # 换用不支持 regenerate 的会话后端（或更老的 flask-session）时降级：
+        # 内容与 CSRF token 已轮换，只是 sid 复用——记一条便于排查。
+        logger.warning("当前会话后端不支持 session id 轮换，会话固定防护已降级")
 
 
 def login():
@@ -207,12 +239,13 @@ def login():
         # 登录接口自身豁免 CSRF（无 session 时先建 token）
         pwd = request.form.get("password", "")
         if hmac.compare_digest(pwd.encode("utf-8"), ACCESS_PASSWORD.encode("utf-8")):
-            # 登录成功即换一份会话内容：丢弃匿名阶段的残留，并轮换 CSRF token
-            # （防御会话固定；Flask-Session 的文件后端没有公开的 sid 轮换 API，
-            #   所以这里至少保证认证状态与匿名状态的 token 不共用）
+            # 登录成功即换一份会话内容：丢弃匿名阶段的残留，并轮换 CSRF token 与 sid
             session.clear()
             session["auth_ok"] = True
             session["csrf_token"] = secrets.token_hex(32)
+            # 必须排在写入 auth_ok/CSRF 之后：regenerate() 用 `if session:` 判空，
+            # 空会话会被它静默跳过（详见函数注释）。
+            _regenerate_session_id()
             _clear_login_failures(ip)
             nxt = request.args.get("next") or ""
             # 防开放重定向：反斜杠先归一为斜杠再判断。浏览器把 `/\evil.com` 当作
