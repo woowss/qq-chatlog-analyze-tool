@@ -28,12 +28,10 @@ package job 真正构建 wheel、拆包比对 web/ 下的文件清单，并安�
 """
 
 import ast
-import atexit
 import contextlib
 import importlib.util
 import io
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -49,20 +47,12 @@ except ModuleNotFoundError:  # pragma: no cover - 仅 Python 3.10
     except ModuleNotFoundError:
         tomllib = None
 
+# 测试隔离 + 网络护栏：数据目录指向本次进程独占的临时目录，且未配置真实 API Key 时
+# 禁止一切真实 LLM 调用。两者都必须在 import 项目模块（config / analyzer.*）之前完成，
+# 否则 config 会把数据目录读成真实目录。实现与理由见 tests/_bootstrap.py。
+from _bootstrap import bootstrap  # noqa: E402
 
-# 测试隔离：数据目录指向临时目录，绝不碰真实 uploads/ai_cache/session。
-# 只清理"自己创建的"目录——外部显式指定的 QQCHAT_DATA_DIR 一律不动。
-def _drop_temp_data_dir():
-    """跑完把临时数据目录删掉（先关日志：否则清理先跑，logging.shutdown 又把 app.log 写回来）"""
-    import logging
-
-    logging.shutdown()
-    shutil.rmtree(os.environ["QQCHAT_DATA_DIR"], ignore_errors=True)
-
-
-if "QQCHAT_DATA_DIR" not in os.environ:
-    os.environ["QQCHAT_DATA_DIR"] = tempfile.mkdtemp(prefix="qqchatlog-test-")
-    atexit.register(_drop_temp_data_dir)
+bootstrap()
 os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
 
 ROOT = Path(__file__).resolve().parent.parent

@@ -10,7 +10,10 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.12", "3.13"]
+        # 3.14 进矩阵是为了让 pyproject.toml 的 classifier 名副其实：
+        # 只写 "支持 3.14" 却不在 3.14 上跑，等于对外声明一件没人验证过的事。
+        # 中间版本（3.11）不排：3.10 与 3.12 已经覆盖了 tomllib 有无这两个分叉。
+        python-version: ["3.10", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
 
