@@ -18,10 +18,13 @@
 # ====================================
 # 路由与基础设施在 webapp/ 包（分层见 webapp/__init__.py 的说明）。
 # 本文件负责：创建并配置 Flask 实例、启动期一次性回收、测试兼容的重导出面、
-# 以及 `python app.py` 的启动横幅。
+# 以及命令行入口 main()（console_scripts `qqchatlog` 与 `python app.py` 共用）。
 
+import argparse
 import os
 import sys
+from importlib.metadata import PackageNotFoundError, version
+from typing import Optional, Sequence
 
 from flask import Flask
 from flask_session import Session
@@ -56,6 +59,7 @@ from analyzer.deepseek_client import (
 )
 from analyzer.logger import get_logger
 
+from web import STATIC_DIR, TEMPLATES_DIR
 from webapp import api, cleanup, security, views
 
 logger = get_logger("app")
@@ -63,9 +67,11 @@ logger = get_logger("app")
 
 def create_app() -> Flask:
     """组装 Flask 应用：实例配置 → 服务端 session → 数据目录 → 月份缓存 → 各层注册"""
+    # 模板/静态目录按 web 包的绝对路径解析，而不是相对工作目录的 "web/templates"：
+    # pip 安装后包在 site-packages 下，从任何目录执行 qqchatlog 都要能找到它们。
     app = Flask(__name__,
-                template_folder="web/templates",
-                static_folder="web/static",
+                template_folder=str(TEMPLATES_DIR),
+                static_folder=str(STATIC_DIR),
                 static_url_path="/static")
     app.secret_key = SECRET_KEY
     app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
@@ -104,69 +110,96 @@ cleanup.startup_cleanup()
 
 
 # ---------------------------------------------------------------------------
-# 命令行入口
+# 命令行入口（console_scripts: qqchatlog = "app:main"；`python app.py` 也走这里）
 # ---------------------------------------------------------------------------
 
 
-if __name__ == "__main__":
+def _print_safe(msg: str) -> None:
+    """打印启动信息：控制台编码表示不了时降级替换，别让一行生僻字把启动打崩"""
     enc = sys.stdout.encoding or "utf-8"
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        print(msg.encode(enc, errors="replace").decode(enc))
 
-    def _p(msg: str):
-        try:
-            print(msg)
-        except UnicodeEncodeError:
-            print(msg.encode(enc, errors="replace").decode(enc))
 
+def _package_version() -> str:
+    """发行版本号：从安装元数据读取；源码直跑（没 pip install 过）时回退为 dev"""
+    try:
+        return version("qqchatlog")
+    except PackageNotFoundError:
+        return "dev"
+
+
+def _startup_report() -> bool:
+    """打印启动横幅与自检结果；返回 False 表示当前配置不允许启动（调用方以退出码 1 结束）"""
     sep = "=" * 50
-    _p(sep)
-    _p("  QQ 聊天记录分析工具")
-    _p(f"  访问地址: http://{FLASK_HOST}:{FLASK_PORT}")
-    _p(sep)
+    _print_safe(sep)
+    _print_safe("  QQ 聊天记录分析工具")
+    _print_safe(f"  访问地址: http://{FLASK_HOST}:{FLASK_PORT}")
+    _print_safe(sep)
     if not is_api_configured():
-        _p("  [WARN] DeepSeek API Key 未配置")
-        _p("  请编辑项目根目录的 .env 文件填入 Key")
+        _print_safe("  [WARN] DeepSeek API Key 未配置")
+        _print_safe("  请编辑项目根目录的 .env 文件填入 Key")
     else:
-        _p("  [OK] DeepSeek API 已配置")
-        _p(f"  模型: {DEEPSEEK_MODEL} · 并发 {CONCURRENCY} · 调用间隔 {CALL_MIN_INTERVAL}s"
-           f"（多月份分析的排队下限 ≈ (月数-1)×{CALL_MIN_INTERVAL}s）")
+        _print_safe("  [OK] DeepSeek API 已配置")
+        _print_safe(f"  模型: {DEEPSEEK_MODEL} · 并发 {CONCURRENCY} · 调用间隔 {CALL_MIN_INTERVAL}s"
+                    f"（多月份分析的排队下限 ≈ (月数-1)×{CALL_MIN_INTERVAL}s）")
         thinking_dims = [d for d in MAX_TOKENS_BY_DIM if thinking_enabled(d)]
         if thinking_dims:
-            _p(f"  思考模式: {', '.join(thinking_dims)}")
+            _print_safe(f"  思考模式: {', '.join(thinking_dims)}")
         conflicts = thinking_budget_warnings()
         if conflicts:
-            _p("  [WARN] 思考模式与输出预算冲突，这些维度会因截断丢弃结果：")
-            _p(f"         {', '.join(conflicts)}")
-            _p("         请在 .env 里调大对应维度的 LLM_MAX_TOKENS_<维度>（如 LLM_MAX_TOKENS_PROFILE），")
-            _p("         或关闭该维度的思考模式")
+            _print_safe("  [WARN] 思考模式与输出预算冲突，这些维度会因截断丢弃结果：")
+            _print_safe(f"         {', '.join(conflicts)}")
+            _print_safe("         请在 .env 里调大对应维度的 LLM_MAX_TOKENS_<维度>"
+                        "（如 LLM_MAX_TOKENS_PROFILE），")
+            _print_safe("         或关闭该维度的思考模式")
         if is_insecure_base_url():
-            _p("  [WARN] DEEPSEEK_BASE_URL 是明文 http 且非本机地址：")
-            _p("         API Key 与聊天内容会以明文过网，建议改成 https 端点")
-    _p(f"  数据目录: {os.path.dirname(AI_CACHE_DIR)}（可用 QQCHAT_DATA_DIR 迁移，测试更安全）")
-    _p(f"  单次上传上限: {MAX_CONTENT_LENGTH // 1048576} MB（QQCHAT_MAX_UPLOAD_MB 可调）")
-    _p(f"  增量缓存: {'开（只分析新增月份）' if MONTH_CACHE_ENABLED else '关'}")
-    _p(f"  内存任务 TTL: {JOB_TTL_SECONDS}s · 结果本身永远先落盘（重启/超时不丢）")
+            _print_safe("  [WARN] DEEPSEEK_BASE_URL 是明文 http 且非本机地址：")
+            _print_safe("         API Key 与聊天内容会以明文过网，建议改成 https 端点")
+    _print_safe(f"  数据目录: {os.path.dirname(AI_CACHE_DIR)}（可用 QQCHAT_DATA_DIR 迁移，测试更安全）")
+    _print_safe(f"  单次上传上限: {MAX_CONTENT_LENGTH // 1048576} MB（QQCHAT_MAX_UPLOAD_MB 可调）")
+    _print_safe(f"  增量缓存: {'开（只分析新增月份）' if MONTH_CACHE_ENABLED else '关'}")
+    _print_safe(f"  内存任务 TTL: {JOB_TTL_SECONDS}s · 结果本身永远先落盘（重启/超时不丢）")
 
     loopback = FLASK_HOST in ("127.0.0.1", "localhost", "::1")
     if not loopback and not ACCESS_PASSWORD:
-        _p("  [ERROR] 绑定到非回环地址必须设置 ACCESS_PASSWORD（见 .env.example）")
-        _p("  已拒绝启动，以免聊天记录与 AI 结果被局域网内陌生人访问")
-        sys.exit(1)
+        _print_safe("  [ERROR] 绑定到非回环地址必须设置 ACCESS_PASSWORD（见 .env.example）")
+        _print_safe("  已拒绝启动，以免聊天记录与 AI 结果被局域网内陌生人访问")
+        return False
     if ACCESS_PASSWORD:
-        _p("  [OK] 访问口令已启用")
+        _print_safe("  [OK] 访问口令已启用")
     if not loopback:
         if ALLOWED_ORIGINS:
-            _p(f"  [OK] 允许的浏览器来源: {', '.join(sorted(ALLOWED_ORIGINS))}")
+            _print_safe(f"  [OK] 允许的浏览器来源: {', '.join(sorted(ALLOWED_ORIGINS))}")
         else:
-            _p("  [WARN] 未设置 ALLOWED_ORIGINS：用局域网 IP 或域名打开页面时，")
-            _p("         上传与 AI 分析请求会被 403 拒绝（Origin 校验不信任请求 Host）")
+            _print_safe("  [WARN] 未设置 ALLOWED_ORIGINS：用局域网 IP 或域名打开页面时，")
+            _print_safe("         上传与 AI 分析请求会被 403 拒绝（Origin 校验不信任请求 Host）")
     if FLASK_DEBUG:
-        _p("  [WARN] 调试模式已开启（调试器可执行任意代码，仅限本机开发）")
+        _print_safe("  [WARN] 调试模式已开启（调试器可执行任意代码，仅限本机开发）")
 
-    _p(sep)
+    _print_safe(sep)
     redact = "昵称与文件名已脱敏" if LOG_REDACT_NAMES else "含明文昵称（LOG_REDACT_NAMES=false）"
-    _p(f"  日志: {LOG_RETENTION_DAYS} 天轮转保留 · {redact}")
-    _p("  uploads/ flask_session/ ai_cache/ 过期文件启动时清理，之后每小时随请求去抖清理")
-    _p(sep)
+    _print_safe(f"  日志: {LOG_RETENTION_DAYS} 天轮转保留 · {redact}")
+    _print_safe("  uploads/ flask_session/ ai_cache/ 过期文件启动时清理，之后每小时随请求去抖清理")
+    _print_safe(sep)
+    return True
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """启动 Web 服务，返回进程退出码（0 = 正常结束，1 = 配置或端口问题拒绝启动）
+
+    绑定地址/端口/调试开关仍由 .env 与环境变量决定，命令行只提供 --version：
+    Origin 白名单在 webapp/security.py 里是按 import 时的 FLASK_HOST 算的，
+    运行时改监听地址会让校验与真实地址对不上，所以这里不开 --host/--port。
+    """
+    parser = argparse.ArgumentParser(prog="qqchatlog", description="QQ 聊天记录分析工具")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {_package_version()}")
+    parser.parse_args(argv)
+
+    if not _startup_report():
+        return 1
 
     logger.info("=" * 40)
     logger.info("应用启动 - http://%s:%d", FLASK_HOST, FLASK_PORT)
@@ -177,7 +210,12 @@ if __name__ == "__main__":
     try:
         app.run(debug=FLASK_DEBUG, host=FLASK_HOST, port=FLASK_PORT)
     except OSError as e:
-        _p(f"  [ERROR] 启动失败: {e}")
-        _p(f"  端口 {FLASK_PORT} 可能被占用（Windows 上 5000 常被 AirPlay/Hyper-V 占用），")
-        _p("  可在 .env 中设置 FLASK_PORT=5001 换一个端口")
-        sys.exit(1)
+        _print_safe(f"  [ERROR] 启动失败: {e}")
+        _print_safe(f"  端口 {FLASK_PORT} 可能被占用（Windows 上 5000 常被 AirPlay/Hyper-V 占用），")
+        _print_safe("  可在 .env 中设置 FLASK_PORT=5001 换一个端口")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
