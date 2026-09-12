@@ -25,6 +25,7 @@ tests/test_sri.py 只能证明"内联常量 == 本地文件"；"本地文件 == 
 退出码 0 = 一致，1 = 有出入。脚本只读不写：哈希该不该改由人决定——自动改写
 等于把 CDN 上的变化当成"正常"咽下去，那正是 SRI 要防的事。
 """
+
 import argparse
 import base64
 import hashlib
@@ -176,8 +177,9 @@ def render_table(table: dict) -> str:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="核对报告导出用的 vendor SRI 哈希")
     parser.add_argument("--offline", action="store_true", help="不联网：只比对本地文件与内联常量")
-    parser.add_argument("--print", dest="print_table", action="store_true",
-                        help="不联网：按本地文件打印 VENDOR_CDN 表")
+    parser.add_argument(
+        "--print", dest="print_table", action="store_true", help="不联网：按本地文件打印 VENDOR_CDN 表"
+    )
     args = parser.parse_args(argv)
 
     try:

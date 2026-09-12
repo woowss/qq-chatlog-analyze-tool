@@ -27,6 +27,7 @@ RotatingFileHandler，Windows 上轮转时 os.rename 会因另一个句柄占用
 量很小，25MB 相当于"无限期"，而日志行里会出现昵称与文件名，无期限留存与
 "不留敏感数据"的承诺相悖。
 """
+
 import logging
 import sys
 from logging.handlers import TimedRotatingFileHandler
@@ -51,7 +52,7 @@ def mask_name(name: str) -> str:
     if not n:
         return "*"
     if len(n) == 1:
-        return "*"          # 单字昵称留首字等于没脱敏
+        return "*"  # 单字昵称留首字等于没脱敏
     return n[0] + "*" * (len(n) - 1)
 
 
@@ -85,7 +86,7 @@ def _configure(base: logging.Logger) -> None:
     if base.handlers:
         return
     base.setLevel(LOG_LEVEL)
-    base.propagate = False        # 不再向 root 传播，避免被第三方/默认配置重复输出
+    base.propagate = False  # 不再向 root 传播，避免被第三方/默认配置重复输出
 
     # 1) 文件日志 — 按天轮转，保留 LOG_RETENTION_DAYS 天
     LOG_DIR_PATH.mkdir(parents=True, exist_ok=True)
@@ -94,8 +95,10 @@ def _configure(base: logging.Logger) -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     file_handler = TimedRotatingFileHandler(
-        LOG_FILE, when="midnight",
-        backupCount=LOG_RETENTION_DAYS, encoding="utf-8",
+        LOG_FILE,
+        when="midnight",
+        backupCount=LOG_RETENTION_DAYS,
+        encoding="utf-8",
     )
     file_handler.setLevel(LOG_LEVEL)
     file_handler.setFormatter(file_fmt)
@@ -120,7 +123,7 @@ def get_logger(name: str = PACKAGE_LOGGER) -> logging.Logger:
     if not clean or clean in (PACKAGE_LOGGER, "qq_analyzer"):
         return base
     if clean.startswith(PACKAGE_LOGGER + "."):
-        clean = clean[len(PACKAGE_LOGGER) + 1:]
+        clean = clean[len(PACKAGE_LOGGER) + 1 :]
     child = logging.getLogger(f"{PACKAGE_LOGGER}.{clean}")
     child.setLevel(LOG_LEVEL)
     return child

@@ -15,6 +15,7 @@
 #
 #
 """应用配置：从 .env 读取 DeepSeek API 配置"""
+
 import os
 import sys
 from pathlib import Path
@@ -79,6 +80,7 @@ LOG_DIR = os.getenv("LOG_DIR", "").strip() or str(DATA_DIR / "logs")
 LOG_FILE = os.path.join(LOG_DIR, "app.log")
 TOKEN_USAGE_FILE = os.getenv("TOKEN_USAGE_FILE", "").strip() or str(DATA_DIR / "logs" / "token_usage.json")
 
+
 def _env_int(name: str, default: int, low: int, high: int) -> int:
     """读取整型环境变量：非法值不再让应用崩在 import 阶段，而是回退默认值并提示"""
     raw = (os.getenv(name, "") or "").strip()
@@ -135,15 +137,16 @@ VISION_ENABLED = _env_bool("LLM_VISION", True)
 # 准确性优先：默认 20 张（约 2 万 tokens/月，成本可忽略），能覆盖更多截图与表情包。
 VISION_MAX_PER_MONTH = _env_int("LLM_VISION_MAX_PER_MONTH", 20, 0, 50)
 # 送图清晰度：high 保留原图（截图里的字才看得清）；low 压到 512x512（更省 token）
-VISION_DETAIL = (os.getenv("LLM_VISION_DETAIL", "high").strip().lower() or "high")
+VISION_DETAIL = os.getenv("LLM_VISION_DETAIL", "high").strip().lower() or "high"
 # 太小的图基本是表情包/缩略图，跳过以省 token（按最长边像素判断）
 VISION_MIN_SIDE = _env_int("LLM_VISION_MIN_SIDE", 200, 0, 4000)
 # 单张图片体积上限（官方 base64 上限 32 MiB，这里留一半余量）
 VISION_MAX_BYTES = _env_int("LLM_VISION_MAX_BYTES", 12 * 1024 * 1024, 65536, 32 * 1024 * 1024)
 # 一次摘要请求的图片总体积上限：官方请求体上限 48 MiB，而 base64 会膨胀约 1/3，
 # 所以原始字节控制在 32 MiB 以内（图片按顺序贪心装入，装不下的留到下次）
-VISION_MAX_TOTAL_BYTES = _env_int("LLM_VISION_MAX_TOTAL_BYTES", 32 * 1024 * 1024,
-                                  1024 * 1024, 32 * 1024 * 1024)
+VISION_MAX_TOTAL_BYTES = _env_int(
+    "LLM_VISION_MAX_TOTAL_BYTES", 32 * 1024 * 1024, 1024 * 1024, 32 * 1024 * 1024
+)
 
 # ---------------------------------------------------------------------------
 # 表情图（可选，默认关）：把 QQ 表情的原始图片缓存到本地，界面直接显示真表情
@@ -178,7 +181,7 @@ def _load_or_create_secret() -> str:
             continue
         if not key:
             continue
-        if index > 0:                     # 旧位置的密钥：顺手迁到数据目录
+        if index > 0:  # 旧位置的密钥：顺手迁到数据目录
             try:
                 os.makedirs(DATA_DIR, exist_ok=True)
                 target.write_text(key, encoding="utf-8")
@@ -212,7 +215,5 @@ ACCESS_PASSWORD = os.getenv("ACCESS_PASSWORD", "").strip()
 # 否则 DNS rebinding 场景下 "Origin == Host" 会让校验形同虚设）。
 # 例：ALLOWED_ORIGINS=192.168.1.5,chat.lan
 ALLOWED_ORIGINS = frozenset(
-    h.strip().lower()
-    for h in (os.getenv("ALLOWED_ORIGINS", "") or "").split(",")
-    if h.strip()
+    h.strip().lower() for h in (os.getenv("ALLOWED_ORIGINS", "") or "").split(",") if h.strip()
 )

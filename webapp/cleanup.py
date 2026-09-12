@@ -27,6 +27,7 @@
 早先清理只在 import 时跑一次，长跑进程永不回收；后来挂到上传路径，可
 "长期开着不上传"的实例又漏了。现在同时由启动与每个请求（去抖）触发。
 """
+
 import json
 import os
 import time
@@ -99,35 +100,35 @@ def _purge_tree(root: str, expired) -> int:
                 continue
         if os.path.abspath(dirpath) != root_abs:
             try:
-                os.rmdir(dirpath)     # 只删空目录：还有未过期内容时 rmdir 自然失败
+                os.rmdir(dirpath)  # 只删空目录：还有未过期内容时 rmdir 自然失败
             except OSError:
                 pass
     return removed
 
 
-def cleanup_old_files(max_age_seconds: int = 86400, cache_max_age: int = 30 * 86400,
-                      cache_hard_max_age: int = 90 * 86400) -> int:
+def cleanup_old_files(
+    max_age_seconds: int = 86400, cache_max_age: int = 30 * 86400, cache_hard_max_age: int = 90 * 86400
+) -> int:
     """删除过期的临时文件与缓存；日志按天保留 LOG_RETENTION_DAYS 天"""
     now = time.time()
     cleaned = 0
     for directory in (UPLOAD_FOLDER, SESSION_FILE_DIR):
-        cleaned += _purge_tree(
-            directory, lambda p: now - os.path.getmtime(p) > max_age_seconds)
+        cleaned += _purge_tree(directory, lambda p: now - os.path.getmtime(p) > max_age_seconds)
     for directory in (AI_CACHE_DIR, STATS_CACHE_DIR):
-        cleaned += _purge_dir(directory, lambda p: (
-            now - os.path.getmtime(p) > cache_max_age
-            or now - _cache_created_at(p) > cache_hard_max_age))
+        cleaned += _purge_dir(
+            directory,
+            lambda p: (
+                now - os.path.getmtime(p) > cache_max_age or now - _cache_created_at(p) > cache_hard_max_age
+            ),
+        )
     # 所有轮转出的旧日志一律按保留天数回收：既覆盖历史遗留的按大小产物
     # （app.log.1 / app.log.2…，新 handler 不认领它们），也兜住应用长期闲置
     # 时 TimedRotatingFileHandler 来不及在轮转中删掉的日期文件。
     log_cutoff = LOG_RETENTION_DAYS * 86400
-    cleaned += _purge_dir(
-        LOG_DIR,
-        lambda p: now - os.path.getmtime(p) > log_cutoff,
-        name_prefix="app.log.")
+    cleaned += _purge_dir(LOG_DIR, lambda p: now - os.path.getmtime(p) > log_cutoff, name_prefix="app.log.")
     try:
         cleaned += sweep_orphan_month_cache()
-    except Exception as e:                       # 回收失败不影响主流程
+    except Exception as e:  # 回收失败不影响主流程
         logger.warning("月份缓存回收失败: %s", e)
     if cleaned:
         logger.info("已清理 %d 个过期文件", cleaned)
@@ -145,7 +146,7 @@ def maybe_cleanup(interval_seconds: int = 3600) -> None:
     _last_cleanup[0] = now
     try:
         cleanup_old_files(max_age_seconds=86400)
-    except Exception as e:                      # 清理失败不能影响请求
+    except Exception as e:  # 清理失败不能影响请求
         logger.warning("定期清理失败: %s", e)
 
 

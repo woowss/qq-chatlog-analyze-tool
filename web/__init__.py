@@ -25,6 +25,7 @@ CI 的 package job 还会拆开 wheel 再核一遍。
 模板与静态目录一律走下面的绝对路径（而不是相对当前工作目录的 "web/templates"）：
 安装后包在 site-packages 里，从任何目录执行 `qqchatlog` 都要能找到它们。
 """
+
 from pathlib import Path
 
 #: web 包所在目录：源码运行时是仓库下的 web/，安装后是 site-packages/web/

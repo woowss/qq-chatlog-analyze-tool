@@ -22,6 +22,7 @@
 "本地文件 == CDN 实际提供的字节"由 tools/verify_vendor_sri.py 联网复核
 （2026-09-12 已按 sha256 逐条核对，并得到 data.jsdelivr.com 公布哈希的旁证）。
 """
+
 import base64
 import importlib.util
 import sys
@@ -62,7 +63,8 @@ class TestReportSriConstants(unittest.TestCase):
                 self.assertTrue(path.is_file(), f"{name} 在 {VENDOR_DIR} 下不存在")
                 expected = sri.sri_of_file(path)
                 self.assertEqual(
-                    entry["integrity"], expected,
+                    entry["integrity"],
+                    expected,
                     f"{name}: 内联常量 {entry['integrity']} 与本地文件 {expected} 不一致；"
                     f"升级 vendor 后请跑 python tools/verify_vendor_sri.py --print 更新常量",
                 )
@@ -94,11 +96,13 @@ class TestReportSriConstants(unittest.TestCase):
         self.assertIn("s.setAttribute('src', asset.url)", text)
         self.assertIn("l.setAttribute('href', asset.url)", text)
         self.assertGreaterEqual(
-            text.count("markSri("), 3,
+            text.count("markSri("),
+            3,
             "markSri 应出现 3 次（1 处定义 + script/link 两处调用），少了就是漏加 integrity",
         )
         self.assertEqual(
-            text.count("VENDOR_CDN[vendorName("), 2,
+            text.count("VENDOR_CDN[vendorName("),
+            2,
             "两处换 CDN 都要走 vendorName()，否则带 ?v= 的路径匹配不上映射表",
         )
 

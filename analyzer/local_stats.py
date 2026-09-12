@@ -15,6 +15,7 @@
 #
 #
 """本地统计分析 — 不依赖大模型 API"""
+
 import logging
 import re
 from collections import Counter, defaultdict
@@ -42,35 +43,186 @@ def is_session_start(prev_ts: Optional[int], ts: int) -> bool:
     """
     return prev_ts is None or ts - prev_ts > SESSION_GAP_MS
 
+
 # 中文停用词（常见虚词、标点、语气词、QQ 专用词汇）。
 # 按语义分组、每项只出现一次：原先是一长串随手追加的字面量，"的/了/还是/因为"
 # 之类重复了 2-3 次（set 下无害，但读的人分不清是笔误还是有意，也看不出真正的新增项）。
 _STOP_WORDS: set[str] = {
     # —— 高频虚词、代词、介词 ——
-    "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一",
-    "一个", "上", "也", "很", "到", "说", "要", "去", "你", "会", "着",
-    "没有", "看", "好", "自己", "这", "他", "她", "它", "们", "那", "什么",
-    "怎么", "么", "得", "能", "做", "对", "与", "以", "及", "而", "或", "但",
-    "被", "把", "从", "向", "于", "让", "给", "为", "所", "比", "还", "又",
-    "再", "才", "只", "可", "来",
+    "的",
+    "了",
+    "在",
+    "是",
+    "我",
+    "有",
+    "和",
+    "就",
+    "不",
+    "人",
+    "都",
+    "一",
+    "一个",
+    "上",
+    "也",
+    "很",
+    "到",
+    "说",
+    "要",
+    "去",
+    "你",
+    "会",
+    "着",
+    "没有",
+    "看",
+    "好",
+    "自己",
+    "这",
+    "他",
+    "她",
+    "它",
+    "们",
+    "那",
+    "什么",
+    "怎么",
+    "么",
+    "得",
+    "能",
+    "做",
+    "对",
+    "与",
+    "以",
+    "及",
+    "而",
+    "或",
+    "但",
+    "被",
+    "把",
+    "从",
+    "向",
+    "于",
+    "让",
+    "给",
+    "为",
+    "所",
+    "比",
+    "还",
+    "又",
+    "再",
+    "才",
+    "只",
+    "可",
+    "来",
     # —— 语气词 ——
-    "吗", "啊", "吧", "呢", "呀", "哦", "嗯", "哈", "嘛", "哇",
-    "哎", "哟", "咯", "嗨", "呵", "喂", "啦", "呐", "唔", "噢",
+    "吗",
+    "啊",
+    "吧",
+    "呢",
+    "呀",
+    "哦",
+    "嗯",
+    "哈",
+    "嘛",
+    "哇",
+    "哎",
+    "哟",
+    "咯",
+    "嗨",
+    "呵",
+    "喂",
+    "啦",
+    "呐",
+    "唔",
+    "噢",
     # —— 连词与高频副词短语 ——
-    "如果", "因为", "所以", "然后", "但是", "而且", "虽然",
-    "我们", "确实", "这么", "觉得", "算是", "还有", "知道", "应该",
-    "其实", "现在", "有点", "不能", "可以", "那么", "那个", "这个",
-    "怎么样", "为什么", "时候", "时间", "地方", "方式", "可能", "需要",
-    "开始", "最后", "之后", "之前", "这些", "那些", "这样", "那样",
-    "已经", "还是", "就是", "不是",
+    "如果",
+    "因为",
+    "所以",
+    "然后",
+    "但是",
+    "而且",
+    "虽然",
+    "我们",
+    "确实",
+    "这么",
+    "觉得",
+    "算是",
+    "还有",
+    "知道",
+    "应该",
+    "其实",
+    "现在",
+    "有点",
+    "不能",
+    "可以",
+    "那么",
+    "那个",
+    "这个",
+    "怎么样",
+    "为什么",
+    "时候",
+    "时间",
+    "地方",
+    "方式",
+    "可能",
+    "需要",
+    "开始",
+    "最后",
+    "之后",
+    "之前",
+    "这些",
+    "那些",
+    "这样",
+    "那样",
+    "已经",
+    "还是",
+    "就是",
+    "不是",
     # —— 笑声、口头禅与网络用语 ——
-    "哈哈", "呵呵", "嘿嘿", "嘻嘻", "hhhh", "hhh", "hh",
-    "草", "靠", "操", "tm", "tmd", "md", "吃糖", "问题", "答案", "这种",
-    "不会", "你们", "他们",
-    "emmm", "emmmm", "emmmmm", "emmmmmmm", "emmmmmmmm",
+    "哈哈",
+    "呵呵",
+    "嘿嘿",
+    "嘻嘻",
+    "hhhh",
+    "hhh",
+    "hh",
+    "草",
+    "靠",
+    "操",
+    "tm",
+    "tmd",
+    "md",
+    "吃糖",
+    "问题",
+    "答案",
+    "这种",
+    "不会",
+    "你们",
+    "他们",
+    "emmm",
+    "emmmm",
+    "emmmmm",
+    "emmmmmmm",
+    "emmmmmmmm",
     # —— 标点与空白（长度 1 的纯标点/数字/字母另有 _RE_PUNCT 过滤）——
-    " ", "", "：", "，", "。", "！", "？", "…", "·", "、",
-    "（", "）", "【", "】", "—", "～", "~", "\"", "''",
+    " ",
+    "",
+    "：",
+    "，",
+    "。",
+    "！",
+    "？",
+    "…",
+    "·",
+    "、",
+    "（",
+    "）",
+    "【",
+    "】",
+    "—",
+    "～",
+    "~",
+    '"',
+    "''",
 }
 
 # 纯标点符号正则（用于过滤）
@@ -94,15 +246,51 @@ def calc_word_freq(chat: ChatData, top_n: int = 50) -> dict:
 
     # 技术性过滤词（QQ 协议 / UID / XML 残留 / 消息格式标记）
     _TECH_STOP = {
-        "jpg", "png", "gif", "bmp", "jpeg", "webp",
-        "uid", "xml", "version", "encoding", "utf", "serviceID",
-        "templateID", "action", "brief", "m_resid", "tSum", "flag",
-        "title", "color", "size", "hr", "summary", "source",
-        "senderName", "referencedMessageId", "msg", "item", "layout",
-        "nickname", "remark", "selfUid", "selfUin", "selfName",
-        "chatInfo", "statistics", "totalMessages", "timeRange",
-        "messageTypes", "senders", "resources",
-        "图片", "表情", "回复", "合并转发",
+        "jpg",
+        "png",
+        "gif",
+        "bmp",
+        "jpeg",
+        "webp",
+        "uid",
+        "xml",
+        "version",
+        "encoding",
+        "utf",
+        "serviceID",
+        "templateID",
+        "action",
+        "brief",
+        "m_resid",
+        "tSum",
+        "flag",
+        "title",
+        "color",
+        "size",
+        "hr",
+        "summary",
+        "source",
+        "senderName",
+        "referencedMessageId",
+        "msg",
+        "item",
+        "layout",
+        "nickname",
+        "remark",
+        "selfUid",
+        "selfUin",
+        "selfName",
+        "chatInfo",
+        "statistics",
+        "totalMessages",
+        "timeRange",
+        "messageTypes",
+        "senders",
+        "resources",
+        "图片",
+        "表情",
+        "回复",
+        "合并转发",
     }
 
     # UID 正则：16 位以上字母数字下划线组合
@@ -134,10 +322,7 @@ def calc_word_freq(chat: ChatData, top_n: int = 50) -> dict:
             if re.fullmatch(r"[Ee]m{2,}", w):
                 w = "emmm"
             counter[w] += 1
-        return [
-            {"word": w, "count": c}
-            for w, c in counter.most_common(top_n)
-        ]
+        return [{"word": w, "count": c} for w, c in counter.most_common(top_n)]
 
     return {
         "self": _count(self_texts),
@@ -158,8 +343,7 @@ def _statistical(chat: ChatData) -> tuple[list, list[tuple[str, int, int, str]]]
         fields = []
         for m in msgs:
             dt = datetime.fromtimestamp(m.timestamp / 1000, tz=CST)
-            fields.append((dt.strftime("%Y-%m-%d"), dt.hour, dt.weekday(),
-                           dt.strftime("%Y-%m")))
+            fields.append((dt.strftime("%Y-%m-%d"), dt.hour, dt.weekday(), dt.strftime("%Y-%m")))
         cache = (msgs, fields)
         chat._stats_cache = cache  # type: ignore[attr-defined]
     return cache
@@ -187,6 +371,7 @@ def calc_daily_counts(chat: ChatData, fill_gaps: bool = True) -> list[dict]:
         return [daily[k] for k in sorted(daily)]
 
     from datetime import date as _date, timedelta as _timedelta
+
     first, last = min(daily), max(daily)
     out: list[dict] = []
     cur = _date.fromisoformat(first)
@@ -237,8 +422,10 @@ def calc_message_length_stats(chat: ChatData) -> dict:
         n = len(s)
         return {
             "avg": round(sum(s) / n, 1),
-            "max": max(s), "min": min(s),
-            "median": s[n // 2], "total": n,
+            "max": max(s),
+            "min": min(s),
+            "median": s[n // 2],
+            "total": n,
         }
 
     return {"self": _stats(self_lens), "other": _stats(other_lens)}
@@ -278,7 +465,7 @@ def calc_response_time(chat: ChatData) -> dict:
         if prev.sender_uid == curr.sender_uid:
             continue
         gap = (curr.timestamp - prev.timestamp) / 1000
-        if gap > 3600 * 6:          # 超过 6 小时不算同轮
+        if gap > 3600 * 6:  # 超过 6 小时不算同轮
             continue
         (self_times if curr.sender_uid == chat.self_uid else other_times).append(gap)
 
@@ -319,8 +506,7 @@ def calc_exchange_rounds(chat: ChatData) -> int:
     last_uid: Optional[str] = None
     last_ts: Optional[int] = None
     for msg in msgs:
-        if (last_uid is None or msg.sender_uid != last_uid
-                or is_session_start(last_ts, msg.timestamp)):
+        if last_uid is None or msg.sender_uid != last_uid or is_session_start(last_ts, msg.timestamp):
             rounds += 1
         last_uid, last_ts = msg.sender_uid, msg.timestamp
     return rounds
@@ -333,10 +519,16 @@ def calc_conversation_sessions(chat: ChatData) -> list[dict]:
     for i, msg in enumerate(msgs):
         prev_ts = sessions[-1]["last_ts"] if sessions else None
         if is_session_start(prev_ts, msg.timestamp):
-            sessions.append({"date": fields[i][0], "start_ts": msg.timestamp,
-                             "last_ts": msg.timestamp, "count": 0,
-                             "opener": _party(msg, chat.self_uid),
-                             "opener_uid": msg.sender_uid})
+            sessions.append(
+                {
+                    "date": fields[i][0],
+                    "start_ts": msg.timestamp,
+                    "last_ts": msg.timestamp,
+                    "count": 0,
+                    "opener": _party(msg, chat.self_uid),
+                    "opener_uid": msg.sender_uid,
+                }
+            )
         sessions[-1]["count"] += 1
         sessions[-1]["last_ts"] = msg.timestamp
     return sessions
@@ -386,7 +578,7 @@ def calc_overview(chat: ChatData) -> dict:
     image_bytes = sum(m.media_bytes for m in image_msgs)
     other_media_bytes = sum(m.media_bytes for m in msgs if m.media_kind)
     image_ids = {m.media_id for m in image_msgs if m.media_id}
-    unique_images = len(image_ids) if image_ids else None    # 无 md5 的导出器给 None
+    unique_images = len(image_ids) if image_ids else None  # 无 md5 的导出器给 None
     # 非文本媒体（文件/视频/转发/红包/表情气泡/Markdown）：原先完全不统计，
     # 现在按类型计数，界面上与图片并列展示
     media = Counter(m.media_kind for m in msgs if m.media_kind)
@@ -395,8 +587,10 @@ def calc_overview(chat: ChatData) -> dict:
     span_days = 0
     if fields:
         from datetime import date as _date
-        span_days = (_date.fromisoformat(max(f[0] for f in fields))
-                     - _date.fromisoformat(min(f[0] for f in fields))).days + 1
+
+        span_days = (
+            _date.fromisoformat(max(f[0] for f in fields)) - _date.fromisoformat(min(f[0] for f in fields))
+        ).days + 1
     days = chat.duration_days or span_days or 1
 
     return {
@@ -409,8 +603,9 @@ def calc_overview(chat: ChatData) -> dict:
         "total_files": media.get("file", 0),
         "total_videos": media.get("video", 0),
         "total_forwards": media.get("forward", 0),
-        "total_other_media": (media.get("wallet", 0) + media.get("face_bubble", 0)
-                              + media.get("markdown", 0)),
+        "total_other_media": (
+            media.get("wallet", 0) + media.get("face_bubble", 0) + media.get("markdown", 0)
+        ),
         "image_bytes": image_bytes,
         "other_media_bytes": other_media_bytes,
         "unique_images": unique_images,
@@ -446,10 +641,10 @@ def calc_milestones(chat: ChatData) -> dict:
         return {}
 
     day_counter: Counter = Counter()
-    midnight_msg_count = 0          # 0-6 点的发言条数
-    late_night_msgs = 0             # 2-6 点的发言条数
+    midnight_msg_count = 0  # 0-6 点的发言条数
+    late_night_msgs = 0  # 2-6 点的发言条数
     midnight_day_set: set[str] = set()
-    late_by_day: dict[str, set] = {}   # date -> {self/other}
+    late_by_day: dict[str, set] = {}  # date -> {self/other}
     month_counter: Counter = Counter()
 
     for i, m in enumerate(msgs):
@@ -495,9 +690,7 @@ def calc_milestones(chat: ChatData) -> dict:
         "first_day": first_day,
         "last_day": last_day,
         "active_days": len(sorted_days),
-        "longest_streak": {"days": best_run,
-                           "start": best_start.isoformat(),
-                           "end": best_end.isoformat()},
+        "longest_streak": {"days": best_run, "start": best_start.isoformat(), "end": best_end.isoformat()},
         "longest_silence": {"days": silence_days, "before": sil_before, "after": sil_after},
         "midnight_days": len(midnight_day_set),
         "midnight_msgs": midnight_msg_count,
