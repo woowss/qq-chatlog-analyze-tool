@@ -27,44 +27,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-# 让测试可以从项目根目录导入包
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# 测试隔离：数据目录指向临时目录，避免测试读写真实的 uploads/ai_cache/session
-import tempfile as _tempfile
+# 测试隔离 + 网络护栏：数据目录指向本次进程独占的临时目录，且未配置真实 API Key 时
+# 禁止一切真实 LLM 调用。两者都必须在 import 项目模块（config / analyzer.*）之前完成，
+# 否则 config 会把数据目录读成真实目录。实现与理由见 tests/_bootstrap.py。
+from _bootstrap import bootstrap  # noqa: E402
 
-# 测试隔离：数据目录指向临时目录，绝不碰真实 uploads/ai_cache/session。
-# 只清理"自己创建的"目录——外部显式指定的 QQCHAT_DATA_DIR 一律不动。
-import atexit as _atexit
-import shutil as _shutil
-
-
-def _drop_temp_data_dir():
-    """跑完把临时数据目录删掉（先关日志：否则我们的清理先跑，logging 的
-    shutdown 又把 app.log 写回来，留下一堆空目录）"""
-    import logging
-
-    logging.shutdown()
-    _shutil.rmtree(os.environ["QQCHAT_DATA_DIR"], ignore_errors=True)
-
-
-if "QQCHAT_DATA_DIR" not in os.environ:
-    os.environ["QQCHAT_DATA_DIR"] = _tempfile.mkdtemp(prefix="qqchatlog-test-")
-    _atexit.register(_drop_temp_data_dir)
+bootstrap()
 # 月份缓存会跨用例复用同一份月份内容，使"调用次数"断言失去确定性；
 # 专门验证增量缓存的用例会自行开启并指向临时目录。
 os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
 
-# 本进程的临时目录统一挪到数据目录下，两个好处：
-# 1) %TEMP% 只读受限的环境（沙箱、部分容器）里 tempfile.* 不再直接 PermissionError；
-# 2) 用例产生的临时json/图片/表情包都落在数据目录内，随测试隔离目录一起回收，
-#    不会在用户 %TEMP% 里留下上百个 qqchatlog-* 垃圾目录。
-_TMP_ROOT = os.path.join(os.environ["QQCHAT_DATA_DIR"], "tmp")
-os.makedirs(_TMP_ROOT, exist_ok=True)
-tempfile.tempdir = _TMP_ROOT
-
 # 数据目录/路径准备必须在导入项目模块之前完成，故下面的导入带 noqa: E402
-# （别名同样要放在这里：提前导入 webapp.* 会连带导入 config，把环境开关读成默认值）
 from webapp import security as securitymod  # noqa: E402
 from webapp import store as storemod  # noqa: E402
 from parser.qq_parser import (  # noqa: E402
