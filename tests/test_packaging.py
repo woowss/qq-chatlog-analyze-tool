@@ -33,6 +33,7 @@ import importlib.util
 import io
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -284,6 +285,54 @@ class TestDataDirDefaults(unittest.TestCase):
         path = configmod._user_data_dir()
         self.assertTrue(path.is_absolute())
         self.assertEqual(path.name, "qqchatlog")
+
+
+class TestDataDirEnvFile(unittest.TestCase):
+    """数据目录下的 .env 必须被读到
+
+    pip 安装后没有"项目根目录"可以放配置，用户数据目录是唯一确定的位置（`.secret_key` 也在那儿），
+    README 的安装说明按这个行为写。`.env` 已在进程内导入过，所以只能用子进程验证。
+    """
+
+    #: 候选断言键：要挑一个本仓库 .env 里没定义的，否则本地开发时项目 .env 会先赢（这正是设计优先级）
+    CANDIDATES = (
+        ("QQCHAT_FACE_FETCH_LIMIT", "77", "config.FACE_FETCH_LIMIT"),
+        ("LOG_RETENTION_DAYS", "5", "config.LOG_RETENTION_DAYS"),
+        ("FLASK_PORT", "5099", "config.FLASK_PORT"),
+    )
+
+    def _probe(self, data_dir: Path, expression: str, extra_env=None) -> str:
+        """在子进程里导入 config 并打印某个常量（cwd 与数据目录都指向临时目录）"""
+        env = {**os.environ, "PYTHONPATH": str(ROOT), "QQCHAT_DATA_DIR": str(data_dir)}
+        env.update(extra_env or {})
+        result = subprocess.run([sys.executable, "-c", f"import config; print({expression})"],
+                                cwd=str(data_dir), env=env, capture_output=True, text=True, timeout=180)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def _local_env_keys(self) -> str:
+        """本地 .env 的原文（只用来判断某个键是否已被定义，不打印内容）"""
+        path = ROOT / ".env"
+        return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+    def test_env_file_in_data_dir_is_loaded(self):
+        local_env = self._local_env_keys()
+        for key, value, expression in self.CANDIDATES:
+            if f"{key}=" in local_env or key in os.environ:
+                continue
+            with tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / ".env").write_text(f"{key}={value}\n", encoding="utf-8")
+                self.assertEqual(self._probe(Path(tmp), expression), value,
+                                 f"数据目录下的 .env 没被读到（{key}）")
+            return
+        self.skipTest("本仓库 .env / 环境变量把候选键都占了，跳过（CI 无 .env，必然执行）")
+
+    def test_real_env_var_still_wins(self):
+        """真实环境变量优先级最高：与数据目录 .env 冲突时不能被覆盖"""
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".env").write_text("FLASK_PORT=5099\n", encoding="utf-8")
+            probed = self._probe(Path(tmp), "config.FLASK_PORT", {"FLASK_PORT": "5111"})
+        self.assertEqual(probed, "5111")
 
 
 if __name__ == "__main__":

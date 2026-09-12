@@ -21,13 +21,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# ① 从本文件所在目录向上找 .env —— 源码直跑时就是仓库根目录。
+#    必须先于数据目录计算：QQCHAT_DATA_DIR 可能就写在项目 .env 里。
 load_dotenv()
-
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-# 官方当前模型：deepseek-flash（V4.1-Flash）/ deepseek-v4-pro；
-# 旧名 deepseek-chat 仍可调用但会被路由到 Flash，这里直接用真名，避免误导
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 
 # 应用配置
 BASE_DIR = Path(__file__).parent
@@ -60,6 +56,19 @@ def _user_data_dir() -> Path:
 # 也可用 UPLOAD_DIR / SESSION_DIR / AI_CACHE_DIR 单独覆盖。
 DEFAULT_DATA_DIR = BASE_DIR if _is_source_checkout() else _user_data_dir()
 DATA_DIR = Path(os.getenv("QQCHAT_DATA_DIR", "").strip() or DEFAULT_DATA_DIR)
+
+# ② 数据目录下的 .env —— pip 安装后没有"项目根目录"可放配置，用户数据目录是确定的位置
+#    （`.secret_key` 也在这里）。override=False：真实环境变量与 ① 读到的值优先，
+#    这里只补全还没定义的键。注意它必须排在下面那些常量之前——那些常量都是在这一行
+#    之后才从 os.environ 取值的；唯一放不进来的是 QQCHAT_DATA_DIR 本身（先有鸡还是先有蛋）。
+load_dotenv(DATA_DIR / ".env", override=False)
+
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+# 官方当前模型：deepseek-flash（V4.1-Flash）/ deepseek-v4-pro；
+# 旧名 deepseek-chat 仍可调用但会被路由到 Flash，这里直接用真名，避免误导
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+
 UPLOAD_FOLDER = os.getenv("UPLOAD_DIR", "").strip() or str(DATA_DIR / "uploads")
 SESSION_FILE_DIR = os.getenv("SESSION_DIR", "").strip() or str(DATA_DIR / "flask_session")
 AI_CACHE_DIR = os.getenv("AI_CACHE_DIR", "").strip() or str(DATA_DIR / "ai_cache")
