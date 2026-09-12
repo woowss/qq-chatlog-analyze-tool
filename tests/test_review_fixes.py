@@ -1178,7 +1178,17 @@ class TestFaceEmoji(unittest.TestCase):
         self.assertNotEqual(FACE_EMOJI["鄙视"], FACE_EMOJI["撇嘴"], "鄙视 与 撇嘴 不该共用同一个 emoji")
 
     def test_no_mapping_points_at_a_non_emoji(self):
-        """表里的每一个值都必须真的是 emoji（挡住"手滑贴进一个普通字符"）"""
+        """表里的每一个值都必须真的是 emoji（挡住"手滑贴进一个普通字符"）
+
+        **不能用 `unicodedata.name()` 当唯一判据**：它查的是当前解释器自带的 Unicode
+        版本。Python 3.10 还是 Unicode 13.0，而 🥹(U+1F979)、🫶(U+1FAF6) 是 14.0 才
+        收录的，于是"这个 emoji 比解释器新"会被判成"这不是 emoji"——CI 的 3.10 就是
+        这么红的（3.12+ 自带 Unicode 14/15，同一份代码全绿）。
+
+        判据改成两条与 UCD 版本无关的条件：① 字符类别不是文字/数字/标点/分隔符；
+        ② 有 Unicode 名字，或落在补充符号平面（U+1F000 以上，emoji 都在这一带）。
+        这样"字母、数字、全角标点、空格"照旧判红，而"解释器还不认识的 emoji"不再误伤。
+        """
         import unicodedata
 
         from analyzer.face_emoji import FACE_EMOJI
@@ -1186,12 +1196,21 @@ class TestFaceEmoji(unittest.TestCase):
         for name, char in FACE_EMOJI.items():
             with self.subTest(face=name):
                 self.assertTrue(char, f"{name} 映射到了空串")
-                # 变体选择符 / ZWJ 组合之外的每个码位都要有 Unicode 名字
+                # 变体选择符 / ZWJ 是组合用码位，不是独立图形
                 for ch in char:
                     if ch in ("\ufe0f", "\u200d"):
                         continue
-                    self.assertIsNotNone(
-                        unicodedata.name(ch, None), f"{name} -> {char!r} 含非法码位 U+{ord(ch):04X}"
+                    cp = ord(ch)
+                    cat = unicodedata.category(ch)
+                    self.assertNotIn(
+                        cat[0],
+                        "LNPDZ",
+                        f"{name} -> {char!r} U+{cp:04X} 类别 {cat}，不是图形字符",
+                    )
+                    self.assertTrue(
+                        unicodedata.name(ch, None) is not None or cp >= 0x1F000,
+                        f"{name} -> {char!r} 含非法码位 U+{cp:04X}"
+                        "（既没有 Unicode 名字，也不在 U+1F000 以上的 emoji 平面）",
                     )
 
     def test_habits_page_embeds_emoji_map(self):
