@@ -32,33 +32,45 @@ jieba.setLogLevel(logging.ERROR)
 SESSION_GAP_MINUTES = 30
 SESSION_GAP_MS = SESSION_GAP_MINUTES * 60 * 1000
 
-# 中文停用词（常见虚词、标点、语气词、QQ 专用词汇）
+
+def is_session_start(prev_ts: Optional[int], ts: int) -> bool:
+    """两条相邻消息是否分属不同对话段（"什么算新的一段"的唯一口径来源）。
+
+    轮次统计、对话段划分、以及送进 prompt 的统计头原先各写一遍同样的比较：
+    阈值虽然共用常量，但规则一旦要改（比如按"双方都在线"细分），
+    三处必须同时改才不会出现"报表说 12 段、模型看到 9 段"的口径分裂。
+    """
+    return prev_ts is None or ts - prev_ts > SESSION_GAP_MS
+
+# 中文停用词（常见虚词、标点、语气词、QQ 专用词汇）。
+# 按语义分组、每项只出现一次：原先是一长串随手追加的字面量，"的/了/还是/因为"
+# 之类重复了 2-3 次（set 下无害，但读的人分不清是笔误还是有意，也看不出真正的新增项）。
 _STOP_WORDS: set[str] = {
+    # —— 高频虚词、代词、介词 ——
     "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一",
     "一个", "上", "也", "很", "到", "说", "要", "去", "你", "会", "着",
     "没有", "看", "好", "自己", "这", "他", "她", "它", "们", "那", "什么",
-    "怎么", "吗", "啊", "吧", "呢", "呀", "哦", "嗯", "哈", "嘛", "哇",
+    "怎么", "么", "得", "能", "做", "对", "与", "以", "及", "而", "或", "但",
+    "被", "把", "从", "向", "于", "让", "给", "为", "所", "比", "还", "又",
+    "再", "才", "只", "可", "来",
+    # —— 语气词 ——
+    "吗", "啊", "吧", "呢", "呀", "哦", "嗯", "哈", "嘛", "哇",
     "哎", "哟", "咯", "嗨", "呵", "喂", "啦", "呐", "唔", "噢",
-    "的", "了", "么", "得", "能", "做", "对", "与", "以", "及",
-    "而", "或", "但", "被", "把", "从", "向", "在", "于", "让",
-    "给", "为", "所", "比", "还", "又", "再", "才", "只", "可",
-    "如果", "因为", "所以", "然后", "但是", "而且", "虽然", "虽然", "因为",
+    # —— 连词与高频副词短语 ——
+    "如果", "因为", "所以", "然后", "但是", "而且", "虽然",
     "我们", "确实", "这么", "觉得", "算是", "还有", "知道", "应该",
-    "其实", "现在", "有点", "不能", "可以", "这么", "那么", "那个",
-    "这个", "什么", "怎么", "怎么样", "为什么", "时候", "时间", "地方",
-    "方式", "一个", "可能", "需要", "开始", "最后", "之后", "之前",
-    "这个", "那个", "这些", "那些", "这样", "那样",
-    "可以", "没有", "已经", "还是", "还是", "就是", "不是",
+    "其实", "现在", "有点", "不能", "可以", "那么", "那个", "这个",
+    "怎么样", "为什么", "时候", "时间", "地方", "方式", "可能", "需要",
+    "开始", "最后", "之后", "之前", "这些", "那些", "这样", "那样",
+    "已经", "还是", "就是", "不是",
+    # —— 笑声、口头禅与网络用语 ——
     "哈哈", "呵呵", "嘿嘿", "嘻嘻", "hhhh", "hhh", "hh",
-    "草", "靠", "操", "tm", "tmd", "md","吃糖","问题","答案","这种",
-    "不会","你们","他们","emmm","emmmm","emmmmm","emmmmmmm","emmmmmmmm",
-    " ", "", "：", "：", "，", "。", "！", "？", "…", "·", "、",
-    "（", "）", "【", "】", "—", "～", "~", "\"", "\"", "''",
-    "的", "了", "是", "不", "我", "你", "他", "她", "它",
-    "有", "在", "就", "也", "都", "这", "那", "和", "与",
-    "把", "被", "让", "从", "对", "到", "去", "来", "说",
-    "会", "能", "要", "可以", "没有", "还", "就", "很",
-    # 长度 1 的纯标点/数字/字母会在代码中过滤
+    "草", "靠", "操", "tm", "tmd", "md", "吃糖", "问题", "答案", "这种",
+    "不会", "你们", "他们",
+    "emmm", "emmmm", "emmmmm", "emmmmmmm", "emmmmmmmm",
+    # —— 标点与空白（长度 1 的纯标点/数字/字母另有 _RE_PUNCT 过滤）——
+    " ", "", "：", "，", "。", "！", "？", "…", "·", "、",
+    "（", "）", "【", "】", "—", "～", "~", "\"", "''",
 }
 
 # 纯标点符号正则（用于过滤）
@@ -305,10 +317,10 @@ def calc_exchange_rounds(chat: ChatData) -> int:
     msgs, _ = _statistical(chat)
     rounds = 0
     last_uid: Optional[str] = None
-    last_ts = 0
+    last_ts: Optional[int] = None
     for msg in msgs:
         if (last_uid is None or msg.sender_uid != last_uid
-                or msg.timestamp - last_ts > SESSION_GAP_MS):
+                or is_session_start(last_ts, msg.timestamp)):
             rounds += 1
         last_uid, last_ts = msg.sender_uid, msg.timestamp
     return rounds
@@ -319,7 +331,8 @@ def calc_conversation_sessions(chat: ChatData) -> list[dict]:
     msgs, fields = _statistical(chat)
     sessions: list[dict] = []
     for i, msg in enumerate(msgs):
-        if not sessions or msg.timestamp - sessions[-1]["last_ts"] > SESSION_GAP_MS:
+        prev_ts = sessions[-1]["last_ts"] if sessions else None
+        if is_session_start(prev_ts, msg.timestamp):
             sessions.append({"date": fields[i][0], "start_ts": msg.timestamp,
                              "last_ts": msg.timestamp, "count": 0,
                              "opener": _party(msg, chat.self_uid),
@@ -456,7 +469,7 @@ def calc_milestones(chat: ChatData) -> dict:
     # 连续聊天纪录
     best_run = cur_run = 1
     best_start = best_end = cur_start = _date.fromisoformat(first_day)
-    for prev, cur in zip(sorted_days, sorted_days[1:]):
+    for prev, cur in zip(sorted_days, sorted_days[1:], strict=False):
         if (_date.fromisoformat(cur) - _date.fromisoformat(prev)).days == 1:
             cur_run += 1
         else:
@@ -469,7 +482,7 @@ def calc_milestones(chat: ChatData) -> dict:
 
     # 最长沉默期（相邻活跃日之间的空档）
     silence_days, sil_before, sil_after = 0, "", ""
-    for prev, cur in zip(sorted_days, sorted_days[1:]):
+    for prev, cur in zip(sorted_days, sorted_days[1:], strict=False):
         gap = (_date.fromisoformat(cur) - _date.fromisoformat(prev)).days - 1
         if gap > silence_days:
             silence_days, sil_before, sil_after = gap, prev, cur

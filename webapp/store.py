@@ -139,11 +139,47 @@ STATS_WAIT_SECONDS = 20.0
 _STATS_ERRORS: dict[str, str] = {}
 # 最近被级联清理过的哈希：防止仍在跑的统计线程把结果"复活"成孤儿缓存
 _RECENTLY_PURGED: deque = deque(maxlen=256)
+# 上面两处由后台统计线程与请求线程共同读写：GIL 让简单操作"大多不会炸"，
+# 但 pop/迭代混在一起时并不可靠，统一挂到这把独立锁下（不复用 _STATS_LOCK，
+# 避免与"等线程结束"的 join 路径互相等待）
+_META_LOCK = threading.Lock()
 
 
 def stats_error(chat_hash: str) -> str:
     """该聊天上次统计失败的原因（没有则空串），供首页提示用"""
-    return _STATS_ERRORS.get(chat_hash or "", "")
+    with _META_LOCK:
+        return _STATS_ERRORS.get(chat_hash or "", "")
+
+
+def _record_stats_error(chat_hash: str, message: str) -> None:
+    with _META_LOCK:
+        _STATS_ERRORS[chat_hash] = message
+        while len(_STATS_ERRORS) > 64:          # 只留最近的失败记录
+            _STATS_ERRORS.pop(next(iter(_STATS_ERRORS)), None)
+
+
+def _clear_stats_error(chat_hash: str) -> None:
+    with _META_LOCK:
+        _STATS_ERRORS.pop(chat_hash, None)
+
+
+def _mark_purged(chat_hash: str) -> None:
+    with _META_LOCK:
+        _RECENTLY_PURGED.append(chat_hash)
+        _STATS_ERRORS.pop(chat_hash, None)
+
+
+def _unmark_purged(chat_hash: str) -> None:
+    with _META_LOCK:
+        try:
+            _RECENTLY_PURGED.remove(chat_hash)
+        except ValueError:
+            pass
+
+
+def _is_recently_purged(chat_hash: str) -> bool:
+    with _META_LOCK:
+        return chat_hash in _RECENTLY_PURGED
 
 
 def vision_enabled() -> bool:
@@ -232,10 +268,7 @@ def start_stats_job(chat, chat_hash: str) -> None:
     if not chat_hash:
         return
     # 用户清掉后又重新上传同一份文件：这是新会话的正当计算，撤销旧的"已清理"标记
-    try:
-        _RECENTLY_PURGED.remove(chat_hash)
-    except ValueError:
-        pass
+    _unmark_purged(chat_hash)
     with _STATS_LOCK:
         if chat_hash in _STATS_THREADS:
             return
@@ -248,18 +281,16 @@ def start_stats_job(chat, chat_hash: str) -> None:
             stats = compute_stats(chat)
             # 守卫必须放在计算之后、落盘之前复查：计算期间用户可能已清理该聊天，
             # 开算前查一次是不够的（那正是"晚到的线程复活孤儿缓存"的窗口）。
-            if chat_hash in _RECENTLY_PURGED:
+            if _is_recently_purged(chat_hash):
                 logger.info("该聊天的缓存已被清理，放弃写入后台统计结果（避免孤儿）")
                 return
             _save_stats(chat_hash, stats)
-            _STATS_ERRORS.pop(chat_hash, None)
+            _clear_stats_error(chat_hash)
             logger.info("本地统计完成（%.0f ms，后台线程），已落盘复用",
                         (time.time() - t0) * 1000)
         except Exception as e:
             # 异步之后没有 HTTP 响应能承载这个错误：记在案，首页会提示用户
-            _STATS_ERRORS[chat_hash] = f"{type(e).__name__}: {e}"
-            while len(_STATS_ERRORS) > 64:          # 只留最近的失败记录
-                _STATS_ERRORS.pop(next(iter(_STATS_ERRORS)), None)
+            _record_stats_error(chat_hash, f"{type(e).__name__}: {e}")
             logger.error("本地统计失败（该文件统计结果不可用）: %s", e)
         finally:
             with _STATS_LOCK:
@@ -350,10 +381,17 @@ def _purge_chat_caches(chat_hash: str) -> int:
         pass
     # 月份级缓存：删 manifest，并回收不再被其他聊天引用的月份文件
     removed += purge_month_cache(chat_hash)
+    # 看图用的图片副本（uploads/media/<chat_hash>/）：源文件都换了/没了，
+    # 派生出来的图片本体必须一起走，否则它只受"24 小时 mtime 回收"约束，
+    # 而在那之前一直是盘上最敏感的一批数据。
+    try:
+        from analyzer import vision              # 延迟导入，避免 store→vision 模块级依赖
+        removed += vision.purge_session_media(chat_hash)
+    except Exception as e:                       # 回收失败不影响主流程
+        logger.warning("图片副本回收失败: %s", e)
     # 记下这次清理：若该哈希的后台统计线程还在跑，落盘前会检查这里并放弃写入，
     # 避免把刚清掉的缓存"复活"成没人认领的孤儿。
-    _RECENTLY_PURGED.append(chat_hash)
-    _STATS_ERRORS.pop(chat_hash, None)
+    _mark_purged(chat_hash)
     return removed
 
 

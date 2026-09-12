@@ -179,11 +179,17 @@ def api_faces_fetch():
         chat_hash = session.get("chat_hash", "")
         chat = store._load_chat_cached(filepath)
         faces = face_images.collect_cached(chat, chat_hash)
+        total = len(faces)
         before = len(face_images.url_map(face_images.ensure(faces, allow_network=False)))
-        have = face_images.ensure(faces, allow_network=True)
+        # 带上时长上限：抓取同步跑在请求线程里，不设预算时 300 张 × 6s 超时能挂住半小时
+        have = face_images.ensure(faces, allow_network=True,
+                                  max_seconds=face_images.FETCH_BUDGET_SECONDS)
         after = len(face_images.url_map(have))
-        return jsonify({"total": len(faces), "available": after,
-                        "fetched": max(0, after - before)})
+        return jsonify({"total": total, "available": after,
+                        "fetched": max(0, after - before),
+                        # 仍未拿到图的（超级表情 + 本次没抓完的），前端据此如实提示
+                        "pending": max(0, total - after),
+                        "budget_seconds": face_images.FETCH_BUDGET_SECONDS})
     finally:
         _FACE_FETCH_LOCK.release()
 

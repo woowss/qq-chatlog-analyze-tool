@@ -44,7 +44,6 @@ STATS_CACHE_DIR = os.getenv("STATS_CACHE_DIR", "").strip() or str(DATA_DIR / "st
 LOG_DIR = os.getenv("LOG_DIR", "").strip() or str(DATA_DIR / "logs")
 LOG_FILE = os.path.join(LOG_DIR, "app.log")
 TOKEN_USAGE_FILE = os.getenv("TOKEN_USAGE_FILE", "").strip() or str(DATA_DIR / "logs" / "token_usage.json")
-MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
 
 def _env_int(name: str, default: int, low: int, high: int) -> int:
     """读取整型环境变量：非法值不再让应用崩在 import 阶段，而是回退默认值并提示"""
@@ -70,6 +69,11 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+# 单次上传体积上限（MB）：超长聊天（实测 数万条私聊）导出的 JSON 会逼近 50MB，
+# 撞上限制时 Flask 直接回 413，用户只看到"上传失败"却不知为何，所以留一个可调口子。
+MAX_CONTENT_LENGTH = _env_int("QQCHAT_MAX_UPLOAD_MB", 50, 1, 4096) * 1024 * 1024
+
+
 # 日志隐私闭环：按天轮转并只保留 N 天（轮转文件由 handler 自行删除，
 # 历史遗留的 5×5MB 式 app.log.1/.2 由启动/定期清理按时间回收）。
 LOG_RETENTION_DAYS = _env_int("LOG_RETENTION_DAYS", 7, 1, 90)
@@ -81,8 +85,7 @@ JOB_TTL_SECONDS = _env_int("QQCHAT_JOB_TTL_SECONDS", 900, 60, 86400)
 
 # 月份级增量缓存开关（默认开）：重新导出同一段对话时只为新增月份付费。
 # 关掉后行为回到"整份文件哈希"的维度级缓存。
-MONTH_CACHE_ENABLED = os.getenv("QQCHAT_MONTH_CACHE", "true").strip().lower() not in (
-    "0", "false", "no", "off")
+MONTH_CACHE_ENABLED = _env_bool("QQCHAT_MONTH_CACHE", True)
 
 # ---------------------------------------------------------------------------
 # 图片理解（视觉）：让模型"看"聊天里的截图/照片/表情包
@@ -124,17 +127,34 @@ FACE_FETCH_TIMEOUT = _env_int("QQCHAT_FACE_FETCH_TIMEOUT", 6, 1, 60)
 def _load_or_create_secret() -> str:
     """读取持久化的 SECRET_KEY；首次运行生成并落盘，保证重启后 session 仍有效。
 
-    优先使用环境变量 SECRET_KEY，其次 `.secret_key` 文件（该文件已被 .gitignore 忽略）。
+    查找顺序：环境变量 SECRET_KEY → 数据目录下的 `.secret_key` → 项目根目录的
+    `.secret_key`（旧位置，读到即迁移到数据目录）。密钥跟着数据走，
+    这样 QQCHAT_DATA_DIR 迁到别处时不会出现"数据搬了、密钥留在原地"的错位。
     """
     env_key = os.getenv("SECRET_KEY", "").strip()
     if env_key:
         return env_key
-    key_file = BASE_DIR / ".secret_key"
-    if key_file.exists():
-        return key_file.read_text(encoding="utf-8").strip()
+    target = DATA_DIR / ".secret_key"
+    legacy = BASE_DIR / ".secret_key"
+    candidates = [target] if legacy == target else [target, legacy]
+    for index, path in enumerate(candidates):
+        try:
+            key = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not key:
+            continue
+        if index > 0:                     # 旧位置的密钥：顺手迁到数据目录
+            try:
+                os.makedirs(DATA_DIR, exist_ok=True)
+                target.write_text(key, encoding="utf-8")
+            except OSError:
+                pass
+        return key
     key = os.urandom(24).hex()
     try:
-        key_file.write_text(key, encoding="utf-8")
+        os.makedirs(DATA_DIR, exist_ok=True)
+        target.write_text(key, encoding="utf-8")
     except OSError:
         pass  # 写失败时退化为本次进程内随机值
     return key
@@ -144,7 +164,7 @@ SECRET_KEY = _load_or_create_secret()
 
 # 调试模式开关：默认关闭（避免暴露 Werkzeug 调试器导致任意代码执行风险），
 # 本地开发时可设环境变量 FLASK_DEBUG=true 开启自动重载
-FLASK_DEBUG = os.getenv("FLASK_DEBUG", "false").strip().lower() in ("1", "true", "yes", "on")
+FLASK_DEBUG = _env_bool("FLASK_DEBUG", False)
 
 # 绑定地址与端口：默认仅本机。Windows 上 5000 常被 AirPlay/Hyper-V 占用，可改 FLASK_PORT
 FLASK_HOST = os.getenv("FLASK_HOST", "127.0.0.1").strip() or "127.0.0.1"

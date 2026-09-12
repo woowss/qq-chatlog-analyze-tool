@@ -108,7 +108,8 @@ Firefox 等不支持目录选择的环境，可以在 `.env` 里设 `QQCHAT_MEDI
 在 `.env` 里设 `QQCHAT_FACE_IMAGES=true`，然后到「习惯」页点一次「获取原始表情图」。程序会从 QQ 的公开
 表情 CDN 把经典黄脸和商城表情的原图下载到本地缓存（`face_cache/`），之后离线复用、不再联网。
 
-实测覆盖约 58% 的表情使用次数。QQ 的超级表情（吃糖、大怨种、菜汪之类）没有公开地址，抓不到，会继续用
+实测覆盖约 58% 的表情使用次数。一次点击最多联网抓 60 秒，抓不完的会在下次点击时继续（已抓到的都已落盘）。
+QQ 的超级表情（吃糖、大怨种、菜汪之类）没有公开地址，抓不到，会继续用
 emoji 或表情名显示。想要 100% 原样，可以把 `QQCHAT_FACE_DIR` 指向自己准备的表情图目录，文件名支持
 `<编号>.gif`、`e<编号+100>.gif`、`<表情名>.gif`。断网或抓取失败时静默跳过，不影响其它功能。
 
@@ -118,7 +119,7 @@ emoji 或表情名显示。想要 100% 原样，可以把 `QQCHAT_FACE_DIR` 指�
 
 - 单月对话预算 60 万字符，足以装下绝大多数月份的全部消息，正常情况下不抽样；
 - 官方 DeepSeek 端点默认全维度开启思考模式，各维度输出预算 32k（锐评 49k），不会出现思维链吃满预算导致
-  结果被截断丢弃；
+  结果被截断丢弃；图片摘要固定走非思考模式（它的预算只有 512 tokens，思维链必然把摘要截成半截话）；
 - 每月最多送 20 张图片做视觉理解，摘要按图片指纹缓存；
 - 输出被截断时自动改用非思考模式重试一次，避免某个月从结果里消失。
 
@@ -147,6 +148,7 @@ emoji 或表情名显示。想要 100% 原样，可以把 `QQCHAT_FACE_DIR` 指�
 | `LLM_CONCURRENCY` | 官方 6 / 其它 2 | 并发月份数 |
 | `LLM_CALL_MIN_INTERVAL` | 官方 0.5 / 其它 3 | 两次调用最小间隔（秒） |
 | `LLM_MAX_DIALOG_CHARS` | 600000 | 单月对话文本上限（字符） |
+| `LLM_MAX_TOKENS_<维度>` | 32k / 锐评 49k | 按维度覆盖输出预算，如 `LLM_MAX_TOKENS_PROFILE=65536`；截断报错时调这里 |
 | `LLM_THINKING` | 官方端点开启 | `disabled` 关闭思考模式 |
 | `LLM_THINKING_DIMS` | 空 | 只对指定维度开启，逗号分隔 |
 | `LLM_PRICE_IN` / `LLM_PRICE_OUT` | 按模型内置 | 费用估算单价（元/百万 tokens） |
@@ -164,6 +166,7 @@ emoji 或表情名显示。想要 100% 原样，可以把 `QQCHAT_FACE_DIR` 指�
 | `LLM_VISION_DETAIL` | `high` | 送图清晰度，`low` 会压到 512×512 |
 | `LLM_VISION_MIN_SIDE` | 200 | 小于该像素的图按表情包跳过 |
 | `LLM_VISION_MAX_BYTES` | 12582912 | 单张图片体积上限（字节） |
+| `LLM_VISION_MAX_TOTAL_BYTES` | 33554432 | 单次摘要请求的图片总体积上限（字节），装不下的留到下次 |
 | `QQCHAT_FACE_IMAGES` | `false` | 是否允许抓取 QQ 表情原图 |
 | `QQCHAT_FACE_DIR` | 空 | 本地表情包目录，优先级高于联网抓取 |
 | `QQCHAT_FACE_FETCH_LIMIT` | 300 | 一次抓取的表情图数量上限 |
@@ -178,7 +181,8 @@ emoji 或表情名显示。想要 100% 原样，可以把 `QQCHAT_FACE_DIR` 指�
 | `FLASK_DEBUG` | `false` | 调试模式与自动重载 |
 | `ACCESS_PASSWORD` | 空 | 访问口令，设置后所有页面需登录 |
 | `ALLOWED_ORIGINS` | 空 | 额外允许的浏览器来源主机，用局域网 IP 或域名访问时必填 |
-| `SECRET_KEY` | 自动生成 | Session 签名密钥，留空则生成并持久化到 `.secret_key` |
+| `SECRET_KEY` | 自动生成 | Session 签名密钥，留空则生成并持久化到数据目录下的 `.secret_key` |
+| `QQCHAT_MAX_UPLOAD_MB` | 50 | 单次上传体积上限；超长聊天的 JSON 逼近该值时可调大 |
 | `QQCHAT_JOB_TTL_SECONDS` | 900 | 内存任务记录的存活时间 |
 | `QQCHAT_ALLOW_MULTI_PARTY` | `false` | 设为 `1` 才允许分析多人记录 |
 
@@ -248,7 +252,8 @@ qqchatlog/
 │       ├── css/style.css      # 样式与日/夜主题
 │       ├── js/                # 图表渲染与任务轮询
 │       └── vendor/            # Bootstrap、jQuery、ECharts（本地化）
-├── tests/                     # unittest：core / hardening / optimizations / review_fixes / smoke
+├── tests/                     # unittest：core / hardening / optimizations / review_fixes / review_round2 / sri / smoke
+├── tools/verify_vendor_sri.py # 导出报告用的 SRI 哈希：联网复核 本地 <-> CDN <-> 内联常量
 ├── docs/                      # 早期设计文档与界面预览（内容已过时，以本 README 为准）
 ├── pyproject.toml             # ruff 配置
 └── .github/workflows/test.yml # CI：ruff + py_compile + unittest
