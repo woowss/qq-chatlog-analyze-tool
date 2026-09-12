@@ -140,10 +140,35 @@ function applyChartTheme(option) {
     };
 })();
 
+// ---------------------------------------------------------------- 图表实例表
+// 早先每个渲染函数都自己挂一个 window resize 监听，且从不移除：同一页面重绘 N 次
+// 就留下 N 个监听器（每次 resize 触发 N 次）。同一容器上重复 echarts.init 还会
+// 留下无法回收的旧实例。现在统一登记：同一容器重绘先 dispose 旧实例，resize 只挂一次。
+var _CHARTS = {};
+
+function mountChart(domId) {
+    var el = document.getElementById(domId);
+    if (!el) return null;
+    var old = _CHARTS[domId];
+    if (old) {
+        try { old.dispose(); } catch (e) { /* 已释放/容器已换，忽略 */ }
+        delete _CHARTS[domId];
+    }
+    var chart = echarts.init(el);
+    _CHARTS[domId] = chart;
+    return chart;
+}
+
+window.addEventListener('resize', function () {
+    Object.keys(_CHARTS).forEach(function (key) {
+        var chart = _CHARTS[key];
+        if (chart && !chart.isDisposed()) chart.resize();
+    });
+});
+
 function renderPieChart(domId, data, name) {
-    const el = document.getElementById(domId);
-    if (!el) return;
-    const chart = echarts.init(el);
+    const chart = mountChart(domId);
+    if (!chart) return;
     const colors = T.palette;
     chart.setOption({
         tooltip: { trigger: 'item', formatter: function(p) { return esc(p.name) + ': ' + p.value + ' (' + p.percent + '%)'; } },
@@ -159,7 +184,6 @@ function renderPieChart(domId, data, name) {
             emphasis: { itemStyle: { shadowBlur: 10, shadowColor: 'rgba(0,0,0,0.2)' } }
         }]
     });
-    window.addEventListener('resize', function() { chart.resize(); });
 }
 
 // 日线聚合：消息只出现在少数日子时，类目轴会把空档压平（首末相隔 100 天可能只画 3 个点）。
@@ -194,9 +218,8 @@ function aggregateDaily(data, maxPoints) {
 }
 
 function renderLineChart(domId, data, yName) {
-    const el = document.getElementById(domId);
-    if (!el) return;
-    const chart = echarts.init(el);
+    const chart = mountChart(domId);
+    if (!chart) return;
     var view = aggregateDaily(data);
     var titleEl = document.getElementById(domId + 'Title');
     if (titleEl && view.note) titleEl.textContent = '消息量（' + view.note + '）';
@@ -233,13 +256,11 @@ function renderLineChart(domId, data, yName) {
             }
         ]
     });
-    window.addEventListener('resize', function() { chart.resize(); });
 }
 
 function renderBarChart(domId, data, yName) {
-    const el = document.getElementById(domId);
-    if (!el) return;
-    const chart = echarts.init(el);
+    const chart = mountChart(domId);
+    if (!chart) return;
     chart.setOption({
         tooltip: { trigger: 'axis' },
         legend: { data: ['对方', '自己'], bottom: 0 },
@@ -259,13 +280,11 @@ function renderBarChart(domId, data, yName) {
             }
         ]
     });
-    window.addEventListener('resize', function() { chart.resize(); });
 }
 
 function renderWeeklyChart(domId, data) {
-    const el = document.getElementById(domId);
-    if (!el) return;
-    const chart = echarts.init(el);
+    const chart = mountChart(domId);
+    if (!chart) return;
     chart.setOption({
         tooltip: { trigger: 'axis' },
         legend: { data: ['对方', '自己'], bottom: 0 },
@@ -285,13 +304,11 @@ function renderWeeklyChart(domId, data) {
             }
         ]
     });
-    window.addEventListener('resize', function() { chart.resize(); });
 }
 
 function renderResponseChart(domId, data) {
-    const el = document.getElementById(domId);
-    if (!el) return;
-    const chart = echarts.init(el);
+    const chart = mountChart(domId);
+    if (!chart) return;
     chart.setOption({
         tooltip: { trigger: 'axis' },
         grid: { left: '10%', right: '10%', containLabel: true },
@@ -307,7 +324,6 @@ function renderResponseChart(domId, data) {
             label: { show: true, formatter: '{c}s', position: 'top' }
         }]
     });
-    window.addEventListener('resize', function() { chart.resize(); });
 }
 
 function renderWordCloud(domId, data, title) {
@@ -317,7 +333,8 @@ function renderWordCloud(domId, data, title) {
         el.innerHTML = '<div class="text-muted text-center py-4">暂无数据</div>';
         return;
     }
-    const chart = echarts.init(el);
+    const chart = mountChart(domId);
+    if (!chart) return;
     var maxCount = data[0].count;
     var minCount = data[data.length - 1].count || 1;
 
@@ -358,7 +375,6 @@ function renderWordCloud(domId, data, title) {
             })
         }]
     });
-    window.addEventListener('resize', function() { chart.resize(); });
 }
 
 function renderFaceBarChart(domId, data, personName, emojiMap, imageMap) {
@@ -388,7 +404,8 @@ function renderFaceBarChart(domId, data, personName, emojiMap, imageMap) {
         }
         return emojiMap[name] ? emojiMap[name] : name.replace(/^\//, '');
     });
-    const chart = echarts.init(el);
+    const chart = mountChart(domId);
+    if (!chart) return;
     chart.setOption({
         tooltip: {
             trigger: 'axis',
@@ -425,13 +442,11 @@ function renderFaceBarChart(domId, data, personName, emojiMap, imageMap) {
             label: { show: true, position: 'right', fontWeight: 'bold' }
         }]
     });
-    window.addEventListener('resize', function() { chart.resize(); });
 }
 
 function renderHeatmapChart(domId, data) {
-    const el = document.getElementById(domId);
-    if (!el) return;
-    const chart = echarts.init(el);
+    const chart = mountChart(domId);
+    if (!chart) return;
     const weekdays = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
     var maxVal = 1;
     data.forEach(function(d) { if (d.count > maxVal) maxVal = d.count; });
@@ -476,7 +491,6 @@ function renderHeatmapChart(domId, data) {
             emphasis: { itemStyle: { borderColor: T.axis, borderWidth: 1 } }
         }]
     });
-    window.addEventListener('resize', function() { chart.resize(); });
 }
 
 // ========== AI 分析图表 ==========
@@ -495,9 +509,8 @@ function renderEmotionCharts(data) {
     var otherEmotions = months.map(function(m) { return val(m, 'other_emotion', '数据不足'); });
 
     // 情绪强度折线图
-    var lineEl = document.getElementById('emotionLineChart');
-    if (!lineEl) return;
-    var lineChart = echarts.init(lineEl);
+    var lineChart = mountChart('emotionLineChart');
+    if (!lineChart) return;
     lineChart.setOption({
         tooltip: {
             trigger: 'axis',

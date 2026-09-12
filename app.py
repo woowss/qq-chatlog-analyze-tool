@@ -34,6 +34,7 @@ from config import (
     FLASK_DEBUG,
     FLASK_HOST,
     FLASK_PORT,
+    JOB_TTL_SECONDS,
     LOG_REDACT_NAMES,
     LOG_RETENTION_DAYS,
     MAX_CONTENT_LENGTH,
@@ -49,12 +50,13 @@ from analyzer.deepseek_client import (
     MAX_TOKENS_BY_DIM,
     configure_month_cache,
     is_api_configured,
+    is_insecure_base_url,
     thinking_budget_warnings,
     thinking_enabled,
 )
 from analyzer.logger import get_logger
 
-from webapp import api, cleanup, jobs, security, store, views
+from webapp import api, cleanup, security, views
 
 logger = get_logger("app")
 
@@ -95,53 +97,6 @@ def create_app() -> Flask:
 
 app = create_app()
 
-# 测试兼容的重导出面：历史测试以 `import app as appmod` 为入口直接触碰这些符号。
-# 函数/对象是同一份（不是副本），直接调用完全等价；但 mock.patch.object 必须打在
-# 定义模块（webapp.store / webapp.security / webapp.cleanup / webapp.api）上才生效。
-_chat_hash = store._chat_hash
-save_and_hash = store.save_and_hash
-_load_chat_cached = store._load_chat_cached
-_stats_path = store._stats_path
-_load_stats = store._load_stats
-_save_stats = store._save_stats
-_delete_stats = store._delete_stats
-_current_stats = store._current_stats
-_stats_with_word_freq = store._stats_with_word_freq
-_cache_path = store._cache_path
-_read_cache = store._read_cache
-_write_cache = store._write_cache
-_purge_chat_caches = store._purge_chat_caches
-start_stats_job = store.start_stats_job
-wait_for_stats = store.wait_for_stats
-
-_cache_created_at = cleanup._cache_created_at
-_cleanup_old_files = cleanup.cleanup_old_files
-_purge_dir = cleanup._purge_dir
-_maybe_cleanup = cleanup.maybe_cleanup
-
-JOBS = jobs.JOBS
-JOBS_LOCK = jobs.JOBS_LOCK
-JOB_TTL_SECONDS = jobs.JOB_TTL_SECONDS
-DIMENSION_NAMES = jobs.DIMENSION_NAMES
-ANALYZE_FUNCS = jobs.ANALYZE_FUNCS
-_prune_jobs = jobs._prune_jobs
-_get_or_create_job = jobs._get_or_create_job
-_run_job = jobs._run_job
-_run_analyze_all = jobs._run_analyze_all
-_session_chat_file = jobs._session_chat_file
-
-_check_csrf = security._check_csrf
-_origin_allowed = security._origin_allowed
-_guard_post = security._guard_post
-_login_failures = security._login_failures
-_login_lock = security._login_lock
-_login_throttle_ok = security._login_throttle_ok
-_record_login_failure = security._record_login_failure
-_clear_login_failures = security._clear_login_failures
-LOGIN_MAX_ATTEMPTS = security.LOGIN_MAX_ATTEMPTS
-LOGIN_WINDOW_SECONDS = security.LOGIN_WINDOW_SECONDS
-PUBLIC_ENDPOINTS = security.PUBLIC_ENDPOINTS
-
 # ---------------------------------------------------------------------------
 # 启动时回收一次过期临时文件（覆盖 python app.py 与 flask --app app run 两种方式）
 # ---------------------------------------------------------------------------
@@ -181,8 +136,13 @@ if __name__ == "__main__":
         if conflicts:
             _p("  [WARN] 思考模式与输出预算冲突，这些维度会因截断丢弃结果：")
             _p(f"         {', '.join(conflicts)}")
-            _p("         请调大 MAX_TOKENS_BY_DIM（analyzer/deepseek_client.py）或关闭对应维度的思考模式")
+            _p("         请在 .env 里调大对应维度的 LLM_MAX_TOKENS_<维度>（如 LLM_MAX_TOKENS_PROFILE），")
+            _p("         或关闭该维度的思考模式")
+        if is_insecure_base_url():
+            _p("  [WARN] DEEPSEEK_BASE_URL 是明文 http 且非本机地址：")
+            _p("         API Key 与聊天内容会以明文过网，建议改成 https 端点")
     _p(f"  数据目录: {os.path.dirname(AI_CACHE_DIR)}（可用 QQCHAT_DATA_DIR 迁移，测试更安全）")
+    _p(f"  单次上传上限: {MAX_CONTENT_LENGTH // 1048576} MB（QQCHAT_MAX_UPLOAD_MB 可调）")
     _p(f"  增量缓存: {'开（只分析新增月份）' if MONTH_CACHE_ENABLED else '关'}")
     _p(f"  内存任务 TTL: {JOB_TTL_SECONDS}s · 结果本身永远先落盘（重启/超时不丢）")
 

@@ -53,7 +53,16 @@ if "QQCHAT_DATA_DIR" not in os.environ:
     _atexit.register(_drop_temp_data_dir)
 os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
 
+# 本进程的临时目录统一挪到数据目录下，两个好处：
+# 1) %TEMP% 只读受限的环境（沙箱、部分容器）里 tempfile.* 不再直接 PermissionError；
+# 2) 用例产生的临时json/图片/表情包都落在数据目录内，随测试隔离目录一起回收，
+#    不会在用户 %TEMP% 里留下上百个 qqchatlog-* 垃圾目录。
+_TMP_ROOT = os.path.join(os.environ["QQCHAT_DATA_DIR"], "tmp")
+os.makedirs(_TMP_ROOT, exist_ok=True)
+tempfile.tempdir = _TMP_ROOT
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from webapp import store as storemod  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 CST = timezone(timedelta(hours=8))
@@ -182,9 +191,9 @@ class TestGroupChatGuard(unittest.TestCase):
         self.assertEqual(r.status_code, 302)
         with client.session_transaction() as sess:
             p, h = sess.get("filepath"), sess.get("chat_hash")
-        appmod.wait_for_stats(h)
+        storemod.wait_for_stats(h)
         try:
-            appmod._purge_chat_caches(h)
+            storemod._purge_chat_caches(h)
         finally:
             if p and os.path.exists(p):
                 os.remove(p)
@@ -374,8 +383,8 @@ class TestStatsInBackground(unittest.TestCase):
             self.assertIn("milestones", stats)
             self.assertNotIn("word_freq", stats, "词频仍应是懒算，不进后台统计")
         finally:
-            appmod.wait_for_stats(chat_hash, timeout=30)
-            appmod._purge_chat_caches(chat_hash)
+            storemod.wait_for_stats(chat_hash, timeout=30)
+            storemod._purge_chat_caches(chat_hash)
             if path and os.path.exists(path):
                 os.remove(path)
 
@@ -383,7 +392,6 @@ class TestStatsInBackground(unittest.TestCase):
         """级联清理发生时统计线程仍在跑：它收尾时不得把刚删的缓存复活；
         而用户之后重新上传同一内容（新会话）必须能正常重算——标记要撤销"""
         import threading
-        import app as appmod
         from webapp import store as storemod
         stats = {"overview": {"x": 1}}
         started, release = threading.Event(), threading.Event()
@@ -396,7 +404,7 @@ class TestStatsInBackground(unittest.TestCase):
         with mock.patch.object(storemod, "compute_stats", side_effect=blocking_compute):
             storemod.start_stats_job(object(), "hashG")
             started.wait(10)                       # 线程已进入计算
-            appmod._purge_chat_caches("hashG")     # 用户在它落盘前清掉了这个聊天
+            storemod._purge_chat_caches("hashG")     # 用户在它落盘前清掉了这个聊天
             release.set()
             storemod.wait_for_stats("hashG", timeout=10)
             self.assertIsNone(storemod._load_stats("hashG"),
@@ -408,7 +416,7 @@ class TestStatsInBackground(unittest.TestCase):
             storemod.start_stats_job(object(), "hashG")
             storemod.wait_for_stats("hashG", timeout=10)
             self.assertIsNotNone(storemod._load_stats("hashG"))
-            appmod._purge_chat_caches("hashG")
+            storemod._purge_chat_caches("hashG")
 
 
 class TestSaveAndHash(unittest.TestCase):
@@ -441,9 +449,9 @@ class TestSaveAndHash(unittest.TestCase):
         with client.session_transaction() as sess:
             path, h = sess["filepath"], sess["chat_hash"]
         try:
-            self.assertEqual(h, appmod._chat_hash(path))
+            self.assertEqual(h, storemod._chat_hash(path))
         finally:
-            appmod._purge_chat_caches(h)
+            storemod._purge_chat_caches(h)
             if path and os.path.exists(path):
                 os.remove(path)
 
@@ -789,7 +797,7 @@ class TestWebUIMediaUpload(unittest.TestCase):
         with self.client.session_transaction() as s:
             chat_hash, path = s.get("chat_hash"), s.get("filepath")
         if chat_hash:
-            self.appmod._purge_chat_caches(chat_hash)
+            storemod._purge_chat_caches(chat_hash)
             shutil.rmtree(self.vision.session_media_dir(chat_hash), ignore_errors=True)
         if path and os.path.exists(path):
             os.remove(path)
@@ -910,7 +918,7 @@ class TestFaceEmoji(unittest.TestCase):
         with client.session_transaction() as s:
             chat_hash, path = s["chat_hash"], s["filepath"]
         try:
-            appmod.wait_for_stats(chat_hash, timeout=20)
+            storemod.wait_for_stats(chat_hash, timeout=20)
             body = client.get("/habits").get_data(as_text=True)
             # tojson 会把 emoji 转成 \ud83e\udd7a 转义，这里还原后断言真实字符。
             # 现在是 renderFaceBarChart(dom, 排行数组, 名字, emoji 映射, 表情图映射)
@@ -922,7 +930,7 @@ class TestFaceEmoji(unittest.TestCase):
             report = client.get("/report").get_data(as_text=True)
             self.assertIn("🥺", report, "报告页也应显示 emoji")
         finally:
-            appmod._purge_chat_caches(chat_hash)
+            storemod._purge_chat_caches(chat_hash)
             if path and os.path.exists(path):
                 os.remove(path)
 
@@ -953,7 +961,7 @@ class TestFaceEmoji(unittest.TestCase):
         with client.session_transaction() as s:
             chat_hash, path = s["chat_hash"], s["filepath"]
         try:
-            appmod.wait_for_stats(chat_hash, timeout=20)
+            storemod.wait_for_stats(chat_hash, timeout=20)
             body = client.get("/habits").get_data(as_text=True)
             m = re.search(r"renderFaceBarChart\('selfFaceChart',\s*(\[\[.*?\]\]),", body)
             self.assertIsNotNone(m, "表情排行应按二维数组传参（保序）")
@@ -961,7 +969,7 @@ class TestFaceEmoji(unittest.TestCase):
             self.assertEqual([r[0] for r in ranking][:3], ["/流泪", "/可怜", "/微笑"])
             self.assertEqual([r[1] for r in ranking][:3], [3, 2, 1], "必须按次数降序")
         finally:
-            appmod._purge_chat_caches(chat_hash)
+            storemod._purge_chat_caches(chat_hash)
             if path and os.path.exists(path):
                 os.remove(path)
 
@@ -1088,33 +1096,36 @@ class TestFaceImagesOptional(unittest.TestCase):
         with client.session_transaction() as s:
             chat_hash, path = s["chat_hash"], s["filepath"]
         try:
-            appmod.wait_for_stats(chat_hash, timeout=20)
+            storemod.wait_for_stats(chat_hash, timeout=20)
             on = client.get("/habits").get_data(as_text=True)
             self.assertIn('id="fetchFacesBtn"', on, "开关打开时应给出联网抓取入口")
             with mock.patch.object(self.fi, "FACE_IMAGES_ENABLED", False):
                 off = client.get("/habits").get_data(as_text=True)
             self.assertNotIn('id="fetchFacesBtn"', off, "开关关闭时不该出现联网入口")
         finally:
-            appmod._purge_chat_caches(chat_hash)
+            storemod._purge_chat_caches(chat_hash)
             if path and os.path.exists(path):
                 os.remove(path)
 
 
     def test_report_export_does_not_swallow_the_body(self):
-        """导出报告的正则不得跨脚本吞内容。
+        """导出报告在 DOM 克隆体上删节点，不再对 HTML 字符串做正则手术。
 
         曾经的写法 `<script(?![^>]*src=)[^>]*>[\\s\\S]*?window\\.CSRF_TOKEN[\\s\\S]*?</script>`
         会从 <head> 的主题脚本一路匹配到页面底部的 CSRF 脚本，把整个 body 删掉
-        （实测导出的 HTML 只剩 205 字节）。这里守住"逐块处理"的写法。
+        （实测导出的 HTML 只剩 205 字节）。这里守住"按节点处理"的写法：
+        跨脚本的贪婪正则不许再出现，CSRF 脚本仍要按内容精确剔除。
         """
         src = (ROOT / "web" / "templates" / "report.html").read_text(encoding="utf-8")
         # 注释里会引用旧写法作为反面教材，所以只检查真正的代码行
         code = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("//"))
         self.assertNotIn("[\\s\\S]*?window\\.CSRF_TOKEN", code,
                          "不许再用跨脚本的贪婪正则删 CSRF 脚本")
+        self.assertNotIn("document.documentElement.outerHTML", code,
+                         "导出快照必须走 cloneNode，不能拿整页 HTML 串做替换")
+        self.assertIn("cloneNode(true)", code, "应当在 DOM 克隆体上删改")
         self.assertIn("window\\.CSRF_TOKEN", code, "仍要剥掉带 token 的那个脚本")
-        self.assertIn("<script\\b[^>]*>[\\s\\S]*?<\\/script>", code,
-                      "应按单个 <script> 块逐一处理")
+        self.assertIn("querySelectorAll('script')", code, "按节点遍历脚本，逐块判断")
 
     def test_report_export_inlines_face_images(self):
         """导出的报告要自带表情图（内联成 data URL），否则分享出去就是裂图"""
@@ -1226,12 +1237,17 @@ class TestFrontendRegressionGuards(unittest.TestCase):
     def test_report_keeps_style_link_when_inlining_failed(self):
         """样式没取到时不能把 <link> 也删掉，否则导出的报告只剩 Bootstrap"""
         src = self.REPORT.read_text(encoding="utf-8")
-        self.assertIn("if (inlineCss)", src)
+        self.assertIn("if (cssText) {", src)
+        # 删 <link> 必须发生在这个守卫之内：取不到样式就保留原链接，别让报告裸奔
+        self.assertLess(src.index("if (cssText) {"),
+                        src.index('link[href^="/static/css/"]'),
+                        "删样式表链接的代码要在 cssText 守卫之内")
         self.assertIn("asList", src, "模型返回值先兜底成数组，避免一处 TypeError 打断报告")
 
     def test_report_replaces_unavailable_face_images(self):
         src = self.REPORT.read_text(encoding="utf-8")
-        self.assertIn("failed.push", src, "内联失败的表情图要记录并降级成文字")
+        self.assertIn("replaceChild", src, "内联失败的表情图要降级成文字，不能留裂图")
+        self.assertIn("getAttribute('alt')", src, "降级文字取自 alt（表情名）")
 
     def test_index_reports_partial_upload_failure(self):
         """分批上传失败时不能静默跳转，要如实说明还剩多少没传"""
@@ -1267,7 +1283,7 @@ class TestFailureSurfacedToUser(unittest.TestCase):
         # 仪表盘没有数据可渲染，回首页——但首页必须解释原因
         self.assertEqual(client.get("/dashboard").status_code, 302)
         storemod._STATS_ERRORS.pop(chat_hash, None)
-        appmod._purge_chat_caches(chat_hash)
+        storemod._purge_chat_caches(chat_hash)
 
     def test_csrf_failure_message_is_actionable(self):
         import app as appmod

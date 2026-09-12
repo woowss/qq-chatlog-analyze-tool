@@ -28,7 +28,7 @@ import os
 import threading
 from datetime import datetime, timedelta, timezone
 
-from config import TOKEN_USAGE_FILE
+from config import LOG_RETENTION_DAYS, TOKEN_USAGE_FILE
 from analyzer.logger import get_logger
 
 logger = get_logger("usage")
@@ -106,6 +106,21 @@ def flush() -> None:
         _flush_locked()
 
 
+def _prune_days(data: dict) -> None:
+    """按天聚合的用量只保留 LOG_RETENTION_DAYS 天。
+
+    日志已经按天轮转只留 7 天，这里原先却把每天的调用次数无限累积：虽然只有数字，
+    但与"不留无限历史"的口径不一致，而且没人需要三年前的调用次数。
+    日期串是 YYYY-MM-DD，字典序即时间序，直接按字符串比较即可。
+    """
+    days = data.get("days")
+    if not isinstance(days, dict) or not days:
+        return
+    cutoff = (datetime.now(tz=CST) - timedelta(days=LOG_RETENTION_DAYS)).strftime("%Y-%m-%d")
+    for key in [k for k in days if k < cutoff]:
+        days.pop(key, None)
+
+
 def _flush_locked() -> None:
     """（须持有 _LOCK）有增量才读写文件：N 次连续调用合并为一次落盘"""
     global _DIRTY
@@ -118,7 +133,14 @@ def _flush_locked() -> None:
     t = _PENDING["total"]
     for k in ("calls", "prompt", "completion"):
         data["total"][k] = data["total"].get(k, 0) + t[k]
-    _dump(data)
+    _prune_days(data)
+    try:
+        _dump(data)
+    except OSError as e:
+        # 落盘失败就把增量留在内存里下次再试：原先这里会把异常抛给调用方，
+        # /api/usage 直接 500，而增量已被下面的清空逻辑丢掉（用量永久少记）。
+        logger.warning("token 用量写入失败（保留增量，稍后重试）: %s", e)
+        return
     _PENDING["days"].clear()
     _PENDING["dims"].clear()
     for k in t:

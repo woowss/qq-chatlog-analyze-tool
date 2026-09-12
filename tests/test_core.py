@@ -52,7 +52,18 @@ if "QQCHAT_DATA_DIR" not in os.environ:
 # 专门验证增量缓存的用例会自行开启并指向临时目录。
 os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
 
+# 本进程的临时目录统一挪到数据目录下，两个好处：
+# 1) %TEMP% 只读受限的环境（沙箱、部分容器）里 tempfile.* 不再直接 PermissionError；
+# 2) 用例产生的临时json/图片/表情包都落在数据目录内，随测试隔离目录一起回收，
+#    不会在用户 %TEMP% 里留下上百个 qqchatlog-* 垃圾目录。
+_TMP_ROOT = os.path.join(os.environ["QQCHAT_DATA_DIR"], "tmp")
+os.makedirs(_TMP_ROOT, exist_ok=True)
+tempfile.tempdir = _TMP_ROOT
+
 # 数据目录/路径准备必须在导入项目模块之前完成，故下面的导入带 noqa: E402
+# （别名同样要放在这里：提前导入 webapp.* 会连带导入 config，把环境开关读成默认值）
+from webapp import security as securitymod  # noqa: E402
+from webapp import store as storemod  # noqa: E402
 from parser.qq_parser import (CST, ChatData, Message, is_statistical,  # noqa: E402
                               load_chat, split_by_month)
 from analyzer.deepseek_client import (MAX_DIALOG_CHARS, _build_dialog,  # noqa: E402
@@ -253,10 +264,10 @@ class TestCsrfProtection(unittest.TestCase):
         import app as appmod
         with appmod.app.test_request_context(
                 "/upload", headers={"Host": "evil.example.com", "Origin": "http://evil.example.com"}):
-            self.assertFalse(appmod._origin_allowed())
+            self.assertFalse(securitymod._origin_allowed())
         with appmod.app.test_request_context(
                 "/upload", headers={"Host": "127.0.0.1:5000", "Origin": "http://127.0.0.1:5000"}):
-            self.assertTrue(appmod._origin_allowed())
+            self.assertTrue(securitymod._origin_allowed())
 
     def test_allowed_origins_config_is_honored(self):
         """局域网/自定义域名通过 ALLOWED_ORIGINS 显式放行"""
@@ -265,10 +276,10 @@ class TestCsrfProtection(unittest.TestCase):
         with mock.patch.object(securitymod, "ALLOWED_ORIGINS", frozenset({"chat.lan"})):
             with appmod.app.test_request_context(
                     "/upload", headers={"Host": "127.0.0.1:5000", "Origin": "http://chat.lan"}):
-                self.assertTrue(appmod._origin_allowed())
+                self.assertTrue(securitymod._origin_allowed())
         with appmod.app.test_request_context(
                 "/upload", headers={"Host": "127.0.0.1:5000", "Origin": "http://chat.lan"}):
-            self.assertFalse(appmod._origin_allowed())
+            self.assertFalse(securitymod._origin_allowed())
 
 
 class TestStatisticalFiltering(unittest.TestCase):
@@ -333,21 +344,20 @@ class TestAiCache(unittest.TestCase):
     """服务端缓存：哈希稳定、读写往返、api_analyze 命中缓存不再调用模型"""
 
     def test_chat_hash_stable_and_cache_roundtrip(self):
-        import app as appmod
         fd, path = tempfile.mkstemp(suffix=".json")
         os.close(fd)
         try:
-            h1 = appmod._chat_hash(path)
-            h2 = appmod._chat_hash(path)
+            h1 = storemod._chat_hash(path)
+            h2 = storemod._chat_hash(path)
             self.assertEqual(h1, h2)
             self.assertEqual(len(h1), 16)
             payload = {"2024-01": {"self_emotion": "快乐"}}
-            appmod._write_cache("emotion", h1, payload)
-            got = appmod._read_cache("emotion", h1)
+            storemod._write_cache("emotion", h1, payload)
+            got = storemod._read_cache("emotion", h1)
             self.assertEqual(got, payload)
         finally:
             os.remove(path)
-            for f in Path(appmod.AI_CACHE_DIR).glob(f"emotion_{h1}_*"):
+            for f in Path(storemod.AI_CACHE_DIR).glob(f"emotion_{h1}_*"):
                 f.unlink()
 
     def test_api_analyze_uses_cache_then_job(self):
@@ -380,7 +390,7 @@ class TestAiCache(unittest.TestCase):
                        "self_intensity": 5, "other_intensity": 7,
                        "self_keywords": ["在吗"], "other_keywords": ["在的"],
                        "overall_tone": "轻松愉快"}
-        cache_dir = Path(appmod.AI_CACHE_DIR)
+        cache_dir = Path(storemod.AI_CACHE_DIR)
         cache_before = set(cache_dir.glob("*")) if cache_dir.exists() else set()
         try:
             with mock.patch("analyzer.deepseek_client._call_api", return_value=fake_result) as m:
@@ -711,7 +721,7 @@ class TestAnalyzeAll(unittest.TestCase):
                 "self_intensity": 5, "other_intensity": 7,
                 "self_keywords": [], "other_keywords": [],
                 "overall_tone": "轻松愉快", "topics": [], "summary": "s"}
-        cache_dir = Path(appmod.AI_CACHE_DIR)
+        cache_dir = Path(storemod.AI_CACHE_DIR)
         cache_before = set(cache_dir.glob("*"))
         try:
             with mock.patch("analyzer.deepseek_client._call_api", return_value=fake) as m, \
@@ -797,50 +807,46 @@ class TestCacheLifecycle(unittest.TestCase):
 
     def test_cache_path_includes_prompt_fingerprint(self):
         """缓存键用提示词/格式指纹：改 prompt 或对话格式后旧缓存自动失效"""
-        import app as appmod
         from analyzer.deepseek_client import PROMPT_FINGERPRINT
-        path = appmod._cache_path("emotion", "deadbeef" * 2)
+        path = storemod._cache_path("emotion", "deadbeef" * 2)
         self.assertIn(PROMPT_FINGERPRINT, path)
 
     def test_cache_path_separates_thinking_mode(self):
         """切换思考模式必须换键：否则开/关 thinking 后会命中另一模式的旧结果"""
-        import app as appmod
         from webapp import store as storemod
         with mock.patch.object(storemod, "thinking_enabled", lambda d: d == "profile"):
-            think_path = appmod._cache_path("profile", "hashX")
-            plain_path = appmod._cache_path("emotion", "hashX")
+            think_path = storemod._cache_path("profile", "hashX")
+            plain_path = storemod._cache_path("emotion", "hashX")
         self.assertTrue(think_path.endswith("_think.json"))
         self.assertFalse(plain_path.endswith("_think.json"))
         # 未开思考时不加后缀，既有缓存键保持兼容
         with mock.patch.object(storemod, "thinking_enabled", lambda d: False):
-            self.assertFalse(appmod._cache_path("profile", "hashX").endswith("_think.json"))
+            self.assertFalse(storemod._cache_path("profile", "hashX").endswith("_think.json"))
 
     def test_purge_removes_thinking_cache_too(self):
         """级联删除不看思考模式后缀，思考模式结果同样不会成为孤儿"""
-        import app as appmod
         from webapp import store as storemod
         with mock.patch.object(storemod, "thinking_enabled", lambda d: True):
-            appmod._write_cache("profile", "hashCCC", {"x": 1})
-            path = appmod._cache_path("profile", "hashCCC")
+            storemod._write_cache("profile", "hashCCC", {"x": 1})
+            path = storemod._cache_path("profile", "hashCCC")
             try:
                 self.assertTrue(os.path.exists(path))
-                self.assertEqual(appmod._purge_chat_caches("hashCCC"), 1)
+                self.assertEqual(storemod._purge_chat_caches("hashCCC"), 1)
                 self.assertFalse(os.path.exists(path))
             finally:
                 if os.path.exists(path):
                     os.remove(path)
 
     def test_purge_chat_caches(self):
-        import app as appmod
-        appmod._write_cache("emotion", "hashAAA", {"x": 1})
-        appmod._write_cache("topics", "hashAAA", {"x": 2})
-        appmod._write_cache("emotion", "hashBBB", {"x": 3})
+        storemod._write_cache("emotion", "hashAAA", {"x": 1})
+        storemod._write_cache("topics", "hashAAA", {"x": 2})
+        storemod._write_cache("emotion", "hashBBB", {"x": 3})
         try:
-            self.assertEqual(appmod._purge_chat_caches("hashAAA"), 2)
-            self.assertIsNone(appmod._read_cache("emotion", "hashAAA"))
-            self.assertIsNotNone(appmod._read_cache("emotion", "hashBBB"))
+            self.assertEqual(storemod._purge_chat_caches("hashAAA"), 2)
+            self.assertIsNone(storemod._read_cache("emotion", "hashAAA"))
+            self.assertIsNotNone(storemod._read_cache("emotion", "hashBBB"))
         finally:
-            appmod._purge_chat_caches("hashBBB")
+            storemod._purge_chat_caches("hashBBB")
 
 
 class TestJobDedup(unittest.TestCase):
@@ -878,7 +884,7 @@ class TestJobDedup(unittest.TestCase):
             self.assertTrue(release.wait(15), "测试超时未放行")
             return fake
 
-        cache_dir = Path(appmod.AI_CACHE_DIR)
+        cache_dir = Path(storemod.AI_CACHE_DIR)
         cache_before = set(cache_dir.glob("*"))
         try:
             with mock.patch("analyzer.deepseek_client._call_api", side_effect=blocking), \
@@ -973,23 +979,23 @@ class TestReuploadCacheLifecycle(unittest.TestCase):
         with client.session_transaction() as sess:
             hash_a = sess["chat_hash"]
             path_a = sess["filepath"]
-        appmod._write_cache("emotion", hash_a, {"keep": True})
+        storemod._write_cache("emotion", hash_a, {"keep": True})
 
         # 重传同一文件：旧文件删除但缓存保留
         r2 = self._upload(client, token, chat_a)
         self.assertEqual(r2.status_code, 302)
         self.assertFalse(os.path.exists(path_a))          # 旧文件已清理
-        self.assertIsNotNone(appmod._read_cache("emotion", hash_a))  # 缓存还在
+        self.assertIsNotNone(storemod._read_cache("emotion", hash_a))  # 缓存还在
 
         # 换不同内容文件：旧哈希的缓存被联动清除
         r3 = self._upload(client, token, chat_b)
         self.assertEqual(r3.status_code, 302)
-        self.assertIsNone(appmod._read_cache("emotion", hash_a))
+        self.assertIsNone(storemod._read_cache("emotion", hash_a))
         with client.session_transaction() as sess:
             path_b = sess.get("filepath")
             hash_b = sess.get("chat_hash")
         try:
-            appmod._purge_chat_caches(hash_b)
+            storemod._purge_chat_caches(hash_b)
         finally:
             if path_b and os.path.exists(path_b):
                 os.remove(path_b)

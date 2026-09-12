@@ -160,6 +160,28 @@ def _clear_login_failures(ip: str) -> None:
         _login_failures.pop(ip, None)
 
 
+def add_security_headers(response):
+    """统一安全响应头。
+
+    前端把 AI 输出与聊天内容渲染进 DOM 时都做了 esc() 转义，这里再给浏览器一层
+    默认约束：即便将来某个渲染路径漏了转义，注入也拿不到跨站资源。
+    内联脚本/样式是这个项目的既有写法（主题初始化、ECharts 配置、模板内 onclick），
+    所以 script-src/style-src 必须放行 'unsafe-inline'；但 default-src 仍锁死同源。
+    """
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    # 用 SAMEORIGIN 而非 DENY：只挡跨站被框（防点击劫持），
+    # 不阻断用户自己在同源页面里嵌入（例如把仪表盘放进自己的本地面板）
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; connect-src 'self'; "
+        "base-uri 'none'; form-action 'self'; frame-ancestors 'self'",
+    )
+    return response
+
+
 def require_login():
     """未登录时重定向到登录页；未设置口令则不启用"""
     if not ACCESS_PASSWORD:
@@ -185,13 +207,21 @@ def login():
         # 登录接口自身豁免 CSRF（无 session 时先建 token）
         pwd = request.form.get("password", "")
         if hmac.compare_digest(pwd.encode("utf-8"), ACCESS_PASSWORD.encode("utf-8")):
+            # 登录成功即换一份会话内容：丢弃匿名阶段的残留，并轮换 CSRF token
+            # （防御会话固定；Flask-Session 的文件后端没有公开的 sid 轮换 API，
+            #   所以这里至少保证认证状态与匿名状态的 token 不共用）
+            session.clear()
             session["auth_ok"] = True
+            session["csrf_token"] = secrets.token_hex(32)
             _clear_login_failures(ip)
             nxt = request.args.get("next") or ""
-            if not nxt.startswith("/") or nxt.startswith("//"):  # 防开放重定向
-                nxt = url_for("index")
+            # 防开放重定向：反斜杠先归一为斜杠再判断。浏览器把 `/\evil.com` 当作
+            # 协议相对地址（等价于 //evil.com），只查 "//" 会被这样绕过。
+            safe_next = nxt.replace("\\", "/")
+            if not safe_next.startswith("/") or safe_next.startswith("//"):
+                safe_next = url_for("index")
             logger.info("登录成功 [%s]", ip)
-            return redirect(nxt)
+            return redirect(safe_next)
         _record_login_failure(ip)
         error = "口令错误，请重试"
         logger.warning("登录失败 [%s]", ip)
@@ -202,5 +232,6 @@ def register(app):
     """把防护挂钩到 Flask 实例（保持原始注册顺序）"""
     app.before_request(ensure_csrf_token)
     app.before_request(require_login)
+    app.after_request(add_security_headers)
     app.context_processor(inject_csrf_token)
     app.add_url_rule("/login", "login", login, methods=["GET", "POST"])

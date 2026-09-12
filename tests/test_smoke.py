@@ -18,6 +18,8 @@
 
 这一层原来靠每次手工跑脚本验证，现在固化成测试，改模板或改路由都会立刻暴露问题。
 """
+import base64
+import hashlib
 import io
 import json
 import os
@@ -47,7 +49,16 @@ if "QQCHAT_DATA_DIR" not in os.environ:
     _atexit.register(_drop_temp_data_dir)
 os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
 
+# 本进程的临时目录统一挪到数据目录下，两个好处：
+# 1) %TEMP% 只读受限的环境（沙箱、部分容器）里 tempfile.* 不再直接 PermissionError；
+# 2) 用例产生的临时json/图片/表情包都落在数据目录内，随测试隔离目录一起回收，
+#    不会在用户 %TEMP% 里留下上百个 qqchatlog-* 垃圾目录。
+_TMP_ROOT = os.path.join(os.environ["QQCHAT_DATA_DIR"], "tmp")
+os.makedirs(_TMP_ROOT, exist_ok=True)
+_tempfile.tempdir = _TMP_ROOT
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from webapp import store as storemod  # noqa: E402
 
 import app as appmod  # noqa: E402
 
@@ -97,7 +108,7 @@ class TestPageSmoke(unittest.TestCase):
     def tearDownClass(cls):
         if cls.filepath and os.path.exists(cls.filepath):
             os.remove(cls.filepath)
-        appmod._purge_chat_caches(cls.chat_hash)
+        storemod._purge_chat_caches(cls.chat_hash)
 
     def test_pages_render_clean(self):
         for path in ("/", "/dashboard", "/emotion", "/relationship",
@@ -122,6 +133,23 @@ class TestPageSmoke(unittest.TestCase):
         body = self.client.get("/dashboard").get_data(as_text=True)
         for label in ("仪表盘", "情绪", "关系", "习惯", "话题", "锐评", "报告"):
             self.assertIn(label, body, f"导航缺少 {label}")
+
+    def test_report_page_inlines_vendor_sri(self):
+        """渲染结果里必须带与本地 vendor 文件一致的 SRI 常量
+
+        分享出去的 HTML 把 /static/vendor/* 换成 CDN，靠 integrity 兜底：哈希错了浏览器
+        静默拦掉资源（样式、图表全没）。tests/test_sri.py 校验模板里的常量，这里再按
+        "真正渲染出来的页面"验一遍，防止常量被 Jinja/转义/替换弄丢。
+        """
+        body = self.client.get("/report").get_data(as_text=True)
+        vendor = Path(appmod.__file__).resolve().parent / "web" / "static" / "vendor"
+        files = sorted(p for p in vendor.iterdir() if p.suffix in (".css", ".js"))
+        self.assertTrue(files, f"{vendor} 下没有 vendor 资源？")
+        for path in files:
+            with self.subTest(vendor=path.name):
+                digest = base64.b64encode(hashlib.sha384(path.read_bytes()).digest()).decode()
+                self.assertIn(f"sha384-{digest}", body, f"{path.name} 的 SRI 常量没出现在报告页")
+        self.assertIn("crossorigin", body, "SRI 缺少 crossorigin，跨源资源会被跳过校验")
 
     def test_missing_session_redirects_home(self):
         fresh = appmod.app.test_client()

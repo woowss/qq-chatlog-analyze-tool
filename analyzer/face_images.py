@@ -79,6 +79,10 @@ NAME_TO_CLASSIC = {name: fid for fid, name in CLASSIC_NAMES.items()}
 _IMAGE_EXT = (".gif", ".png", ".jpg", ".jpeg", ".webp")
 _MAGIC = (b"GIF8", b"\x89PNG", b"\xff\xd8\xff", b"RIFF")
 
+#: 单次点击"获取原始表情图"的联网抓取时长上限（秒）：请求是同步的，
+#: 宁可少抓几张下次接着抓，也不要把页面挂住十几分钟。
+FETCH_BUDGET_SECONDS = 60.0
+
 
 def enabled() -> bool:
     return bool(FACE_IMAGES_ENABLED)
@@ -205,11 +209,15 @@ def _store(key: str, data: bytes) -> str:
     return path
 
 
-def ensure(faces: dict, allow_network: bool = True) -> dict:
+def ensure(faces: dict, allow_network: bool = True, max_seconds: float = 0.0) -> dict:
     """确保这些表情有本地图片，返回 {表情名: {"key","path","source"}}。
 
     faces: {表情名: {"market_url": str|None}}（键由 key_for 统一决定）
     已有缓存的直接用；本地表情包目录优先；联网失败逐条跳过。
+
+    max_seconds > 0 时限制本次联网抓取的墙钟时长：抓取是同步跑在请求线程里的，
+    上限 300 张 × 单张超时 6s 理论上能挂住半小时，用户只能看着转圈。
+    到点就收工，剩下的留给下次点击（缓存已落盘，下次自然接着抓）。
     """
     if not enabled():
         return {}
@@ -227,7 +235,13 @@ def ensure(faces: dict, allow_network: bool = True) -> dict:
 
     if pending and allow_network:
         fetched = 0
-        for name, info, key in pending[:FACE_FETCH_LIMIT]:
+        deadline = (time.monotonic() + max_seconds) if max_seconds > 0 else None
+        queue = pending[:FACE_FETCH_LIMIT]
+        for idx, (name, info, key) in enumerate(queue):
+            if deadline is not None and time.monotonic() > deadline:
+                logger.info("表情图抓取已达单次时长上限（%.0fs），剩余 %d 个留到下次",
+                            max_seconds, len(queue) - idx)
+                break
             url = url_for(name, info.get("market_url") or "")
             if not url:
                 continue                      # 超级表情：没有公开地址，保持 emoji/文字

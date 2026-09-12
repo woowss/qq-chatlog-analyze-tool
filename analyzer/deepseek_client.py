@@ -32,7 +32,7 @@ from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL, DEEPSEEK_BASE_URL
 from parser.qq_parser import CST, MEDIA_KINDS, ChatData, is_statistical, split_by_month
 from analyzer.logger import get_logger
 from analyzer.usage import record_call
-from analyzer.local_stats import SESSION_GAP_MS
+from analyzer.local_stats import SESSION_GAP_MS, is_session_start
 from analyzer.prompts import (
     SYSTEM_PROMPT_EMOTION,
     SYSTEM_PROMPT_TOPICS,
@@ -86,13 +86,39 @@ TPM_WAIT_SECONDS = 25.0
 # max_tokens 只是上限，模型停下来就不计费，卡太紧才会真的出事：
 # 实测最长那个月（prompt 可达数十万 tokens）开着思考模式时
 # 8192 会被思维链吃满 → finish_reason=length → 整月结果被丢弃。
-MAX_TOKENS_BY_DIM = {
+_DEFAULT_MAX_TOKENS = {
     "emotion": 32768,
     "topics": 32768,
     "relationship": 32768,
     "habits": 32768,
     "profile": 49152,
 }
+
+
+def _max_tokens(dim: str, default: int) -> int:
+    """按维度读输出预算，可用 LLM_MAX_TOKENS_<维度> 覆盖（如 LLM_MAX_TOKENS_PROFILE=65536）。
+
+    此前遇到截断时，启动横幅让用户"调大 MAX_TOKENS_BY_DIM（analyzer/deepseek_client.py）"，
+    等于要求普通用户改源码；现在改 .env 即可。预算参与提示词指纹，
+    所以调大之后旧缓存会自动失效、按新预算重算。
+    """
+    env_name = f"LLM_MAX_TOKENS_{dim.upper()}"
+    raw = (os.getenv(env_name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(float(raw))
+    except ValueError:
+        logger.warning("%s=%r 不是数字，已回退为 %d", env_name, raw, default)
+        return default
+    if not 256 <= value <= 384_000:
+        logger.warning("%s=%d 超出 [256, 384000]，已回退为 %d", env_name, value, default)
+        return default
+    return value
+
+
+MAX_TOKENS_BY_DIM = {dim: _max_tokens(dim, default)
+                     for dim, default in _DEFAULT_MAX_TOKENS.items()}
 
 # 思考模式：准确性优先——官方 DeepSeek 端点默认**全维度开启**（思维链能显著提升
 # 证据引用与推断质量），并且各维度输出预算已提到 8192 以上，不会再出现
@@ -168,17 +194,29 @@ def _is_tpm_throttle(e: Exception) -> bool:
 # .env 模板中的占位符值，视为"未配置"
 _PLACEHOLDER_KEYS = {"", "你的DeepSeek_API_Key", "你的API_Key"}
 
+_CLIENT: Optional[OpenAI] = None
+_CLIENT_LOCK = threading.Lock()
+
 
 def _get_client() -> Optional[OpenAI]:
-    """获取 OpenAI 客户端；未配置 API Key 则返回 None"""
+    """获取 OpenAI 客户端（进程内复用）。
+
+    每次调用都新建 client 会让连接池无法复用：一次全量分析几十次调用就是几十次
+    TLS 握手，而且并发月份各自建池。key/base_url 都是 import 期常量，缓存无风险。
+    """
+    global _CLIENT
     if DEEPSEEK_API_KEY.strip() in _PLACEHOLDER_KEYS:
         return None
-    return OpenAI(
-        api_key=DEEPSEEK_API_KEY,
-        base_url=DEEPSEEK_BASE_URL,
-        timeout=REQUEST_TIMEOUT,
-        max_retries=0,  # 重试由 _call_api 自行实现（指数退避）
-    )
+    if _CLIENT is None:
+        with _CLIENT_LOCK:
+            if _CLIENT is None:
+                _CLIENT = OpenAI(
+                    api_key=DEEPSEEK_API_KEY,
+                    base_url=DEEPSEEK_BASE_URL,
+                    timeout=REQUEST_TIMEOUT,
+                    max_retries=0,  # 重试由 _call_api 自行实现（指数退避）
+                )
+    return _CLIENT
 
 
 def _fit_lines(lines: list[str], max_chars: int) -> list[str]:
@@ -237,7 +275,7 @@ def _conversation_stats(messages: list, self_uid: str = "") -> dict:
     self_opened = 0
     for m in messages:
         hours[datetime.fromtimestamp(m.timestamp / 1000, tz=CST).hour] += 1
-        if last is None or m.timestamp - last.timestamp > SESSION_GAP_MS:
+        if last is None or is_session_start(last.timestamp, m.timestamp):
             sessions += 1
             if self_uid and m.sender_uid == self_uid:
                 self_opened += 1
@@ -441,6 +479,9 @@ THINKING_MIN_TOKENS = 4096
 # 从而保留"不留孤儿敏感数据"的隐私属性。
 _MONTH_CACHE_DIR = ""
 _MONTH_CACHE_LOCK = threading.Lock()
+# 缓存写失败的告警去抖（磁盘满时每次调用都会失败，不能每次刷一行）
+_WRITE_WARN_INTERVAL = 300.0
+_last_write_warning = [0.0]
 # 无引用的月份缓存先留一段宽限期：上传新文件时的级联清理不能顺手删掉
 # "同一段对话的历史月份"，否则增量分析就失去意义。孤儿文件由定期清理回收。
 MONTH_CACHE_GRACE_SECONDS = _env_number("LLM_MONTH_CACHE_GRACE_HOURS", 24, 0, 24 * 30) * 3600
@@ -485,6 +526,20 @@ def _read_month_cache(key: str) -> Optional[dict]:
     return data if isinstance(data, dict) else None
 
 
+def _warn_write_failure(what: str, path: str, err: OSError) -> None:
+    """缓存落盘失败必须出声。
+
+    静默吞掉 OSError 的后果不是"少一个文件"，而是月份缓存与 manifest 从此写不进去：
+    用户以为命中了缓存，实际上每个月都在重复付费，且界面上完全看不出来。
+    磁盘满时会高频失败，所以按 5 分钟去抖，避免刷爆日志。
+    """
+    now = time.monotonic()
+    if now - _last_write_warning[0] < _WRITE_WARN_INTERVAL:
+        return
+    _last_write_warning[0] = now
+    logger.warning("%s写入失败（缓存不生效，可能重复调用 API）: %s (%s)", what, path, err)
+
+
 def _write_month_cache(key: str, result: dict) -> None:
     if not _MONTH_CACHE_DIR:
         return
@@ -494,7 +549,8 @@ def _write_month_cache(key: str, result: dict) -> None:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False)
         os.replace(tmp, path)
-    except OSError:
+    except OSError as e:
+        _warn_write_failure("月份缓存", path, e)
         try:
             os.remove(tmp)
         except OSError:
@@ -524,8 +580,10 @@ def _record_month_usage(chat_hash: str, key: str) -> None:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
             os.replace(tmp, path)
-        except OSError:
-            pass
+        except OSError as e:
+            # manifest 写不进去同样只影响"重新导出时能否复用历史月份"，
+            # 但会让增量分析静默失效（每次都全量付费），所以也要出声
+            _warn_write_failure("月份缓存 manifest", path, e)
 
 
 def purge_month_cache(chat_hash: str) -> int:
@@ -755,12 +813,13 @@ def _call_vision(system_prompt: str, user_text: str, images: list) -> str:
                 ],
                 "max_tokens": 512,
             }
-            if thinking_enabled("vision"):
-                params["extra_body"] = {"thinking": {"type": "enabled"}}
-            else:
-                params["temperature"] = 0.3
-                if _SEND_THINKING_PARAM:
-                    params["extra_body"] = {"thinking": {"type": "disabled"}}
+            # 图片摘要**固定走非思考模式**：思维链同样计入 max_tokens，而这里的预算是
+            # 512（摘要本身要求不超过 240 字，够用），开思考会稳定撞上 finish_reason=length
+            # 把摘要截成半截话——与"思考模式吃满预算就丢结果"是同一个坑。
+            # 摘要要的是"看到什么写什么"，本来也不需要推理链。
+            params["temperature"] = 0.3
+            if _SEND_THINKING_PARAM:
+                params["extra_body"] = {"thinking": {"type": "disabled"}}
             resp = client.chat.completions.create(**params)
             choice = resp.choices[0]
             if resp.usage:
@@ -1111,3 +1170,19 @@ def analyze_profile(chat: ChatData, on_progress=None, should_cancel=None,
 def is_api_configured() -> bool:
     """检查 API Key 是否已配置（占位符视为未配置）"""
     return DEEPSEEK_API_KEY.strip() not in _PLACEHOLDER_KEYS
+
+
+def is_insecure_base_url() -> bool:
+    """base_url 是否为"明文 http 且指向非本机"——这种配置下 Key 与聊天内容会明文过网"""
+    url = (DEEPSEEK_BASE_URL or "").strip().lower()
+    if not url.startswith("http://"):
+        return False
+    host = url[len("http://"):].split("/", 1)[0]
+    host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host      # 去掉端口
+    return host not in ("localhost", "127.0.0.1", "::1", "[::1]")
+
+
+# 启动即检查一次：明文 http 的非本机端点会让 API Key 与聊天内容裸奔，值得每次都提醒
+if is_insecure_base_url():
+    logger.warning("DEEPSEEK_BASE_URL 使用明文 http 且不是本机地址："
+                   "API Key 与聊天内容会以明文过网，请改用 https 端点")

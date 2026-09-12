@@ -20,7 +20,7 @@ import uuid
 
 from flask import jsonify, redirect, render_template, request, send_file, session, url_for
 
-from config import LOG_REDACT_NAMES, UPLOAD_FOLDER
+from config import LOG_REDACT_NAMES, MAX_CONTENT_LENGTH, UPLOAD_FOLDER
 from analyzer.deepseek_client import is_api_configured
 from analyzer.logger import get_logger, mask_name
 from webapp import store
@@ -77,7 +77,8 @@ def upload():
 
     file = request.files["file"]
     orig_name = file.filename
-    if orig_name == "" or not orig_name.endswith(".json"):
+    # 大小写不敏感：导出器/浏览器给出的扩展名可能是 .JSON
+    if orig_name == "" or not orig_name.lower().endswith(".json"):
         logger.warning("上传文件格式无效: %s", orig_name if not LOG_REDACT_NAMES else "<脱敏>")
         return "请选择有效的 .json 文件", 400
 
@@ -164,6 +165,22 @@ def _wants_json() -> bool:
     """AJAX 上传（带选中的导出目录）走 JSON 响应，普通表单提交仍走 302 跳转"""
     return (request.headers.get("X-Requested-With") == "fetch"
             or "application/json" in (request.headers.get("Accept") or ""))
+
+
+def upload_too_large(error):
+    """413：超过 MAX_CONTENT_LENGTH 时给出可执行的中文提示。
+
+    Flask 默认回的是 Werkzeug 自带的英文页（实测正文只有
+    "The data value transmitted exceeds the capacity limit."），既没说限制是多少，
+    也没说怎么调——用户只看到"上传失败"，无从下手。
+    """
+    limit_mb = MAX_CONTENT_LENGTH // 1048576
+    message = (f"上传文件超过 {limit_mb} MB 上限：可在 .env 中调大 QQCHAT_MAX_UPLOAD_MB 后重启，"
+               "或在 QQChatExporter 里缩小导出范围（例如按月分批导出）")
+    logger.warning("上传被拒：超过 %d MB 上限（QQCHAT_MAX_UPLOAD_MB 可调）", limit_mb)
+    if _wants_json():
+        return jsonify({"error": message}), 413
+    return message, 413
 
 
 def _require_stats():
@@ -313,6 +330,7 @@ def register(app):
     app.before_request(log_request)
     app.after_request(log_response)
     app.context_processor(inject_stats_flag)
+    app.register_error_handler(413, upload_too_large)
     app.add_url_rule("/", "index", index)
     app.add_url_rule("/upload", "upload", upload, methods=["POST"])
     app.add_url_rule("/dashboard", "dashboard", dashboard)

@@ -27,7 +27,9 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import threading
+import time
 
 from config import (
     AI_CACHE_DIR,
@@ -84,6 +86,26 @@ def available(chat_hash: str = "") -> bool:
 def session_media_dir(chat_hash: str) -> str:
     """WebUI 上传的图片副本目录：uploads/media/<chat_hash>/"""
     return os.path.join(UPLOAD_FOLDER, MEDIA_SUBDIR, chat_hash or "nohash")
+
+
+def purge_session_media(chat_hash: str) -> int:
+    """删除某次上传的图片副本目录，返回删掉的文件数。
+
+    聊天被替换或删除时级联调用：源文件及其派生结果都清了，图片本体没有理由留着
+    （它的唯一用途是"生产摘要"，而摘要已按图片指纹另行缓存）。
+    """
+    if not chat_hash:
+        return 0
+    target = session_media_dir(chat_hash)
+    if not os.path.isdir(target):
+        return 0
+    try:
+        count = sum(1 for name in os.listdir(target)
+                    if os.path.isfile(os.path.join(target, name)))
+    except OSError:
+        count = 0
+    shutil.rmtree(target, ignore_errors=True)
+    return count
 
 
 def _within(root: str, path: str) -> bool:
@@ -222,6 +244,7 @@ def _cache_path(chat_hash: str, key: str) -> str:
 
 
 def _read_cache(path: str):
+    """读摘要缓存；旧格式（只有 digest 字段）同样兼容"""
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -237,10 +260,15 @@ def _read_cache(path: str):
 
 
 def _write_cache(path: str, digest: str) -> None:
+    """写摘要缓存，并记下创建时间。
+
+    创建时间是"绝对 90 天上限"的依据（清理任务读 _created）：只写 mtime 的话，
+    天天看的报告会把 mtime 一直续期，这类含聊天图片描述的缓存就永远不会被回收。
+    """
     tmp = f"{path}.tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"digest": digest}, f, ensure_ascii=False)
+            json.dump({"_created": time.time(), "digest": digest}, f, ensure_ascii=False)
         os.replace(tmp, path)
     except OSError as e:
         logger.warning("图片摘要缓存写入失败: %s", e)

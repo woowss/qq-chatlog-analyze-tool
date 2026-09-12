@@ -43,6 +43,18 @@ if "QQCHAT_DATA_DIR" not in os.environ:
 # 需要它的用例会自行开启并指向临时目录。
 os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
 
+# 本进程的临时目录统一挪到数据目录下，两个好处：
+# 1) %TEMP% 只读受限的环境（沙箱、部分容器）里 tempfile.* 不再直接 PermissionError；
+# 2) 用例产生的临时json/图片/表情包都落在数据目录内，随测试隔离目录一起回收，
+#    不会在用户 %TEMP% 里留下上百个 qqchatlog-* 垃圾目录。
+_TMP_ROOT = os.path.join(os.environ["QQCHAT_DATA_DIR"], "tmp")
+os.makedirs(_TMP_ROOT, exist_ok=True)
+tempfile.tempdir = _TMP_ROOT
+
+# 别名与项目模块的导入都必须排在环境准备之后（提前导入会把开关读成默认值）
+from webapp import cleanup as cleanupmod  # noqa: E402
+from webapp import store as storemod  # noqa: E402
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from parser.qq_parser import CST, ChatData, Message  # noqa: E402
@@ -292,28 +304,28 @@ class TestStatsCache(unittest.TestCase):
             filepath = sess["filepath"]
             self.assertNotIn("overview", sess, "统计结果不应再塞进 session")
             self.assertNotIn("daily_counts", sess)
-        appmod.wait_for_stats(chat_hash)   # 统计已挪到后台线程，断言前先收口
+        storemod.wait_for_stats(chat_hash)   # 统计已挪到后台线程，断言前先收口
         try:
-            stats = appmod._load_stats(chat_hash)
+            stats = storemod._load_stats(chat_hash)
             self.assertIsNotNone(stats)
             self.assertIn("overview", stats)
             self.assertNotIn("word_freq", stats, "词频应懒算，不该在上传时就算")
 
             # 结构版本不匹配时判为过期（避免旧结构把模板打 500）
-            path = appmod._stats_path(chat_hash)
+            path = storemod._stats_path(chat_hash)
             with open(path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
             raw["_v"] = 0
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(raw, f, ensure_ascii=False)
-            self.assertIsNone(appmod._load_stats(chat_hash))
+            self.assertIsNone(storemod._load_stats(chat_hash))
 
             # 懒算词频：访问 habits 页后应写回统计缓存
             client.get("/habits")
-            stats2 = appmod._load_stats(chat_hash)
+            stats2 = storemod._load_stats(chat_hash)
             self.assertIsNone(stats2)           # _v 已被改坏 → 但页面不该崩
         finally:
-            appmod._purge_chat_caches(chat_hash)
+            storemod._purge_chat_caches(chat_hash)
             if filepath and os.path.exists(filepath):
                 os.remove(filepath)
 
@@ -329,7 +341,7 @@ class TestStatsCache(unittest.TestCase):
                     storemod, "_load_chat_cached",
                     return_value=_chat([_msg("u1", 1704067200000, "今天加班到十点")])), \
                  mock.patch.object(storemod, "_save_stats") as saved:
-                out = appmod._stats_with_word_freq(dict(stats), "hashW")
+                out = storemod._stats_with_word_freq(dict(stats), "hashW")
         self.assertIn("word_freq", out)
         self.assertTrue(saved.called)
 
@@ -406,8 +418,7 @@ class TestPromptFingerprint(unittest.TestCase):
                                 "改了时间标记口径必须换指纹")
 
     def test_cache_key_uses_fingerprint_not_manual_version(self):
-        import app as appmod
-        path = appmod._cache_path("emotion", "deadbeefdeadbeef")
+        path = storemod._cache_path("emotion", "deadbeefdeadbeef")
         self.assertIn(dc.PROMPT_FINGERPRINT, path)
         self.assertNotIn("v2.", os.path.basename(path))
 
@@ -442,13 +453,12 @@ class TestCacheRetention(unittest.TestCase):
             p.stop()
 
     def test_absolute_cap_removes_frequently_read_cache(self):
-        import app as appmod
         with tempfile.TemporaryDirectory() as tmp:
             patches = self._patch_dirs(tmp)
             self._start(patches)
             try:
-                appmod._write_cache("emotion", "hashOld", {"a": 1})
-                path = appmod._cache_path("emotion", "hashOld")
+                storemod._write_cache("emotion", "hashOld", {"a": 1})
+                path = storemod._cache_path("emotion", "hashOld")
                 # 模拟"创建于 100 天前、但昨天刚被读过"（mtime 新，_created 很老）
                 with open(path, "r", encoding="utf-8") as f:
                     payload = json.load(f)
@@ -456,20 +466,19 @@ class TestCacheRetention(unittest.TestCase):
                 with open(path, "w", encoding="utf-8") as f:
                     json.dump(payload, f, ensure_ascii=False)
                 os.utime(path, None)
-                appmod._cleanup_old_files()
+                cleanupmod.cleanup_old_files()
                 self.assertFalse(os.path.exists(path), "超过绝对上限的缓存必须删除")
             finally:
                 self._stop(patches)
 
     def test_sliding_window_keeps_active_cache(self):
-        import app as appmod
         with tempfile.TemporaryDirectory() as tmp:
             patches = self._patch_dirs(tmp)
             self._start(patches)
             try:
-                appmod._write_cache("emotion", "hashNew", {"a": 1})
-                appmod._cleanup_old_files()
-                self.assertTrue(os.path.exists(appmod._cache_path("emotion", "hashNew")))
+                storemod._write_cache("emotion", "hashNew", {"a": 1})
+                cleanupmod.cleanup_old_files()
+                self.assertTrue(os.path.exists(storemod._cache_path("emotion", "hashNew")))
             finally:
                 self._stop(patches)
 
