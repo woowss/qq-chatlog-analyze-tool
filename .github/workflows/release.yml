@@ -90,8 +90,15 @@ jobs:
             echo
             echo '完整变更见 `CHANGELOG.md`。'
           } > notes.md
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
-            --notes-file notes.md \
-            --draft \
-            .tmp_dist/*.whl .tmp_dist/*.tar.gz .tmp_dist/SHA256SUMS.txt
+          # 幂等：同一 tag 重复触发（重跑 / 改 tag 后重推）时 create 会因"已存在"而失败，
+          # 所以先看有没有，有就只更新说明，附件一律用 --clobber 覆盖
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file notes.md \
+              --draft
+          fi
+          gh release upload "$GITHUB_REF_NAME" \
+            .tmp_dist/*.whl .tmp_dist/*.tar.gz .tmp_dist/SHA256SUMS.txt --clobber
