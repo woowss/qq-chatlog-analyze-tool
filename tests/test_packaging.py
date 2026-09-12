@@ -256,11 +256,11 @@ class TestDependencyDeclarations(unittest.TestCase):
         undeclared = sorted(self._imported() - self._declared())
         self.assertEqual(undeclared, [], f"这些包被 import 了却没写进 dependencies: {undeclared}")
 
-    def test_declared_runtime_deps_are_the_expected_five(self):
-        """依赖面有意保持在 5 个直连包；多一个都要在这里显式改，避免悄悄膨胀"""
+    def test_declared_runtime_deps_are_the_expected_six(self):
+        """依赖面有意保持在 6 个直连包；多一个都要在这里显式改，避免悄悄膨胀"""
         self.assertEqual(
             self._declared(),
-            {"flask", "flask-session", "openai", "jieba", "python-dotenv"},
+            {"flask", "flask-session", "cachelib", "openai", "jieba", "python-dotenv"},
         )
 
     def test_requirements_pins_every_declared_dependency(self):
