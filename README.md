@@ -99,7 +99,7 @@ AI 分析，而消息正文保持干净（文件名和占位符不会进入词�
 
 ```bash
 # 方式 A（推荐）：直接装 Release 里的 wheel，装完即得 qqchatlog 命令
-pip install https://github.com/woowss/qq-chatlog-analyze-tool/releases/download/v1.1.0/qqchatlog-1.1.0-py3-none-any.whl
+pip install https://github.com/woowss/qq-chatlog-analyze-tool/releases/download/v1.1.1/qqchatlog-1.1.1-py3-none-any.whl
 qqchatlog --version
 
 # 方式 B：从源码装成命令（想改代码就用可编辑安装）
