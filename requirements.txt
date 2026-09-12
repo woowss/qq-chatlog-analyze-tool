@@ -9,7 +9,7 @@ Flask-Session==0.8.0
 cachelib==0.14.0
 openai==1.61.0
 jieba==0.42.1
-python-dotenv==1.2.2
+python-dotenv==1.2.3
 
 # 以下是上面几个包的运行期需求，本项目不直接 import，但**不能删**：
 #   msgspec  —— Flask-Session 的消息序列化（SESSION_SERIALIZATION_FORMAT=msgpack）依赖
@@ -18,7 +18,7 @@ python-dotenv==1.2.2
 #   其余（click/itsdangerous/Jinja2/MarkupSafe/Werkzeug）同属这些包的传递依赖，
 #   固定版本是为了让 CI 与本地装出同一套环境。
 blinker==1.9.0
-click==8.4.2
+click==8.5.0
 colorama==0.4.6
 itsdangerous==2.2.0
 Jinja2==3.1.6
