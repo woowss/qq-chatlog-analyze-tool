@@ -1096,14 +1096,17 @@ class TestJobDedup(unittest.TestCase):
                 self.assertIn("job", b1)
                 self.assertEqual(b1["job"], b2["job"])  # 复用同一任务
                 self.assertTrue(b2.get("reused"))
-            release.set()
-            deadline = time.time() + 15
-            while time.time() < deadline:
-                s = client.get("/api/analyze-job/" + b1["job"]).get_json()
-                if s.get("status") in ("done", "error", "cancelled"):
-                    break
-                time.sleep(0.1)
-            self.assertEqual(s.get("status"), "done")
+                # 放行与轮询必须留在 mock 生效区间内：worker 线程可能还没被调度到
+                # _call_api，主线程若这时退出 with，patch 就被撤销，后台任务会一头撞上
+                # "测试中禁止真实 LLM 调用"护栏变成 error（CI 上稳定复现的竞态）。
+                release.set()
+                deadline = time.time() + 15
+                while time.time() < deadline:
+                    s = client.get("/api/analyze-job/" + b1["job"]).get_json()
+                    if s.get("status") in ("done", "error", "cancelled"):
+                        break
+                    time.sleep(0.1)
+                self.assertEqual(s.get("status"), "done")
         finally:
             release.set()
             if uploaded_path and os.path.exists(uploaded_path):

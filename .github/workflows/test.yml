@@ -9,6 +9,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      # 不 fail-fast：一个版本红就把其余三个取消，等于放弃"到底哪些版本真的受影响"
+      # 这条信息（曾因此把一个只在 3.10 上暴露的竞态误读成"测试通过后被取消"）。
+      fail-fast: false
       matrix:
         # 3.14 进矩阵是为了让 pyproject.toml 的 classifier 名副其实：
         # 只写 "支持 3.14" 却不在 3.14 上跑，等于对外声明一件没人验证过的事。
