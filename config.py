@@ -116,7 +116,7 @@ def _env_choice(name: str, default: str, allowed: tuple) -> str:
     return raw
 
 
-# 单次上传体积上限（MB）：超长聊天（实测 数万条私聊）导出的 JSON 会逼近 50MB，
+# 单次上传体积上限（MB）：超长聊天（实测数万条私聊）导出的 JSON 可达数十 MB，逼近默认上限，
 # 撞上限制时 Flask 直接回 413，用户只看到"上传失败"却不知为何，所以留一个可调口子。
 MAX_CONTENT_LENGTH = _env_int("QQCHAT_MAX_UPLOAD_MB", 50, 1, 4096) * 1024 * 1024
 

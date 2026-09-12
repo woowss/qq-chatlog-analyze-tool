@@ -297,7 +297,7 @@ def calc_word_freq(chat: ChatData, top_n: int = 50) -> dict:
 
     # UID 正则：16 位以上字母数字下划线组合
     _RE_UID = re.compile(r"^[a-zA-Z0-9_]{16,}$")
-    # 单词+数字混合（如 "1W2g", "3bcc2a8b5d9b8f30171ee1fba56fb201"）
+    # 单词+数字混合（如 "1W2g", "0123456789abcdef0123456789abcdef"）
     _RE_MIXED = re.compile(r"^(?:\d+[a-zA-Z]+|[a-zA-Z]+\d+)[a-zA-Z0-9]*$")
 
     def _count(texts: list[str]) -> list[dict]:
