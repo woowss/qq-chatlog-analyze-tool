@@ -32,9 +32,34 @@ DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"
 # 应用配置
 BASE_DIR = Path(__file__).parent
 
-# 数据目录：默认在项目内，可用 QQCHAT_DATA_DIR 整体迁移（测试/多实例友好），
+
+def _is_source_checkout() -> bool:
+    """当前是"源码检出"还是"pip 安装后的 site-packages"
+
+    用构建元数据判断：源码检出里 config.py 旁边有 pyproject.toml 与 app.py；
+    wheel 装出来的目录只有 .py 文件与 dist-info。两者的数据目录默认值不同——
+    源码跑沿用历史行为（数据在仓库内，README/测试脚本都这么描述），
+    安装后不能往 site-packages 写 uploads/ai_cache（可能只读，升级/卸载还会丢数据）。
+    """
+    return (BASE_DIR / "pyproject.toml").is_file() and (BASE_DIR / "app.py").is_file()
+
+
+def _user_data_dir() -> Path:
+    """安装态的用户级数据目录，按各平台惯例取值（不为这点事引入 platformdirs 依赖）"""
+    if os.name == "nt":
+        root = os.getenv("LOCALAPPDATA", "").strip() or Path.home() / "AppData" / "Local"
+    elif sys.platform == "darwin":
+        root = Path.home() / "Library" / "Application Support"
+    else:
+        root = os.getenv("XDG_DATA_HOME", "").strip() or Path.home() / ".local" / "share"
+    return Path(root) / "qqchatlog"
+
+
+# 数据目录：源码运行时默认在项目内（历史行为）；pip 安装后落到用户数据目录。
+# 都可用 QQCHAT_DATA_DIR 整体迁移（测试/多实例友好），
 # 也可用 UPLOAD_DIR / SESSION_DIR / AI_CACHE_DIR 单独覆盖。
-DATA_DIR = Path(os.getenv("QQCHAT_DATA_DIR", "").strip() or BASE_DIR)
+DEFAULT_DATA_DIR = BASE_DIR if _is_source_checkout() else _user_data_dir()
+DATA_DIR = Path(os.getenv("QQCHAT_DATA_DIR", "").strip() or DEFAULT_DATA_DIR)
 UPLOAD_FOLDER = os.getenv("UPLOAD_DIR", "").strip() or str(DATA_DIR / "uploads")
 SESSION_FILE_DIR = os.getenv("SESSION_DIR", "").strip() or str(DATA_DIR / "flask_session")
 AI_CACHE_DIR = os.getenv("AI_CACHE_DIR", "").strip() or str(DATA_DIR / "ai_cache")

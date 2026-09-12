@@ -45,13 +45,25 @@ AI 分析，而消息正文保持干净（文件名和占位符不会进入词�
 用 QQChatExporter 导出私聊记录为 JSON。准备使用图片理解时，导出时勾选导出资源文件
 （`includeResourceLinks`），导出目录下会有 `resources/`。
 
-### 2. 安装依赖
+### 2. 安装
+
+需要 Python 3.10 或更高版本。两种方式选一种：
 
 ```bash
+# 方式 A（推荐）：装成本机命令，之后任何目录都能用 qqchatlog 启动
+pip install .
+qqchatlog --version
+
+# 方式 B：源码直接跑（开发/改造时用），依赖照旧从 requirements.txt 装
 pip install -r requirements.txt
+python app.py
 ```
 
-需要 Python 3.10 或更高版本。
+方式 A 会把 `web/templates`、`web/static`（含本地化的 Bootstrap/jQuery/ECharts）作为 package-data 一起装进
+wheel，所以装完不依赖源码目录；方式 B 就是原来的用法。数据目录两种方式都可用 `QQCHAT_DATA_DIR` 指定（见
+下文「配置项」），源码运行时默认落在仓库内，pip 安装后默认落在用户数据目录（Windows
+`%LOCALAPPDATA%\qqchatlog`、Linux `~/.local/share/qqchatlog`、macOS
+`~/Library/Application Support/qqchatlog`），不会往 site-packages 里写上传与缓存文件。
 
 ### 3. 配置 API Key（可选）
 
@@ -76,13 +88,18 @@ DEEPSEEK_BASE_URL=https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mod
 ### 4. 启动
 
 ```bash
-python app.py
+qqchatlog          # pip install . 装出来的命令
+python app.py      # 源码运行，等价入口
 ```
+
+两者跑的是同一个 `app:main`：先打印启动横幅与自检结果（API Key、数据目录、上传上限、口令与 Origin 提醒），
+再交给 Flask 起服务。也可以用 `flask --app app run`（只跳过横幅，其余一致）。
 
 浏览器打开 http://localhost:5000 。默认只监听 `127.0.0.1`，调试模式关闭。
 
 端口被占用时（Windows 上 5000 常被占用）在 `.env` 里设 `FLASK_PORT=5001`。本地开发需要自动重载时设
-`FLASK_DEBUG=true`，注意调试器可以执行任意代码，只在本机使用。
+`FLASK_DEBUG=true`，注意调试器可以执行任意代码，只在本机使用。绑定地址、端口、调试开关都走 `.env`／环境
+变量：Origin 白名单是按启动时的 `FLASK_HOST` 算的，所以命令行不提供 `--host/--port`（只有 `--version`）。
 
 ### 5. 使用
 
@@ -190,7 +207,7 @@ emoji 或表情名显示。想要 100% 原样，可以把 `QQCHAT_FACE_DIR` 指�
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `QQCHAT_DATA_DIR` | 项目目录 | 数据总目录，可整体迁到别处 |
+| `QQCHAT_DATA_DIR` | 源码运行：项目目录；pip 安装：用户数据目录（见「安装」一节） | 数据总目录，可整体迁到别处 |
 | `UPLOAD_DIR` / `SESSION_DIR` / `AI_CACHE_DIR` / `STATS_CACHE_DIR` / `LOG_DIR` / `FACE_CACHE_DIR` | 数据目录下各子目录 | 单独覆盖某一类数据的位置 |
 | `TOKEN_USAGE_FILE` | `logs/token_usage.json` | token 用量统计文件位置 |
 | `LOG_RETENTION_DAYS` | 7 | 日志按天轮转保留天数 |
@@ -211,23 +228,29 @@ AI 分析发送给你自己配置的接口，发送的内容包括：
 
 | 目录 | 策略 |
 |---|---|
-| `uploads/`、`flask_session/` | 超过 24 小时回收（启动时一次，之后每小时随请求触发一次） |
+| `uploads/`、`flask_session/` | 超过 24 小时回收（启动时一次，之后每小时随请求触发一次）。`uploads/` 是**递归**回收的：看图用的图片副本在 `uploads/media/<哈希>/`，属于子目录，早先只扫一层文件会导致它们永不回收 |
 | `ai_cache/`、`stats_cache/` | 滑动 30 天 + 绝对 90 天，两条上限同时生效 |
 | `logs/` | 按天轮转，默认保留 7 天，昵称脱敏 |
 | `face_cache/` | QQ 表情原图，与聊天内容无关，可随时删除 |
 
-重新上传时，旧文件及其派生缓存立即删除；删除聊天记录时，对应的统计缓存、AI 缓存、图片摘要一并回收。
-想立即清除全部数据，删除上述目录即可，或者用 `QQCHAT_DATA_DIR` 把数据整体放到别处。
+重新上传时，旧文件及其派生缓存立即删除；删除聊天记录时，对应的统计缓存、AI 缓存、图片摘要**以及
+`uploads/media/<哈希>/` 里的图片副本**一并回收。想立即清除全部数据，删除上述目录即可，或者用
+`QQCHAT_DATA_DIR` 把数据整体放到别处（`.secret_key` 也会跟着数据目录走）。
 
-其它安全措施：服务默认只绑定回环地址，POST 请求同时校验 CSRF token 与 Origin；绑定非回环地址时若未设置
+其它安全措施：服务默认只绑定回环地址，POST 请求同时校验 CSRF token 与 Origin（登录后的 `next=` 跳转
+只接受站内路径，含 `/\host` 这类反斜杠变体）；绑定非回环地址时若未设置
 `ACCESS_PASSWORD` 则拒绝启动，Origin 白名单不信任请求自带的 Host（防 DNS rebinding）；登录接口对同一 IP
-有失败限流。导出的 HTML 报告会剥掉 CSRF token、把第三方资源换回 CDN、自有样式与表情图内联，可以直接分享。
+有失败限流。所有响应都带 `X-Content-Type-Options`、`X-Frame-Options`、`Referrer-Policy` 与同源 CSP，
+即便某处渲染漏了转义也拿不到跨站资源。导出的 HTML 报告会剥掉 CSRF token、把第三方资源换回 CDN
+（并带上 SRI `integrity` + `crossorigin`；哈希与本地 vendor 文件由 `tests/test_sri.py` 钉死，
+升级资源后可用 `python tools/verify_vendor_sri.py` 联网复核）、自有样式与表情图内联，
+可以直接分享（导出走 DOM 节点操作，不再对整页 HTML 做正则替换）。
 
 ## 项目结构
 
 ```
 qqchatlog/
-├── app.py                     # 组装入口：Flask 初始化、启动横幅、测试兼容重导出
+├── app.py                     # 组装入口：Flask 初始化 + 命令行 main()（qqchatlog 命令）、测试兼容重导出
 ├── config.py                  # 配置读取
 ├── parser/qq_parser.py        # QQ JSON 解析（含多人记录防线）
 ├── analyzer/
@@ -246,18 +269,24 @@ qqchatlog/
 │   ├── cleanup.py             # 临时文件与缓存的生命周期回收
 │   ├── views.py               # 页面路由（含上传）
 │   └── api.py                 # /api/* 路由
-├── web/
+├── web/                       # 前端资源（作为数据包随 wheel 分发）
+│   ├── __init__.py            # 让 web/ 成为包并给出 templates/static 的包内绝对路径
 │   ├── templates/             # 页面模板
 │   └── static/
 │       ├── css/style.css      # 样式与日/夜主题
 │       ├── js/                # 图表渲染与任务轮询
 │       └── vendor/            # Bootstrap、jQuery、ECharts（本地化）
-├── tests/                     # unittest：core / hardening / optimizations / review_fixes / review_round2 / sri / smoke
+├── tests/                     # unittest：core / hardening / optimizations / review_fixes / review_round2 / sri / smoke / packaging
 ├── tools/verify_vendor_sri.py # 导出报告用的 SRI 哈希：联网复核 本地 <-> CDN <-> 内联常量
+├── tools/verify_wheel.py      # 拆 wheel 核对：代码、templates/static、qqchatlog 入口点、依赖元数据
 ├── docs/                      # 早期设计文档与界面预览（内容已过时，以本 README 为准）
-├── pyproject.toml             # ruff 配置
-└── .github/workflows/test.yml # CI：ruff + py_compile + unittest
+├── pyproject.toml             # 打包元数据（console_scripts / package-data）+ ruff 配置
+└── .github/workflows/test.yml # CI：ruff + py_compile + unittest，另有一条 wheel 构建/安装验证
 ```
+
+`qqchatlog = app:main` 由 `[project.scripts]` 声明，`pip install .` 时生成同名命令；模板与静态资源的
+package-data 覆盖范围由 `tests/test_packaging.py` 在源码侧逐个文件核对，CI 的 package job 再真正构建
+wheel、用 `tools/verify_wheel.py` 拆包比对，并装进干净 venv 跑一次 `qqchatlog --version`。
 
 上传目录、缓存目录、日志目录在首次运行时自动创建。
 
