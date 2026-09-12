@@ -1,0 +1,73 @@
+<!--
+Copyright (C) 2026 woowss
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-->
+{% extends "base.html" %}
+{% block title %}成员画像{% endblock %}
+
+{% block head %}
+<script src="{{ url_for('static', filename='js/group_charts.js') }}?v={{ asset_v }}"></script>
+{% endblock %}
+
+{% block content %}
+
+<h2 class="page-title">成员画像 <span class="sub">{{ overview.group_name }} · 本次分析 {{ ai_plan.members }} 位成员</span></h2>
+
+<div class="alert alert-secondary small">
+    成员画像看的是"<strong>在这个群里</strong>的样子"：样本是该成员的发言，前面附上本地精确统计的互动数字
+    （被回复 / 被@ / 主要互动对象），并明确区分事实与推断。发言极少的人会被跳过，不硬凑。
+</div>
+
+<div class="card mb-4">
+    <div class="card-header">本次分析的成员 <small class="text-muted ms-2">按发言量排序，自己必定入选</small></div>
+    <div class="card-body">
+        <div class="d-flex flex-wrap gap-2">
+            {% for m in member_activity[:ai_plan.members] %}
+            <span class="badge bg-secondary">{{ m.name }}{% if m.is_self %}（我）{% endif %} · {{ m.msg_count }} 条</span>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+
+{% if api_ok %}
+<div class="card mb-4">
+    <div class="card-header">成员画像</div>
+    <div class="card-body">
+        <div class="d-flex gap-2 flex-wrap mb-3">
+            <button class="btn btn-outline-primary btn-analyze" data-dim="member_profiles" data-orig="分析成员画像" data-target="sec-profiles">分析成员画像</button>
+            <div class="form-check ms-2 d-flex align-items-center">
+                <input class="form-check-input me-2" type="checkbox" id="forceRefresh">
+                <label class="form-check-label small text-muted" for="forceRefresh">强制重分析（会产生 API 费用）</label>
+            </div>
+        </div>
+        <div id="analyzeStatus"></div>
+        <div id="sec-profiles" class="mt-3"><div class="text-muted small">尚未分析（命中缓存则自动显示）</div></div>
+    </div>
+</div>
+{% else %}
+<div class="alert alert-warning small">未配置 API Key：本地统计照常可用。</div>
+{% endif %}
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+const MEMBERS = {{ member_activity | tojson }};
+loadGroupAnalysis('member_profiles', document.getElementById('sec-profiles'), function (el, data) {
+    return renderMemberProfiles(el, data, MEMBERS);
+});
+wireGroupAnalyzeButtons(MEMBERS);
+</script>
+{% endblock %}

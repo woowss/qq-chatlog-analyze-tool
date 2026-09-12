@@ -32,6 +32,8 @@ import json
 import os
 import time
 
+from flask import request
+
 from config import (
     AI_CACHE_DIR,
     LOG_DIR,
@@ -42,6 +44,7 @@ from config import (
 )
 from analyzer.deepseek_client import sweep_orphan_month_cache
 from analyzer.logger import get_logger
+from webapp.security import BYPASS_ENDPOINTS
 
 logger = get_logger("app")
 
@@ -106,6 +109,20 @@ def _purge_tree(root: str, expired) -> int:
     return removed
 
 
+def _older_than(now: float, seconds: float):
+    """返回"该文件是否早于 now-seconds"的判定函数。
+
+    显式把 now 冻进闭包，而不是让 lambda 直接引用外层的循环变量：读的人不必
+    再去确认 now 在后面有没有被改写（原先两个 lambda 共享同一个 now，加一处
+    赋值就会同时改变两处的判定口径）。
+    """
+
+    def expired(path: str) -> bool:
+        return now - os.path.getmtime(path) > seconds
+
+    return expired
+
+
 def cleanup_old_files(
     max_age_seconds: int = 86400, cache_max_age: int = 30 * 86400, cache_hard_max_age: int = 90 * 86400
 ) -> int:
@@ -113,19 +130,21 @@ def cleanup_old_files(
     now = time.time()
     cleaned = 0
     for directory in (UPLOAD_FOLDER, SESSION_FILE_DIR):
-        cleaned += _purge_tree(directory, lambda p: now - os.path.getmtime(p) > max_age_seconds)
-    for directory in (AI_CACHE_DIR, STATS_CACHE_DIR):
-        cleaned += _purge_dir(
-            directory,
-            lambda p: (
-                now - os.path.getmtime(p) > cache_max_age or now - _cache_created_at(p) > cache_hard_max_age
-            ),
+        cleaned += _purge_tree(directory, _older_than(now, max_age_seconds))
+
+    def _cache_expired(path: str) -> bool:
+        """缓存的双上限：滑动 30 天（按 mtime，命中即续期）+ 绝对 90 天（按 _created）"""
+        return (
+            now - os.path.getmtime(path) > cache_max_age or now - _cache_created_at(path) > cache_hard_max_age
         )
+
+    for directory in (AI_CACHE_DIR, STATS_CACHE_DIR):
+        cleaned += _purge_dir(directory, _cache_expired)
     # 所有轮转出的旧日志一律按保留天数回收：既覆盖历史遗留的按大小产物
     # （app.log.1 / app.log.2…，新 handler 不认领它们），也兜住应用长期闲置
     # 时 TimedRotatingFileHandler 来不及在轮转中删掉的日期文件。
     log_cutoff = LOG_RETENTION_DAYS * 86400
-    cleaned += _purge_dir(LOG_DIR, lambda p: now - os.path.getmtime(p) > log_cutoff, name_prefix="app.log.")
+    cleaned += _purge_dir(LOG_DIR, _older_than(now, log_cutoff), name_prefix="app.log.")
     try:
         cleaned += sweep_orphan_month_cache()
     except Exception as e:  # 回收失败不影响主流程
@@ -156,6 +175,13 @@ def startup_cleanup() -> None:
     _last_cleanup[0] = time.time()
 
 
+def cleanup_hook():
+    """before_request 钩子：健康探针不触发清理（它可能每秒被调一次）"""
+    if request.endpoint in BYPASS_ENDPOINTS:
+        return None
+    return maybe_cleanup()
+
+
 def register(app):
     """每个请求过一遍带间隔去抖的清理：只开着不上传也不再漏回收"""
-    app.before_request(lambda: maybe_cleanup())
+    app.before_request(cleanup_hook)

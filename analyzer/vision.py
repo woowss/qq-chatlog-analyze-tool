@@ -73,9 +73,31 @@ SUPPORTED_EXT = frozenset(_SUPPORTED)  # 供上传接口做扩展名白名单
 MEDIA_UPLOAD_MAX_FILES = 400
 MEDIA_UPLOAD_MAX_BYTES = 256 * 1024 * 1024
 
-_MEMO: dict[str, str] = {}  # 进程内摘要缓存：key -> 摘要文本
+# 进程内摘要缓存：key -> 摘要文本，按 LRU 淘汰（依赖 dict 的插入序，3.7+ 有语言保证）。
+# 不用"超限就 clear()"：这里的每一条背后都是一次**付费**的视觉调用，全清等于下次把
+# 同一批图重新送一遍模型（重新计费 + 重新等待）。另外原来的容量检查只写在"调模型"
+# 那条路径上，命中磁盘缓存那条路径根本没查——条目数本就可以越过上限。
+_MEMO: dict[str, str] = {}
 _MEMO_LOCK = threading.Lock()
 _MEMO_MAX = 64
+
+
+def _memo_get(key: str) -> str | None:
+    """读进程内摘要缓存，并把命中项挪到"最近使用"一端（自带加锁，调用方不要另加）"""
+    with _MEMO_LOCK:
+        if key not in _MEMO:
+            return None
+        _MEMO[key] = _MEMO.pop(key)  # 重新插到末尾 = 最近使用
+        return _MEMO[key]
+
+
+def _memo_put(key: str, text: str) -> None:
+    """写进程内摘要缓存并淘汰最久未用的（自带加锁，调用方不要另加）"""
+    with _MEMO_LOCK:
+        _MEMO.pop(key, None)
+        _MEMO[key] = text
+        while len(_MEMO) > _MEMO_MAX:
+            _MEMO.pop(next(iter(_MEMO)))  # 淘汰最久未用
 
 
 def available(chat_hash: str = "") -> bool:
@@ -300,15 +322,13 @@ def digest(msgs: list, chat_hash: str = "", label: str = "") -> str:
     if not images:
         return ""
     key = _images_key(images)
-    with _MEMO_LOCK:
-        hit = _MEMO.get(key)
+    hit = _memo_get(key)
     if hit is not None:
         return hit
     path = _cache_path(chat_hash or "nohash", key)
     cached = _read_cache(path)
     if cached is not None:
-        with _MEMO_LOCK:
-            _MEMO[key] = cached
+        _memo_put(key, cached)
         return cached
 
     from analyzer import deepseek_client as dc  # 延迟导入，避免循环依赖
@@ -317,10 +337,7 @@ def digest(msgs: list, chat_hash: str = "", label: str = "") -> str:
     if not text:
         return ""
     _write_cache(path, text)
-    with _MEMO_LOCK:
-        if len(_MEMO) > _MEMO_MAX:
-            _MEMO.clear()
-        _MEMO[key] = text
+    _memo_put(key, text)
     logger.info("图片摘要完成：%d 张（%s）", len(images), label or "本批")
     return text
 

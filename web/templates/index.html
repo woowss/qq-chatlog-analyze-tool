@@ -181,8 +181,12 @@ $(function() {
         if (!pickedJson) { return; }
         e.preventDefault();
         $('#submitBtn').prop('disabled', true).text('上传中…');
-        // 上传新聊天记录时清掉上一次的 AI 分析结果，避免在新聊天页面展示旧数据
-        ['emotion', 'relationship', 'habits', 'topics', 'profile'].forEach(function(k) {
+        // 上传新聊天记录时清掉上一次的 AI 分析结果，避免在新聊天页面展示旧数据。
+        // 私聊 5 维 + 群聊 4 维都要清：上传页此刻的会话可能是上一条记录（私聊或群聊），
+        // 而 loadAnalysis 在服务端缓存未命中时会回退到 sessionStorage——只清一半就会出现
+        // "换了文件还显示上一份的群聊分析结果"。两个列表的并集是唯一安全的选择。
+        ['emotion', 'relationship', 'habits', 'topics', 'profile',
+         'group_dynamics', 'group_topics', 'group_emotion', 'member_profiles'].forEach(function(k) {
             sessionStorage.removeItem('ai_' + k);
         });
         var fd = new FormData();

@@ -1,0 +1,137 @@
+<!--
+Copyright (C) 2026 woowss
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-->
+{% extends "base.html" %}
+{% block title %}群聊报告{% endblock %}
+
+{% block head %}
+{% include "_report_style.html" %}
+<script src="{{ url_for('static', filename='js/group_charts.js') }}?v={{ asset_v }}"></script>
+{% endblock %}
+
+{% block content %}
+<div class="report-header">
+    <h1>QQ 群聊分析报告</h1>
+    <p class="meta">
+        {{ overview.group_name }} · {{ overview.member_count }} 位成员 ·
+        {{ overview.total_messages }} 条消息 · {{ overview.first_day if overview.first_day else '' }}
+        {% if milestones.first_day %}（{{ milestones.first_day }} ~ {{ milestones.last_day }}）{% endif %}
+    </p>
+    <div class="mt-3">
+        <button class="btn btn-primary no-print" onclick="window.print()">打印 / 导出 PDF</button>
+        <button class="btn btn-outline-secondary no-print ms-2" onclick="downloadReport()">下载 HTML</button>
+    </div>
+</div>
+
+<h5 class="section-title">群概览</h5>
+<div class="stat-grid">
+    <div class="stat-item"><div class="num">{{ overview.total_messages }}</div><div class="label">总消息数</div></div>
+    <div class="stat-item"><div class="num">{{ overview.member_count }}</div><div class="label">发言成员</div></div>
+    <div class="stat-item"><div class="num">{{ overview.total_days }}</div><div class="label">记录天数</div></div>
+    <div class="stat-item"><div class="num">{{ overview.avg_daily }}</div><div class="label">日均消息</div></div>
+    <div class="stat-item"><div class="num">{{ overview.peak_concurrent.count }}</div><div class="label">同时在线高峰（人）</div></div>
+    <div class="stat-item"><div class="num">{{ overview.total_images }}</div><div class="label">图片</div></div>
+    <div class="stat-item"><div class="num">{{ overview.total_faces }}</div><div class="label">表情</div></div>
+    <div class="stat-item"><div class="num">{{ overview.active_days }}</div><div class="label">有聊天天数</div></div>
+</div>
+
+<h5 class="section-title">成员活跃度</h5>
+<table class="ai-detail">
+    <thead><tr><th>成员</th><th>发言</th><th>占比</th><th>平均每条</th><th>活跃天数</th><th>被回复</th><th>回复别人</th><th>被@</th><th>@别人</th></tr></thead>
+    <tbody>
+    {% for m in member_activity %}
+        <tr>
+            <td>{{ m.name }}{% if m.is_self %}（我）{% endif %}</td>
+            <td>{{ m.msg_count }}</td>
+            <td>{{ (m.share * 100) | round(1) }}%</td>
+            <td>{{ m.avg_chars }}</td>
+            <td>{{ m.active_days }}</td>
+            {% set t = (interaction.totals | selectattr('uid', 'equalto', m.uid) | list | first) or {} %}
+            <td>{{ t.get('explicit_replied_by', 0) }}</td>
+            <td>{{ t.get('explicit_replies_to', 0) }}</td>
+            <td>{{ t.get('mentions_received', 0) }}</td>
+            <td>{{ t.get('mentions_sent', 0) }}</td>
+        </tr>
+    {% endfor %}
+    </tbody>
+</table>
+<p class="text-muted small">
+    「被回复/回复别人/被@/@别人」是导出器记录的精确信号；推断的「接话」不计入本表
+    （相邻消息换人且间隔在 30 分钟内，可信度低于精确回复）。
+    {% if interaction.truncated %}矩阵只保留发言最多的 {{ interaction.matrix_limit }} 位成员。{% endif %}
+</p>
+
+<h5 class="section-title">成员发言量</h5>
+<div id="memberBar" style="height: 360px;"></div>
+
+<h5 class="section-title">互动关系图</h5>
+<p class="text-muted small">实线=精确回复/@（事实）；虚线=相邻接话（推断）。节点越大发言越多。</p>
+<div id="relationGraph" style="height: 460px;"></div>
+
+<h5 class="section-title">互动热力矩阵</h5>
+<p class="text-muted small">纵向：谁先说；横向：谁接话。</p>
+<div id="interactionHeat" style="height: 460px;"></div>
+
+<h5 class="section-title">成员活跃时段</h5>
+<div id="memberHourly" style="height: 380px;"></div>
+
+<h5 class="section-title">群里程碑</h5>
+<table class="ai-detail">
+    <tr><th>记录跨度</th><td>{{ milestones.first_day }} ~ {{ milestones.last_day }}（{{ milestones.active_days }} 天有人说话）</td></tr>
+    <tr><th>最长连续</th><td>{{ milestones.longest_streak.days }} 天（{{ milestones.longest_streak.start }} 起）</td></tr>
+    <tr><th>最长沉默</th><td>{{ milestones.longest_silence.days }} 天（{{ milestones.longest_silence.before }} 之后）</td></tr>
+    <tr><th>单日峰值</th><td>{{ milestones.peak_day.date }} · {{ milestones.peak_day.count }} 条 · {{ milestones.peak_day_members }} 人发言</td></tr>
+    <tr><th>最活跃月份</th><td>{{ milestones.busiest_month.month }} · {{ milestones.busiest_month.count }} 条</td></tr>
+    <tr><th>深夜</th><td>0-6 点 {{ milestones.midnight_msgs }} 条（{{ milestones.midnight_days }} 天）；其中凌晨 2-5 点 {{ milestones.late_night_msgs }} 条</td></tr>
+</table>
+
+<h5 class="section-title">群聊动态</h5>
+<div id="sec-dynamics"><p class="text-muted">尚未分析</p></div>
+
+<h5 class="section-title">群聊话题</h5>
+<div id="sec-topics"><p class="text-muted">尚未分析</p></div>
+
+<h5 class="section-title">群聊情绪</h5>
+<div id="sec-emotion"><p class="text-muted">尚未分析</p></div>
+
+<h5 class="section-title">成员画像</h5>
+<div id="sec-profiles"><p class="text-muted">尚未分析</p></div>
+
+<p class="text-muted small mt-4">报告生成时间：<span id="reportGenTime"></span></p>
+{% endblock %}
+
+{% block scripts %}
+{% set report_download_name = 'QQ群聊分析报告_' ~ overview.group_name ~ '.html' %}{% include "_report_assets.html" %}
+$(function() {
+    $('#reportGenTime').text(new Date().toLocaleString('zh-CN'));
+
+    var MEMBERS = {{ member_activity | tojson }};
+    var INTERACTION = {{ interaction | tojson }};
+    renderMemberBar('memberBar', MEMBERS);
+    renderRelationGraph('relationGraph', INTERACTION, MEMBERS);
+    renderInteractionHeatmap('interactionHeat', INTERACTION);
+    renderMemberHourlyArea('memberHourly', {{ member_hourly | tojson }});
+
+    // 报告里的 AI 小节：进页面回读缓存后渲染（与私聊报告同一套机制）
+    loadGroupAnalysis('group_dynamics', document.getElementById('sec-dynamics'), renderGroupDynamics);
+    loadGroupAnalysis('group_topics', document.getElementById('sec-topics'), renderGroupTopics);
+    loadGroupAnalysis('group_emotion', document.getElementById('sec-emotion'), renderGroupEmotion);
+    loadGroupAnalysis('member_profiles', document.getElementById('sec-profiles'), function (el, data) {
+        return renderMemberProfiles(el, data, MEMBERS);
+    });
+});
+</script>
+{% endblock %}

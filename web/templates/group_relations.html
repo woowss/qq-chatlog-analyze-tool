@@ -1,0 +1,101 @@
+<!--
+Copyright (C) 2026 woowss
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-->
+{% extends "base.html" %}
+{% block title %}群聊关系{% endblock %}
+
+{% block head %}
+<script src="{{ url_for('static', filename='js/group_charts.js') }}?v={{ asset_v }}"></script>
+{% endblock %}
+
+{% block content %}
+
+<h2 class="page-title">群聊关系 <span class="sub">{{ overview.group_name }} · {{ overview.member_count }} 位成员</span></h2>
+
+<div class="card mb-4">
+    <div class="card-header">
+        互动关系图
+        <small class="text-muted ms-2">节点大小=发言量；实线=精确回复/@（事实），虚线=相邻接话（推断）</small>
+    </div>
+    <div class="card-body"><div id="relationGraph" style="height: 460px;"></div></div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-header">互动热力矩阵 <small class="text-muted ms-2">纵向：谁先说；横向：谁接话（30 分钟内的相邻发言）</small></div>
+    <div class="card-body"><div id="interactionHeat" style="height: 460px;"></div></div>
+</div>
+
+{% if interaction.truncated %}
+<div class="alert alert-secondary small">
+    矩阵只保留发言最多的 {{ interaction.matrix_limit }} 位成员（{{ interaction.dropped }} 位未进矩阵，
+    {{ interaction.dropped_replies }} 次推断互动未计入）。精确回复共 {{ interaction.reply_total }} 条，
+    其中 {{ interaction.reply_no_target }} 条的原消息已被删除；@点名共 {{ interaction.mention_total }} 次。
+</div>
+{% endif %}
+
+<div class="card mb-4">
+    <div class="card-header">谁最常和谁互动 <small class="text-muted ms-2">精确回复是事实、接话是推断，分开看</small></div>
+    <div class="card-body">
+        <table class="table table-sm table-hover mb-0">
+            <thead><tr><th>成员</th><th>被回复</th><th>回复别人</th><th>被@</th><th>@别人</th><th>被接话</th><th>接话</th></tr></thead>
+            <tbody>
+            {% for t in interaction.totals %}
+                <tr>
+                    <td>{% if t.is_self %}<span class="badge bg-warning">我</span> {% endif %}{{ t.name }}</td>
+                    <td>{{ t.explicit_replied_by }}</td>
+                    <td>{{ t.explicit_replies_to }}</td>
+                    <td>{{ t.mentions_received }}</td>
+                    <td>{{ t.mentions_sent }}</td>
+                    <td>{{ t.replied_by }}</td>
+                    <td>{{ t.replies_to }}</td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        <div class="small text-muted mt-2">「被接话/接话」是推断（相邻 30 分钟内换人）；「被回复/回复别人/被@/@别人」是导出器记录的精确信号。</div>
+    </div>
+</div>
+
+{% if api_ok %}
+<div class="card mb-4">
+    <div class="card-header">群聊动态</div>
+    <div class="card-body">
+        <div class="d-flex gap-2 flex-wrap mb-3">
+            <button class="btn btn-outline-primary btn-analyze" data-dim="group_dynamics" data-orig="分析群聊动态" data-target="sec-dynamics">分析群聊动态</button>
+            <div class="form-check ms-2 d-flex align-items-center">
+                <input class="form-check-input me-2" type="checkbox" id="forceRefresh">
+                <label class="form-check-label small text-muted" for="forceRefresh">强制重分析（会产生 API 费用）</label>
+            </div>
+        </div>
+        <div id="analyzeStatus"></div>
+        <div id="sec-dynamics" class="mt-3"><div class="text-muted small">尚未分析（命中缓存则自动显示）</div></div>
+    </div>
+</div>
+{% else %}
+<div class="alert alert-warning small">未配置 API Key：本地统计照常可用。</div>
+{% endif %}
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+const MEMBERS = {{ member_activity | tojson }};
+renderRelationGraph('relationGraph', {{ interaction | tojson }}, MEMBERS);
+renderInteractionHeatmap('interactionHeat', {{ interaction | tojson }});
+loadGroupAnalysis('group_dynamics', document.getElementById('sec-dynamics'), renderGroupDynamics);
+wireGroupAnalyzeButtons(MEMBERS);
+</script>
+{% endblock %}

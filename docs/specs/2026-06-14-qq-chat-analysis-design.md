@@ -474,7 +474,7 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
 ## 8. 未来扩展（非 MVP）
 
 - [ ] 多 JSON 文件对比分析
-- [ ] 群聊记录支持
+- [x] 群聊记录支持（2026-09-12 完成：见 docs/specs/2026-09-12-group-chat-analysis-design.md）
 - [ ] 导出分析报告 PDF
 - [ ] 长期趋势跟踪（多次上传同一聊天的历史对比）
 - [ ] 使用本地模型（如 Ollama）替代 DeepSeek API

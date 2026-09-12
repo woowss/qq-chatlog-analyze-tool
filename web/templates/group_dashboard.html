@@ -1,0 +1,260 @@
+<!--
+Copyright (C) 2026 woowss
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-->
+{% extends "base.html" %}
+{% block title %}群聊仪表盘{% endblock %}
+
+{% block head %}
+<script src="{{ url_for('static', filename='js/group_charts.js') }}?v={{ asset_v }}"></script>
+{% endblock %}
+
+{% block content %}
+<h2 class="page-title">群聊仪表盘 <span class="sub">{{ overview.group_name }}</span></h2>
+
+<div class="row mb-4">
+    <div class="col-md-3 mb-3">
+        <div class="card stat-card text-center h-100">
+            <div class="card-body">
+                <div class="stat-value">{{ overview.total_messages }}</div>
+                <div class="stat-label">总消息数</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3 mb-3">
+        <div class="card stat-card text-center h-100">
+            <div class="card-body">
+                <div class="stat-value">{{ overview.member_count }}</div>
+                <div class="stat-label">群成员<br><small class="text-muted">统计口径内发过言的人</small></div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3 mb-3">
+        <div class="card stat-card text-center h-100">
+            <div class="card-body">
+                <div class="stat-value">{{ overview.total_days }}</div>
+                <div class="stat-label">记录天数<br><small class="text-muted">其中 {{ overview.active_days }} 天有人说话</small></div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3 mb-3">
+        <div class="card stat-card text-center h-100">
+            <div class="card-body">
+                <div class="stat-value">{{ overview.avg_daily }}</div>
+                <div class="stat-label">日均消息</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-6 mb-3">
+        <div class="card h-100">
+            <div class="card-header">同时在线高峰</div>
+            <div class="card-body text-center">
+                <div class="stat-value text-primary">{{ overview.peak_concurrent.count }} 人</div>
+                <div class="stat-label">
+                    {{ overview.peak_concurrent.window_minutes }} 分钟窗口内同时发言
+                    {% if overview.peak_concurrent.at %}<br><small class="text-muted">{{ overview.peak_concurrent.at }}</small>{% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6 mb-3">
+        <div class="card h-100">
+            <div class="card-header">最活跃成员</div>
+            <div class="card-body text-center">
+                {% if overview.most_active_member %}
+                <div class="stat-value">{{ overview.most_active_member.msg_count }} 条</div>
+                <div class="stat-label">{{ overview.most_active_member.name }}</div>
+                {% else %}
+                <div class="stat-label text-muted">数据不足</div>
+                {% endif %}
+                <small class="text-muted d-block mt-2">
+                    图片 {{ overview.total_images }} · 表情 {{ overview.total_faces }}
+                    · 文件 {{ overview.get('total_files', 0) }} · 转发 {{ overview.get('total_forwards', 0) }}
+                </small>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-6 mb-3">
+        <div class="card h-100">
+            <div class="card-header">成员发言量（前 15 位）</div>
+            <div class="card-body"><div id="memberBar" style="height: 360px;"></div></div>
+        </div>
+    </div>
+    <div class="col-md-6 mb-3">
+        <div class="card h-100">
+            <div class="card-header">互动热力矩阵<small class="text-muted ms-2">纵向：谁先说；横向：谁接话</small></div>
+            <div class="card-body"><div id="interactionHeat" style="height: 360px;"></div></div>
+        </div>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-6 mb-3">
+        <div class="card h-100">
+            <div class="card-header">成员活跃时段（前 8 位堆叠）</div>
+            <div class="card-body"><div id="memberHourly" style="height: 340px;"></div></div>
+        </div>
+    </div>
+    <div class="col-md-6 mb-3">
+        <div class="card h-100">
+            <div class="card-header">
+                互动关系图
+                <small class="text-muted ms-2">实线=精确回复/@（事实）· 虚线=相邻接话（推断）</small>
+            </div>
+            <div class="card-body"><div id="relationGraph" style="height: 340px;"></div></div>
+        </div>
+    </div>
+</div>
+
+{% if interaction.truncated %}
+<div class="alert alert-secondary small">
+    互动矩阵只保留发言最多的 {{ interaction.matrix_limit }} 位成员
+    （另有 {{ interaction.dropped }} 位未进矩阵，{{ interaction.dropped_replies }} 次互动未计入）。
+    成员活跃度与群总览仍包含全部成员。
+</div>
+{% endif %}
+
+<div class="card mb-4">
+    <div class="card-header">群里程碑</div>
+    <div class="card-body">
+        <div class="row text-center">
+            <div class="col-6 col-md-3 mb-3">
+                <div class="stat-value" style="font-size:1.3rem;">{{ milestones.first_day }} ~ {{ milestones.last_day }}</div>
+                <div class="stat-label">记录跨度</div>
+            </div>
+            <div class="col-6 col-md-3 mb-3">
+                <div class="stat-value" style="font-size:1.3rem;">{{ milestones.longest_streak.days }} 天</div>
+                <div class="stat-label">最长连续聊天（{{ milestones.longest_streak.start }} 起）</div>
+            </div>
+            <div class="col-6 col-md-3 mb-3">
+                <div class="stat-value" style="font-size:1.3rem;">{{ milestones.peak_day.count }} 条</div>
+                <div class="stat-label">单日峰值（{{ milestones.peak_day.date }}，{{ milestones.peak_day_members }} 人发言）</div>
+            </div>
+            <div class="col-6 col-md-3 mb-3">
+                <div class="stat-value" style="font-size:1.3rem;">{{ milestones.multi_member_days }} 天</div>
+                <div class="stat-label">两人以上同时冒泡的天数</div>
+            </div>
+        </div>
+        <div class="small text-muted">
+            深夜（0-6 点）发言 {{ milestones.midnight_msgs }} 条，覆盖 {{ milestones.midnight_days }} 天；
+            其中凌晨 2-5 点 {{ milestones.late_night_msgs }} 条。
+            「{{ milestones.mutual_nights }} 个夜晚」是{{ milestones.mutual_nights_note }}。
+        </div>
+    </div>
+</div>
+
+{% if api_ok %}
+<div class="card mb-4">
+    <div class="card-header">AI 分析</div>
+    <div class="card-body">
+        <p class="text-muted small mb-2">
+            群聊维度按<strong>月</strong>分析（成员画像按<strong>人</strong>）。
+            本次预计调用 <strong>{{ ai_plan.calls }}</strong> 次
+            （{{ ai_plan.months }} 个月 × 3 个群级维度 + {{ ai_plan.members }} 位成员画像）。
+            已分析过的维度命中本地缓存，不重复计费。
+        </p>
+        <div class="d-flex gap-2 flex-wrap">
+            <button class="btn btn-outline-primary btn-analyze" data-dim="group_dynamics" data-orig="群聊动态">群聊动态</button>
+            <button class="btn btn-outline-primary btn-analyze" data-dim="group_topics" data-orig="群聊话题">群聊话题</button>
+            <button class="btn btn-outline-primary btn-analyze" data-dim="group_emotion" data-orig="群聊情绪">群聊情绪</button>
+            <button class="btn btn-outline-primary btn-analyze" data-dim="member_profiles" data-orig="成员画像">成员画像</button>
+            <button class="btn btn-primary" id="btn-analyze-all">全量分析</button>
+        </div>
+        <div class="form-check mt-3">
+            <input class="form-check-input" type="checkbox" id="forceRefresh">
+            <label class="form-check-label small text-muted" for="forceRefresh">强制重新分析（忽略缓存，会产生 API 费用）</label>
+        </div>
+        <div id="analyzeStatus" class="mt-3"></div>
+        <div class="mt-3"><a href="/report" class="btn btn-outline-primary btn-sm">查看完整报告</a></div>
+    </div>
+</div>
+{% else %}
+<div class="alert alert-warning small">未配置 API Key：本地统计照常可用，AI 维度需要先在 .env 里配置 Key。</div>
+{% endif %}
+
+<div class="card mb-4">
+    <div class="card-header">群聊动态</div>
+    <div class="card-body" id="sec-dynamics"><div class="text-muted small">尚未分析（或命中缓存后自动显示）</div></div>
+</div>
+<div class="card mb-4">
+    <div class="card-header">群聊话题</div>
+    <div class="card-body" id="sec-topics"><div class="text-muted small">尚未分析</div></div>
+</div>
+<div class="card mb-4">
+    <div class="card-header">群聊情绪</div>
+    <div class="card-body" id="sec-emotion"><div class="text-muted small">尚未分析</div></div>
+</div>
+<div class="card mb-4">
+    <div class="card-header">成员画像</div>
+    <div class="card-body" id="sec-profiles"><div class="text-muted small">尚未分析</div></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const MEMBERS = {{ member_activity | tojson }};
+const SECTIONS = {
+    group_dynamics: ['sec-dynamics', renderGroupDynamics],
+    group_topics: ['sec-topics', renderGroupTopics],
+    group_emotion: ['sec-emotion', renderGroupEmotion],
+    member_profiles: ['sec-profiles', function (el, data) { return renderMemberProfiles(el, data, MEMBERS); }]
+};
+
+renderMemberBar('memberBar', MEMBERS);
+renderInteractionHeatmap('interactionHeat', {{ interaction | tojson }});
+renderMemberHourlyArea('memberHourly', {{ member_hourly | tojson }});
+renderRelationGraph('relationGraph', {{ interaction | tojson }}, MEMBERS);
+
+// 进页面先回读缓存：已分析过的维度直接显示，不必重新点
+Object.keys(SECTIONS).forEach(function (dim) {
+    loadGroupAnalysis(dim, document.getElementById(SECTIONS[dim][0]), SECTIONS[dim][1]);
+});
+
+// 按钮接线统一走 group_charts.js（data-target 指向要渲染的容器）
+$('.btn-analyze').each(function () {
+    $(this).attr('data-target', SECTIONS[$(this).data('dim')][0]);
+});
+wireGroupAnalyzeButtons(MEMBERS);
+
+$('#btn-analyze-all').on('click', function () {
+    var btn = $(this);
+    var status = $('#analyzeStatus');
+    var queue = Object.keys(SECTIONS);
+    $('.btn-analyze, #btn-analyze-all').prop('disabled', true);
+    btn.text('全量分析中…');
+    status.html('<div class="alert alert-secondary mb-0">正在按顺序分析 ' + queue.length + ' 个维度…</div>');
+    // 群聊的"全量"在前端按顺序驱动：每个维度的进度/取消逻辑与单维度完全一致，
+    // 不额外引入一套后端编排（后端 /api/analyze-all 同样支持群聊维度）。
+    (function next(i) {
+        if (i >= queue.length) {
+            $('.btn-analyze').prop('disabled', false).each(function () { $(this).text($(this).data('orig')); });
+            btn.prop('disabled', false).text('全量分析');
+            status.html('<div class="alert alert-success mb-0">全量分析完成。</div>');
+            return;
+        }
+        var dim = queue[i];
+        var sub = $('.btn-analyze[data-dim="' + dim + '"]');
+        var target = SECTIONS[dim];
+        analyzeGroupDimension(dim, sub, target[0], target[1], function () { next(i + 1); });
+    })(0);
+});
+</script>
+{% endblock %}

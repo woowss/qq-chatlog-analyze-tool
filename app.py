@@ -22,7 +22,9 @@
 
 import argparse
 import os
+import signal
 import sys
+import time
 from importlib.metadata import PackageNotFoundError, version
 from typing import Optional, Sequence
 
@@ -34,6 +36,7 @@ from config import (
     ACCESS_PASSWORD,
     AI_CACHE_DIR,
     ALLOWED_ORIGINS,
+    COOKIE_SECURE,
     DEEPSEEK_MODEL,
     FLASK_DEBUG,
     FLASK_HOST,
@@ -59,11 +62,39 @@ from analyzer.deepseek_client import (
     thinking_enabled,
 )
 from analyzer.logger import get_logger
+from analyzer.shutdown import request_shutdown
+from analyzer.usage import flush as flush_usage
 
 from web import STATIC_DIR, TEMPLATES_DIR
 from webapp import api, cleanup, security, views
 
 logger = get_logger("app")
+
+#: 视为"本机、不经网络"的绑定地址（回环）。两个用途共用一份口径：
+#: ① 非回环绑定必须设访问口令；② Secure cookie 的 auto 判定。
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _is_loopback(host: str) -> bool:
+    """绑定地址是否为本机回环（本文件里"是否需要网络侧防护"的唯一口径来源）"""
+    return (host or "").strip().lower() in _LOOPBACK_HOSTS
+
+
+def _secure_cookie_enabled() -> bool:
+    """会话 cookie 是否打 Secure 标志。
+
+    auto（默认）跟着绑定地址走：回环不过网，恒 False 才不会把本机 http 访问
+    也挡掉；一旦绑定到局域网/公网地址，就默认要求 HTTPS——明文 http 下 cookie
+    会裸奔过网，中间人拿到 sid 等于拿到登录态。
+
+    局域网明文 http 的用户需要在 .env 里显式设 QQCHAT_COOKIE_SECURE=false，
+    启动横幅会提示这一点（否则症状是"登录成功却立刻被弹回登录页"，很难自查）。
+    """
+    if COOKIE_SECURE == "true":
+        return True
+    if COOKIE_SECURE == "false":
+        return False
+    return not _is_loopback(FLASK_HOST)
 
 
 def create_app() -> Flask:
@@ -89,6 +120,8 @@ def create_app() -> Flask:
     app.config["SESSION_PERMANENT"] = False
     app.config["SESSION_COOKIE_HTTPONLY"] = True  # 禁止 JS 读取会话 cookie
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"  # 跨站请求不携带 cookie（CSRF 纵深防御）
+    # Secure：非回环绑定默认开启（HTTPS 才回传会话 cookie）。详见 _secure_cookie_enabled
+    app.config["SESSION_COOKIE_SECURE"] = _secure_cookie_enabled()
     Session(app)
 
     for directory in (UPLOAD_FOLDER, SESSION_FILE_DIR, AI_CACHE_DIR, STATS_CACHE_DIR):
@@ -171,7 +204,7 @@ def _startup_report() -> bool:
     _print_safe(f"  增量缓存: {'开（只分析新增月份）' if MONTH_CACHE_ENABLED else '关'}")
     _print_safe(f"  内存任务 TTL: {JOB_TTL_SECONDS}s · 结果本身永远先落盘（重启/超时不丢）")
 
-    loopback = FLASK_HOST in ("127.0.0.1", "localhost", "::1")
+    loopback = _is_loopback(FLASK_HOST)
     if not loopback and not ACCESS_PASSWORD:
         _print_safe("  [ERROR] 绑定到非回环地址必须设置 ACCESS_PASSWORD（见 .env.example）")
         _print_safe("  已拒绝启动，以免聊天记录与 AI 结果被局域网内陌生人访问")
@@ -184,6 +217,15 @@ def _startup_report() -> bool:
         else:
             _print_safe("  [WARN] 未设置 ALLOWED_ORIGINS：用局域网 IP 或域名打开页面时，")
             _print_safe("         上传与 AI 分析请求会被 403 拒绝（Origin 校验不信任请求 Host）")
+        # Secure cookie 与"明文 http 局域网访问"互斥：必须把症状与解法一起说清，
+        # 否则用户只会看到"登录成功却立刻被弹回登录页"，完全无从自查。
+        if _secure_cookie_enabled():
+            _print_safe("  [OK] 会话 cookie 已加 Secure：仅在 https 下回传（QQCHAT_COOKIE_SECURE=auto）")
+            _print_safe("       若你用明文 http 访问局域网地址，登录将无法保持——请改用 https 反代，")
+            _print_safe("       或设 QQCHAT_COOKIE_SECURE=false（明文传输口令与会话，风险自负）")
+        else:
+            _print_safe("  [WARN] 会话 cookie 未加 Secure（QQCHAT_COOKIE_SECURE=false）")
+            _print_safe("         明文 http 下中间人可直接窃取会话 id 并接管登录态，建议改用 https")
     if FLASK_DEBUG:
         _print_safe("  [WARN] 调试模式已开启（调试器可执行任意代码，仅限本机开发）")
 
@@ -193,6 +235,47 @@ def _startup_report() -> bool:
     _print_safe("  uploads/ flask_session/ ai_cache/ 过期文件启动时清理，之后每小时随请求去抖清理")
     _print_safe(sep)
     return True
+
+
+#: 收到中断信号后，留给"正在跑的那一个月"的收尾时间（秒）。
+#: 设 0 即恢复"按下就退出"的行为。
+SHUTDOWN_GRACE_SECONDS = float(os.getenv("QQCHAT_SHUTDOWN_GRACE_SECONDS") or 5)
+
+
+def _install_shutdown_handler() -> None:
+    """Ctrl+C / SIGTERM 优雅关闭：先停止派发新的付费调用，再退出。
+
+    默认行为是收到信号立刻打断进程：分析线程池里"已经排上队"的月份照发不误——
+    钱花掉了，结果却随进程一起消失；正在跑的那一个月也拿不回来。这里换成两段式：
+
+    1. 置位全局关闭标志。分析循环在每个派发点检查它，于是不再启动新月份，
+       已经完成的月份结果照常落盘（月份级缓存在每个月完成时就写了）；
+    2. 最多等 SHUTDOWN_GRACE_SECONDS 秒让进行中的那一个月收尾，然后抛
+       KeyboardInterrupt —— Werkzeug 的 serve_forever 会吞掉它并关闭服务器，
+       退出流程与原来一致。
+
+    顺带把 token 用量落盘（它按天累计在内存里，进程被硬杀就丢了）。
+    """
+
+    def _handler(signum, _frame):
+        request_shutdown()
+        logger.warning(
+            "收到中断信号（%s）：不再发起新的分析请求，最多等 %.0f 秒让进行中的月份收尾"
+            "（可用 QQCHAT_SHUTDOWN_GRACE_SECONDS=0 关掉这段等待）",
+            signum,
+            SHUTDOWN_GRACE_SECONDS,
+        )
+        flush_usage()
+        if SHUTDOWN_GRACE_SECONDS > 0:
+            time.sleep(SHUTDOWN_GRACE_SECONDS)
+        raise KeyboardInterrupt
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError, AttributeError):
+            # 非主线程、或平台不支持该信号：保持默认行为即可，不影响启动
+            continue
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -208,6 +291,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if not _startup_report():
         return 1
+
+    _install_shutdown_handler()
 
     logger.info("=" * 40)
     logger.info("应用启动 - http://%s:%d", FLASK_HOST, FLASK_PORT)

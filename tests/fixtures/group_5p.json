@@ -1,0 +1,2803 @@
+{
+ "chatInfo": {
+  "name": "摸鱼群",
+  "selfUid": "u_self",
+  "selfName": "我",
+  "type": "group"
+ },
+ "statistics": {
+  "senders": [
+   {
+    "uid": "u_self",
+    "name": "我"
+   },
+   {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   {
+    "uid": "u_4",
+    "name": "阿强"
+   },
+   {
+    "uid": "u_5",
+    "name": "小美"
+   },
+   {
+    "uid": "未知uid未知",
+    "name": "系统消息"
+   }
+  ],
+  "totalMessages": 126,
+  "timeRange": {
+   "start": "2025-01-05 21:42:00",
+   "end": "2025-03-18 09:42:00",
+   "durationDays": 73
+  }
+ },
+ "messages": [
+  {
+   "id": "m0000",
+   "timestamp": 1736084520000,
+   "time": "2025-01-05 21:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "今晚开黑吗",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "今晚开黑吗"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0040",
+   "timestamp": 1736101980000,
+   "time": "2025-01-06 02:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "别卷了",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "别卷了"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0070",
+   "timestamp": 1736123760000,
+   "time": "2025-01-06 08:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "哈哈哈哈哈",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "哈哈哈哈哈"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0095",
+   "timestamp": 1736152740000,
+   "time": "2025-01-06 16:39:00",
+   "sender": {
+    "uid": "u_4",
+    "name": "阿强"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "明天交作业？",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "明天交作业？"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0110",
+   "timestamp": 1736196120000,
+   "time": "2025-01-07 04:42:00",
+   "sender": {
+    "uid": "u_5",
+    "name": "小美"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "刚下班 累死",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "刚下班 累死"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0001",
+   "timestamp": 1736242920000,
+   "time": "2025-01-07 17:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "刚下班 累死",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "刚下班 累死"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0041",
+   "timestamp": 1736310780000,
+   "time": "2025-01-08 12:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "笑死",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "笑死"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0071",
+   "timestamp": 1736375760000,
+   "time": "2025-01-09 06:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "这也太离谱了",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "这也太离谱了"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0002",
+   "timestamp": 1736401320000,
+   "time": "2025-01-09 13:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我点了外卖",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我点了外卖"
+      }
+     },
+     {
+      "type": "image",
+      "data": {
+       "md5": "md5u_self2",
+       "size": "184320",
+       "url": "resources/images/u_self_2.jpg",
+       "width": 1080,
+       "height": 720
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0042",
+   "timestamp": 1736519580000,
+   "time": "2025-01-10 22:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我先睡了 晚安",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我先睡了 晚安"
+      }
+     },
+     {
+      "type": "image",
+      "data": {
+       "md5": "md5u_22",
+       "size": "184320",
+       "url": "resources/images/u_2_2.jpg",
+       "width": 1080,
+       "height": 720
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0003",
+   "timestamp": 1736559720000,
+   "time": "2025-01-11 09:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "这题谁会啊",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "这题谁会啊"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0096",
+   "timestamp": 1736573940000,
+   "time": "2025-01-11 13:39:00",
+   "sender": {
+    "uid": "u_4",
+    "name": "阿强"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "别卷了",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "别卷了"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0072",
+   "timestamp": 1736627760000,
+   "time": "2025-01-12 04:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我投一票",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我投一票"
+      }
+     },
+     {
+      "type": "image",
+      "data": {
+       "md5": "md5u_32",
+       "size": "184320",
+       "url": "resources/images/u_3_2.jpg",
+       "width": 1080,
+       "height": 720
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0004",
+   "timestamp": 1736718120000,
+   "time": "2025-01-13 05:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "明天交作业？",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "明天交作业？"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0043",
+   "timestamp": 1736728380000,
+   "time": "2025-01-13 08:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "周末去爬山不",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "周末去爬山不"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0118",
+   "timestamp": 1736868600000,
+   "time": "2025-01-14 23:30:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "说错话了",
+    "elements": []
+   },
+   "recalled": true
+  },
+  {
+   "id": "m0005",
+   "timestamp": 1736876520000,
+   "time": "2025-01-15 01:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "别卷了",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "别卷了"
+      }
+     },
+     {
+      "type": "market_face",
+      "data": {
+       "name": "[[叉腰]]",
+       "url": "https://example.invalid/face.png"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0073",
+   "timestamp": 1736879760000,
+   "time": "2025-01-15 02:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "带我一个",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "带我一个"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0044",
+   "timestamp": 1736937180000,
+   "time": "2025-01-15 18:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "群里有人打游戏吗",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "群里有人打游戏吗"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0111",
+   "timestamp": 1736988120000,
+   "time": "2025-01-16 08:42:00",
+   "sender": {
+    "uid": "u_5",
+    "name": "小美"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我点了外卖",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我点了外卖"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0097",
+   "timestamp": 1736995140000,
+   "time": "2025-01-16 10:39:00",
+   "sender": {
+    "uid": "u_4",
+    "name": "阿强"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "笑死",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "笑死"
+      }
+     },
+     {
+      "type": "image",
+      "data": {
+       "md5": "md5u_42",
+       "size": "184320",
+       "url": "resources/images/u_4_2.jpg",
+       "width": 1080,
+       "height": 720
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0006",
+   "timestamp": 1737034920000,
+   "time": "2025-01-16 21:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "笑死",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "笑死"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0119",
+   "timestamp": 1737120600000,
+   "time": "2025-01-17 21:30:00",
+   "sender": {
+    "uid": "未知uid未知",
+    "name": "系统消息"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "",
+    "elements": []
+   },
+   "system": true
+  },
+  {
+   "id": "m0074",
+   "timestamp": 1737131760000,
+   "time": "2025-01-18 00:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "今晚开黑吗",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "今晚开黑吗"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0045",
+   "timestamp": 1737145980000,
+   "time": "2025-01-18 04:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "刚看到消息",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "刚看到消息"
+      }
+     },
+     {
+      "type": "market_face",
+      "data": {
+       "name": "[[叉腰]]",
+       "url": "https://example.invalid/face.png"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0007",
+   "timestamp": 1737193320000,
+   "time": "2025-01-18 17:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我先睡了 晚安",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我先睡了 晚安"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0008",
+   "timestamp": 1737351720000,
+   "time": "2025-01-20 13:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "周末去爬山不",
+    "elements": [
+     {
+      "type": "reply",
+      "data": {
+       "referencedMessageId": "m0001"
+      }
+     },
+     {
+      "type": "text",
+      "data": {
+       "text": "周末去爬山不"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0046",
+   "timestamp": 1737354780000,
+   "time": "2025-01-20 14:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "哈哈哈哈哈",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "哈哈哈哈哈"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0075",
+   "timestamp": 1737383760000,
+   "time": "2025-01-20 22:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "刚下班 累死",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "刚下班 累死"
+      }
+     },
+     {
+      "type": "market_face",
+      "data": {
+       "name": "[[叉腰]]",
+       "url": "https://example.invalid/face.png"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0098",
+   "timestamp": 1737416340000,
+   "time": "2025-01-21 07:39:00",
+   "sender": {
+    "uid": "u_4",
+    "name": "阿强"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我先睡了 晚安",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我先睡了 晚安"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0009",
+   "timestamp": 1737510120000,
+   "time": "2025-01-22 09:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "群里有人打游戏吗",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "群里有人打游戏吗"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0047",
+   "timestamp": 1737563580000,
+   "time": "2025-01-23 00:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "这也太离谱了",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "这也太离谱了"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0076",
+   "timestamp": 1737635760000,
+   "time": "2025-01-23 20:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我点了外卖",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我点了外卖"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0010",
+   "timestamp": 1737668520000,
+   "time": "2025-01-24 05:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "刚看到消息",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "刚看到消息"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0048",
+   "timestamp": 1737772380000,
+   "time": "2025-01-25 10:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我投一票",
+    "elements": [
+     {
+      "type": "reply",
+      "data": {
+       "referencedMessageId": "m0001"
+      }
+     },
+     {
+      "type": "text",
+      "data": {
+       "text": "我投一票"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0112",
+   "timestamp": 1737780120000,
+   "time": "2025-01-25 12:42:00",
+   "sender": {
+    "uid": "u_5",
+    "name": "小美"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "这题谁会啊",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "这题谁会啊"
+      }
+     },
+     {
+      "type": "image",
+      "data": {
+       "md5": "md5u_52",
+       "size": "184320",
+       "url": "resources/images/u_5_2.jpg",
+       "width": 1080,
+       "height": 720
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0011",
+   "timestamp": 1737826920000,
+   "time": "2025-01-26 01:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "哈哈哈哈哈",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "哈哈哈哈哈"
+      }
+     },
+     {
+      "type": "file",
+      "data": {
+       "filename": "我的资料.pdf",
+       "size": "204800"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0099",
+   "timestamp": 1737837540000,
+   "time": "2025-01-26 04:39:00",
+   "sender": {
+    "uid": "u_4",
+    "name": "阿强"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "周末去爬山不",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "周末去爬山不"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0077",
+   "timestamp": 1737887760000,
+   "time": "2025-01-26 18:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "这题谁会啊",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "这题谁会啊"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0049",
+   "timestamp": 1737981180000,
+   "time": "2025-01-27 20:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "带我一个",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "带我一个"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0012",
+   "timestamp": 1737985320000,
+   "time": "2025-01-27 21:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "这也太离谱了",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "这也太离谱了"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0078",
+   "timestamp": 1738139760000,
+   "time": "2025-01-29 16:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "明天交作业？",
+    "elements": [
+     {
+      "type": "reply",
+      "data": {
+       "referencedMessageId": "m0001"
+      }
+     },
+     {
+      "type": "text",
+      "data": {
+       "text": "明天交作业？"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0013",
+   "timestamp": 1738143720000,
+   "time": "2025-01-29 17:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我投一票",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我投一票"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0050",
+   "timestamp": 1738189980000,
+   "time": "2025-01-30 06:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "今晚开黑吗",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "今晚开黑吗"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0100",
+   "timestamp": 1738258740000,
+   "time": "2025-01-31 01:39:00",
+   "sender": {
+    "uid": "u_4",
+    "name": "阿强"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "群里有人打游戏吗",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "群里有人打游戏吗"
+      }
+     },
+     {
+      "type": "market_face",
+      "data": {
+       "name": "[[叉腰]]",
+       "url": "https://example.invalid/face.png"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0014",
+   "timestamp": 1738302120000,
+   "time": "2025-01-31 13:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "带我一个",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "带我一个"
+      }
+     },
+     {
+      "type": "forward",
+      "data": {
+       "title": "群聊的聊天记录",
+       "messageCount": "26"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0079",
+   "timestamp": 1738391760000,
+   "time": "2025-02-01 14:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "别卷了",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "别卷了"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0051",
+   "timestamp": 1738398780000,
+   "time": "2025-02-01 16:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "刚下班 累死",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "刚下班 累死"
+      }
+     },
+     {
+      "type": "file",
+      "data": {
+       "filename": "小明的资料.pdf",
+       "size": "204800"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0015",
+   "timestamp": 1738460520000,
+   "time": "2025-02-02 09:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "今晚开黑吗",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "今晚开黑吗"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0113",
+   "timestamp": 1738572120000,
+   "time": "2025-02-03 16:42:00",
+   "sender": {
+    "uid": "u_5",
+    "name": "小美"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "明天交作业？",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "明天交作业？"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0052",
+   "timestamp": 1738607580000,
+   "time": "2025-02-04 02:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我点了外卖",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我点了外卖"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0016",
+   "timestamp": 1738618920000,
+   "time": "2025-02-04 05:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "刚下班 累死",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "刚下班 累死"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0080",
+   "timestamp": 1738643760000,
+   "time": "2025-02-04 12:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "笑死",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "笑死"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0120",
+   "timestamp": 1738675800000,
+   "time": "2025-02-04 21:30:00",
+   "sender": {
+    "uid": "未知uid未知",
+    "name": "系统消息"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "",
+    "elements": []
+   },
+   "system": true
+  },
+  {
+   "id": "m0101",
+   "timestamp": 1738679940000,
+   "time": "2025-02-04 22:39:00",
+   "sender": {
+    "uid": "u_4",
+    "name": "阿强"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "刚看到消息",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "刚看到消息"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0017",
+   "timestamp": 1738777320000,
+   "time": "2025-02-06 01:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我点了外卖",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我点了外卖"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0053",
+   "timestamp": 1738816380000,
+   "time": "2025-02-06 12:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "这题谁会啊",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "这题谁会啊"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0081",
+   "timestamp": 1738895760000,
+   "time": "2025-02-07 10:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我先睡了 晚安",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我先睡了 晚安"
+      }
+     },
+     {
+      "type": "file",
+      "data": {
+       "filename": "小明的资料.pdf",
+       "size": "204800"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0018",
+   "timestamp": 1738935720000,
+   "time": "2025-02-07 21:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "这题谁会啊",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "这题谁会啊"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0054",
+   "timestamp": 1739025180000,
+   "time": "2025-02-08 22:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "明天交作业？",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "明天交作业？"
+      }
+     },
+     {
+      "type": "forward",
+      "data": {
+       "title": "群聊的聊天记录",
+       "messageCount": "26"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0019",
+   "timestamp": 1739094120000,
+   "time": "2025-02-09 17:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "明天交作业？",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "明天交作业？"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0102",
+   "timestamp": 1739101140000,
+   "time": "2025-02-09 19:39:00",
+   "sender": {
+    "uid": "u_4",
+    "name": "阿强"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "哈哈哈哈哈",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "哈哈哈哈哈"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0082",
+   "timestamp": 1739147760000,
+   "time": "2025-02-10 08:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "周末去爬山不",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "周末去爬山不"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0055",
+   "timestamp": 1739233980000,
+   "time": "2025-02-11 08:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "别卷了",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "别卷了"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0020",
+   "timestamp": 1739252520000,
+   "time": "2025-02-11 13:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "别卷了",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "别卷了"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0114",
+   "timestamp": 1739364120000,
+   "time": "2025-02-12 20:42:00",
+   "sender": {
+    "uid": "u_5",
+    "name": "小美"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "别卷了",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "别卷了"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0083",
+   "timestamp": 1739399760000,
+   "time": "2025-02-13 06:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "群里有人打游戏吗",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "群里有人打游戏吗"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0021",
+   "timestamp": 1739410920000,
+   "time": "2025-02-13 09:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "笑死",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "笑死"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0056",
+   "timestamp": 1739442780000,
+   "time": "2025-02-13 18:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "笑死",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "笑死"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0103",
+   "timestamp": 1739522340000,
+   "time": "2025-02-14 16:39:00",
+   "sender": {
+    "uid": "u_4",
+    "name": "阿强"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "这也太离谱了",
+    "elements": [
+     {
+      "type": "reply",
+      "data": {
+       "referencedMessageId": "m0001"
+      }
+     },
+     {
+      "type": "text",
+      "data": {
+       "text": "这也太离谱了"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0122",
+   "timestamp": 1739539800000,
+   "time": "2025-02-14 21:30:00",
+   "sender": {
+    "uid": "未知uid未知",
+    "name": "系统消息"
+   },
+   "type": "type_23",
+   "content": {
+    "text": "商城表情",
+    "elements": []
+   }
+  },
+  {
+   "id": "m0022",
+   "timestamp": 1739569320000,
+   "time": "2025-02-15 05:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我先睡了 晚安",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我先睡了 晚安"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0057",
+   "timestamp": 1739651580000,
+   "time": "2025-02-16 04:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我先睡了 晚安",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我先睡了 晚安"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0084",
+   "timestamp": 1739651760000,
+   "time": "2025-02-16 04:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "刚看到消息",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "刚看到消息"
+      }
+     },
+     {
+      "type": "forward",
+      "data": {
+       "title": "群聊的聊天记录",
+       "messageCount": "26"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0023",
+   "timestamp": 1739727720000,
+   "time": "2025-02-17 01:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "周末去爬山不",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "周末去爬山不"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0058",
+   "timestamp": 1739860380000,
+   "time": "2025-02-18 14:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "周末去爬山不",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "周末去爬山不"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0024",
+   "timestamp": 1739886120000,
+   "time": "2025-02-18 21:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "群里有人打游戏吗",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "群里有人打游戏吗"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0085",
+   "timestamp": 1739903760000,
+   "time": "2025-02-19 02:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "哈哈哈哈哈",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "哈哈哈哈哈"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0104",
+   "timestamp": 1739943540000,
+   "time": "2025-02-19 13:39:00",
+   "sender": {
+    "uid": "u_4",
+    "name": "阿强"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我投一票",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我投一票"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0025",
+   "timestamp": 1740044520000,
+   "time": "2025-02-20 17:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "刚看到消息",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "刚看到消息"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0059",
+   "timestamp": 1740069180000,
+   "time": "2025-02-21 00:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "群里有人打游戏吗",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "群里有人打游戏吗"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0086",
+   "timestamp": 1740155760000,
+   "time": "2025-02-22 00:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "这也太离谱了",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "这也太离谱了"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0115",
+   "timestamp": 1740156120000,
+   "time": "2025-02-22 00:42:00",
+   "sender": {
+    "uid": "u_5",
+    "name": "小美"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "笑死",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "笑死"
+      }
+     },
+     {
+      "type": "market_face",
+      "data": {
+       "name": "[[叉腰]]",
+       "url": "https://example.invalid/face.png"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0026",
+   "timestamp": 1740202920000,
+   "time": "2025-02-22 13:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "哈哈哈哈哈",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "哈哈哈哈哈"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0060",
+   "timestamp": 1740277980000,
+   "time": "2025-02-23 10:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "刚看到消息",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "刚看到消息"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0027",
+   "timestamp": 1740361320000,
+   "time": "2025-02-24 09:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "这也太离谱了",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "这也太离谱了"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0105",
+   "timestamp": 1740364740000,
+   "time": "2025-02-24 10:39:00",
+   "sender": {
+    "uid": "u_4",
+    "name": "阿强"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "带我一个",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "带我一个"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0087",
+   "timestamp": 1740407760000,
+   "time": "2025-02-24 22:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我投一票",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我投一票"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0061",
+   "timestamp": 1740486780000,
+   "time": "2025-02-25 20:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "哈哈哈哈哈",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "哈哈哈哈哈"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0028",
+   "timestamp": 1740519720000,
+   "time": "2025-02-26 05:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我投一票",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我投一票"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0088",
+   "timestamp": 1740659760000,
+   "time": "2025-02-27 20:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "带我一个",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "带我一个"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0029",
+   "timestamp": 1740678120000,
+   "time": "2025-02-28 01:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "带我一个",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "带我一个"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0062",
+   "timestamp": 1740695580000,
+   "time": "2025-02-28 06:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "这也太离谱了",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "这也太离谱了"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0106",
+   "timestamp": 1740785940000,
+   "time": "2025-03-01 07:39:00",
+   "sender": {
+    "uid": "u_4",
+    "name": "阿强"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "今晚开黑吗",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "今晚开黑吗"
+      }
+     },
+     {
+      "type": "file",
+      "data": {
+       "filename": "阿强的资料.pdf",
+       "size": "204800"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0121",
+   "timestamp": 1740835800000,
+   "time": "2025-03-01 21:30:00",
+   "sender": {
+    "uid": "未知uid未知",
+    "name": "系统消息"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "",
+    "elements": []
+   },
+   "system": true
+  },
+  {
+   "id": "m0030",
+   "timestamp": 1740836520000,
+   "time": "2025-03-01 21:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "今晚开黑吗",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "今晚开黑吗"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0063",
+   "timestamp": 1740904380000,
+   "time": "2025-03-02 16:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我投一票",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我投一票"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0089",
+   "timestamp": 1740911760000,
+   "time": "2025-03-02 18:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "今晚开黑吗",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "今晚开黑吗"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0116",
+   "timestamp": 1740948120000,
+   "time": "2025-03-03 04:42:00",
+   "sender": {
+    "uid": "u_5",
+    "name": "小美"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我先睡了 晚安",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我先睡了 晚安"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0031",
+   "timestamp": 1740994920000,
+   "time": "2025-03-03 17:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "刚下班 累死",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "刚下班 累死"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0064",
+   "timestamp": 1741113180000,
+   "time": "2025-03-05 02:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "带我一个",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "带我一个"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0032",
+   "timestamp": 1741153320000,
+   "time": "2025-03-05 13:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我点了外卖",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我点了外卖"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0090",
+   "timestamp": 1741163760000,
+   "time": "2025-03-05 16:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "刚下班 累死",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "刚下班 累死"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0107",
+   "timestamp": 1741207140000,
+   "time": "2025-03-06 04:39:00",
+   "sender": {
+    "uid": "u_4",
+    "name": "阿强"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "刚下班 累死",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "刚下班 累死"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0123",
+   "timestamp": 1741267800000,
+   "time": "2025-03-06 21:30:00",
+   "sender": {
+    "uid": "",
+    "name": ""
+   },
+   "type": "type_1",
+   "content": {
+    "text": "（无发送者的条目）",
+    "elements": []
+   }
+  },
+  {
+   "id": "m0124",
+   "timestamp": 1741285800000,
+   "time": "2025-03-07 02:30:00",
+   "sender": {
+    "uid": "",
+    "name": ""
+   },
+   "type": "type_1",
+   "content": {
+    "text": "（无发送者的条目）",
+    "elements": []
+   }
+  },
+  {
+   "id": "m0125",
+   "timestamp": 1741303800000,
+   "time": "2025-03-07 07:30:00",
+   "sender": {
+    "uid": "",
+    "name": ""
+   },
+   "type": "type_1",
+   "content": {
+    "text": "（无发送者的条目）",
+    "elements": []
+   }
+  },
+  {
+   "id": "m0033",
+   "timestamp": 1741311720000,
+   "time": "2025-03-07 09:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "这题谁会啊",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "这题谁会啊"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0065",
+   "timestamp": 1741321980000,
+   "time": "2025-03-07 12:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "今晚开黑吗",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "今晚开黑吗"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0091",
+   "timestamp": 1741415760000,
+   "time": "2025-03-08 14:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我点了外卖",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我点了外卖"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0034",
+   "timestamp": 1741470120000,
+   "time": "2025-03-09 05:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "明天交作业？",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "明天交作业？"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0066",
+   "timestamp": 1741530780000,
+   "time": "2025-03-09 22:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "刚下班 累死",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "刚下班 累死"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0108",
+   "timestamp": 1741628340000,
+   "time": "2025-03-11 01:39:00",
+   "sender": {
+    "uid": "u_4",
+    "name": "阿强"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我点了外卖",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我点了外卖"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0035",
+   "timestamp": 1741628520000,
+   "time": "2025-03-11 01:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "别卷了",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "别卷了"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0092",
+   "timestamp": 1741667760000,
+   "time": "2025-03-11 12:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "这题谁会啊",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "这题谁会啊"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0067",
+   "timestamp": 1741739580000,
+   "time": "2025-03-12 08:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我点了外卖",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我点了外卖"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0117",
+   "timestamp": 1741740120000,
+   "time": "2025-03-12 08:42:00",
+   "sender": {
+    "uid": "u_5",
+    "name": "小美"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "周末去爬山不",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "周末去爬山不"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0036",
+   "timestamp": 1741786920000,
+   "time": "2025-03-12 21:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "笑死",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "笑死"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0093",
+   "timestamp": 1741919760000,
+   "time": "2025-03-14 10:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "明天交作业？",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "明天交作业？"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0037",
+   "timestamp": 1741945320000,
+   "time": "2025-03-14 17:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "我先睡了 晚安",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "我先睡了 晚安"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0068",
+   "timestamp": 1741948380000,
+   "time": "2025-03-14 18:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "这题谁会啊",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "这题谁会啊"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0109",
+   "timestamp": 1742049540000,
+   "time": "2025-03-15 22:39:00",
+   "sender": {
+    "uid": "u_4",
+    "name": "阿强"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "这题谁会啊",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "这题谁会啊"
+      }
+     },
+     {
+      "type": "forward",
+      "data": {
+       "title": "群聊的聊天记录",
+       "messageCount": "26"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0038",
+   "timestamp": 1742103720000,
+   "time": "2025-03-16 13:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "周末去爬山不",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "周末去爬山不"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0069",
+   "timestamp": 1742157180000,
+   "time": "2025-03-17 04:33:00",
+   "sender": {
+    "uid": "u_2",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "明天交作业？",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "明天交作业？"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0094",
+   "timestamp": 1742171760000,
+   "time": "2025-03-17 08:36:00",
+   "sender": {
+    "uid": "u_3",
+    "name": "小明"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "别卷了",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "别卷了"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "m0039",
+   "timestamp": 1742262120000,
+   "time": "2025-03-18 09:42:00",
+   "sender": {
+    "uid": "u_self",
+    "name": "我"
+   },
+   "type": "type_1",
+   "content": {
+    "text": "群里有人打游戏吗",
+    "elements": [
+     {
+      "type": "text",
+      "data": {
+       "text": "群里有人打游戏吗"
+      }
+     }
+    ]
+   }
+  }
+ ]
+}

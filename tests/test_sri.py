@@ -32,7 +32,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-REPORT_HTML = ROOT / "web" / "templates" / "report.html"
+# VENDOR_CDN 表与导出代码 2026-09-12 起在 partial 里（私聊/群聊报告共用同一份导出机制）；
+# 校验对象跟着搬，断言与语义不变。报告页渲染结果里是否带这些常量由 test_smoke 再验一遍。
+REPORT_HTML = ROOT / "web" / "templates" / "_report_assets.html"
 VENDOR_DIR = ROOT / "web" / "static" / "vendor"
 
 

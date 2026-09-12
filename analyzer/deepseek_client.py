@@ -25,13 +25,15 @@ import threading
 import time
 from collections import Counter
 from datetime import datetime
-from typing import Any, Callable, Optional
+from functools import partial
+from typing import Any, Callable, Iterable, Optional
 
 from openai import OpenAI
 
 from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL, DEEPSEEK_BASE_URL
 from parser.qq_parser import CST, MEDIA_KINDS, ChatData, is_statistical, split_by_month
 from analyzer.logger import get_logger
+from analyzer.shutdown import shutdown_requested
 from analyzer.usage import record_call
 from analyzer.local_stats import SESSION_GAP_MS, is_session_start
 from analyzer.prompts import (
@@ -43,6 +45,20 @@ from analyzer.prompts import (
 )
 
 logger = get_logger("deepseek")
+
+#: 参与私聊提示词指纹的提示词**名单**，顺序即哈希顺序，不要动。
+#: 取值与排列必须与旧实现 `sorted(dir(analyzer.prompts)) 里 SYSTEM_PROMPT_*` 完全一致
+#: ——这样改成显式名单是"零值变更"，所有既有私聊缓存继续命中（有测试钉住这一点）。
+#: 名单是**封闭**的：往 analyzer/prompts.py 里新加常量（例如群聊提示词）不会被算进来，
+#: 因此不会作废私聊缓存。群聊提示词请放 analyzer/group_prompts.py 并使用自己的指纹。
+#: 改名或删除名单里的常量会在 import 期直接报 AttributeError（响亮失败，好过静默换键）。
+_PRIVATE_PROMPT_NAMES = (
+    "SYSTEM_PROMPT_EMOTION",
+    "SYSTEM_PROMPT_HABITS",
+    "SYSTEM_PROMPT_PROFILE",
+    "SYSTEM_PROMPT_RELATIONSHIP",
+    "SYSTEM_PROMPT_TOPICS",
+)
 
 
 def _env_number(name: str, default: float, low: float, high: float) -> float:
@@ -93,6 +109,13 @@ _DEFAULT_MAX_TOKENS = {
     "relationship": 32768,
     "habits": 32768,
     "profile": 49152,
+    # —— 群聊维度（analyzer/group_client.py）。加在这里是为了共用
+    #    LLM_MAX_TOKENS_<维度> 的环境变量覆盖；它们**不在**下面的私聊指纹常量元组里，
+    #    因此增删/调整不会让任何私聊缓存失效。成员画像与私聊锐评同档（每个成员一次调用）。
+    "group_dynamics": 32768,
+    "group_topics": 32768,
+    "group_emotion": 32768,
+    "member_profiles": 49152,
 }
 
 
@@ -343,15 +366,19 @@ def _message_line(m, name: str, prev_uid: Optional[str] = None, prev_ts: Optiona
     first = prev_uid is None or prev_ts is None
     gap_ms = 0 if first else max(0, m.timestamp - prev_ts)
     changed = first or m.sender_uid != prev_uid
+    # 段内小间隔不值得标注（阈值以下留空）
+    mark = _gap_mark(gap_ms) if gap_ms >= RELATIVE_MARK_MINUTES * 60000 else ""
 
+    # 三种打印形态（信息量相同，但字符数递减）：
+    #   跨段/间隔够大 → `[09-16 21:56] 昵称:`   换人时靠时间戳认出"这是新的一段"
+    #   段内换人      → `昵称(+3m):`            省掉时间，只留"谁说的、隔了多久"
+    #   段内同人连发  → `(+3m):`                连昵称都省掉，间隔太小则什么都不印
     if first or gap_ms >= TIME_MARK_MS:
         prefix = f"[{_short_time(m.time_str)}] {name}:"
     elif changed:
-        mark = _gap_mark(gap_ms) if gap_ms >= RELATIVE_MARK_MINUTES * 60000 else ""
         prefix = f"{name}{mark}:"
     else:
-        prefix = _gap_mark(gap_ms) if gap_ms >= RELATIVE_MARK_MINUTES * 60000 else ""
-        prefix = f"{prefix}:" if prefix else ""
+        prefix = f"{mark}:" if mark else ""
 
     if marks:
         mark = "[" + ", ".join(marks) + "]"
@@ -440,8 +467,19 @@ def _prompt_fingerprint(salt: "str | None" = None) -> str:
     """提示词 + 对话格式的指纹，参与缓存键。
 
     以前靠手工维护 PROMPT_VERSION：改了 prompt 或抓取/抽样逻辑却忘了 bump，
-    旧缓存就会顶着"新分析"的名义返回旧风格结果。现在把 SYSTEM_PROMPT_* 与所有
-    影响模型输入的格式化函数一起哈希，任何改动都会自动让旧缓存失效。
+    旧缓存就会顶着"新分析"的名义返回旧风格结果。现在把私聊的 SYSTEM_PROMPT_*
+    与所有影响模型输入的格式化函数一起哈希，任何改动都会自动让旧缓存失效。
+
+    **只哈希下面 _PRIVATE_PROMPT_NAMES 里显式列出的提示词**（不是"dir() 里所有
+    SYSTEM_PROMPT_*"）：这个指纹同时进维度级缓存文件名与月份级缓存键，一旦多出
+    一个常量（例如把群聊提示词放进 analyzer/prompts.py），全部私聊缓存与月份缓存
+    会在 24 小时后被孤儿回收删除，用户下次分析要**全量重新付费**。群聊提示词因此
+    必须放在独立模块（analyzer/group_prompts.py）并使用自己的指纹。
+    改动名单的内容或顺序 = 故意换键，等同于让所有私聊缓存失效。
+
+    取值仍然在调用时从 analyzer.prompts 现取（而不是 import 期把字符串绑进元组）：
+    这样"改了提示词文本必须换指纹"这条既有保证不受影响（tests 里有用例靠打桩
+    prompts 模块来验证它），也让运行时热改提示词同样能反映到指纹上。
 
     源码不可读时（frozen/编译打包，inspect.getsource 抛 OSError）降级为
     函数名占位——提示词改动仍然会失效缓存，但格式逻辑改动不会，
@@ -451,7 +489,7 @@ def _prompt_fingerprint(salt: "str | None" = None) -> str:
 
     if salt is None:
         salt = (os.getenv("PROMPT_CACHE_SALT", "") or "").strip()
-    parts = [getattr(_prompts, n) for n in sorted(dir(_prompts)) if n.startswith("SYSTEM_PROMPT_")]
+    parts = [getattr(_prompts, name) for name in _PRIVATE_PROMPT_NAMES]
     # 影响模型输入的模块级常量也要进指纹：getsource 只覆盖函数体，函数引用的
     # MAX_DIALOG_CHARS / 时间标记阈值 等常量改了源码也不变——只哈希函数会让
     # "调小了对话预算"或"改了时间标记口径"之后继续命中旧缓存（输入其实变了）。
@@ -495,6 +533,20 @@ def _prompt_fingerprint(salt: "str | None" = None) -> str:
 
 PROMPT_FINGERPRINT = _prompt_fingerprint()
 
+
+def fingerprint_for_dimension(dim: str) -> str:
+    """该维度该用哪个提示词指纹：群聊维度走群聊指纹，其余（私聊/未知）走私聊指纹。
+
+    维度级缓存的文件名里嵌着这个值，所以群聊提示词一改，群聊维度的旧缓存自动失效，
+    而私聊维度的文件名**一个字都不变**（用户不会因为新增群聊功能而重新付费）。
+    """
+    from analyzer import group_client  # 延迟导入：group_client 在模块级 import 本模块
+
+    if dim in group_client.GROUP_DIMENSIONS:
+        return group_client.GROUP_PROMPT_FINGERPRINT
+    return PROMPT_FINGERPRINT
+
+
 # 思考模式的最低输出预算：思维链 token 也计入 max_tokens，低于这个值必然截断
 THINKING_MIN_TOKENS = 4096
 
@@ -511,6 +563,13 @@ THINKING_MIN_TOKENS = 4096
 # 从而保留"不留孤儿敏感数据"的隐私属性。
 _MONTH_CACHE_DIR = ""
 _MONTH_CACHE_LOCK = threading.Lock()
+# manifest 已引用月份的进程级缓存：{manifest 文件名: (mtime, keys)}。
+# _referenced_keys_locked 会被 purge（每次上传）与 sweep（定期清理）调用，原实现
+# 每次都要把目录下所有 manifest 完整读一遍再做 json.loads——分析过的聊天越多越慢。
+# 这里缓存结果并用 mtime 校验：文件没被改过（stat 比"读文件 + 解析"便宜一个量级）
+# 就直接复用。写 manifest 的那一处会同步更新缓存，不依赖 mtime 精度。
+# 受 _MONTH_CACHE_LOCK 保护。
+_MANIFEST_KEYS: dict[str, tuple[float, set]] = {}
 # 缓存写失败的告警去抖（磁盘满时每次调用都会失败，不能每次刷一行）
 _WRITE_WARN_INTERVAL = 300.0
 _last_write_warning = [0.0]
@@ -523,12 +582,20 @@ def configure_month_cache(directory: str) -> None:
     """由应用层注入缓存目录；传空字符串即关闭月份级缓存"""
     global _MONTH_CACHE_DIR
     _MONTH_CACHE_DIR = directory or ""
+    # 目录换了，上一个目录的 manifest 缓存必须丢弃（键只是文件名，会张冠李戴）
+    with _MONTH_CACHE_LOCK:
+        _MANIFEST_KEYS.clear()
 
 
-def _month_key(system_prompt: str, user_content: str) -> str:
-    """月份缓存的键：任何影响该月输出的因素（模型/提示词/格式/对话文本）都进哈希"""
+def _month_key(system_prompt: str, user_content: str, fingerprint: "str | None" = None) -> str:
+    """月份缓存的键：任何影响该月输出的因素（模型/提示词/格式/对话文本）都进哈希。
+
+    fingerprint 默认取私聊指纹（既有行为，键值与升级前完全一致）；群聊维度传
+    group_prompt_fingerprint()，两类月份的缓存互不干扰——私聊月份也不会因为
+    新增群聊提示词而变成"无引用"被回收。
+    """
     digest = hashlib.sha256()
-    for part in (DEEPSEEK_MODEL, PROMPT_FINGERPRINT, system_prompt, user_content):
+    for part in (DEEPSEEK_MODEL, fingerprint or PROMPT_FINGERPRINT, system_prompt, user_content):
         digest.update(part.encode("utf-8"))
         digest.update(b"\x00")
     return digest.hexdigest()[:20]
@@ -589,11 +656,20 @@ def _write_month_cache(key: str, result: dict) -> None:
             pass
 
 
-def _record_month_usage(chat_hash: str, key: str) -> None:
-    """把用到的月份缓存记进该聊天的 manifest，供级联清理做引用计数"""
+def _record_month_usage(chat_hash: str, keys: "Iterable[str]") -> None:
+    """把这一批用到的月份缓存记进该聊天的 manifest，供级联清理做引用计数。
+
+    调用方按"一次分析"批量传入（见 _analyze_periods）：原先每完成一个月就
+    「读 manifest → 改 → 写回」，24 个月就是 48 次文件 I/O，而写进去的内容
+    只是同一个集合在变大。现在整个维度只读一次、写一次。
+    """
     if not _MONTH_CACHE_DIR or not chat_hash:
         return
+    new_keys = set(keys)
+    if not new_keys:
+        return
     path = _manifest_path(chat_hash)
+    name = os.path.basename(path)
     with _MONTH_CACHE_LOCK:
         data: dict = {}
         try:
@@ -603,9 +679,9 @@ def _record_month_usage(chat_hash: str, key: str) -> None:
                 data = loaded
         except (OSError, json.JSONDecodeError):
             pass
-        keys = set(data.get("months") or [])
-        keys.add(key)
-        data["months"] = sorted(keys)
+        merged = set(data.get("months") or [])
+        merged |= new_keys
+        data["months"] = sorted(merged)
         data["updated"] = time.time()
         tmp = f"{path}.tmp"
         try:
@@ -616,6 +692,9 @@ def _record_month_usage(chat_hash: str, key: str) -> None:
             # manifest 写不进去同样只影响"重新导出时能否复用历史月份"，
             # 但会让增量分析静默失效（每次都全量付费），所以也要出声
             _warn_write_failure("月份缓存 manifest", path, e)
+            _MANIFEST_KEYS.pop(name, None)
+        else:
+            _MANIFEST_KEYS[name] = (os.path.getmtime(path), set(data["months"]))
 
 
 def purge_month_cache(chat_hash: str) -> int:
@@ -629,15 +708,12 @@ def purge_month_cache(chat_hash: str) -> int:
     if not _MONTH_CACHE_DIR or not chat_hash:
         return 0
     path = _manifest_path(chat_hash)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            mine = set(json.load(f).get("months") or [])
-    except (OSError, json.JSONDecodeError):
-        mine = set()
+    name = os.path.basename(path)
 
     removed = 0
     with _MONTH_CACHE_LOCK:
-        others = _referenced_keys_locked(exclude=os.path.basename(path))
+        mine = _manifest_keys_locked(name)
+        others = _referenced_keys_locked(exclude=name)
         now = time.time()
         for key in mine - others:
             target = month_cache_path(key)
@@ -652,7 +728,32 @@ def purge_month_cache(chat_hash: str) -> int:
         os.remove(path)
     except OSError:
         pass
+    with _MONTH_CACHE_LOCK:
+        _MANIFEST_KEYS.pop(name, None)
     return removed
+
+
+def _manifest_keys_locked(name: str) -> set:
+    """（调用方须持有 _MONTH_CACHE_LOCK）单个 manifest 引用的月份 key 集合
+
+    带 mtime 缓存：manifest 只由本模块写，写路径会同步刷缓存，所以命中时直接用。
+    """
+    path = os.path.join(_MONTH_CACHE_DIR, name)
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        _MANIFEST_KEYS.pop(name, None)
+        return set()
+    cached = _MANIFEST_KEYS.get(name)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            keys = set(json.load(f).get("months") or [])
+    except (OSError, json.JSONDecodeError):
+        keys = set()
+    _MANIFEST_KEYS[name] = (mtime, keys)
+    return keys
 
 
 def _referenced_keys_locked(exclude: str = "") -> set:
@@ -662,14 +763,15 @@ def _referenced_keys_locked(exclude: str = "") -> set:
         names = os.listdir(_MONTH_CACHE_DIR)
     except OSError:
         return keys
-    for name in names:
-        if not name.startswith("manifest_") or name == exclude:
+    live = {n for n in names if n.startswith("manifest_")}
+    for name in live:
+        if name == exclude:
             continue
-        try:
-            with open(os.path.join(_MONTH_CACHE_DIR, name), "r", encoding="utf-8") as f:
-                keys |= set(json.load(f).get("months") or [])
-        except (OSError, json.JSONDecodeError):
-            continue
+        keys |= _manifest_keys_locked(name)
+    # 目录里已经没有的 manifest，其缓存条目顺手清掉，避免随历史会话无限增长
+    if len(_MANIFEST_KEYS) > len(live):
+        for stale in [n for n in _MANIFEST_KEYS if n not in live]:
+            _MANIFEST_KEYS.pop(stale, None)
     return keys
 
 
@@ -710,6 +812,97 @@ def thinking_budget_warnings() -> list[str]:
     ]
 
 
+def _request_with_retry(
+    client: OpenAI,
+    build_params: Callable[[], dict],
+    *,
+    tag: str,
+    max_attempts: int,
+    generic_retries: int,
+    tpm_wait: float,
+    fatal_message: str,
+) -> tuple[Any, Optional[str]]:
+    """调用 API 的公共骨架：调用闸门 → 请求 → 用量记账 → 错误分类与退避。
+
+    _call_api 与 _call_vision 原先各抄了一份近 100 行的同样逻辑（_pace、限流重试、
+    额度耗尽判定、指数退避、用量统计），改一处必须记得改两处——这里收成一份，
+    两个调用方只管各自的参数构建与结果解析。
+
+    错误分类（两份调用必须一致，否则"文本分析会退避、看图不会"这种差异会
+    在最需要稳定的时候暴露出来）：
+    - 429（TPM/RPM 每分钟限流，含误导性的 "Allocated quota exceeded/insufficient_quota"
+      文案）：全局冷却后重试，最多 TPM_MAX_ATTEMPTS 次；
+    - 401/403 配额、402 余额、欠费等真正的额度耗尽：立即抛 QuotaExhaustedError
+      （重试无意义，且要让上层中止剩余任务而不是烧钱）；
+    - 其他错误：指数退避，最多 generic_retries 次，仍失败则原样抛出。
+
+    返回值：(resp, None) 表示成功；(None, "tpm") 表示限流重试已用尽，由调用方
+    决定是抛 QuotaExhaustedError（文本分析）还是降级返回空串（看图，不致命）。
+    """
+    tpm_hits = 0
+    for attempt in range(max_attempts):
+        try:
+            _pace()
+            resp = client.chat.completions.create(**build_params())
+            choice = resp.choices[0]
+            if resp.usage:
+                logger.info(
+                    "token 用量[%s]: prompt=%s completion=%s finish=%s",
+                    tag,
+                    resp.usage.prompt_tokens,
+                    resp.usage.completion_tokens,
+                    choice.finish_reason,
+                )
+                record_call(
+                    DEEPSEEK_MODEL, tag, resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0
+                )
+            return resp, None
+        except Exception as e:
+            if _is_plan_exhausted(e):
+                raise QuotaExhaustedError(fatal_message) from e
+            if _is_tpm_throttle(e):
+                tpm_hits += 1
+                if tpm_hits < TPM_MAX_ATTEMPTS:
+                    logger.warning(
+                        "触发每分钟限流（TPM/RPM），全局冷却 %.0fs 后重试（%d/%d）",
+                        tpm_wait,
+                        tpm_hits,
+                        TPM_MAX_ATTEMPTS,
+                    )
+                    _set_cooldown(tpm_wait)  # 让所有并发线程一起退避，而非各自撞
+                    time.sleep(tpm_wait)
+                    continue
+                return None, "tpm"
+            if attempt < generic_retries:
+                delay = 2**attempt
+                logger.warning("API 调用失败（第 %s 次，%ss 后重试）: %s", attempt + 1, delay, e)
+                time.sleep(delay)
+                continue
+            raise  # 最后仍失败则抛出，由调用方决定"致命"还是"降级"
+    return None, "error"
+
+
+def _json_request_params(system_prompt: str, user_content: str, max_tokens: int, think: bool) -> dict:
+    """JSON 模式的请求参数（思考模式决定 extra_body 与是否下发 temperature）"""
+    params: dict = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+    }
+    if think:
+        params["extra_body"] = {"thinking": {"type": "enabled"}}
+    else:
+        # 非思考模式：temperature 生效，保持原有低随机性以保证 JSON 稳定
+        params["temperature"] = 0.3
+        if _SEND_THINKING_PARAM:
+            params["extra_body"] = {"thinking": {"type": "disabled"}}
+    return params
+
+
 def _call_api(
     system_prompt: str,
     user_content: str,
@@ -745,93 +938,58 @@ def _call_api(
             THINKING_MIN_TOKENS,
         )
     tpm_wait = TPM_WAIT_SECONDS if tpm_wait is None else tpm_wait
-    tpm_hits = 0
     max_attempts = max(retry, TPM_MAX_ATTEMPTS - 1) + 1
 
-    for attempt in range(max_attempts):
-        try:
-            _pace()
-            params = {
-                "model": DEEPSEEK_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-                "max_tokens": max_tokens,
-                "response_format": {"type": "json_object"},
-            }
+    while True:
+        # partial 而不是闭包：把当前的 think 值**绑定**进参数里（闭包会跟着
+        # 后面的 think = False 一起变，被截断降级后的重试就不是同一个请求了）
+        resp, reason = _request_with_retry(
+            client,
+            partial(_json_request_params, system_prompt, user_content, max_tokens, think),
+            tag=tag,
+            max_attempts=max_attempts,
+            generic_retries=retry,
+            tpm_wait=tpm_wait,
+            fatal_message=(
+                "套餐额度耗尽/账号异常（401/403 配额、402 余额不足、欠费）：请到服务商控制台"
+                "充值或等待配额周期重置后重试。剩余任务已中止，已完成部分已保留。"
+            ),
+        )
+        if resp is None:
+            # 走到这里只可能是限流重试已用尽（其他失败在骨架里已抛出）
+            raise QuotaExhaustedError(
+                "每分钟限流（TPM/RPM）多次等待后仍未恢复：可能同账号其他程序正在占用配额。"
+                "可稍后再试，或在 .env 中调低 LLM_CONCURRENCY / LLM_CALL_MIN_INTERVAL，"
+                "也可到服务商控制台提升该模型的 TPM 限额。"
+            )
+        choice = resp.choices[0]
+        if choice.finish_reason == "length":
+            # 思考模式下思维链也占 max_tokens：大月份偶发被吃满。
+            # 结果被截断=该月白跑，所以先降级为"关思考"重试一次——宁可精度略降，
+            # 也不让这个月从结果里消失（真实数据踩过：最大月份整月丢失）。
             if think:
-                params["extra_body"] = {"thinking": {"type": "enabled"}}
-            else:
-                # 非思考模式：temperature 生效，保持原有低随机性以保证 JSON 稳定
-                params["temperature"] = 0.3
-                if _SEND_THINKING_PARAM:
-                    params["extra_body"] = {"thinking": {"type": "disabled"}}
-            resp = client.chat.completions.create(**params)
-            choice = resp.choices[0]
-            if resp.usage:
-                logger.info(
-                    "token 用量[%s]: prompt=%s completion=%s finish=%s",
-                    tag,
-                    resp.usage.prompt_tokens,
-                    resp.usage.completion_tokens,
-                    choice.finish_reason,
+                logger.warning(
+                    "输出被 max_tokens=%s 截断，改用非思考模式重试一次（保住这个月的结果）", max_tokens
                 )
-                record_call(
-                    DEEPSEEK_MODEL, tag, resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0
-                )
-            if choice.finish_reason == "length":
-                # 思考模式下思维链也占 max_tokens：大月份偶发被吃满。
-                # 结果被截断=该月白跑，所以先降级为"关思考"重试一次——宁可精度略降，
-                # 也不让这个月从结果里消失（真实数据踩过：最大月份整月丢失）。
-                if think:
-                    logger.warning(
-                        "输出被 max_tokens=%s 截断，改用非思考模式重试一次（保住这个月的结果）", max_tokens
-                    )
-                    think = False
-                    continue
-                logger.error("模型输出被 max_tokens=%s 截断，放弃本次结果（不重试）", max_tokens)
-                return None
-            try:
-                return json.loads(choice.message.content)
-            except (json.JSONDecodeError, TypeError) as e:
-                logger.error("模型返回非法 JSON（不重试）: %s", e)
-                return None
-        except Exception as e:
-            if _is_plan_exhausted(e):
-                raise QuotaExhaustedError(
-                    "套餐额度耗尽/账号异常（401/403 配额、402 余额不足、欠费）：请到服务商控制台"
-                    "充值或等待配额周期重置后重试。剩余任务已中止，已完成部分已保留。"
-                ) from e
-            if _is_tpm_throttle(e):
-                tpm_hits += 1
-                if tpm_hits < TPM_MAX_ATTEMPTS:
-                    logger.warning(
-                        "触发每分钟限流（TPM/RPM），全局冷却 %.0fs 后重试（%d/%d）",
-                        tpm_wait,
-                        tpm_hits,
-                        TPM_MAX_ATTEMPTS,
-                    )
-                    _set_cooldown(tpm_wait)  # 让所有并发线程一起退避，而非各自撞
-                    time.sleep(tpm_wait)
-                    continue
-                raise QuotaExhaustedError(
-                    "每分钟限流（TPM/RPM）多次等待后仍未恢复：可能同账号其他程序正在占用配额。"
-                    "可稍后再试，或在 .env 中调低 LLM_CONCURRENCY / LLM_CALL_MIN_INTERVAL，"
-                    "也可到服务商控制台提升该模型的 TPM 限额。"
-                ) from e
-            if attempt < retry:
-                delay = 2**attempt
-                logger.warning("API 调用失败（第 %s 次，%ss 后重试）: %s", attempt + 1, delay, e)
-                time.sleep(delay)
+                think = False
                 continue
-            raise  # 最后仍失败则抛出
+            logger.error("模型输出被 max_tokens=%s 截断，放弃本次结果（不重试）", max_tokens)
+            return None
+        try:
+            # strict=False：容忍字符串里未转义的控制字符。模型偶尔把多行文本写成**裸换行**
+            # （锐评、群动态里常见），严格模式会直接判非法 JSON，从而丢掉整月/整位成员的结果。
+            # 真实数据实测：三次失败里有两次属于这种"内容合法、转义偷懒"，放宽解析即可救回；
+            # 它只影响解析容忍度，不会把合法 JSON 解析错。
+            return json.loads(choice.message.content, strict=False)
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.error("模型返回非法 JSON（不重试）: %s", e)
+            return None
 
 
 def _call_vision(system_prompt: str, user_text: str, images: list) -> str:
     """多模态调用：图片 + 文本一起发给模型，返回纯文本（失败返回空串）。
 
-    与 _call_api 的关系：共用调用闸门（_pace）、客户端、429/额度错误分类与用量统计，
+    与 _call_api 的关系：共用 _request_with_retry 的闸门、429/额度错误分类与用量统计，
     区别是输出为自由文本（不要 JSON），且失败**不致命**——图片看不懂不该拖垮文本分析。
     图片只能放在 user 消息里（放 system/assistant 会被官方判 400）。
     """
@@ -851,59 +1009,46 @@ def _call_vision(system_prompt: str, user_text: str, images: list) -> str:
     if len(content) == 1:
         return ""
 
-    tpm_hits = 0
-    for attempt in range(TPM_MAX_ATTEMPTS):
-        try:
-            _pace()
-            params = {
-                "model": DEEPSEEK_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": content},
-                ],
-                "max_tokens": 512,
-            }
+    def _build_params() -> dict:
+        params: dict = {
+            "model": DEEPSEEK_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content},
+            ],
+            "max_tokens": 512,
             # 图片摘要**固定走非思考模式**：思维链同样计入 max_tokens，而这里的预算是
             # 512（摘要本身要求不超过 240 字，够用），开思考会稳定撞上 finish_reason=length
             # 把摘要截成半截话——与"思考模式吃满预算就丢结果"是同一个坑。
             # 摘要要的是"看到什么写什么"，本来也不需要推理链。
-            params["temperature"] = 0.3
-            if _SEND_THINKING_PARAM:
-                params["extra_body"] = {"thinking": {"type": "disabled"}}
-            resp = client.chat.completions.create(**params)
-            choice = resp.choices[0]
-            if resp.usage:
-                logger.info(
-                    "token 用量[vision]: prompt=%s completion=%s finish=%s",
-                    resp.usage.prompt_tokens,
-                    resp.usage.completion_tokens,
-                    choice.finish_reason,
-                )
-                record_call(
-                    DEEPSEEK_MODEL, "vision", resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0
-                )
-            if choice.finish_reason == "length":
-                logger.warning("图片摘要被 max_tokens 截断，已按截断内容使用")
-            return (choice.message.content or "").strip()
-        except Exception as e:
-            if _is_plan_exhausted(e):
-                raise QuotaExhaustedError(
-                    "套餐额度耗尽/账号异常：图片理解已中止（文本分析同样无法继续）。"
-                ) from e
-            if _is_tpm_throttle(e):
-                tpm_hits += 1
-                if tpm_hits < TPM_MAX_ATTEMPTS:
-                    _set_cooldown(TPM_WAIT_SECONDS)
-                    time.sleep(TPM_WAIT_SECONDS)
-                    continue
-                logger.warning("图片摘要因限流放弃（文本分析继续）: %s", e)
-                return ""
-            if attempt < 2:
-                time.sleep(2**attempt)
-                continue
-            logger.warning("图片摘要失败（文本分析继续）: %s", e)
-            return ""
-    return ""
+            "temperature": 0.3,
+        }
+        if _SEND_THINKING_PARAM:
+            params["extra_body"] = {"thinking": {"type": "disabled"}}
+        return params
+
+    try:
+        resp, reason = _request_with_retry(
+            client,
+            _build_params,
+            tag="vision",
+            max_attempts=TPM_MAX_ATTEMPTS,
+            generic_retries=2,
+            tpm_wait=TPM_WAIT_SECONDS,
+            fatal_message="套餐额度耗尽/账号异常：图片理解已中止（文本分析同样无法继续）。",
+        )
+    except QuotaExhaustedError:
+        raise  # 额度/账号问题必须上抛：文本分析同样跑不下去，静默降级会让用户以为"只是没图"
+    except Exception as e:
+        logger.warning("图片摘要失败（文本分析继续）: %s", e)
+        return ""
+    if resp is None:
+        logger.warning("图片摘要因限流放弃（文本分析继续）")
+        return ""
+    choice = resp.choices[0]
+    if choice.finish_reason == "length":
+        logger.warning("图片摘要被 max_tokens 截断，已按截断内容使用")
+    return (choice.message.content or "").strip()
 
 
 def _analyze_periods(
@@ -915,6 +1060,7 @@ def _analyze_periods(
     on_progress: Optional[Callable[[int, int], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     chat_hash: str = "",
+    fingerprint: "str | None" = None,
 ) -> dict[str, Any]:
     """并发逐月调用 API，返回 {period: result}。
 
@@ -925,14 +1071,19 @@ def _analyze_periods(
     提交策略是"有界窗口"（最多 CONCURRENCY 个月在跑）：早先一次性 submit
     全部月份时，线程池队列里的月份已经排队，用户点取消也拦不住，剩余月份
     照常调用计费——与"可随时取消"的承诺相反。
+
+    fingerprint：月份缓存的指纹，默认私聊指纹（既有行为、键值不变）。
+    群聊维度传 group_prompt_fingerprint()，两类月份的缓存互不干扰。
     """
     results: dict[str, Any] = {}
     total = len(months)
     done = 0
     fatal: dict[str, str] = {}  # 配额耗尽等致命错误：中止剩余月份
+    used_keys: set[str] = set()  # 本维度命中的月份缓存键，收尾时一次性写 manifest
 
     def _cancel_requested() -> bool:
-        return bool(should_cancel and should_cancel())
+        # 用户点了取消，或进程正在关闭（Ctrl+C）：都不该再往外发新请求
+        return shutdown_requested() or bool(should_cancel and should_cancel())
 
     def _work(period: str, msgs: list) -> tuple[str, Optional[dict]]:
         # 已被排入线程池但尚未开始执行时取消：直接跳过，不产生 API 调用
@@ -942,7 +1093,7 @@ def _analyze_periods(
             prompt = make_prompt(period, msgs)
             if not prompt.strip():
                 return period, None
-            key = _month_key(system_prompt, prompt)
+            key = _month_key(system_prompt, prompt, fingerprint)
             result = _read_month_cache(key)
             if result is not None:
                 logger.info("%s 命中月份缓存，跳过 API 调用", period)
@@ -953,7 +1104,7 @@ def _analyze_periods(
             if result:
                 result["period"] = period
                 result["month"] = period
-                _record_month_usage(chat_hash, key)
+                used_keys.add(key)
                 return period, result
         except QuotaExhaustedError as e:
             fatal.setdefault("error", str(e))
@@ -963,35 +1114,40 @@ def _analyze_periods(
         return period, None
 
     pending = list(months.items())
-    with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures: dict[concurrent.futures.Future, str] = {}
-        while pending or futures:
-            # 只补足到并发上限：取消后窗口内的任务跑完即止，剩余月份不再启动
-            while pending and len(futures) < CONCURRENCY and not fatal and not _cancel_requested():
-                period, msgs = pending.pop(0)
-                futures[pool.submit(_work, period, msgs)] = period
-            if not futures:
-                break
-            finished, _ = concurrent.futures.wait(
-                list(futures), return_when=concurrent.futures.FIRST_COMPLETED
-            )
-            for fut in finished:
-                futures.pop(fut, None)
-                period, result = fut.result()
-                if result:
-                    results[period] = result
-                done += 1
-                if on_progress:
-                    try:
-                        on_progress(done, total)
-                    except Exception as e:
-                        # 进度回调只管界面显示，出错不该中断分析；留一条 debug 便于排查"进度不动"
-                        logger.debug("进度回调异常（忽略）: %s", e)
-            if fatal:
-                # 配额耗尽：取消排队中的月份，尽快收尾
-                for f in futures:
-                    f.cancel()
-                break
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+            futures: dict[concurrent.futures.Future, str] = {}
+            while pending or futures:
+                # 只补足到并发上限：取消后窗口内的任务跑完即止，剩余月份不再启动
+                while pending and len(futures) < CONCURRENCY and not fatal and not _cancel_requested():
+                    period, msgs = pending.pop(0)
+                    futures[pool.submit(_work, period, msgs)] = period
+                if not futures:
+                    break
+                finished, _ = concurrent.futures.wait(
+                    list(futures), return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for fut in finished:
+                    futures.pop(fut, None)
+                    period, result = fut.result()
+                    if result:
+                        results[period] = result
+                    done += 1
+                    if on_progress:
+                        try:
+                            on_progress(done, total)
+                        except Exception as e:
+                            # 进度回调只管界面显示，出错不该中断分析；留一条 debug 便于排查"进度不动"
+                            logger.debug("进度回调异常（忽略）: %s", e)
+                if fatal:
+                    # 配额耗尽：取消排队中的月份，尽快收尾
+                    for f in futures:
+                        f.cancel()
+                    break
+    finally:
+        # manifest 一次写入：不管正常结束、取消还是配额中止，已经用到的月份都要记账
+        # （否则这些月份文件会变成"无引用"，宽限期后被孤儿回收删掉，增量分析白跑）
+        _record_month_usage(chat_hash, used_keys)
 
     if fatal:
         if not results:
@@ -1024,27 +1180,42 @@ def _clamp_float(obj: dict, key: str, lo: float, hi: float, default: float) -> N
 
 
 def _normalize_topic_weights(obj: dict) -> None:
-    """把各话题 weight 归一化，保证总和恒为 1.0（防御模型权重不收敛到 1）"""
+    """把各话题 weight 归一化，保证总和恒为 1.0（防御模型权重不收敛到 1）
+
+    逐个 round(w/total, 2) 之后求和的**和**不保证是 1.0（如 0.333/0.333/0.334 各自
+    舍入成 0.33 → 和 0.99），前端按百分比展示时会出现"加起来 99%/101%"这种对不上
+    的细节。所以先各自舍入，再把舍入误差补给占比最大的那个话题。两个坑：
+    - 补给"最后一个"：话题多、末位又极小时会算出负权重（10 个话题里末位只占 0.1%，
+      漂移可达 -0.04）；最大项 ≥ 1/N，吃掉 ±0.005×N 的漂移既不会变负也不改排序。
+    - 舍入后并列时得用真实占比打破平手：不然 0.333/0.333/0.334 三项都舍成 0.33，
+      误差会落到真实占比最小的那一项上。
+    """
     topics = obj.get("topics")
     if not isinstance(topics, list):
         return
+    valid = [t for t in topics if isinstance(t, dict)]
+    if not valid:
+        return
     total = 0.0
-    for t in topics:
-        if not isinstance(t, dict):
-            continue
+    weights: list[float] = []
+    for t in valid:
         try:
-            total += float(t.get("weight", 0))
+            w = float(t.get("weight", 0))
         except (TypeError, ValueError):
-            t["weight"] = 0.0
+            w = 0.0
+            t["weight"] = 0.0  # 非数值项就地归零，便于排查
+        weights.append(w)
+        total += w
     if total <= 0:
         return
-    for t in topics:
-        if not isinstance(t, dict):
-            continue
-        try:
-            t["weight"] = round(float(t.get("weight", 0)) / total, 2)
-        except (TypeError, ValueError):
-            t["weight"] = 0.0
+    rounded = [round(w / total, 2) for w in weights]
+    drift = round(1.0 - sum(rounded), 2)
+    if drift:
+        # 并列时用真实占比打破平手，保证误差落在真正最大的话题上
+        biggest = max(range(len(rounded)), key=lambda i: (rounded[i], weights[i]))
+        rounded[biggest] = round(rounded[biggest] + drift, 2)
+    for t, w in zip(valid, rounded, strict=True):
+        t["weight"] = w
 
 
 def _month_prompt(chat: ChatData, period: str, msgs: list, chat_hash: str = "") -> str:
