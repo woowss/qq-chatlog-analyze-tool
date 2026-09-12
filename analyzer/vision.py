@@ -43,7 +43,7 @@ from config import (
     VISION_MAX_TOTAL_BYTES,
     VISION_MIN_SIDE,
 )
-from analyzer.logger import get_logger
+from analyzer.logger import get_logger, mask_name
 
 logger = get_logger("vision")
 
@@ -338,7 +338,7 @@ def digest(msgs: list, chat_hash: str = "", label: str = "") -> str:
         return ""
     _write_cache(path, text)
     _memo_put(key, text)
-    logger.info("图片摘要完成：%d 张（%s）", len(images), label or "本批")
+    logger.info("图片摘要完成：%d 张（%s）", len(images), mask_name(label) if label else "本批")
     return text
 
 

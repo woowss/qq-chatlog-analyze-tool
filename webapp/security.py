@@ -27,7 +27,7 @@ import threading
 import time
 from urllib.parse import urlparse
 
-from flask import current_app, redirect, render_template, request, session, url_for
+from flask import abort, current_app, redirect, render_template, request, session, url_for
 
 from config import ACCESS_PASSWORD, ALLOWED_ORIGINS, FLASK_HOST
 from analyzer.logger import get_logger
@@ -190,9 +190,24 @@ def add_security_headers(response):
     return response
 
 
+def _is_loopback() -> bool:
+    """绑定地址是否为本机回环（与 app._is_loopback 同一口径）"""
+    return (FLASK_HOST or "").strip().lower() in ("127.0.0.1", "localhost", "::1")
+
+
 def require_login():
-    """未登录时重定向到登录页；未设置口令则不启用"""
+    """未登录时重定向到登录页；未设置口令则不启用（仅限回环绑定）"""
     if not ACCESS_PASSWORD:
+        # 未设口令 = 不启用登录，但**只在回环绑定下成立**：绑定到非回环又没口令，
+        # 等于同网段任何人都能读到聊天分析与 /report。这里失败关闭，绝不敞开放行。
+        # CLI 路径（qqchatlog / python app.py）在启动时已被 _startup_report 拦住，
+        # 这条兜住的是绕过 main() 的入口（如 gunicorn app:app）。
+        if not _is_loopback():
+            logger.error(
+                "绑定非回环地址（%s）却未设置 ACCESS_PASSWORD：拒绝所有请求。请设置口令，或改回 127.0.0.1。",
+                FLASK_HOST,
+            )
+            abort(503, description="非回环绑定必须设置 ACCESS_PASSWORD")
         return None
     if request.endpoint in PUBLIC_ENDPOINTS or request.endpoint in BYPASS_ENDPOINTS:
         return None

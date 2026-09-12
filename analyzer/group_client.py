@@ -57,6 +57,7 @@ from analyzer.deepseek_client import (
     logger,
 )
 from analyzer.group_stats import calc_interaction_matrix, calc_member_activity, is_unknown_message
+from analyzer.logger import mask_name
 
 #: 单个群聊月的对话文本上限（字符）。默认与私聊同档（准确性优先），
 #: 想省钱可在 .env 里调小 LLM_GROUP_MAX_DIALOG_CHARS。
@@ -406,7 +407,7 @@ def _analyze_member(
         key = _member_cache_key(member, prompt)
         result = dc._read_month_cache(key)
         if result is not None:
-            logger.info("%s 命中成员缓存，跳过 API 调用", member.name)
+            logger.info("%s 命中成员缓存，跳过 API 调用", mask_name(member.name))
         else:
             result = _call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag, dim=tag)
             if result:
@@ -422,7 +423,7 @@ def _analyze_member(
     except QuotaExhaustedError:
         raise  # 配额耗尽要中止整个维度，不能被当作单人失败吞掉
     except Exception as e:
-        logger.error("%s 的群内画像失败: %s", member.name, e)
+        logger.error("%s 的群内画像失败: %s", mask_name(member.name), e)
     return None
 
 

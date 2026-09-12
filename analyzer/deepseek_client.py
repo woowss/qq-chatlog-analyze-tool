@@ -32,7 +32,7 @@ from openai import OpenAI
 
 from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL, DEEPSEEK_BASE_URL
 from parser.qq_parser import CST, MEDIA_KINDS, ChatData, is_statistical, split_by_month
-from analyzer.logger import get_logger
+from analyzer.logger import get_logger, mask_name
 from analyzer.shutdown import shutdown_requested
 from analyzer.usage import record_call
 from analyzer.local_stats import SESSION_GAP_MS, is_session_start
@@ -618,6 +618,8 @@ def _read_month_cache(key: str) -> Optional[dict]:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
+    if isinstance(data, dict):
+        data.pop("_created", None)  # 元数据不进调用方拿到的结果
     try:
         os.utime(path, None)  # 命中即续期，避免常用缓存被 30 天 TTL 回收
     except OSError:
@@ -645,8 +647,13 @@ def _write_month_cache(key: str, result: dict) -> None:
     path = month_cache_path(key)
     tmp = f"{path}.tmp"
     try:
+        # _created 是"绝对 90 天"硬上限的依据（cleanup 读它）。缺了它就只能按 mtime 判，
+        # 而 mtime 在每次命中时被续期（见 _read_month_cache）——含聊天原句引用的这族
+        # 缓存会因此无限期留存。读侧会把它 pop 掉，调用方拿到的结果不变。
+        payload = dict(result) if isinstance(result, dict) else {"result": result}
+        payload.setdefault("_created", time.time())
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False)
+            json.dump(payload, f, ensure_ascii=False)
         os.replace(tmp, path)
     except OSError as e:
         _warn_write_failure("月份缓存", path, e)
@@ -683,6 +690,8 @@ def _record_month_usage(chat_hash: str, keys: "Iterable[str]") -> None:
         merged |= new_keys
         data["months"] = sorted(merged)
         data["updated"] = time.time()
+        # setdefault：绝对上限看的是"首次创建"，重写 manifest 不该把它续期
+        data.setdefault("_created", time.time())
         tmp = f"{path}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as f:
@@ -1351,7 +1360,7 @@ def _analyze_person(
     except QuotaExhaustedError:
         raise  # 配额耗尽需中止整个维度，不能被当作单人失败吞掉
     except Exception as e:
-        logger.error("%s 的 AI 分析失败: %s", display_name, e)
+        logger.error("%s 的 AI 分析失败: %s", mask_name(display_name), e)
     return None
 
 
