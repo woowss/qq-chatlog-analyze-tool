@@ -26,6 +26,7 @@ import sys
 from importlib.metadata import PackageNotFoundError, version
 from typing import Optional, Sequence
 
+from cachelib import FileSystemCache
 from flask import Flask
 from flask_session import Session
 
@@ -78,10 +79,15 @@ def create_app() -> Flask:
     app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 
     # 服务端文件系统 session (避免 cookie 大小限制)
-    app.config["SESSION_TYPE"] = "filesystem"
-    app.config["SESSION_FILE_DIR"] = SESSION_FILE_DIR
+    # 会话存服务端文件：flask-session 0.8 起 "filesystem" 接口（以及 SESSION_FILE_DIR /
+    # SESSION_FILE_THRESHOLD / SESSION_FILE_MODE / SESSION_USE_SIGNER）都已弃用，官方替代是
+    # 直接把 cachelib 实例交给 SESSION_CACHELIB。旧接口内部用的就是同一个 cachelib.FileSystemCache
+    # （threshold/mode 默认 500 / 0o600，这里显式写出），存取与 TTL 语义逐行等价，所以存储格式不变、
+    # 已有会话继续可用。use_signer 的签名只防"会话 id 被篡改"，而 id 本身是 32 字节随机串、
+    # 会话数据全在服务端，去掉它没有实际收益损失，正好跟上上游的移除计划。
+    app.config["SESSION_TYPE"] = "cachelib"
+    app.config["SESSION_CACHELIB"] = FileSystemCache(SESSION_FILE_DIR, threshold=500, mode=0o600)
     app.config["SESSION_PERMANENT"] = False
-    app.config["SESSION_USE_SIGNER"] = True
     app.config["SESSION_COOKIE_HTTPONLY"] = True          # 禁止 JS 读取会话 cookie
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"         # 跨站请求不携带 cookie（CSRF 纵深防御）
     Session(app)
