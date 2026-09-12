@@ -31,6 +31,9 @@ jobs:
       - name: Lint (ruff)
         run: python -m ruff check .
 
+      - name: Format check (ruff format)
+        run: python -m ruff format --check .
+
       - name: Syntax check
         run: |
           python -m py_compile app.py config.py

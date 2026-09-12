@@ -33,6 +33,7 @@
 
 退出码 0 = 通过，1 = 有缺失或混入。
 """
+
 import argparse
 import re
 import sys
@@ -50,8 +51,18 @@ PY_MODULES = ("app.py", "config.py")
 CODE_PACKAGES = ("analyzer", "parser", "webapp")
 #: 这些前缀出现在包里就是打错了（测试/文档/工具/本地数据都不该随 wheel 分发）
 FORBIDDEN_PREFIXES = (
-    "tests/", "tools/", "docs/", ".github/", "build/", "__pycache__/",
-    "ai_cache/", "logs/", "uploads/", "flask_session/", "stats_cache/", "face_cache/",
+    "tests/",
+    "tools/",
+    "docs/",
+    ".github/",
+    "build/",
+    "__pycache__/",
+    "ai_cache/",
+    "logs/",
+    "uploads/",
+    "flask_session/",
+    "stats_cache/",
+    "face_cache/",
 )
 _REQUIRES_DIST_RE = re.compile(r"^Requires-Dist:\s*(?P<spec>.+)$", re.MULTILINE)
 #: 版本约束/extra/环境标记的起始字符——截断到第一个即得裸发行名
@@ -121,12 +132,16 @@ def verify(wheel: Path) -> int:
 
         missing = sorted(_source_files() - nameset)
         if missing:
-            problems.append(f"wheel 缺少 {len(missing)} 个源文件"
-                            "（前端资源漏了通常是 package-data 没写全）："
-                            + "、".join(missing[:8]) + ("…" if len(missing) > 8 else ""))
+            problems.append(
+                f"wheel 缺少 {len(missing)} 个源文件"
+                "（前端资源漏了通常是 package-data 没写全）："
+                + "、".join(missing[:8])
+                + ("…" if len(missing) > 8 else "")
+            )
 
-        leaked = sorted(n for n in names
-                        if n.startswith(FORBIDDEN_PREFIXES) or n.endswith(".pyc") or ".egg-info/" in n)
+        leaked = sorted(
+            n for n in names if n.startswith(FORBIDDEN_PREFIXES) or n.endswith(".pyc") or ".egg-info/" in n
+        )
         if leaked:
             problems.append(f"wheel 混入了不该分发的内容（{len(leaked)} 个）：" + "、".join(leaked[:8]))
 
@@ -146,8 +161,10 @@ def verify(wheel: Path) -> int:
             declared = _expected_dependencies()
             shipped = _runtime_requires_dist(metadata)
             if declared and shipped != declared:
-                problems.append(f"Requires-Dist 与 pyproject 不一致：缺 {sorted(declared - shipped)}、"
-                                f"多 {sorted(shipped - declared)}")
+                problems.append(
+                    f"Requires-Dist 与 pyproject 不一致：缺 {sorted(declared - shipped)}、"
+                    f"多 {sorted(shipped - declared)}"
+                )
             elif not shipped:
                 problems.append("METADATA 没有任何 Requires-Dist（dependencies 没生效）")
             if "Requires-Python:" not in metadata:
@@ -160,8 +177,7 @@ def verify(wheel: Path) -> int:
         for item in problems:
             print(f"[FAIL] {wheel.name}: {item}")
         return 1
-    print(f"[OK] {wheel.name}: {len(names)} 个文件，代码 + 前端资源齐全，"
-          f"qqchatlog 入口点与依赖元数据正常")
+    print(f"[OK] {wheel.name}: {len(names)} 个文件，代码 + 前端资源齐全，qqchatlog 入口点与依赖元数据正常")
     return 0
 
 

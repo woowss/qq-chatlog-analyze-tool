@@ -20,6 +20,7 @@
 指纹降级与手动 salt、用量合并写盘、统计后台化、保存即哈希、
 前端资源本地化、webapp 拆分后的路由面兼容。
 """
+
 import io
 import json
 import os
@@ -34,6 +35,7 @@ from unittest import mock
 
 # 测试隔离：数据目录指向临时目录（同其它测试文件）
 import tempfile as _tempfile
+
 # 测试隔离：数据目录指向临时目录，绝不碰真实 uploads/ai_cache/session。
 # 只清理"自己创建的"目录——外部显式指定的 QQCHAT_DATA_DIR 一律不动。
 import atexit as _atexit
@@ -44,6 +46,7 @@ def _drop_temp_data_dir():
     """跑完把临时数据目录删掉（先关日志：否则我们的清理先跑，logging 的
     shutdown 又把 app.log 写回来，留下一堆空目录）"""
     import logging
+
     logging.shutdown()
     _shutil.rmtree(os.environ["QQCHAT_DATA_DIR"], ignore_errors=True)
 
@@ -74,25 +77,36 @@ def _chat_payload(uids_to_msgs):
     i = 0
     for uid, texts in uids_to_msgs.items():
         for t in texts:
-            msgs.append({
-                "id": str(i), "timestamp": base + i * 60000,
-                "time": "2025-03-01 20:%02d:00" % (i % 60),
-                "sender": {"uid": uid, "name": "人" + uid[-1]},
-                "content": t,
-            })
+            msgs.append(
+                {
+                    "id": str(i),
+                    "timestamp": base + i * 60000,
+                    "time": "2025-03-01 20:%02d:00" % (i % 60),
+                    "sender": {"uid": uid, "name": "人" + uid[-1]},
+                    "content": t,
+                }
+            )
             i += 1
     return _wrap(msgs, {k: "人" + k[-1] for k in uids_to_msgs})
 
 
 def _wrap(msgs, senders, self_uid="uA"):
     """按导出格式包装（msgs 为完整消息字典，便于构造 system/type_23 等特殊条目）"""
-    return json.dumps({
-        "chatInfo": {"name": senders.get("uB", "对方"), "selfUid": self_uid,
-                     "selfName": senders.get(self_uid, "我")},
-        "statistics": {"senders": [{"uid": uid, "name": name} for uid, name in senders.items()],
-                       "totalMessages": len(msgs)},
-        "messages": msgs,
-    }, ensure_ascii=False).encode("utf-8")
+    return json.dumps(
+        {
+            "chatInfo": {
+                "name": senders.get("uB", "对方"),
+                "selfUid": self_uid,
+                "selfName": senders.get(self_uid, "我"),
+            },
+            "statistics": {
+                "senders": [{"uid": uid, "name": name} for uid, name in senders.items()],
+                "totalMessages": len(msgs),
+            },
+            "messages": msgs,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
 
 
 def _bulk(uid, name, n, start=0, text="在吗", **extra):
@@ -100,9 +114,13 @@ def _bulk(uid, name, n, start=0, text="在吗", **extra):
     base = int(datetime(2025, 3, 1, 20, 0, tzinfo=CST).timestamp() * 1000)
     out = []
     for i in range(n):
-        m = {"id": str(start + i), "timestamp": base + (start + i) * 60000,
-             "time": "2025-03-01 20:%02d:00" % ((start + i) % 60),
-             "sender": {"uid": uid, "name": name}, "content": text}
+        m = {
+            "id": str(start + i),
+            "timestamp": base + (start + i) * 60000,
+            "time": "2025-03-01 20:%02d:00" % ((start + i) % 60),
+            "sender": {"uid": uid, "name": name},
+            "content": text,
+        }
         m.update(extra)
         out.append(m)
     return out
@@ -123,11 +141,11 @@ class TestGroupChatGuard(unittest.TestCase):
     """
 
     def test_three_participant_upload_is_rejected(self):
-        msgs = (_bulk("uA", "我", 20) + _bulk("uB", "对方", 20, start=20)
-                + _bulk("uC", "第三人", 6, start=40))
+        msgs = _bulk("uA", "我", 20) + _bulk("uB", "对方", 20, start=20) + _bulk("uC", "第三人", 6, start=40)
         path = _write_tmp(_wrap(msgs, {"uA": "我", "uB": "对方", "uC": "第三人"}))
         try:
             from parser.qq_parser import load_chat
+
             with self.assertRaises(ValueError) as ctx:
                 load_chat(path)
             self.assertIn("群聊", str(ctx.exception))
@@ -139,16 +157,21 @@ class TestGroupChatGuard(unittest.TestCase):
         """真实形态：占位 sender（系统消息）里混了一条无 system 标记的 type_23"""
         msgs = _bulk("uA", "我", 30) + _bulk("uB", "对方", 28, start=30)
         placeholder = _bulk("未知uid未知", "系统消息", 4, start=100, system=True)
-        placeholder.append({                        # 唯一没有 system 标记的占位消息
-            "id": "999", "timestamp": int(datetime(2025, 3, 2, 9, 0, tzinfo=CST).timestamp() * 1000),
-            "time": "2025-03-02 09:00:00", "sender": {"uid": "未知uid未知", "name": "系统消息"},
-            "type": "type_23", "content": "商城表情",
-        })
-        path = _write_tmp(_wrap(msgs + placeholder,
-                                {"uA": "我", "uB": "对方", "未知uid未知": "系统消息"}))
+        placeholder.append(
+            {  # 唯一没有 system 标记的占位消息
+                "id": "999",
+                "timestamp": int(datetime(2025, 3, 2, 9, 0, tzinfo=CST).timestamp() * 1000),
+                "time": "2025-03-02 09:00:00",
+                "sender": {"uid": "未知uid未知", "name": "系统消息"},
+                "type": "type_23",
+                "content": "商城表情",
+            }
+        )
+        path = _write_tmp(_wrap(msgs + placeholder, {"uA": "我", "uB": "对方", "未知uid未知": "系统消息"}))
         try:
             from parser.qq_parser import load_chat
-            chat = load_chat(path)                  # 不得抛异常
+
+            chat = load_chat(path)  # 不得抛异常
             self.assertEqual(chat.self_uid, "uA")
             self.assertEqual(len(chat.messages), 63)
         finally:
@@ -161,16 +184,17 @@ class TestGroupChatGuard(unittest.TestCase):
         path = _write_tmp(_wrap(msgs + stray, {"uA": "我", "uB": "对方", "uX": "路人"}))
         try:
             from parser.qq_parser import load_chat
+
             self.assertEqual(len(load_chat(path).messages), 51)
         finally:
             os.remove(path)
 
     def test_env_override_allows_multi_party(self):
-        msgs = (_bulk("uA", "我", 20) + _bulk("uB", "对方", 20, start=20)
-                + _bulk("uC", "第三人", 6, start=40))
+        msgs = _bulk("uA", "我", 20) + _bulk("uB", "对方", 20, start=20) + _bulk("uC", "第三人", 6, start=40)
         path = _write_tmp(_wrap(msgs, {"uA": "我", "uB": "对方", "uC": "第三人"}))
         try:
             from parser.qq_parser import load_chat
+
             with mock.patch.dict(os.environ, {"QQCHAT_ALLOW_MULTI_PARTY": "1"}):
                 chat = load_chat(path)
             self.assertEqual(len(chat.messages), 46)
@@ -181,13 +205,17 @@ class TestGroupChatGuard(unittest.TestCase):
 
     def test_two_participant_upload_still_fine(self):
         import app as appmod
+
         payload = _chat_payload({"uA": ["在吗"], "uB": ["在的"]})
         client = appmod.app.test_client()
         client.get("/")
         with client.session_transaction() as sess:
             token = sess["csrf_token"]
-        r = client.post("/upload", data={"file": (io.BytesIO(payload), "ok.json")},
-                        headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+        r = client.post(
+            "/upload",
+            data={"file": (io.BytesIO(payload), "ok.json")},
+            headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token},
+        )
         self.assertEqual(r.status_code, 302)
         with client.session_transaction() as sess:
             p, h = sess.get("filepath"), sess.get("chat_hash")
@@ -204,9 +232,10 @@ class TestLogPrivacy(unittest.TestCase):
 
     def test_mask_name_keeps_first_char(self):
         import analyzer.logger as L
+
         with mock.patch.object(L, "LOG_REDACT_NAMES", True):
             self.assertEqual(L.mask_name("阿甜"), "阿*")
-            self.assertEqual(L.mask_name("甜"), "*")   # 单字也不泄露全名
+            self.assertEqual(L.mask_name("甜"), "*")  # 单字也不泄露全名
             self.assertEqual(L.mask_name(""), "*")
         with mock.patch.object(L, "LOG_REDACT_NAMES", False):
             self.assertEqual(L.mask_name("阿甜"), "阿甜")
@@ -215,12 +244,12 @@ class TestLogPrivacy(unittest.TestCase):
         from logging.handlers import TimedRotatingFileHandler
         import analyzer.logger as L
         import config
+
         base = L.get_logger()
         handlers = [h for h in base.handlers if isinstance(h, TimedRotatingFileHandler)]
         self.assertEqual(len(handlers), 1, "文件 handler 必须是按天轮转且只有一个")
         self.assertEqual(handlers[0].backupCount, config.LOG_RETENTION_DAYS)
-        self.assertLessEqual(handlers[0].backupCount, 90,
-                             "日志保留必须有上界，5×5MB 式无限留存不得回潮")
+        self.assertLessEqual(handlers[0].backupCount, 90, "日志保留必须有上界，5×5MB 式无限留存不得回潮")
 
 
 class TestCleanupTriggeredWithoutUpload(unittest.TestCase):
@@ -229,15 +258,21 @@ class TestCleanupTriggeredWithoutUpload(unittest.TestCase):
     def test_get_request_triggers_maybe_cleanup(self):
         import app as appmod
         from webapp import cleanup as cleanupmod
-        with mock.patch.object(cleanupmod, "_last_cleanup", [0.0]), \
-             mock.patch.object(cleanupmod, "cleanup_old_files") as co:
+
+        with (
+            mock.patch.object(cleanupmod, "_last_cleanup", [0.0]),
+            mock.patch.object(cleanupmod, "cleanup_old_files") as co,
+        ):
             appmod.app.test_client().get("/")
             self.assertTrue(co.called, "GET / 也必须触发过期回收")
 
     def test_debounce_prevents_rescan(self):
         from webapp import cleanup as cleanupmod
-        with mock.patch.object(cleanupmod, "_last_cleanup", [time.time()]), \
-             mock.patch.object(cleanupmod, "cleanup_old_files") as co:
+
+        with (
+            mock.patch.object(cleanupmod, "_last_cleanup", [time.time()]),
+            mock.patch.object(cleanupmod, "cleanup_old_files") as co,
+        ):
             cleanupmod.maybe_cleanup(3600)
             self.assertFalse(co.called, "一小时内重复请求不该反复扫描目录")
 
@@ -247,16 +282,20 @@ class TestFingerprintRobustness(unittest.TestCase):
 
     def test_fallback_when_source_unavailable(self):
         import analyzer.deepseek_client as dc
-        with mock.patch("inspect.getsource", side_effect=OSError("no source here")), \
-             mock.patch.dict(os.environ, {"PROMPT_CACHE_SALT": ""}):
+
+        with (
+            mock.patch("inspect.getsource", side_effect=OSError("no source here")),
+            mock.patch.dict(os.environ, {"PROMPT_CACHE_SALT": ""}),
+        ):
             fp = dc._prompt_fingerprint()
-            fp2 = dc._prompt_fingerprint()      # 必须在同一个降级上下文里比稳定性
+            fp2 = dc._prompt_fingerprint()  # 必须在同一个降级上下文里比稳定性
         self.assertEqual(len(fp), 12)
         self.assertNotEqual(fp, dc.PROMPT_FINGERPRINT, "降级指纹应与正常指纹不同")
         self.assertEqual(fp, fp2, "降级指纹仍须稳定")
 
     def test_salt_changes_fingerprint(self):
         import analyzer.deepseek_client as dc
+
         with mock.patch.dict(os.environ, {"PROMPT_CACHE_SALT": "2026-08-a"}):
             fp1 = dc._prompt_fingerprint()
             fp2 = dc._prompt_fingerprint()
@@ -268,9 +307,10 @@ class TestFingerprintRobustness(unittest.TestCase):
 
     def test_grace_hours_env_invalid_does_not_crash(self):
         import analyzer.deepseek_client as dc
+
         with mock.patch.dict(os.environ, {"LLM_MONTH_CACHE_GRACE_HOURS": "abc"}):
             val = dc._env_number("LLM_MONTH_CACHE_GRACE_HOURS", 24, 0, 720)
-        self.assertEqual(val, 24)   # 回退默认而不是 ValueError 崩在 import
+        self.assertEqual(val, 24)  # 回退默认而不是 ValueError 崩在 import
 
 
 class TestJobsHygiene(unittest.TestCase):
@@ -278,24 +318,33 @@ class TestJobsHygiene(unittest.TestCase):
 
     def _mk(self, n, status, finished_at):
         from webapp import jobs as jobsmod
+
         with jobsmod.JOBS_LOCK:
             for i in range(n):
                 jobsmod.JOBS[f"j{i}-{status}-{finished_at}"] = {
-                    "status": status, "dim": "emotion", "done": 0, "total": 0,
-                    "cancel": False, "chat_hash": "h", "sid": "s",
-                    "created": finished_at, "finished_at": finished_at,
+                    "status": status,
+                    "dim": "emotion",
+                    "done": 0,
+                    "total": 0,
+                    "cancel": False,
+                    "chat_hash": "h",
+                    "sid": "s",
+                    "created": finished_at,
+                    "finished_at": finished_at,
                 }
 
     def test_default_ttl_is_short(self):
         import config
+
         self.assertLessEqual(config.JOB_TTL_SECONDS, 3600)
 
     def test_expired_and_overflow_pruned_running_kept(self):
         from webapp import jobs as jobsmod
+
         jobsmod.JOBS.clear()
         old = time.time() - 99999
-        self._mk(3, "done", old)                       # 超 TTL
-        self._mk(2, "running", time.time())            # 进行中
+        self._mk(3, "done", old)  # 超 TTL
+        self._mk(2, "running", time.time())  # 进行中
         self._mk(jobsmod.MAX_JOBS_KEPT + 10, "done", time.time())
         jobsmod._prune_jobs()
         statuses = [v["status"] for v in jobsmod.JOBS.values()]
@@ -307,11 +356,20 @@ class TestJobsHygiene(unittest.TestCase):
     def test_poll_prunes_even_without_new_jobs(self):
         import app as appmod
         from webapp import jobs as jobsmod
+
         jobsmod.JOBS.clear()
         old = time.time() - 99999
-        jobsmod.JOBS["stale"] = {"status": "done", "dim": "emotion", "done": 0,
-                                 "total": 0, "cancel": False, "chat_hash": "h",
-                                 "sid": "other", "created": old, "finished_at": old}
+        jobsmod.JOBS["stale"] = {
+            "status": "done",
+            "dim": "emotion",
+            "done": 0,
+            "total": 0,
+            "cancel": False,
+            "chat_hash": "h",
+            "sid": "other",
+            "created": old,
+            "finished_at": old,
+        }
         client = appmod.app.test_client()
         r = client.get("/api/analyze-job/nonexistent")
         self.assertEqual(r.status_code, 404)
@@ -324,6 +382,7 @@ class TestUsageBatchWrite(unittest.TestCase):
 
     def test_batching_and_read_your_write(self):
         import analyzer.usage as usage
+
         fd, tmp = tempfile.mkstemp(suffix=".json")
         os.close(fd)
         os.remove(tmp)
@@ -333,10 +392,11 @@ class TestUsageBatchWrite(unittest.TestCase):
         def counting_dump(d):
             writes.append(1)
             orig_dump(d)
+
         usage.TOKEN_USAGE_FILE = tmp
         usage._dump = counting_dump
         try:
-            usage.flush()          # 清掉别的测试可能留下的未决增量
+            usage.flush()  # 清掉别的测试可能留下的未决增量
             for _ in range(50):
                 usage.record_call("deepseek-flash", "emotion", 100, 20)
             self.assertEqual(len(writes), 0, "增量不该逐次落盘")
@@ -358,12 +418,16 @@ class TestStatsInBackground(unittest.TestCase):
     """上传响应不再背着统计计算；首个页面请求自动等它收口"""
 
     def _upload(self, client, token, payload):
-        return client.post("/upload", data={"file": (io.BytesIO(payload), "c.json")},
-                           headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+        return client.post(
+            "/upload",
+            data={"file": (io.BytesIO(payload), "c.json")},
+            headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token},
+        )
 
     def test_dashboard_waits_for_background_stats(self):
         import app as appmod
         from webapp import store as storemod
+
         payload = _chat_payload({"uA": ["在吗", "今晚吃啥"], "uB": ["在的", "火锅"]})
         client = appmod.app.test_client()
         client.get("/")
@@ -393,6 +457,7 @@ class TestStatsInBackground(unittest.TestCase):
         而用户之后重新上传同一内容（新会话）必须能正常重算——标记要撤销"""
         import threading
         from webapp import store as storemod
+
         stats = {"overview": {"x": 1}}
         started, release = threading.Event(), threading.Event()
 
@@ -403,12 +468,11 @@ class TestStatsInBackground(unittest.TestCase):
 
         with mock.patch.object(storemod, "compute_stats", side_effect=blocking_compute):
             storemod.start_stats_job(object(), "hashG")
-            started.wait(10)                       # 线程已进入计算
-            storemod._purge_chat_caches("hashG")     # 用户在它落盘前清掉了这个聊天
+            started.wait(10)  # 线程已进入计算
+            storemod._purge_chat_caches("hashG")  # 用户在它落盘前清掉了这个聊天
             release.set()
             storemod.wait_for_stats("hashG", timeout=10)
-            self.assertIsNone(storemod._load_stats("hashG"),
-                              "被清理的哈希不能由晚到的线程复活成孤儿缓存")
+            self.assertIsNone(storemod._load_stats("hashG"), "被清理的哈希不能由晚到的线程复活成孤儿缓存")
 
             # 同一内容重新上传：新任务的正当写入不能被旧标记误拦
             release.set()
@@ -428,6 +492,7 @@ class TestSaveAndHash(unittest.TestCase):
         class FS:
             def __init__(self, data):
                 self.stream = io.BytesIO(data)
+
         data = json.dumps({"hello": "世界" * 500}).encode("utf-8")
         with tempfile.TemporaryDirectory() as tmp:
             dest = os.path.join(tmp, "f.json")
@@ -438,13 +503,17 @@ class TestSaveAndHash(unittest.TestCase):
 
     def test_upload_records_hash_from_stream(self):
         import app as appmod
+
         payload = _chat_payload({"uA": ["在吗"], "uB": ["在的"]})
         client = appmod.app.test_client()
         client.get("/")
         with client.session_transaction() as sess:
             token = sess["csrf_token"]
-        r = client.post("/upload", data={"file": (io.BytesIO(payload), "h.json")},
-                        headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+        r = client.post(
+            "/upload",
+            data={"file": (io.BytesIO(payload), "h.json")},
+            headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token},
+        )
         self.assertEqual(r.status_code, 302)
         with client.session_transaction() as sess:
             path, h = sess["filepath"], sess["chat_hash"]
@@ -461,11 +530,13 @@ class TestLocalizedAssets(unittest.TestCase):
 
     def test_vendor_files_present_and_nonempty(self):
         vendor = ROOT / "web" / "static" / "vendor"
-        for name, min_size in (("bootstrap.min.css", 100_000),
-                               ("bootstrap.bundle.min.js", 50_000),
-                               ("jquery.min.js", 50_000),
-                               ("echarts.min.js", 500_000),
-                               ("echarts-wordcloud.min.js", 10_000)):
+        for name, min_size in (
+            ("bootstrap.min.css", 100_000),
+            ("bootstrap.bundle.min.js", 50_000),
+            ("jquery.min.js", 50_000),
+            ("echarts.min.js", 500_000),
+            ("echarts-wordcloud.min.js", 10_000),
+        ):
             p = vendor / name
             self.assertTrue(p.exists(), f"缺少本地化资源 {name}")
             self.assertGreater(p.stat().st_size, min_size, f"{name} 体积异常，疑似下载失败")
@@ -492,13 +563,15 @@ class TestLocalizedAssets(unittest.TestCase):
         那份报告掉了样式/图表，而导出是纯前端拼接，没人会立刻发现。
         """
         import re
+
         base = (ROOT / "web" / "templates" / "base.html").read_text(encoding="utf-8")
         report = (ROOT / "web" / "templates" / "report.html").read_text(encoding="utf-8")
         refs = set(re.findall(r"filename='vendor/([\w.-]+)'", base))
         self.assertTrue(refs, "base.html 应引用本地化的 vendor 资源")
         for name in sorted(refs):
-            self.assertIn("'%s'" % name, report,
-                          f"{name} 不在 report.html 的 VENDOR_CDN 映射里，导出的报告会 404")
+            self.assertIn(
+                "'%s'" % name, report, f"{name} 不在 report.html 的 VENDOR_CDN 映射里，导出的报告会 404"
+            )
 
 
 class TestMediaParticipation(unittest.TestCase):
@@ -506,10 +579,14 @@ class TestMediaParticipation(unittest.TestCase):
 
     @staticmethod
     def _msg_with(el_type, data, msg_type=None, text="", **kw):
-        m = {"id": "1", "timestamp": 1704067200000, "time": "2024-01-01T00:00:00.000Z",
-             "sender": {"uid": "uA", "name": "我"},
-             "type": msg_type or el_type,
-             "content": {"text": text, "elements": [{"type": el_type, "data": data}]}}
+        m = {
+            "id": "1",
+            "timestamp": 1704067200000,
+            "time": "2024-01-01T00:00:00.000Z",
+            "sender": {"uid": "uA", "name": "我"},
+            "type": msg_type or el_type,
+            "content": {"text": text, "elements": [{"type": el_type, "data": data}]},
+        }
         m.update(kw)
         return m
 
@@ -517,17 +594,20 @@ class TestMediaParticipation(unittest.TestCase):
         path = _write_tmp(_wrap(msgs, {"uA": "我", "uB": "对方"}))
         try:
             from parser.qq_parser import load_chat
+
             return load_chat(path)
         finally:
             os.remove(path)
 
     def test_file_and_video_carry_labels_but_not_body_text(self):
-        chat = self._load([
-            self._msg_with("file", {"filename": "example.zip", "size": "12345"},
-                           text="[文件:example.zip]"),
-            self._msg_with("video", {"filename": "clip.mp4", "size": "999"},
-                           text="[视频:clip.mp4]"),
-        ])
+        chat = self._load(
+            [
+                self._msg_with(
+                    "file", {"filename": "example.zip", "size": "12345"}, text="[文件:example.zip]"
+                ),
+                self._msg_with("video", {"filename": "clip.mp4", "size": "999"}, text="[视频:clip.mp4]"),
+            ]
+        )
         f, v = chat.messages
         self.assertEqual((f.media_kind, f.media_label), ("file", "example.zip"))
         self.assertEqual((v.media_kind, v.media_label), ("video", "clip.mp4"))
@@ -536,45 +616,65 @@ class TestMediaParticipation(unittest.TestCase):
         self.assertEqual(v.text, "")
 
     def test_forward_card_gets_title_and_count(self):
-        chat = self._load([self._msg_with(
-            "forward", {"title": "小明和小红的聊天记录", "messageCount": "25"},
-            msg_type="json", text="[转发消息: 25条]")])
+        chat = self._load(
+            [
+                self._msg_with(
+                    "forward",
+                    {"title": "小明和小红的聊天记录", "messageCount": "25"},
+                    msg_type="json",
+                    text="[转发消息: 25条]",
+                )
+            ]
+        )
         m = chat.messages[0]
         self.assertEqual(m.media_kind, "forward")
         self.assertIn("25条", m.media_label)
         self.assertIn("聊天记录", m.media_label)
 
     def test_call_record_and_json_card_and_wallet(self):
-        chat = self._load([
-            self._msg_with("av_record", {}, msg_type="type_19", text="通话 - 未接听，点击回拨"),
-            self._msg_with("json", {}, msg_type="json", text="[JSON消息]"),
-            self._msg_with("wallet", {"summary": "红包/钱包消息"}, msg_type="type_10",
-                           text="红包/钱包消息"),
-        ])
+        chat = self._load(
+            [
+                self._msg_with("av_record", {}, msg_type="type_19", text="通话 - 未接听，点击回拨"),
+                self._msg_with("json", {}, msg_type="json", text="[JSON消息]"),
+                self._msg_with(
+                    "wallet", {"summary": "红包/钱包消息"}, msg_type="type_10", text="红包/钱包消息"
+                ),
+            ]
+        )
         kinds = [m.media_kind for m in chat.messages]
         self.assertEqual(kinds, ["av_record", "json", "wallet"])
         self.assertIn("未接听", chat.messages[0].media_label)
 
     def test_market_face_counts_as_face_and_is_not_skipped(self):
         """type_17（商城大表情）此前被整个跳过，是 277 条白白丢掉的信号"""
-        chat = self._load([self._msg_with("market_face", {"name": "[[叉腰]]"},
-                                          msg_type="type_17", text="[[叉腰]]")])
+        chat = self._load(
+            [self._msg_with("market_face", {"name": "[[叉腰]]"}, msg_type="type_17", text="[[叉腰]]")]
+        )
         m = chat.messages[0]
         self.assertEqual(m.face_names, ["叉腰"])
         from parser.qq_parser import is_statistical
+
         self.assertTrue(is_statistical(m), "商城表情不该被当成不可分析的卡片")
         from analyzer.local_stats import calc_face_stats, calc_overview
+
         self.assertEqual(calc_overview(chat)["total_faces"], 1)
         self.assertEqual(calc_face_stats(chat)["self"], {"叉腰": 1})
 
     def test_media_messages_enter_ai_dialog_with_markers(self):
         import analyzer.deepseek_client as dc
-        chat = self._load([
-            self._msg_with("file", {"filename": "示例表.xlsx"}, text="[文件:示例表.xlsx]"),
-            self._msg_with("forward", {"title": "小明和小红的聊天记录", "messageCount": "4"},
-                           msg_type="json", text="[转发消息: 4条]"),
-            self._msg_with("av_record", {}, msg_type="type_19", text="通话 - 未接听"),
-        ])
+
+        chat = self._load(
+            [
+                self._msg_with("file", {"filename": "示例表.xlsx"}, text="[文件:示例表.xlsx]"),
+                self._msg_with(
+                    "forward",
+                    {"title": "小明和小红的聊天记录", "messageCount": "4"},
+                    msg_type="json",
+                    text="[转发消息: 4条]",
+                ),
+                self._msg_with("av_record", {}, msg_type="type_19", text="通话 - 未接听"),
+            ]
+        )
         for m in chat.messages:
             self.assertTrue(dc._has_content(m), "媒体消息必须能进 AI 对话")
         lines = [dc._message_line(m, "我") for m in chat.messages]
@@ -584,21 +684,24 @@ class TestMediaParticipation(unittest.TestCase):
 
     def test_media_does_not_pollute_length_or_word_stats(self):
         from analyzer.local_stats import calc_message_length_stats
+
         long_name = "a" * 80 + ".zip"
-        chat = self._load([self._msg_with("file", {"filename": long_name},
-                                          text=f"[文件:{long_name}]")])
+        chat = self._load([self._msg_with("file", {"filename": long_name}, text=f"[文件:{long_name}]")])
         stats = calc_message_length_stats(chat)
         self.assertEqual(stats["self"]["max"], 0, "文件名不该计入发言长度")
 
     def test_overview_counts_media_by_kind(self):
         from analyzer.local_stats import calc_overview
-        chat = self._load([
-            self._msg_with("file", {"filename": "a.zip"}),
-            self._msg_with("file", {"filename": "b.zip"}),
-            self._msg_with("video", {"filename": "c.mp4"}),
-            self._msg_with("forward", {"title": "t", "messageCount": "3"}, msg_type="json"),
-            self._msg_with("wallet", {"summary": "红包"}),
-        ])
+
+        chat = self._load(
+            [
+                self._msg_with("file", {"filename": "a.zip"}),
+                self._msg_with("file", {"filename": "b.zip"}),
+                self._msg_with("video", {"filename": "c.mp4"}),
+                self._msg_with("forward", {"title": "t", "messageCount": "3"}, msg_type="json"),
+                self._msg_with("wallet", {"summary": "红包"}),
+            ]
+        )
         ov = calc_overview(chat)
         self.assertEqual(ov["total_files"], 2)
         self.assertEqual(ov["total_videos"], 1)
@@ -608,13 +711,16 @@ class TestMediaParticipation(unittest.TestCase):
     def test_media_volume_and_dedup(self):
         """导出器给到的 size/md5 用于体积与去重统计（同一张图反复发只算一张）"""
         from analyzer.local_stats import calc_overview
+
         img = {"filename": "a.jpg", "size": "2048", "md5": "AAA"}
-        chat = self._load([
-            self._msg_with("image", img),
-            self._msg_with("image", img),                      # 同一张图重复发送
-            self._msg_with("image", {"filename": "b.jpg", "size": "1024", "md5": "BBB"}),
-            self._msg_with("file", {"filename": "c.zip", "size": "4096", "md5": "CCC"}),
-        ])
+        chat = self._load(
+            [
+                self._msg_with("image", img),
+                self._msg_with("image", img),  # 同一张图重复发送
+                self._msg_with("image", {"filename": "b.jpg", "size": "1024", "md5": "BBB"}),
+                self._msg_with("file", {"filename": "c.zip", "size": "4096", "md5": "CCC"}),
+            ]
+        )
         ov = calc_overview(chat)
         self.assertEqual(ov["total_images"], 3)
         self.assertEqual(ov["image_bytes"], 2048 * 2 + 1024)
@@ -623,6 +729,7 @@ class TestMediaParticipation(unittest.TestCase):
 
     def test_media_size_dirty_values_do_not_crash(self):
         from analyzer.local_stats import calc_overview
+
         chat = self._load([self._msg_with("image", {"filename": "x.jpg", "size": "未知", "md5": None})])
         ov = calc_overview(chat)
         self.assertEqual(ov["image_bytes"], 0)
@@ -634,10 +741,16 @@ class TestTimeNormalization(unittest.TestCase):
 
     def test_iso_utc_time_is_converted_to_cst(self):
         from parser.qq_parser import load_chat
-        msgs = [{"id": "1", "timestamp": 1704067200000, "time": "2024-01-01T00:00:00.000Z",
-                 "sender": {"uid": "uA", "name": "我"},
-                 "content": {"text": "在吗",
-                             "elements": [{"type": "text", "data": {"text": "在吗"}}]}}]
+
+        msgs = [
+            {
+                "id": "1",
+                "timestamp": 1704067200000,
+                "time": "2024-01-01T00:00:00.000Z",
+                "sender": {"uid": "uA", "name": "我"},
+                "content": {"text": "在吗", "elements": [{"type": "text", "data": {"text": "在吗"}}]},
+            }
+        ]
         path = _write_tmp(_wrap(msgs, {"uA": "我", "uB": "对方"}))
         try:
             chat = load_chat(path)
@@ -647,6 +760,7 @@ class TestTimeNormalization(unittest.TestCase):
 
     def test_iso_fallback_when_timestamp_missing(self):
         from parser.qq_parser import _parse_timestamp
+
         ts = _parse_timestamp(None, "2024-01-01T00:00:00.000Z")
         self.assertIsNotNone(ts, "缺 timestamp 时应能从 ISO 字符串回退解析")
         self.assertEqual(ts, 1704067200000)
@@ -659,33 +773,57 @@ class TestVisionDigest(unittest.TestCase):
     def _png(w, h, rgb):
         import struct
         import zlib
+
         raw = b"".join(b"\x00" + bytes(rgb) * w for _ in range(h))
 
         def chunk(tag, data):
-            return (struct.pack(">I", len(data)) + tag + data
-                    + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
-        return (b"\x89PNG\r\n\x1a\n"
-                + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
-                + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+            return (
+                struct.pack(">I", len(data))
+                + tag
+                + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+            )
+
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw))
+            + chunk(b"IEND", b"")
+        )
 
     def _media_dir(self, tmp, specs):
         """specs: [(相对路径, 宽, 高, md5)] → 建立假图片文件并返回消息列表"""
         from parser.qq_parser import Message
+
         msgs = []
         for i, (rel, w, h, md5) in enumerate(specs):
             path = os.path.join(tmp, rel)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "wb") as f:
                 f.write(self._png(max(w, 1), max(h, 1), (10, 20, 30)))
-            msgs.append(Message(
-                id=str(i), timestamp=1704067200000 + i * 1000, time_str="2024-01-01 08:00:00",
-                sender_name="我", sender_uid="uA", text="", raw_text="", msg_type="type_3",
-                has_image=True, is_reply=False, media_path=rel, media_w=w, media_h=h,
-                media_id=md5 or ""))
+            msgs.append(
+                Message(
+                    id=str(i),
+                    timestamp=1704067200000 + i * 1000,
+                    time_str="2024-01-01 08:00:00",
+                    sender_name="我",
+                    sender_uid="uA",
+                    text="",
+                    raw_text="",
+                    msg_type="type_3",
+                    has_image=True,
+                    is_reply=False,
+                    media_path=rel,
+                    media_w=w,
+                    media_h=h,
+                    media_id=md5 or "",
+                )
+            )
         return msgs
 
     def test_disabled_without_media_root(self):
         from analyzer import vision
+
         with mock.patch.object(vision, "MEDIA_ROOT", ""):
             self.assertFalse(vision.available())
             with mock.patch("analyzer.deepseek_client._call_vision") as call:
@@ -694,36 +832,63 @@ class TestVisionDigest(unittest.TestCase):
 
     def test_pick_images_dedupes_small_and_missing(self):
         from analyzer import vision
+
         with tempfile.TemporaryDirectory() as tmp:
-            msgs = self._media_dir(tmp, [
-                ("resources/images/a.png", 1080, 2400, "AAA"),
-                ("resources/images/a2.png", 1080, 2400, "AAA"),     # 同一张图（md5 相同）
-                ("resources/images/tiny.png", 64, 64, "TINY"),      # 表情包尺寸，跳过
-                ("resources/images/b.png", 1200, 900, "BBB"),
-            ])
-            msgs.append(msgs[0].__class__(
-                id="9", timestamp=1, time_str="", sender_name="我", sender_uid="uA",
-                text="", raw_text="", msg_type="type_3", has_image=True, is_reply=False,
-                media_path="resources/images/missing.png", media_w=1000, media_h=1000,
-                media_id="MISSING"))
-            with mock.patch.object(vision, "MEDIA_ROOT", tmp), \
-                 mock.patch.object(vision, "VISION_MIN_SIDE", 200), \
-                 mock.patch.object(vision, "VISION_MAX_BYTES", 10 ** 7):
+            msgs = self._media_dir(
+                tmp,
+                [
+                    ("resources/images/a.png", 1080, 2400, "AAA"),
+                    ("resources/images/a2.png", 1080, 2400, "AAA"),  # 同一张图（md5 相同）
+                    ("resources/images/tiny.png", 64, 64, "TINY"),  # 表情包尺寸，跳过
+                    ("resources/images/b.png", 1200, 900, "BBB"),
+                ],
+            )
+            msgs.append(
+                msgs[0].__class__(
+                    id="9",
+                    timestamp=1,
+                    time_str="",
+                    sender_name="我",
+                    sender_uid="uA",
+                    text="",
+                    raw_text="",
+                    msg_type="type_3",
+                    has_image=True,
+                    is_reply=False,
+                    media_path="resources/images/missing.png",
+                    media_w=1000,
+                    media_h=1000,
+                    media_id="MISSING",
+                )
+            )
+            with (
+                mock.patch.object(vision, "MEDIA_ROOT", tmp),
+                mock.patch.object(vision, "VISION_MIN_SIDE", 200),
+                mock.patch.object(vision, "VISION_MAX_BYTES", 10**7),
+            ):
                 picked = vision.pick_images(msgs, limit=8)
             self.assertEqual([p["key"] for p in picked], ["AAA", "BBB"])
 
     def test_digest_cached_across_dimensions_and_runs(self):
         from analyzer import vision
+
         with tempfile.TemporaryDirectory() as tmp:
-            msgs = self._media_dir(tmp, [
-                ("resources/images/a.png", 1080, 2400, "AAA"),
-                ("resources/images/b.png", 1200, 900, "BBB"),
-            ])
-            with mock.patch.object(vision, "MEDIA_ROOT", tmp), \
-                 mock.patch.object(vision, "VISION_MIN_SIDE", 200), \
-                 mock.patch.object(vision, "_MEMO", {}), \
-                 mock.patch("analyzer.deepseek_client._call_vision",
-                            return_value="- 截图：在讨论选课\n- 照片：路边的小猫") as call:
+            msgs = self._media_dir(
+                tmp,
+                [
+                    ("resources/images/a.png", 1080, 2400, "AAA"),
+                    ("resources/images/b.png", 1200, 900, "BBB"),
+                ],
+            )
+            with (
+                mock.patch.object(vision, "MEDIA_ROOT", tmp),
+                mock.patch.object(vision, "VISION_MIN_SIDE", 200),
+                mock.patch.object(vision, "_MEMO", {}),
+                mock.patch(
+                    "analyzer.deepseek_client._call_vision",
+                    return_value="- 截图：在讨论选课\n- 照片：路边的小猫",
+                ) as call,
+            ):
                 first = vision.digest(msgs, chat_hash="hashV", label="2026-08 月")
                 second = vision.digest(msgs, chat_hash="hashV", label="2026-08 月")
                 self.assertIn("小猫", first)
@@ -738,19 +903,30 @@ class TestVisionDigest(unittest.TestCase):
     def test_digest_injected_into_dialog(self):
         import analyzer.deepseek_client as dc
         from analyzer import vision
+
         with tempfile.TemporaryDirectory() as tmp:
             msgs = self._media_dir(tmp, [("resources/images/a.png", 1080, 2400, "AAA")])
             text_msg = msgs[0].__class__(
-                id="x", timestamp=1704067200000, time_str="2024-01-01 08:00:00",
-                sender_name="我", sender_uid="uA", text="在吗", raw_text="在吗",
-                msg_type="type_1", has_image=False, is_reply=False)
-            with mock.patch.object(vision, "MEDIA_ROOT", tmp), \
-                 mock.patch.object(vision, "VISION_MIN_SIDE", 200), \
-                 mock.patch.object(vision, "_MEMO", {}), \
-                 mock.patch("analyzer.deepseek_client._call_vision",
-                            return_value="- 截图：课程表"):
-                dialog = dc._build_dialog([text_msg, msgs[0]], "uA", "我", "对方",
-                                          chat_hash="h", vision_label="2026-08 月")
+                id="x",
+                timestamp=1704067200000,
+                time_str="2024-01-01 08:00:00",
+                sender_name="我",
+                sender_uid="uA",
+                text="在吗",
+                raw_text="在吗",
+                msg_type="type_1",
+                has_image=False,
+                is_reply=False,
+            )
+            with (
+                mock.patch.object(vision, "MEDIA_ROOT", tmp),
+                mock.patch.object(vision, "VISION_MIN_SIDE", 200),
+                mock.patch.object(vision, "_MEMO", {}),
+                mock.patch("analyzer.deepseek_client._call_vision", return_value="- 截图：课程表"),
+            ):
+                dialog = dc._build_dialog(
+                    [text_msg, msgs[0]], "uA", "我", "对方", chat_hash="h", vision_label="2026-08 月"
+                )
         self.assertIn("图片内容摘要", dialog)
         self.assertIn("课程表", dialog)
 
@@ -758,6 +934,7 @@ class TestVisionDigest(unittest.TestCase):
         """图片理解出任何非致命问题，都必须退回纯文本分析而不是让分析失败"""
         import analyzer.deepseek_client as dc
         from analyzer import vision
+
         with mock.patch.object(vision, "digest", side_effect=RuntimeError("视觉挂了")):
             self.assertEqual(dc._vision_digest([], "h", "标签"), "")
         with mock.patch.object(vision, "digest", side_effect=dc.QuotaExhaustedError("额度")):
@@ -771,6 +948,7 @@ class TestWebUIMediaUpload(unittest.TestCase):
     def setUp(self):
         import app as appmod
         from analyzer import vision
+
         self.appmod = appmod
         self.vision = vision
         self.client = appmod.app.test_client()
@@ -780,20 +958,46 @@ class TestWebUIMediaUpload(unittest.TestCase):
         self.headers = {"Origin": "http://localhost:5000", "X-CSRF-Token": self.token}
         self._dir = tempfile.mkdtemp(prefix="qqchatlog-media-")
         # 用真实的图片元素构造导出：两条图片消息 + 一条文本
-        self.payload = _wrap([
-            {"id": "1", "timestamp": 1704067200000, "time": "2024-01-01T00:00:00.000Z",
-             "sender": {"uid": "uA", "name": "我"}, "type": "type_3",
-             "content": {"text": "", "elements": [{"type": "image", "data": {
-                 "filename": "pic.jpg", "md5": "AAA", "size": "2048",
-                 "width": "1080", "height": "2400",
-                 "url": "resources/images/aaa_pic.jpg"}}]}},
-            {"id": "2", "timestamp": 1704067260000, "time": "2024-01-01T00:01:00.000Z",
-             "sender": {"uid": "uB", "name": "对方"}, "type": "type_1",
-             "content": {"text": "在吗", "elements": [{"type": "text", "data": {"text": "在吗"}}]}},
-        ], {"uA": "我", "uB": "对方"})
+        self.payload = _wrap(
+            [
+                {
+                    "id": "1",
+                    "timestamp": 1704067200000,
+                    "time": "2024-01-01T00:00:00.000Z",
+                    "sender": {"uid": "uA", "name": "我"},
+                    "type": "type_3",
+                    "content": {
+                        "text": "",
+                        "elements": [
+                            {
+                                "type": "image",
+                                "data": {
+                                    "filename": "pic.jpg",
+                                    "md5": "AAA",
+                                    "size": "2048",
+                                    "width": "1080",
+                                    "height": "2400",
+                                    "url": "resources/images/aaa_pic.jpg",
+                                },
+                            }
+                        ],
+                    },
+                },
+                {
+                    "id": "2",
+                    "timestamp": 1704067260000,
+                    "time": "2024-01-01T00:01:00.000Z",
+                    "sender": {"uid": "uB", "name": "对方"},
+                    "type": "type_1",
+                    "content": {"text": "在吗", "elements": [{"type": "text", "data": {"text": "在吗"}}]},
+                },
+            ],
+            {"uA": "我", "uB": "对方"},
+        )
 
     def tearDown(self):
         import shutil
+
         with self.client.session_transaction() as s:
             chat_hash, path = s.get("chat_hash"), s.get("filepath")
         if chat_hash:
@@ -804,8 +1008,11 @@ class TestWebUIMediaUpload(unittest.TestCase):
         shutil.rmtree(self._dir, ignore_errors=True)
 
     def _upload_json(self):
-        r = self.client.post("/upload", data={"file": (io.BytesIO(self.payload), "c.json")},
-                             headers={**self.headers, "X-Requested-With": "fetch"})
+        r = self.client.post(
+            "/upload",
+            data={"file": (io.BytesIO(self.payload), "c.json")},
+            headers={**self.headers, "X-Requested-With": "fetch"},
+        )
         self.assertEqual(r.status_code, 200)
         return r.get_json()
 
@@ -815,14 +1022,16 @@ class TestWebUIMediaUpload(unittest.TestCase):
     def test_ajax_upload_returns_wanted_media(self):
         body = self._upload_json()
         self.assertTrue(body["ok"])
-        self.assertIn("aaa_pic.jpg", [os.path.basename(p) for p in body["wanted_media"]],
-                      "应告知前端需要哪张图")
+        self.assertIn(
+            "aaa_pic.jpg", [os.path.basename(p) for p in body["wanted_media"]], "应告知前端需要哪张图"
+        )
         self.assertEqual(body["next"], "/dashboard")
 
     def test_plain_form_upload_still_redirects(self):
         """没有 JS/没选目录时，普通表单提交必须照旧 302 跳转"""
-        r = self.client.post("/upload", data={"file": (io.BytesIO(self.payload), "c.json")},
-                             headers=self.headers)
+        r = self.client.post(
+            "/upload", data={"file": (io.BytesIO(self.payload), "c.json")}, headers=self.headers
+        )
         self.assertEqual(r.status_code, 302)
 
     def test_media_endpoint_stores_only_images_and_blocks_traversal(self):
@@ -830,12 +1039,13 @@ class TestWebUIMediaUpload(unittest.TestCase):
         data = {
             "files": [
                 (io.BytesIO(self._png()), "aaa_pic.jpg"),
-                (io.BytesIO(b"not an image"), "evil.exe"),                  # 扩展名白名单拦下
-                (io.BytesIO(self._png()), "../../../evil.jpg"),             # 路径穿越：只取 basename
+                (io.BytesIO(b"not an image"), "evil.exe"),  # 扩展名白名单拦下
+                (io.BytesIO(self._png()), "../../../evil.jpg"),  # 路径穿越：只取 basename
             ],
         }
-        r = self.client.post("/api/media", data=data, headers=self.headers,
-                             content_type="multipart/form-data")
+        r = self.client.post(
+            "/api/media", data=data, headers=self.headers, content_type="multipart/form-data"
+        )
         body = r.get_json()
         self.assertEqual(r.status_code, 200)
         self.assertEqual(body["saved"], 2)
@@ -845,23 +1055,30 @@ class TestWebUIMediaUpload(unittest.TestCase):
         media_dir = self.vision.session_media_dir(chat_hash)
         self.assertEqual(sorted(os.listdir(media_dir)), ["aaa_pic.jpg", "evil.jpg"])
         # 越界文件绝不能写到 uploads/ 之外
-        self.assertFalse(os.path.exists(os.path.abspath(
-            os.path.join(media_dir, "..", "..", "..", "evil.jpg"))))
+        self.assertFalse(
+            os.path.exists(os.path.abspath(os.path.join(media_dir, "..", "..", "..", "evil.jpg")))
+        )
 
     def test_digest_uses_uploaded_copy_without_media_root(self):
         """没配 QQCHAT_MEDIA_DIR 也应该能用（图片来自 WebUI 上传的副本）"""
         self._upload_json()
-        self.client.post("/api/media",
-                         data={"files": [(io.BytesIO(self._png()), "aaa_pic.jpg")]},
-                         headers=self.headers, content_type="multipart/form-data")
+        self.client.post(
+            "/api/media",
+            data={"files": [(io.BytesIO(self._png()), "aaa_pic.jpg")]},
+            headers=self.headers,
+            content_type="multipart/form-data",
+        )
         from parser.qq_parser import load_chat
+
         with self.client.session_transaction() as s:
             chat_hash, path = s["chat_hash"], s["filepath"]
         chat = load_chat(path)
-        with mock.patch.object(self.vision, "MEDIA_ROOT", ""), \
-             mock.patch.object(self.vision, "VISION_MIN_SIDE", 100), \
-             mock.patch.object(self.vision, "_MEMO", {}), \
-             mock.patch("analyzer.deepseek_client._call_vision", return_value="- 截图：宠物医院候诊") as call:
+        with (
+            mock.patch.object(self.vision, "MEDIA_ROOT", ""),
+            mock.patch.object(self.vision, "VISION_MIN_SIDE", 100),
+            mock.patch.object(self.vision, "_MEMO", {}),
+            mock.patch("analyzer.deepseek_client._call_vision", return_value="- 截图：宠物医院候诊") as call,
+        ):
             text = self.vision.digest(chat.messages, chat_hash=chat_hash, label="2024-01 月")
         self.assertIn("宠物医院", text)
         self.assertEqual(call.call_count, 1)
@@ -871,9 +1088,12 @@ class TestWebUIMediaUpload(unittest.TestCase):
         fresh.get("/")
         with fresh.session_transaction() as s:
             tok = s["csrf_token"]
-        r = fresh.post("/api/media", data={"files": [(io.BytesIO(self._png()), "x.jpg")]},
-                       headers={"Origin": "http://localhost:5000", "X-CSRF-Token": tok},
-                       content_type="multipart/form-data")
+        r = fresh.post(
+            "/api/media",
+            data={"files": [(io.BytesIO(self._png()), "x.jpg")]},
+            headers={"Origin": "http://localhost:5000", "X-CSRF-Token": tok},
+            content_type="multipart/form-data",
+        )
         self.assertEqual(r.status_code, 400)
 
 
@@ -882,39 +1102,60 @@ class TestFaceEmoji(unittest.TestCase):
 
     def test_known_faces_map_to_emoji(self):
         from analyzer.face_emoji import emoji_for
+
         self.assertEqual(emoji_for("/可怜"), "🥺")
         self.assertEqual(emoji_for("/流泪"), "😢")
         self.assertEqual(emoji_for("/doge"), "🐶")
-        self.assertEqual(emoji_for("微笑"), "🙂")          # 不带斜杠也能认
+        self.assertEqual(emoji_for("微笑"), "🙂")  # 不带斜杠也能认
 
     def test_qq_only_faces_fall_back_to_empty(self):
         """QQ 专属超级表情/商城表情没有 Unicode 对应，必须返回空串而不是硬凑"""
         from analyzer.face_emoji import emoji_for
+
         for name in ("/吃糖", "/大怨种", "/菜汪", "/宕机", "/偷感", "[[叉腰]]", "[13]"):
             self.assertEqual(emoji_for(name), "", f"{name} 不该被硬映射成某个 emoji")
 
     def test_emoji_map_only_keeps_mapped(self):
         from analyzer.face_emoji import emoji_map
+
         m = emoji_map(["/可怜", "/吃糖", "/流泪"])
         self.assertEqual(m, {"/可怜": "🥺", "/流泪": "😢"})
 
     def test_habits_page_embeds_emoji_map(self):
         """页面里真的把 emoji 传给了前端渲染"""
         import app as appmod
-        payload = _wrap([
-            {"id": "1", "timestamp": 1704067200000, "time": "2024-01-01 08:00:00",
-             "sender": {"uid": "uA", "name": "我"},
-             "content": {"text": "", "elements": [{"type": "face", "data": {"id": "111", "name": "/可怜"}}]}},
-            {"id": "2", "timestamp": 1704067210000, "time": "2024-01-01 08:00:10",
-             "sender": {"uid": "uB", "name": "对方"},
-             "content": {"text": "在吗", "elements": [{"type": "text", "data": {"text": "在吗"}}]}},
-        ], {"uA": "我", "uB": "对方"})
+
+        payload = _wrap(
+            [
+                {
+                    "id": "1",
+                    "timestamp": 1704067200000,
+                    "time": "2024-01-01 08:00:00",
+                    "sender": {"uid": "uA", "name": "我"},
+                    "content": {
+                        "text": "",
+                        "elements": [{"type": "face", "data": {"id": "111", "name": "/可怜"}}],
+                    },
+                },
+                {
+                    "id": "2",
+                    "timestamp": 1704067210000,
+                    "time": "2024-01-01 08:00:10",
+                    "sender": {"uid": "uB", "name": "对方"},
+                    "content": {"text": "在吗", "elements": [{"type": "text", "data": {"text": "在吗"}}]},
+                },
+            ],
+            {"uA": "我", "uB": "对方"},
+        )
         client = appmod.app.test_client()
         client.get("/")
         with client.session_transaction() as s:
             token = s["csrf_token"]
-        client.post("/upload", data={"file": (io.BytesIO(payload), "c.json")},
-                    headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+        client.post(
+            "/upload",
+            data={"file": (io.BytesIO(payload), "c.json")},
+            headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token},
+        )
         with client.session_transaction() as s:
             chat_hash, path = s["chat_hash"], s["filepath"]
         try:
@@ -922,8 +1163,11 @@ class TestFaceEmoji(unittest.TestCase):
             body = client.get("/habits").get_data(as_text=True)
             # tojson 会把 emoji 转成 \ud83e\udd7a 转义，这里还原后断言真实字符。
             # 现在是 renderFaceBarChart(dom, 排行数组, 名字, emoji 映射, 表情图映射)
-            m = re.search(r"renderFaceBarChart\('selfFaceChart',\s*\[.*?\],\s*\"[^\"]*\",\s*"
-                          r"(\{.*?\}),\s*\{.*?\}\);", body)
+            m = re.search(
+                r"renderFaceBarChart\('selfFaceChart',\s*\[.*?\],\s*\"[^\"]*\",\s*"
+                r"(\{.*?\}),\s*\{.*?\}\);",
+                body,
+            )
             self.assertIsNotNone(m, "习惯页应调用 renderFaceBarChart 并传入 emoji 映射")
             mapping = json.loads(m.group(1))
             self.assertEqual(mapping.get("/可怜"), "🥺")
@@ -934,30 +1178,47 @@ class TestFaceEmoji(unittest.TestCase):
             if path and os.path.exists(path):
                 os.remove(path)
 
-
     def test_face_ranking_keeps_count_order(self):
         """表情排行必须按次数排：Flask 的 tojson 默认 sort_keys=True，
         直接传 dict 会被按汉字码点重排，"排行"名不副实（真实踩到过）。"""
         import app as appmod
-        payload = _wrap([
-            {"id": str(i), "timestamp": 1704067200000 + i * 1000,
-             "time": "2024-01-01 08:00:00", "sender": {"uid": "uA", "name": "我"},
-             "content": {"text": "", "elements": [
-                 {"type": "face", "data": {"id": "5", "name": face}}]}}
-            # 次数：/流泪 3 次 > /可怜 2 次 > /微笑 1 次，
-            # 但按编码排序会变成 可怜 < 微笑 < 流泪，正好能验出问题
-            for i, face in enumerate(["/流泪", "/流泪", "/流泪", "/可怜", "/可怜", "/微笑"])
-        ] + [
-            {"id": "x", "timestamp": 1704067260000, "time": "2024-01-01 08:01:00",
-             "sender": {"uid": "uB", "name": "对方"},
-             "content": {"text": "在吗", "elements": [{"type": "text", "data": {"text": "在吗"}}]}},
-        ], {"uA": "我", "uB": "对方"})
+
+        payload = _wrap(
+            [
+                {
+                    "id": str(i),
+                    "timestamp": 1704067200000 + i * 1000,
+                    "time": "2024-01-01 08:00:00",
+                    "sender": {"uid": "uA", "name": "我"},
+                    "content": {
+                        "text": "",
+                        "elements": [{"type": "face", "data": {"id": "5", "name": face}}],
+                    },
+                }
+                # 次数：/流泪 3 次 > /可怜 2 次 > /微笑 1 次，
+                # 但按编码排序会变成 可怜 < 微笑 < 流泪，正好能验出问题
+                for i, face in enumerate(["/流泪", "/流泪", "/流泪", "/可怜", "/可怜", "/微笑"])
+            ]
+            + [
+                {
+                    "id": "x",
+                    "timestamp": 1704067260000,
+                    "time": "2024-01-01 08:01:00",
+                    "sender": {"uid": "uB", "name": "对方"},
+                    "content": {"text": "在吗", "elements": [{"type": "text", "data": {"text": "在吗"}}]},
+                },
+            ],
+            {"uA": "我", "uB": "对方"},
+        )
         client = appmod.app.test_client()
         client.get("/")
         with client.session_transaction() as s:
             token = s["csrf_token"]
-        client.post("/upload", data={"file": (io.BytesIO(payload), "c.json")},
-                    headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+        client.post(
+            "/upload",
+            data={"file": (io.BytesIO(payload), "c.json")},
+            headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token},
+        )
         with client.session_transaction() as s:
             chat_hash, path = s["chat_hash"], s["filepath"]
         try:
@@ -979,6 +1240,7 @@ class TestFaceImagesOptional(unittest.TestCase):
 
     def setUp(self):
         from analyzer import face_images
+
         self.fi = face_images
         self._tmp = tempfile.mkdtemp(prefix="qqchatlog-faces-")
         self._patches = [
@@ -991,12 +1253,14 @@ class TestFaceImagesOptional(unittest.TestCase):
 
     def tearDown(self):
         import shutil
+
         for p in reversed(self._patches):
             p.stop()
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def test_disabled_by_default(self):
         import config
+
         self.assertFalse(config.FACE_IMAGES_ENABLED, "默认必须是关的（可选项）")
         with mock.patch.object(self.fi, "FACE_IMAGES_ENABLED", False):
             self.assertFalse(self.fi.enabled())
@@ -1004,10 +1268,8 @@ class TestFaceImagesOptional(unittest.TestCase):
 
     def test_url_resolved_by_name_not_by_export_id(self):
         """按名字取图：同一张表情在不同导出里的 id 可能不同，名字才与显示一致"""
-        self.assertEqual(self.fi.url_for("/可怜"),
-                         "https://qzonestyle.gtimg.cn/qzone/em/e153.gif")
-        self.assertEqual(self.fi.url_for("流泪"),
-                         "https://qzonestyle.gtimg.cn/qzone/em/e105.gif")
+        self.assertEqual(self.fi.url_for("/可怜"), "https://qzonestyle.gtimg.cn/qzone/em/e153.gif")
+        self.assertEqual(self.fi.url_for("流泪"), "https://qzonestyle.gtimg.cn/qzone/em/e105.gif")
         # 超级表情：既不在经典表里、也没有商城地址 → 绝不猜地址
         self.assertIsNone(self.fi.url_for("/吃糖"))
         self.assertIsNone(self.fi.url_for("/大怨种"))
@@ -1020,15 +1282,17 @@ class TestFaceImagesOptional(unittest.TestCase):
     def test_foreign_host_is_refused(self):
         """只有已知表情 CDN 允许访问，避免这段代码被当成任意下载器"""
         self.assertIsNone(self.fi.url_for("x", "https://evil.example.com/a.gif"))
-        with mock.patch.object(self.fi, "urlopen", create=True) as _u, \
-             mock.patch("urllib.request.urlopen") as real:
+        with (
+            mock.patch.object(self.fi, "urlopen", create=True) as _u,
+            mock.patch("urllib.request.urlopen") as real,
+        ):
             self.assertIsNone(self.fi._download("https://evil.example.com/a.gif"))
             self.assertFalse(real.called)
 
     def test_offline_failure_degrades_gracefully(self):
         import urllib.error
-        with mock.patch.object(self.fi, "_download",
-                               side_effect=urllib.error.URLError("no network")):
+
+        with mock.patch.object(self.fi, "_download", side_effect=urllib.error.URLError("no network")):
             out = self.fi.ensure({"/流泪": {}}, allow_network=True)
         self.assertEqual(out, {}, "离线时应静默返回空，交由 emoji/文字回退")
 
@@ -1047,13 +1311,16 @@ class TestFaceImagesOptional(unittest.TestCase):
         try:
             with open(os.path.join(pack, "吃糖.gif"), "wb") as f:
                 f.write(b"GIF89a" + b"z" * 10)
-            with mock.patch.dict(os.environ, {"QQCHAT_FACE_DIR": pack}), \
-                 mock.patch.object(self.fi, "_download") as dl:
+            with (
+                mock.patch.dict(os.environ, {"QQCHAT_FACE_DIR": pack}),
+                mock.patch.object(self.fi, "_download") as dl,
+            ):
                 out = self.fi.ensure({"/吃糖": {}}, allow_network=True)
             self.assertFalse(dl.called, "本地已有图就不该联网")
             self.assertIn("/吃糖", out)
         finally:
             import shutil
+
             shutil.rmtree(pack, ignore_errors=True)
 
     def test_serve_path_rejects_traversal(self):
@@ -1065,6 +1332,7 @@ class TestFaceImagesOptional(unittest.TestCase):
 
     def test_fetch_endpoint_requires_switch(self):
         import app as appmod
+
         client = appmod.app.test_client()
         client.get("/")
         with client.session_transaction() as s:
@@ -1078,21 +1346,38 @@ class TestFaceImagesOptional(unittest.TestCase):
 
     def test_habits_page_shows_button_when_enabled(self):
         import app as appmod
-        payload = _wrap([
-            {"id": "1", "timestamp": 1704067200000, "time": "2024-01-01 08:00:00",
-             "sender": {"uid": "uA", "name": "我"},
-             "content": {"text": "", "elements": [
-                 {"type": "face", "data": {"id": "5", "name": "/流泪"}}]}},
-            {"id": "2", "timestamp": 1704067260000, "time": "2024-01-01 08:01:00",
-             "sender": {"uid": "uB", "name": "对方"},
-             "content": {"text": "在吗", "elements": [{"type": "text", "data": {"text": "在吗"}}]}},
-        ], {"uA": "我", "uB": "对方"})
+
+        payload = _wrap(
+            [
+                {
+                    "id": "1",
+                    "timestamp": 1704067200000,
+                    "time": "2024-01-01 08:00:00",
+                    "sender": {"uid": "uA", "name": "我"},
+                    "content": {
+                        "text": "",
+                        "elements": [{"type": "face", "data": {"id": "5", "name": "/流泪"}}],
+                    },
+                },
+                {
+                    "id": "2",
+                    "timestamp": 1704067260000,
+                    "time": "2024-01-01 08:01:00",
+                    "sender": {"uid": "uB", "name": "对方"},
+                    "content": {"text": "在吗", "elements": [{"type": "text", "data": {"text": "在吗"}}]},
+                },
+            ],
+            {"uA": "我", "uB": "对方"},
+        )
         client = appmod.app.test_client()
         client.get("/")
         with client.session_transaction() as s:
             tok = s["csrf_token"]
-        client.post("/upload", data={"file": (io.BytesIO(payload), "c.json")},
-                    headers={"Origin": "http://localhost:5000", "X-CSRF-Token": tok})
+        client.post(
+            "/upload",
+            data={"file": (io.BytesIO(payload), "c.json")},
+            headers={"Origin": "http://localhost:5000", "X-CSRF-Token": tok},
+        )
         with client.session_transaction() as s:
             chat_hash, path = s["chat_hash"], s["filepath"]
         try:
@@ -1107,7 +1392,6 @@ class TestFaceImagesOptional(unittest.TestCase):
             if path and os.path.exists(path):
                 os.remove(path)
 
-
     def test_report_export_does_not_swallow_the_body(self):
         """导出报告在 DOM 克隆体上删节点，不再对 HTML 字符串做正则手术。
 
@@ -1119,10 +1403,10 @@ class TestFaceImagesOptional(unittest.TestCase):
         src = (ROOT / "web" / "templates" / "report.html").read_text(encoding="utf-8")
         # 注释里会引用旧写法作为反面教材，所以只检查真正的代码行
         code = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("//"))
-        self.assertNotIn("[\\s\\S]*?window\\.CSRF_TOKEN", code,
-                         "不许再用跨脚本的贪婪正则删 CSRF 脚本")
-        self.assertNotIn("document.documentElement.outerHTML", code,
-                         "导出快照必须走 cloneNode，不能拿整页 HTML 串做替换")
+        self.assertNotIn("[\\s\\S]*?window\\.CSRF_TOKEN", code, "不许再用跨脚本的贪婪正则删 CSRF 脚本")
+        self.assertNotIn(
+            "document.documentElement.outerHTML", code, "导出快照必须走 cloneNode，不能拿整页 HTML 串做替换"
+        )
         self.assertIn("cloneNode(true)", code, "应当在 DOM 克隆体上删改")
         self.assertIn("window\\.CSRF_TOKEN", code, "仍要剥掉带 token 的那个脚本")
         self.assertIn("querySelectorAll('script')", code, "按节点遍历脚本，逐块判断")
@@ -1140,10 +1424,11 @@ class TestPathContainment(unittest.TestCase):
     def test_vision_refuses_path_outside_media_root(self):
         from analyzer import vision
         from parser.qq_parser import Message
+
         base = tempfile.mkdtemp(prefix="qqchatlog-traversal-")
         media_root = os.path.join(base, "exports")
         os.makedirs(media_root, exist_ok=True)
-        outside = os.path.join(base, "private.png")          # 媒体根目录之外的图片
+        outside = os.path.join(base, "private.png")  # 媒体根目录之外的图片
         with open(outside, "wb") as f:
             f.write(b"\x89PNG\r\n\x1a\n" + b"x" * 32)
         inside = os.path.join(media_root, "ok.png")
@@ -1151,35 +1436,52 @@ class TestPathContainment(unittest.TestCase):
             f.write(b"\x89PNG\r\n\x1a\n" + b"y" * 32)
         try:
             with mock.patch.object(vision, "MEDIA_ROOT", media_root):
-                self.assertIsNone(vision.resolve("../private.png"),
-                                  "不得解析到媒体根目录之外的文件")
+                self.assertIsNone(vision.resolve("../private.png"), "不得解析到媒体根目录之外的文件")
                 self.assertIsNone(vision.resolve("..\\private.png"))
                 self.assertIsNone(vision.resolve("resources/../../private.png"))
                 self.assertEqual(vision.resolve("ok.png"), inside)
             # 也不该被挑进"要送给模型的图片"
-            msg = Message(id="1", timestamp=1704067200000, time_str="", sender_name="我",
-                          sender_uid="uA", text="", raw_text="", msg_type="type_3",
-                          has_image=True, is_reply=False, media_path="../private.png",
-                          media_w=1080, media_h=2400, media_id="X")
-            with mock.patch.object(vision, "MEDIA_ROOT", media_root), \
-                 mock.patch.object(vision, "VISION_MIN_SIDE", 100):
+            msg = Message(
+                id="1",
+                timestamp=1704067200000,
+                time_str="",
+                sender_name="我",
+                sender_uid="uA",
+                text="",
+                raw_text="",
+                msg_type="type_3",
+                has_image=True,
+                is_reply=False,
+                media_path="../private.png",
+                media_w=1080,
+                media_h=2400,
+                media_id="X",
+            )
+            with (
+                mock.patch.object(vision, "MEDIA_ROOT", media_root),
+                mock.patch.object(vision, "VISION_MIN_SIDE", 100),
+            ):
                 self.assertEqual(vision.pick_images([msg], limit=5), [])
         finally:
             import shutil
+
             shutil.rmtree(base, ignore_errors=True)
 
     def test_face_pack_refuses_path_outside_pack_dir(self):
         from analyzer import face_images as fi
+
         pack = tempfile.mkdtemp(prefix="qqchatlog-pack2-")
         base = os.path.dirname(pack)
         evil = os.path.join(base, "evil.gif")
         with open(evil, "wb") as f:
             f.write(b"GIF89a" + b"z" * 8)
         try:
-            self.assertIsNone(fi.local_pack_path("n1", "../../evil", local_dir=pack),
-                              "表情名里的 ../ 不能被带出表情包目录")
+            self.assertIsNone(
+                fi.local_pack_path("n1", "../../evil", local_dir=pack), "表情名里的 ../ 不能被带出表情包目录"
+            )
         finally:
             import shutil
+
             shutil.rmtree(pack, ignore_errors=True)
             if os.path.exists(evil):
                 os.remove(evil)
@@ -1192,8 +1494,8 @@ class TestPathContainment(unittest.TestCase):
         """
         import app as appmod
         from webapp import security
-        self.assertEqual(security._safe_for_log("http://a\n[ERROR] 伪造"),
-                         "http://a[ERROR] 伪造")
+
+        self.assertEqual(security._safe_for_log("http://a\n[ERROR] 伪造"), "http://a[ERROR] 伪造")
         self.assertEqual(security._safe_for_log("http://a\u2028伪造"), "http://a伪造")
         self.assertEqual(security._safe_for_log("http://a\t伪造"), "http://a伪造")
         self.assertEqual(len(security._safe_for_log("x" * 500)), 120, "日志长度要有上限")
@@ -1202,8 +1504,7 @@ class TestPathContainment(unittest.TestCase):
         client.get("/")
         with client.session_transaction() as s:
             token = s["csrf_token"]
-        r = client.post("/upload", data={"csrf_token": token},
-                        headers={"Origin": "http://evil.example.com"})
+        r = client.post("/upload", data={"csrf_token": token}, headers={"Origin": "http://evil.example.com"})
         self.assertEqual(r.status_code, 403, "非白名单来源仍必须被拦下")
 
 
@@ -1229,8 +1530,12 @@ class TestFrontendRegressionGuards(unittest.TestCase):
     def test_chart_entry_points_guard_missing_dom(self):
         """图表入口都要能在节点缺失时安全返回，否则一处 TypeError 会打断整块渲染"""
         src = self.JS.read_text(encoding="utf-8")
-        for fn in ("renderEmotionCharts", "renderTopicsCharts", "renderRelationshipInsight",
-                   "renderHabitsInsight"):
+        for fn in (
+            "renderEmotionCharts",
+            "renderTopicsCharts",
+            "renderRelationshipInsight",
+            "renderHabitsInsight",
+        ):
             body = src.split("function %s(" % fn)[1].split("\nfunction ")[0]
             self.assertIn("if (!data) return;", body, f"{fn} 缺少 data 判空")
 
@@ -1239,9 +1544,11 @@ class TestFrontendRegressionGuards(unittest.TestCase):
         src = self.REPORT.read_text(encoding="utf-8")
         self.assertIn("if (cssText) {", src)
         # 删 <link> 必须发生在这个守卫之内：取不到样式就保留原链接，别让报告裸奔
-        self.assertLess(src.index("if (cssText) {"),
-                        src.index('link[href^="/static/css/"]'),
-                        "删样式表链接的代码要在 cssText 守卫之内")
+        self.assertLess(
+            src.index("if (cssText) {"),
+            src.index('link[href^="/static/css/"]'),
+            "删样式表链接的代码要在 cssText 守卫之内",
+        )
         self.assertIn("asList", src, "模型返回值先兜底成数组，避免一处 TypeError 打断报告")
 
     def test_report_replaces_unavailable_face_images(self):
@@ -1260,12 +1567,16 @@ class TestFailureSurfacedToUser(unittest.TestCase):
     """异步化之后，失败必须有人告诉用户——静默跳回首页是最糟的失败方式"""
 
     def _upload(self, client, token, payload):
-        return client.post("/upload", data={"file": (io.BytesIO(payload), "c.json")},
-                           headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+        return client.post(
+            "/upload",
+            data={"file": (io.BytesIO(payload), "c.json")},
+            headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token},
+        )
 
     def test_stats_failure_is_shown_on_home(self):
         import app as appmod
         from webapp import store as storemod
+
         payload = _chat_payload({"uA": ["在吗"], "uB": ["在的"]})
         client = appmod.app.test_client()
         client.get("/")
@@ -1287,12 +1598,13 @@ class TestFailureSurfacedToUser(unittest.TestCase):
 
     def test_csrf_failure_message_is_actionable(self):
         import app as appmod
+
         client = appmod.app.test_client()
         r = client.post("/upload", data={}, headers={"Origin": "http://localhost:5000"})
         self.assertEqual(r.status_code, 400)
         body = r.get_data(as_text=True)
-        self.assertIn("CSRF", body)                  # 保留原有语义（安全测试依赖）
-        self.assertIn("刷新", body)                  # 并且告诉用户怎么办
+        self.assertIn("CSRF", body)  # 保留原有语义（安全测试依赖）
+        self.assertIn("刷新", body)  # 并且告诉用户怎么办
 
 
 class TestOtherUidDerivation(unittest.TestCase):
@@ -1300,10 +1612,21 @@ class TestOtherUidDerivation(unittest.TestCase):
 
     def test_placeholder_sender_does_not_take_other_uid(self):
         from parser.qq_parser import load_chat
+
         # 占位 sender 排在文件最前面，且有一条非 system 消息（真实导出就是这样）
-        msgs = ([{"id": "0", "timestamp": 1704067200000, "time": "2024-01-01 08:00:00",
-                  "sender": {"uid": "未知uid未知", "name": "系统消息"}, "content": "验证消息"}] +
-                _bulk("uA", "我", 20, start=1) + _bulk("uB", "对方", 18, start=21))
+        msgs = (
+            [
+                {
+                    "id": "0",
+                    "timestamp": 1704067200000,
+                    "time": "2024-01-01 08:00:00",
+                    "sender": {"uid": "未知uid未知", "name": "系统消息"},
+                    "content": "验证消息",
+                }
+            ]
+            + _bulk("uA", "我", 20, start=1)
+            + _bulk("uB", "对方", 18, start=21)
+        )
         path = _write_tmp(_wrap(msgs, {"uA": "我", "uB": "对方", "未知uid未知": "系统消息"}))
         try:
             chat = load_chat(path)
@@ -1315,17 +1638,36 @@ class TestOtherUidDerivation(unittest.TestCase):
 
 class TestRouteSurfaceUnchanged(unittest.TestCase):
     """webapp 拆分是搬家不是改建：路由与端点名必须原样"""
+
     def test_all_endpoints_registered(self):
         import app as appmod
+
         endpoints = {r.endpoint for r in appmod.app.url_map.iter_rules()}
-        for e in ("index", "upload", "dashboard", "emotion", "relationship",
-                  "habits", "topics", "profile", "report", "login", "static",
-                  "api_analyze", "api_analyze_job", "api_analyze_cancel",
-                  "api_analysis_result", "api_analyze_all", "api_usage", "api_status"):
+        for e in (
+            "index",
+            "upload",
+            "dashboard",
+            "emotion",
+            "relationship",
+            "habits",
+            "topics",
+            "profile",
+            "report",
+            "login",
+            "static",
+            "api_analyze",
+            "api_analyze_job",
+            "api_analyze_cancel",
+            "api_analysis_result",
+            "api_analyze_all",
+            "api_usage",
+            "api_status",
+        ):
             self.assertIn(e, endpoints, f"端点 {e} 在拆分后消失了")
 
     def test_url_rules_point_where_expected(self):
         import app as appmod
+
         rules = {r.rule: r.endpoint for r in appmod.app.url_map.iter_rules()}
         self.assertEqual(rules["/api/analyze-all"], "api_analyze_all")
         self.assertEqual(rules["/upload"], "upload")

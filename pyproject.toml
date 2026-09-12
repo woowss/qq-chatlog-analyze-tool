@@ -68,7 +68,20 @@ web = ["templates/**/*.html", "static/**/*"]
 [tool.ruff]
 line-length = 110
 target-version = "py310"
-exclude = [".git", "__pycache__", "ai_cache", "stats_cache", "uploads", "flask_session", "logs", ".env"]
+exclude = [
+    ".git",
+    "__pycache__",
+    "ai_cache",
+    "stats_cache",
+    "uploads",
+    "flask_session",
+    "logs",
+    ".env",
+    # 早期设计文档（README 已注明内容过时）：ruff format 会连 Markdown 里 ```python 示例代码
+    # 一起重排，给历史文档做格式化只制造噪音。注意：对 .md 这类非 Python 文件，
+    # [tool.ruff.format] exclude 不生效，必须放在这一层。
+    "docs",
+]
 
 [tool.ruff.lint]
 # E/F/W 是基础项；B（bugbear）与 C4（comprehension）专抓"看起来没问题"的逻辑坑，
@@ -82,3 +95,6 @@ select = ["E", "F", "W", "B", "C4"]
 
 [tool.ruff.format]
 quote-style = "double"
+# 提示词文件保持手工排版：它的可读性靠"一段一行"的隐式拼接，格式化会把它改成带括号的 + 链
+# （字符串内容不变，但 diff 全是噪音）。lint 侧同样只给它 E501 豁免。
+exclude = ["analyzer/prompts.py"]

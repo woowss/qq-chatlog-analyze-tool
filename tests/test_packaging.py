@@ -26,6 +26,7 @@ package job 真正构建 wheel、拆包比对 web/ 下的文件清单，并安�
 本文件负责的是快速反馈：入口点写错、新增模板/静态文件忘了改 glob、新增第三方 import
 忘了写进 dependencies，都会在这里立刻红。
 """
+
 import ast
 import atexit
 import contextlib
@@ -48,11 +49,13 @@ except ModuleNotFoundError:  # pragma: no cover - 仅 Python 3.10
     except ModuleNotFoundError:
         tomllib = None
 
+
 # 测试隔离：数据目录指向临时目录，绝不碰真实 uploads/ai_cache/session。
 # 只清理"自己创建的"目录——外部显式指定的 QQCHAT_DATA_DIR 一律不动。
 def _drop_temp_data_dir():
     """跑完把临时数据目录删掉（先关日志：否则清理先跑，logging.shutdown 又把 app.log 写回来）"""
     import logging
+
     logging.shutdown()
     shutil.rmtree(os.environ["QQCHAT_DATA_DIR"], ignore_errors=True)
 
@@ -97,8 +100,9 @@ class TestConsoleScriptEntryPoint(unittest.TestCase):
 
     def test_pyproject_declares_script(self):
         scripts = _pyproject()["project"]["scripts"]
-        self.assertEqual(scripts.get("qqchatlog"), "app:main",
-                         "[project.scripts] 里 qqchatlog 必须指向 app:main")
+        self.assertEqual(
+            scripts.get("qqchatlog"), "app:main", "[project.scripts] 里 qqchatlog 必须指向 app:main"
+        )
 
     def test_entry_target_is_callable(self):
         self.assertTrue(callable(appmod.main), "app.main 必须存在且可调用")
@@ -114,9 +118,12 @@ class TestConsoleScriptEntryPoint(unittest.TestCase):
     def test_startup_report_allows_loopback_by_default(self):
         """横幅/自检从 __main__ 里搬出来了：回环地址 + 无口令必须放行"""
         buf = io.StringIO()
-        with mock.patch.object(appmod, "FLASK_HOST", "127.0.0.1"), \
-                mock.patch.object(appmod, "ACCESS_PASSWORD", ""), \
-                contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        with (
+            mock.patch.object(appmod, "FLASK_HOST", "127.0.0.1"),
+            mock.patch.object(appmod, "ACCESS_PASSWORD", ""),
+            contextlib.redirect_stdout(buf),
+            contextlib.redirect_stderr(buf),
+        ):
             allowed = appmod._startup_report()
         self.assertTrue(allowed)
         self.assertIn("QQ 聊天记录分析工具", buf.getvalue())
@@ -124,9 +131,12 @@ class TestConsoleScriptEntryPoint(unittest.TestCase):
     def test_startup_report_refuses_public_bind_without_password(self):
         """非回环地址没设口令：体检返回 False，由 main() 以退出码 1 结束（不再 sys.exit 打断调用方）"""
         buf = io.StringIO()
-        with mock.patch.object(appmod, "FLASK_HOST", "0.0.0.0"), \
-                mock.patch.object(appmod, "ACCESS_PASSWORD", ""), \
-                contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        with (
+            mock.patch.object(appmod, "FLASK_HOST", "0.0.0.0"),
+            mock.patch.object(appmod, "ACCESS_PASSWORD", ""),
+            contextlib.redirect_stdout(buf),
+            contextlib.redirect_stderr(buf),
+        ):
             allowed = appmod._startup_report()
         self.assertFalse(allowed)
         self.assertIn("已拒绝启动", buf.getvalue())
@@ -148,8 +158,10 @@ class TestPackageDataCoverage(unittest.TestCase):
                 self.assertIsNotNone(importlib.util.find_spec(name), f"{name} 不可导入")
         for name in tool["packages"]:
             with self.subTest(package=name):
-                self.assertTrue((ROOT / name / "__init__.py").is_file(),
-                                f"{name}/__init__.py 不存在（没有它 setuptools 不会收包内数据）")
+                self.assertTrue(
+                    (ROOT / name / "__init__.py").is_file(),
+                    f"{name}/__init__.py 不存在（没有它 setuptools 不会收包内数据）",
+                )
                 self.assertIsNotNone(importlib.util.find_spec(name), f"{name} 不可导入")
 
     def test_no_undeclared_python_package_on_disk(self):
@@ -157,11 +169,7 @@ class TestPackageDataCoverage(unittest.TestCase):
         declared = set(self._setuptools_config()["packages"])
         # 排除可能存在的本地环境目录（venv/build 产物），它们不是本项目的包
         ignored = {"tests", "docs", "tools", "venv", ".venv", "build", "dist"}
-        found = {
-            path.parent.name
-            for path in ROOT.glob("*/__init__.py")
-            if path.parent.name not in ignored
-        }
+        found = {path.parent.name for path in ROOT.glob("*/__init__.py") if path.parent.name not in ignored}
         self.assertEqual(found - declared, set(), "这些包没写进 [tool.setuptools] packages")
 
     def test_package_data_covers_every_web_asset(self):
@@ -218,10 +226,12 @@ class TestFlaskAssetWiring(unittest.TestCase):
                 path = Path(folder)
                 self.assertTrue(path.is_absolute(), f"{folder} 不该是相对工作目录的路径")
                 self.assertTrue(path.is_dir(), f"{folder} 不存在")
-                self.assertEqual(path.parent, repo_root / "web",
-                                 "模板/静态目录必须解析到 web 包内（源码与安装后同构）")
-        self.assertEqual(appmod.app.static_url_path, "/static",
-                         "URL 前缀变了会让模板/导出报告里的 /static/... 全部 404")
+                self.assertEqual(
+                    path.parent, repo_root / "web", "模板/静态目录必须解析到 web 包内（源码与安装后同构）"
+                )
+        self.assertEqual(
+            appmod.app.static_url_path, "/static", "URL 前缀变了会让模板/导出报告里的 /static/... 全部 404"
+        )
 
     def test_templates_are_found_without_cwd_dependence(self):
         names = sorted(p.name for p in webpkg.TEMPLATES_DIR.glob("*.html"))
@@ -305,8 +315,14 @@ class TestDataDirEnvFile(unittest.TestCase):
         """在子进程里导入 config 并打印某个常量（cwd 与数据目录都指向临时目录）"""
         env = {**os.environ, "PYTHONPATH": str(ROOT), "QQCHAT_DATA_DIR": str(data_dir)}
         env.update(extra_env or {})
-        result = subprocess.run([sys.executable, "-c", f"import config; print({expression})"],
-                                cwd=str(data_dir), env=env, capture_output=True, text=True, timeout=180)
+        result = subprocess.run(
+            [sys.executable, "-c", f"import config; print({expression})"],
+            cwd=str(data_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.strip()
 
@@ -322,8 +338,9 @@ class TestDataDirEnvFile(unittest.TestCase):
                 continue
             with tempfile.TemporaryDirectory() as tmp:
                 (Path(tmp) / ".env").write_text(f"{key}={value}\n", encoding="utf-8")
-                self.assertEqual(self._probe(Path(tmp), expression), value,
-                                 f"数据目录下的 .env 没被读到（{key}）")
+                self.assertEqual(
+                    self._probe(Path(tmp), expression), value, f"数据目录下的 .env 没被读到（{key}）"
+                )
             return
         self.skipTest("本仓库 .env / 环境变量把候选键都占了，跳过（CI 无 .env，必然执行）")
 

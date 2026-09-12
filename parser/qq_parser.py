@@ -15,6 +15,7 @@
 #
 #
 """QQ JSON 聊天记录解析器 — 支持 QQChatExporter V5 格式"""
+
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -36,8 +37,8 @@ MEDIA_KINDS = {
     "wallet": "红包",
     "face_bubble": "表情气泡",
     "markdown": "Markdown消息",
-    "json": "卡片消息",      # QQ 小程序/分享卡片（导出器只给到 "[JSON消息]"）
-    "av_record": "通话",     # 语音/视频通话记录（"通话 - 未接听" 之类）
+    "json": "卡片消息",  # QQ 小程序/分享卡片（导出器只给到 "[JSON消息]"）
+    "av_record": "通话",  # 语音/视频通话记录（"通话 - 未接听" 之类）
 }
 # 媒体标签的长度上限：文件名/转发标题可能很长，截断保留可读性
 MEDIA_LABEL_MAX = 40
@@ -91,8 +92,7 @@ def _media_label(el_type: str, el_data: dict, raw_text: str = "") -> str:
 
 def _allow_multi_party() -> bool:
     """群聊防线放行开关。调用时读 env（而非 import 期常量），方便测试与临时放行"""
-    return (os.getenv("QQCHAT_ALLOW_MULTI_PARTY", "") or "").strip().lower() in (
-        "1", "true", "yes", "on")
+    return (os.getenv("QQCHAT_ALLOW_MULTI_PARTY", "") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 # 第三方要"有实质发言"才认定成群聊：QQChatExporter 会给系统类消息安排占位
@@ -164,14 +164,15 @@ def _parse_timestamp(value, time_str: str = "") -> Optional[int]:
 @dataclass
 class Message:
     """单条消息"""
+
     id: str
-    timestamp: int          # 毫秒时间戳
-    time_str: str           # "2024-01-01 08:00:00"
-    sender_name: str        # 发送者显示名
-    sender_uid: str         # 发送者 UID
-    text: str               # 纯文本（不含图片/表情/媒体标记）
-    raw_text: str           # 原始文本（含占位符）
-    msg_type: str           # type_1 / type_3 / type_17 …
+    timestamp: int  # 毫秒时间戳
+    time_str: str  # "2024-01-01 08:00:00"
+    sender_name: str  # 发送者显示名
+    sender_uid: str  # 发送者 UID
+    text: str  # 纯文本（不含图片/表情/媒体标记）
+    raw_text: str  # 原始文本（含占位符）
+    msg_type: str  # type_1 / type_3 / type_17 …
     has_image: bool
     is_reply: bool
     face_ids: list[int] = field(default_factory=list)
@@ -181,25 +182,25 @@ class Message:
     # 但它们要参与统计与 AI 分析，由 media_kind/label 承载。
     media_kind: str = ""
     media_label: str = ""
-    media_bytes: int = 0    # 媒体体积（导出器给的 size，未知为 0）
-    media_id: str = ""      # 媒体指纹（md5，可用于去重统计；视频等没有则为空）
-    media_path: str = ""    # 资源相对路径（导出器的 url，如 resources/images/xx.jpg）
-    media_w: int = 0        # 图片宽（用于挑图：几百 px 的多半是表情包，不是截图）
+    media_bytes: int = 0  # 媒体体积（导出器给的 size，未知为 0）
+    media_id: str = ""  # 媒体指纹（md5，可用于去重统计；视频等没有则为空）
+    media_path: str = ""  # 资源相对路径（导出器的 url，如 resources/images/xx.jpg）
+    media_w: int = 0  # 图片宽（用于挑图：几百 px 的多半是表情包，不是截图）
     media_h: int = 0
-    face_url: str = ""      # 商城表情的 CDN 地址（可选功能"表情原图"用它取图）
+    face_url: str = ""  # 商城表情的 CDN 地址（可选功能"表情原图"用它取图）
     recalled: bool = False  # 已被撤回（导出器仍会保留该条目）
-    system: bool = False    # 系统提示消息（"对方撤回了一条消息"等）
+    system: bool = False  # 系统提示消息（"对方撤回了一条消息"等）
 
 
 def is_statistical(m: "Message") -> bool:
     """是否应进入统计与 AI 分析：排除系统消息、撤回消息与不可分析的卡片类消息"""
-    return (not m.system and not m.recalled
-            and m.msg_type not in SKIP_MSG_TYPES)
+    return not m.system and not m.recalled and m.msg_type not in SKIP_MSG_TYPES
 
 
 @dataclass
 class ChatData:
     """解析后的完整聊天数据"""
+
     chat_name: str
     self_name: str
     other_name: str
@@ -210,7 +211,7 @@ class ChatData:
     time_start: str = ""
     time_end: str = ""
     duration_days: int = 0
-    dropped_messages: int = 0   # 因时间戳不可用被丢弃的消息数（0 表示全部可用）
+    dropped_messages: int = 0  # 因时间戳不可用被丢弃的消息数（0 表示全部可用）
 
     def statistical(self) -> list["Message"]:
         """参与统计与分析的消息子集（过滤系统/撤回/转发）"""
@@ -354,8 +355,7 @@ def load_chat(filepath: str) -> ChatData:
             # 时间字符串一律由时间戳（权威字段）按北京时间重算：新版导出器的 time
             # 是 UTC ISO（"2024-01-01T00:00:00.000Z"），直接照抄会让 AI 对话行
             # 比统计头（CST）早 8 小时——"凌晨三点还在聊"会被读成下午，直接影响判断。
-            time_str=datetime.fromtimestamp(timestamp / 1000, tz=CST)
-                             .strftime("%Y-%m-%d %H:%M:%S"),
+            time_str=datetime.fromtimestamp(timestamp / 1000, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
             sender_name=sender_name,
             sender_uid=sender_uid,
             text=clean_text,
@@ -400,8 +400,9 @@ def load_chat(filepath: str) -> ChatData:
     # （name="系统消息"、uid 形如"未知…"），它一旦排在真实对话方之前就会被
     # 误认成"对方"——任何依赖该字段的功能都会静默指错人。
     counts = _statistical_sender_counts(chat)
-    ranked = sorted(((uid, n) for uid, n in counts.items() if uid != self_uid),
-                    key=lambda kv: kv[1], reverse=True)
+    ranked = sorted(
+        ((uid, n) for uid, n in counts.items() if uid != self_uid), key=lambda kv: kv[1], reverse=True
+    )
     if ranked:
         chat.other_uid = ranked[0][0]
 

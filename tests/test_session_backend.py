@@ -28,6 +28,7 @@ flask-session 0.8 起，`SESSION_TYPE="filesystem"` 与其配套的 `SESSION_FIL
    因为进程内 app 早已导入）；
 4. 会话真的能写进那个目录、并且能读回来。
 """
+
 import os
 import subprocess
 import sys
@@ -53,8 +54,11 @@ class TestSessionBackend(unittest.TestCase):
         # cachelib 没有公开的目录访问器，只能读私有 _path：这里只是确认"会话目录仍是数据目录下的
         # flask_session/"（清理逻辑按那个目录回收），真正的行为验证是下面的落盘用例。
         cache_dir = Path(getattr(cache, "_path", "") or "")
-        self.assertEqual(cache_dir.resolve(), Path(configmod.SESSION_FILE_DIR).resolve(),
-                         "会话目录必须还是数据目录下的 flask_session/（清理逻辑按这个目录回收）")
+        self.assertEqual(
+            cache_dir.resolve(),
+            Path(configmod.SESSION_FILE_DIR).resolve(),
+            "会话目录必须还是数据目录下的 flask_session/（清理逻辑按这个目录回收）",
+        )
 
     def test_deprecated_session_knobs_are_gone(self):
         for key in DEPRECATED_KEYS:
@@ -80,8 +84,9 @@ class TestSessionBackend(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             env = {**os.environ, "PYTHONPATH": str(ROOT), "QQCHAT_DATA_DIR": tmp}
-            result = subprocess.run([sys.executable, "-c", code], cwd=tmp, env=env,
-                                    capture_output=True, text=True, timeout=180)
+            result = subprocess.run(
+                [sys.executable, "-c", code], cwd=tmp, env=env, capture_output=True, text=True, timeout=180
+            )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("HITS=[]", result.stdout, f"仍在触发 flask-session 弃用告警: {result.stdout.strip()}")
 

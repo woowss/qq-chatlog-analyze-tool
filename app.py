@@ -70,10 +70,9 @@ def create_app() -> Flask:
     """组装 Flask 应用：实例配置 → 服务端 session → 数据目录 → 月份缓存 → 各层注册"""
     # 模板/静态目录按 web 包的绝对路径解析，而不是相对工作目录的 "web/templates"：
     # pip 安装后包在 site-packages 下，从任何目录执行 qqchatlog 都要能找到它们。
-    app = Flask(__name__,
-                template_folder=str(TEMPLATES_DIR),
-                static_folder=str(STATIC_DIR),
-                static_url_path="/static")
+    app = Flask(
+        __name__, template_folder=str(TEMPLATES_DIR), static_folder=str(STATIC_DIR), static_url_path="/static"
+    )
     app.secret_key = SECRET_KEY
     app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
     app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
@@ -88,8 +87,8 @@ def create_app() -> Flask:
     app.config["SESSION_TYPE"] = "cachelib"
     app.config["SESSION_CACHELIB"] = FileSystemCache(SESSION_FILE_DIR, threshold=500, mode=0o600)
     app.config["SESSION_PERMANENT"] = False
-    app.config["SESSION_COOKIE_HTTPONLY"] = True          # 禁止 JS 读取会话 cookie
-    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"         # 跨站请求不携带 cookie（CSRF 纵深防御）
+    app.config["SESSION_COOKIE_HTTPONLY"] = True  # 禁止 JS 读取会话 cookie
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"  # 跨站请求不携带 cookie（CSRF 纵深防御）
     Session(app)
 
     for directory in (UPLOAD_FOLDER, SESSION_FILE_DIR, AI_CACHE_DIR, STATS_CACHE_DIR):
@@ -149,8 +148,10 @@ def _startup_report() -> bool:
         _print_safe("  请编辑项目根目录的 .env 文件填入 Key")
     else:
         _print_safe("  [OK] DeepSeek API 已配置")
-        _print_safe(f"  模型: {DEEPSEEK_MODEL} · 并发 {CONCURRENCY} · 调用间隔 {CALL_MIN_INTERVAL}s"
-                    f"（多月份分析的排队下限 ≈ (月数-1)×{CALL_MIN_INTERVAL}s）")
+        _print_safe(
+            f"  模型: {DEEPSEEK_MODEL} · 并发 {CONCURRENCY} · 调用间隔 {CALL_MIN_INTERVAL}s"
+            f"（多月份分析的排队下限 ≈ (月数-1)×{CALL_MIN_INTERVAL}s）"
+        )
         thinking_dims = [d for d in MAX_TOKENS_BY_DIM if thinking_enabled(d)]
         if thinking_dims:
             _print_safe(f"  思考模式: {', '.join(thinking_dims)}")
@@ -158,8 +159,9 @@ def _startup_report() -> bool:
         if conflicts:
             _print_safe("  [WARN] 思考模式与输出预算冲突，这些维度会因截断丢弃结果：")
             _print_safe(f"         {', '.join(conflicts)}")
-            _print_safe("         请在 .env 里调大对应维度的 LLM_MAX_TOKENS_<维度>"
-                        "（如 LLM_MAX_TOKENS_PROFILE），")
+            _print_safe(
+                "         请在 .env 里调大对应维度的 LLM_MAX_TOKENS_<维度>（如 LLM_MAX_TOKENS_PROFILE），"
+            )
             _print_safe("         或关闭该维度的思考模式")
         if is_insecure_base_url():
             _print_safe("  [WARN] DEEPSEEK_BASE_URL 是明文 http 且非本机地址：")

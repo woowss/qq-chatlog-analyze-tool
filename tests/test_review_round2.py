@@ -27,6 +27,7 @@
 - 对话段口径的唯一来源（is_session_start）；
 - 前端轮询 404 时回读磁盘结果。
 """
+
 import importlib
 import io
 import json
@@ -49,6 +50,7 @@ import shutil as _shutil
 def _drop_temp_data_dir():
     """跑完把临时数据目录删掉（先关日志，否则 logging 的 shutdown 又把它写回来）"""
     import logging
+
     logging.shutdown()
     _shutil.rmtree(os.environ["QQCHAT_DATA_DIR"], ignore_errors=True)
 
@@ -94,12 +96,9 @@ class TestMediaCopyLifecycle(unittest.TestCase):
         """把清理涉及的目录全部指向临时目录，避免碰到真实数据"""
         return [
             mock.patch.object(cleanupmod, "UPLOAD_FOLDER", self.tmp),
-            mock.patch.object(cleanupmod, "SESSION_FILE_DIR",
-                              os.path.join(self.tmp, "session")),
-            mock.patch.object(cleanupmod, "AI_CACHE_DIR",
-                              os.path.join(self.tmp, "ai")),
-            mock.patch.object(cleanupmod, "STATS_CACHE_DIR",
-                              os.path.join(self.tmp, "stats")),
+            mock.patch.object(cleanupmod, "SESSION_FILE_DIR", os.path.join(self.tmp, "session")),
+            mock.patch.object(cleanupmod, "AI_CACHE_DIR", os.path.join(self.tmp, "ai")),
+            mock.patch.object(cleanupmod, "STATS_CACHE_DIR", os.path.join(self.tmp, "stats")),
             mock.patch.object(cleanupmod, "LOG_DIR", os.path.join(self.tmp, "logs")),
             mock.patch.object(vision, "UPLOAD_FOLDER", self.tmp),
         ]
@@ -133,8 +132,7 @@ class TestMediaCopyLifecycle(unittest.TestCase):
         os.utime(new_file, (ancient, ancient))
         cleanupmod.cleanup_old_files()
         self.assertFalse(os.path.isdir(media_dir), "回收干净后应删掉空的哈希目录")
-        self.assertFalse(os.path.isdir(os.path.join(self.tmp, "media")),
-                         "空的 media 目录也不该留着")
+        self.assertFalse(os.path.isdir(os.path.join(self.tmp, "media")), "空的 media 目录也不该留着")
 
     def test_purge_chat_caches_removes_media_copy(self):
         """删聊天（换文件/清理）时必须连带删掉图片副本目录"""
@@ -184,16 +182,18 @@ class TestVisionCallIsNonThinking(unittest.TestCase):
             img_path = f.name
         self.addCleanup(os.remove, img_path)
 
-        with mock.patch.object(dc, "_get_client", return_value=fake_client), \
-             mock.patch.object(dc, "_SEND_THINKING_PARAM", True), \
-             mock.patch.object(dc, "THINKING_DEFAULT", True), \
-             mock.patch.object(dc, "CALL_MIN_INTERVAL", 0.0):
-            text = dc._call_vision("sys", "看图", [
-                {"path": img_path, "mime": "image/png", "key": "k1"}])
+        with (
+            mock.patch.object(dc, "_get_client", return_value=fake_client),
+            mock.patch.object(dc, "_SEND_THINKING_PARAM", True),
+            mock.patch.object(dc, "THINKING_DEFAULT", True),
+            mock.patch.object(dc, "CALL_MIN_INTERVAL", 0.0),
+        ):
+            text = dc._call_vision("sys", "看图", [{"path": img_path, "mime": "image/png", "key": "k1"}])
 
         self.assertEqual(text, "- 一张图")
-        self.assertEqual(captured.get("extra_body"), {"thinking": {"type": "disabled"}},
-                         "图片摘要必须显式关闭思考模式")
+        self.assertEqual(
+            captured.get("extra_body"), {"thinking": {"type": "disabled"}}, "图片摘要必须显式关闭思考模式"
+        )
         self.assertEqual(captured.get("max_tokens"), 512)
 
 
@@ -211,8 +211,9 @@ class TestOpenRedirect(unittest.TestCase):
     def test_backslash_protocol_relative_is_rejected(self):
         r = self._login("/\\evil.example.com")
         self.assertEqual(r.status_code, 302)
-        self.assertNotIn("evil.example.com", r.headers["Location"],
-                         "浏览器把 /\\host 当协议相对地址，必须拦住")
+        self.assertNotIn(
+            "evil.example.com", r.headers["Location"], "浏览器把 /\\host 当协议相对地址，必须拦住"
+        )
         self.assertEqual(r.headers["Location"], "/")
 
     def test_double_slash_is_rejected(self):
@@ -252,9 +253,11 @@ class TestFaceFetchBudget(unittest.TestCase):
             "流泪": {"key": fi.key_for("流泪"), "market_url": None},
         }
         calls = []
-        with mock.patch.object(fi, "FACE_IMAGES_ENABLED", True), \
-             mock.patch.object(fi, "FACE_CACHE_DIR", self.tmp), \
-             mock.patch.object(fi, "_download", side_effect=lambda url: calls.append(url)):
+        with (
+            mock.patch.object(fi, "FACE_IMAGES_ENABLED", True),
+            mock.patch.object(fi, "FACE_CACHE_DIR", self.tmp),
+            mock.patch.object(fi, "_download", side_effect=lambda url: calls.append(url)),
+        ):
             # 极小预算：第一轮就该判定超时并收工
             fi.ensure(faces, allow_network=True, max_seconds=1e-9)
         self.assertEqual(calls, [], "预算用尽后不应再发起下载")
@@ -262,10 +265,12 @@ class TestFaceFetchBudget(unittest.TestCase):
     def test_no_budget_means_no_limit(self):
         faces = {"可怜": {"key": fi.key_for("可怜"), "market_url": None}}
         calls = []
-        with mock.patch.object(fi, "FACE_IMAGES_ENABLED", True), \
-             mock.patch.object(fi, "FACE_CACHE_DIR", self.tmp), \
-             mock.patch.object(fi, "_download", side_effect=lambda url: calls.append(url)):
-            fi.ensure(faces, allow_network=True)      # 默认 0 = 不限时长
+        with (
+            mock.patch.object(fi, "FACE_IMAGES_ENABLED", True),
+            mock.patch.object(fi, "FACE_CACHE_DIR", self.tmp),
+            mock.patch.object(fi, "_download", side_effect=lambda url: calls.append(url)),
+        ):
+            fi.ensure(faces, allow_network=True)  # 默认 0 = 不限时长
         self.assertEqual(len(calls), 1, "默认行为不变：没有预算就一直抓到上限/抓完")
 
 
@@ -287,8 +292,9 @@ class TestCacheWriteFailuresAreLoud(unittest.TestCase):
                     dc._write_month_cache("key1", {"a": 1})
             finally:
                 dc.configure_month_cache("")
-            self.assertTrue(any("写入失败" in line for line in logs.output),
-                            "月份缓存写失败要打警告，而不是静默吞掉")
+            self.assertTrue(
+                any("写入失败" in line for line in logs.output), "月份缓存写失败要打警告，而不是静默吞掉"
+            )
 
     def test_usage_flush_keeps_pending_on_failure(self):
         """用量落盘失败时增量要留在内存里下次再写，而不是被清空丢掉"""
@@ -298,7 +304,7 @@ class TestCacheWriteFailuresAreLoud(unittest.TestCase):
             usage_mod._PENDING["total"][k] = 0
         usage_mod.record_call("deepseek-flash", "emotion", 100, 50)
         with mock.patch.object(usage_mod, "_dump", side_effect=OSError("磁盘满")):
-            usage_mod.flush()                      # 不应抛异常
+            usage_mod.flush()  # 不应抛异常
         self.assertTrue(usage_mod._DIRTY, "失败后仍应标记为待落盘")
         self.assertEqual(usage_mod._PENDING["total"]["calls"], 1, "增量不能被清空")
         usage_mod._PENDING["days"].clear()
@@ -312,8 +318,9 @@ class TestUploadLimitIsConfigurable(unittest.TestCase):
 
     def test_default_is_50mb(self):
         self.assertEqual(config.MAX_CONTENT_LENGTH, 50 * 1024 * 1024)
-        self.assertEqual(appmod.app.config["MAX_CONTENT_LENGTH"],
-                         config.MAX_CONTENT_LENGTH, "配置要真的接到 Flask 上")
+        self.assertEqual(
+            appmod.app.config["MAX_CONTENT_LENGTH"], config.MAX_CONTENT_LENGTH, "配置要真的接到 Flask 上"
+        )
 
     def test_env_override(self):
         with mock.patch.dict(os.environ, {"QQCHAT_MAX_UPLOAD_MB": "120"}):
@@ -338,14 +345,16 @@ class TestUploadLimitIsConfigurable(unittest.TestCase):
         appmod.app.config["MAX_CONTENT_LENGTH"] = 1024
         try:
             # AJAX 上传（首页拖拽）：应拿到 JSON 形式的可读错误
-            r = client.post("/upload", data={"file": (io.BytesIO(payload), "big.json")},
-                            headers={**headers, "X-Requested-With": "fetch"})
+            r = client.post(
+                "/upload",
+                data={"file": (io.BytesIO(payload), "big.json")},
+                headers={**headers, "X-Requested-With": "fetch"},
+            )
             self.assertEqual(r.status_code, 413)
             self.assertIn("QQCHAT_MAX_UPLOAD_MB", r.get_json().get("error", ""))
 
             # 普通表单提交：也应看到中文提示而不是英文模板
-            r2 = client.post("/upload", data={"file": (io.BytesIO(payload), "big.json")},
-                             headers=headers)
+            r2 = client.post("/upload", data={"file": (io.BytesIO(payload), "big.json")}, headers=headers)
             self.assertEqual(r2.status_code, 413)
             body = r2.get_data(as_text=True)
             self.assertIn("上限", body)
@@ -359,32 +368,50 @@ class TestSessionBoundarySingleSource(unittest.TestCase):
 
     def _chat(self, gaps_minutes):
         from parser.qq_parser import ChatData, Message
+
         base = 1704067200000
         ts = base
         msgs = []
         for i, gap in enumerate(gaps_minutes):
             ts += gap * 60000
-            msgs.append(Message(id=str(i), timestamp=ts, time_str="",
-                                sender_name="我" if i % 2 else "对方",
-                                sender_uid="u_self" if i % 2 else "u_other",
-                                text="在吗", raw_text="在吗", msg_type="type_1",
-                                has_image=False, is_reply=False))
-        chat = ChatData(chat_name="c", self_name="我", other_name="对方",
-                        self_uid="u_self", other_uid="u_other", messages=msgs)
+            msgs.append(
+                Message(
+                    id=str(i),
+                    timestamp=ts,
+                    time_str="",
+                    sender_name="我" if i % 2 else "对方",
+                    sender_uid="u_self" if i % 2 else "u_other",
+                    text="在吗",
+                    raw_text="在吗",
+                    msg_type="type_1",
+                    has_image=False,
+                    is_reply=False,
+                )
+            )
+        chat = ChatData(
+            chat_name="c",
+            self_name="我",
+            other_name="对方",
+            self_uid="u_self",
+            other_uid="u_other",
+            messages=msgs,
+        )
         return chat
 
     def test_predicate_boundary(self):
         self.assertTrue(ls.is_session_start(None, 1000), "首条必然是新段")
-        self.assertFalse(ls.is_session_start(1000, 1000 + ls.SESSION_GAP_MS),
-                         "刚好等于阈值不算新段（与原口径一致）")
+        self.assertFalse(
+            ls.is_session_start(1000, 1000 + ls.SESSION_GAP_MS), "刚好等于阈值不算新段（与原口径一致）"
+        )
         self.assertTrue(ls.is_session_start(1000, 1000 + ls.SESSION_GAP_MS + 1))
 
     def test_local_and_prompt_agree_on_session_count(self):
         chat = self._chat([0, 1, 31, 1, 40, 1])
         local_sessions = len(ls.calc_conversation_sessions(chat))
         stats = dc._conversation_stats(chat.messages, chat.self_uid)
-        self.assertEqual(stats["sessions"], local_sessions,
-                         "prompt 统计头与本地统计的段数必须一致（同一份口径）")
+        self.assertEqual(
+            stats["sessions"], local_sessions, "prompt 统计头与本地统计的段数必须一致（同一份口径）"
+        )
         self.assertEqual(stats["sessions"], 3)
 
 
@@ -410,12 +437,12 @@ class TestFrontendRecoversAfterRestart(unittest.TestCase):
     def test_charts_share_one_resize_listener(self):
         """每个图表各挂一个 resize 监听且从不移除：同一页面重绘 N 次就留下 N 个监听"""
         src = (ROOT / "web" / "static" / "js" / "charts.js").read_text(encoding="utf-8")
-        self.assertEqual(src.count("addEventListener('resize'"), 1,
-                         "resize 监听只应保留全局那一个")
+        self.assertEqual(src.count("addEventListener('resize'"), 1, "resize 监听只应保留全局那一个")
         self.assertNotIn("window.addEventListener('resize', function() { chart.resize(); });", src)
         self.assertIn("function mountChart(", src)
-        self.assertEqual(src.count("echarts.init("), 1,
-                         "只允许 mountChart 内部建实例（重绘要先 dispose 旧的）")
+        self.assertEqual(
+            src.count("echarts.init("), 1, "只允许 mountChart 内部建实例（重绘要先 dispose 旧的）"
+        )
         self.assertIn("dispose()", src)
 
 
@@ -424,13 +451,22 @@ class TestUsageRetention(unittest.TestCase):
 
     def test_old_days_are_pruned_on_flush(self):
         path = os.path.join(os.environ["QQCHAT_DATA_DIR"], "usage_prune.json")
-        ancient = (datetime.now(tz=usage_mod.CST)
-                   - timedelta(days=config.LOG_RETENTION_DAYS + 10)).strftime("%Y-%m-%d")
+        ancient = (datetime.now(tz=usage_mod.CST) - timedelta(days=config.LOG_RETENTION_DAYS + 10)).strftime(
+            "%Y-%m-%d"
+        )
         recent = datetime.now(tz=usage_mod.CST).strftime("%Y-%m-%d")
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"days": {ancient: {"calls": 9, "prompt": 1, "completion": 1},
-                                recent: {"calls": 1, "prompt": 1, "completion": 1}},
-                       "dims": {}, "total": {"calls": 10, "prompt": 2, "completion": 2}}, f)
+            json.dump(
+                {
+                    "days": {
+                        ancient: {"calls": 9, "prompt": 1, "completion": 1},
+                        recent: {"calls": 1, "prompt": 1, "completion": 1},
+                    },
+                    "dims": {},
+                    "total": {"calls": 10, "prompt": 2, "completion": 2},
+                },
+                f,
+            )
         try:
             with mock.patch.object(usage_mod, "TOKEN_USAGE_FILE", path):
                 usage_mod.record_call("deepseek-flash", "emotion", 10, 5)
@@ -456,8 +492,9 @@ class TestVisionCacheHasCreatedStamp(unittest.TestCase):
             self.assertIsInstance(payload.get("_created"), float, "要写 _created 供硬上限回收")
             self.assertEqual(payload.get("digest"), "- 一张截图")
             self.assertEqual(vision._read_cache(path), "- 一张截图")
-            self.assertGreater(cleanupmod._cache_created_at(path), time.time() - 60,
-                               "清理任务能读到刚写入的创建时间")
+            self.assertGreater(
+                cleanupmod._cache_created_at(path), time.time() - 60, "清理任务能读到刚写入的创建时间"
+            )
 
             # 旧格式（没有 _created）仍要能读，避免升级后缓存集体失效、重复调用视觉模型
             with open(path, "w", encoding="utf-8") as f:

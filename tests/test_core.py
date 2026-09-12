@@ -15,6 +15,7 @@
 #
 # -*- coding: utf-8 -*-
 """核心逻辑测试：解析器健壮性、统计口径、AI 对话截断、CSRF 防护、缓存与异步任务"""
+
 import io
 import json
 import os
@@ -31,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # 测试隔离：数据目录指向临时目录，避免测试读写真实的 uploads/ai_cache/session
 import tempfile as _tempfile
+
 # 测试隔离：数据目录指向临时目录，绝不碰真实 uploads/ai_cache/session。
 # 只清理"自己创建的"目录——外部显式指定的 QQCHAT_DATA_DIR 一律不动。
 import atexit as _atexit
@@ -41,6 +43,7 @@ def _drop_temp_data_dir():
     """跑完把临时数据目录删掉（先关日志：否则我们的清理先跑，logging 的
     shutdown 又把 app.log 写回来，留下一堆空目录）"""
     import logging
+
     logging.shutdown()
     _shutil.rmtree(os.environ["QQCHAT_DATA_DIR"], ignore_errors=True)
 
@@ -64,10 +67,19 @@ tempfile.tempdir = _TMP_ROOT
 # （别名同样要放在这里：提前导入 webapp.* 会连带导入 config，把环境开关读成默认值）
 from webapp import security as securitymod  # noqa: E402
 from webapp import store as storemod  # noqa: E402
-from parser.qq_parser import (CST, ChatData, Message, is_statistical,  # noqa: E402
-                              load_chat, split_by_month)
-from analyzer.deepseek_client import (MAX_DIALOG_CHARS, _build_dialog,  # noqa: E402
-                                      _fit_lines)
+from parser.qq_parser import (  # noqa: E402
+    CST,
+    ChatData,
+    Message,
+    is_statistical,
+    load_chat,
+    split_by_month,
+)
+from analyzer.deepseek_client import (  # noqa: E402
+    MAX_DIALOG_CHARS,
+    _build_dialog,
+    _fit_lines,
+)
 from analyzer.local_stats import calc_milestones, calc_overview, calc_response_time  # noqa: E402
 
 
@@ -80,10 +92,16 @@ def _write_chat(data: dict) -> str:
 
 def _msg(uid: str, ts: int, text: str = "hello", msg_type: str = "type_1") -> Message:
     return Message(
-        id="", timestamp=ts, time_str="2025-01-01 00:00:00",
-        sender_name="x", sender_uid=uid,
-        text=text, raw_text=text, msg_type=msg_type,
-        has_image=False, is_reply=False,
+        id="",
+        timestamp=ts,
+        time_str="2025-01-01 00:00:00",
+        sender_name="x",
+        sender_uid=uid,
+        text=text,
+        raw_text=text,
+        msg_type=msg_type,
+        has_image=False,
+        is_reply=False,
     )
 
 
@@ -93,11 +111,15 @@ class TestParserRobustness(unittest.TestCase):
         data = {
             "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
             "statistics": {"senders": [{"uid": "u_self", "name": "我"}, {"uid": "u_other", "name": "对方"}]},
-            "messages": [{
-                "id": "1", "timestamp": 1704067200000, "time": "2024-01-01 08:00:00",
-                "sender": {"uid": "u_self", "name": "我"},
-                "content": "这是纯文本消息",
-            }],
+            "messages": [
+                {
+                    "id": "1",
+                    "timestamp": 1704067200000,
+                    "time": "2024-01-01 08:00:00",
+                    "sender": {"uid": "u_self", "name": "我"},
+                    "content": "这是纯文本消息",
+                }
+            ],
         }
         chat = load_chat(_write_chat(data))
         self.assertEqual(chat.messages[0].text, "这是纯文本消息")
@@ -107,11 +129,15 @@ class TestParserRobustness(unittest.TestCase):
         data = {
             "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
             "statistics": {"senders": [{"uid": "u_self", "name": "我"}, {"uid": "u_other", "name": "对方"}]},
-            "messages": [{
-                "id": "1", "timestamp": 1704067200000, "time": "2024-01-01 08:00:00",
-                "sender": {"uid": "u_self", "name": "我"},
-                "content": {"text": "无 elements 的消息"},
-            }],
+            "messages": [
+                {
+                    "id": "1",
+                    "timestamp": 1704067200000,
+                    "time": "2024-01-01 08:00:00",
+                    "sender": {"uid": "u_self", "name": "我"},
+                    "content": {"text": "无 elements 的消息"},
+                }
+            ],
         }
         chat = load_chat(_write_chat(data))
         self.assertEqual(chat.messages[0].text, "无 elements 的消息")
@@ -121,11 +147,15 @@ class TestParserRobustness(unittest.TestCase):
         data = {
             "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
             "statistics": {"senders": [{"uid": "u_self", "name": "我"}, {"uid": "u_other", "name": "对方"}]},
-            "messages": [{
-                "id": "1", "timestamp": 1704067200000, "time": "2024-01-01 08:00:00",
-                "sender": {"uid": "u_self", "name": "我"},
-                "content": {"text": "[图片]", "elements": [{"type": "image", "data": {}}]},
-            }],
+            "messages": [
+                {
+                    "id": "1",
+                    "timestamp": 1704067200000,
+                    "time": "2024-01-01 08:00:00",
+                    "sender": {"uid": "u_self", "name": "我"},
+                    "content": {"text": "[图片]", "elements": [{"type": "image", "data": {}}]},
+                }
+            ],
         }
         chat = load_chat(_write_chat(data))
         self.assertEqual(chat.messages[0].text, "")
@@ -136,11 +166,15 @@ class TestParserRobustness(unittest.TestCase):
         data = {
             "chatInfo": {"name": "对方", "selfName": "我"},
             "statistics": {"senders": [{"uid": "u_other", "name": "对方"}, {"uid": "u_self", "name": "我"}]},
-            "messages": [{
-                "id": "1", "timestamp": 1704067200000, "time": "2024-01-01 08:00:00",
-                "sender": {"uid": "u_self", "name": "我"},
-                "content": "来自我",
-            }],
+            "messages": [
+                {
+                    "id": "1",
+                    "timestamp": 1704067200000,
+                    "time": "2024-01-01 08:00:00",
+                    "sender": {"uid": "u_self", "name": "我"},
+                    "content": "来自我",
+                }
+            ],
         }
         chat = load_chat(_write_chat(data))
         self.assertEqual(chat.self_uid, "u_self")
@@ -151,24 +185,30 @@ class TestResponseTime(unittest.TestCase):
     def test_only_cross_sender_gaps_counted(self):
         """只统计对方发来后本方的回复间隔；同人连发不计入"""
         chat = ChatData(
-            chat_name="", self_name="我", other_name="对方",
-            self_uid="self", other_uid="other",
+            chat_name="",
+            self_name="我",
+            other_name="对方",
+            self_uid="self",
+            other_uid="other",
             messages=[_msg("self", 1000), _msg("other", 6000), _msg("self", 13000)],
         )
         rt = calc_response_time(chat)
         self.assertEqual(rt["other_avg_seconds"], 5.0)  # 对方 5s 内回应
-        self.assertEqual(rt["self_avg_seconds"], 7.0)   # 自己 7s 内回应
+        self.assertEqual(rt["self_avg_seconds"], 7.0)  # 自己 7s 内回应
 
     def test_consecutive_same_sender_skipped(self):
         """self->self 的间隔不应算作响应时间"""
         chat = ChatData(
-            chat_name="", self_name="我", other_name="对方",
-            self_uid="self", other_uid="other",
+            chat_name="",
+            self_name="我",
+            other_name="对方",
+            self_uid="self",
+            other_uid="other",
             messages=[_msg("self", 1000), _msg("self", 5000), _msg("other", 9000)],
         )
         rt = calc_response_time(chat)
-        self.assertEqual(rt["other_avg_seconds"], 4.0)   # self->other 间隔 4s
-        self.assertEqual(rt["self_avg_seconds"], 0)      # 没有 self 的响应记录
+        self.assertEqual(rt["other_avg_seconds"], 4.0)  # self->other 间隔 4s
+        self.assertEqual(rt["self_avg_seconds"], 0)  # 没有 self 的响应记录
 
 
 class TestSplitByMonthTimezone(unittest.TestCase):
@@ -176,8 +216,11 @@ class TestSplitByMonthTimezone(unittest.TestCase):
         """2024-01-31 23:30 UTC = 2024-02-01 07:30 北京时间，应按月归入 2024-02"""
         ts = int(datetime(2024, 1, 31, 23, 30, tzinfo=timezone.utc).timestamp() * 1000)
         chat = ChatData(
-            chat_name="", self_name="我", other_name="对方",
-            self_uid="self", other_uid="other",
+            chat_name="",
+            self_name="我",
+            other_name="对方",
+            self_uid="self",
+            other_uid="other",
             messages=[_msg("self", ts)],
         )
         months = split_by_month(chat)
@@ -211,6 +254,7 @@ class TestCsrfProtection(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from app import app
+
         app.config["TESTING"] = True
         cls.client = app.test_client()
 
@@ -255,30 +299,37 @@ class TestCsrfProtection(unittest.TestCase):
             r = self.client.post("/upload", data=data, headers=headers)
             self.assertEqual(r.status_code, 400, f"应返回 400，实际 {r.status_code}")
         # 对照：普通错误 token 也是 400
-        r = self.client.post("/upload", data={},
-                             headers={"Origin": "http://localhost:5000", "X-CSRF-Token": "wrong"})
+        r = self.client.post(
+            "/upload", data={}, headers={"Origin": "http://localhost:5000", "X-CSRF-Token": "wrong"}
+        )
         self.assertEqual(r.status_code, 400)
 
     def test_origin_equal_to_host_is_not_trusted(self):
         """Origin == Host 也必须是白名单内的主机，否则 DNS rebinding 可绕过校验"""
         import app as appmod
+
         with appmod.app.test_request_context(
-                "/upload", headers={"Host": "evil.example.com", "Origin": "http://evil.example.com"}):
+            "/upload", headers={"Host": "evil.example.com", "Origin": "http://evil.example.com"}
+        ):
             self.assertFalse(securitymod._origin_allowed())
         with appmod.app.test_request_context(
-                "/upload", headers={"Host": "127.0.0.1:5000", "Origin": "http://127.0.0.1:5000"}):
+            "/upload", headers={"Host": "127.0.0.1:5000", "Origin": "http://127.0.0.1:5000"}
+        ):
             self.assertTrue(securitymod._origin_allowed())
 
     def test_allowed_origins_config_is_honored(self):
         """局域网/自定义域名通过 ALLOWED_ORIGINS 显式放行"""
         import app as appmod
         from webapp import security as securitymod
+
         with mock.patch.object(securitymod, "ALLOWED_ORIGINS", frozenset({"chat.lan"})):
             with appmod.app.test_request_context(
-                    "/upload", headers={"Host": "127.0.0.1:5000", "Origin": "http://chat.lan"}):
+                "/upload", headers={"Host": "127.0.0.1:5000", "Origin": "http://chat.lan"}
+            ):
                 self.assertTrue(securitymod._origin_allowed())
         with appmod.app.test_request_context(
-                "/upload", headers={"Host": "127.0.0.1:5000", "Origin": "http://chat.lan"}):
+            "/upload", headers={"Host": "127.0.0.1:5000", "Origin": "http://chat.lan"}
+        ):
             self.assertFalse(securitymod._origin_allowed())
 
 
@@ -303,9 +354,14 @@ class TestStatisticalFiltering(unittest.TestCase):
 
     def test_overview_excludes_non_statistical(self):
         normal, recalled, system, forwarded = self._flagged()
-        chat = ChatData(chat_name="", self_name="我", other_name="对方",
-                        self_uid="self", other_uid="other",
-                        messages=[normal, recalled, system, forwarded])
+        chat = ChatData(
+            chat_name="",
+            self_name="我",
+            other_name="对方",
+            self_uid="self",
+            other_uid="other",
+            messages=[normal, recalled, system, forwarded],
+        )
         ov = calc_overview(chat)
         self.assertEqual(ov["total_messages"], 1)
         self.assertEqual(ov["self_count"], 1)
@@ -313,8 +369,9 @@ class TestStatisticalFiltering(unittest.TestCase):
 
     def test_dialog_excludes_recalled_and_system(self):
         normal, recalled, system, forwarded = self._flagged()
-        dialog = _build_dialog([normal, recalled, system, forwarded],
-                               "self", "我", "对方", max_chars=MAX_DIALOG_CHARS)
+        dialog = _build_dialog(
+            [normal, recalled, system, forwarded], "self", "我", "对方", max_chars=MAX_DIALOG_CHARS
+        )
         self.assertIn("正常消息", dialog)
         self.assertNotIn("被撤回的", dialog)
         self.assertNotIn("撤回了一条消息", dialog)
@@ -323,15 +380,26 @@ class TestStatisticalFiltering(unittest.TestCase):
     def test_parser_reads_recalled_and_system_flags(self):
         data = {
             "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
-            "statistics": {"senders": [{"uid": "u_self", "name": "我"},
-                                       {"uid": "u_other", "name": "对方"}]},
+            "statistics": {"senders": [{"uid": "u_self", "name": "我"}, {"uid": "u_other", "name": "对方"}]},
             "messages": [
-                {"id": "1", "timestamp": 1704067200000, "time": "2024-01-01 08:00:00",
-                 "sender": {"uid": "u_other", "name": "对方"},
-                 "content": "hi", "recalled": True, "system": False},
-                {"id": "2", "timestamp": 1704067201000, "time": "2024-01-01 08:00:01",
-                 "sender": {"uid": "u_other", "name": "系统"},
-                 "content": "对方撤回了一条消息", "recalled": False, "system": True},
+                {
+                    "id": "1",
+                    "timestamp": 1704067200000,
+                    "time": "2024-01-01 08:00:00",
+                    "sender": {"uid": "u_other", "name": "对方"},
+                    "content": "hi",
+                    "recalled": True,
+                    "system": False,
+                },
+                {
+                    "id": "2",
+                    "timestamp": 1704067201000,
+                    "time": "2024-01-01 08:00:01",
+                    "sender": {"uid": "u_other", "name": "系统"},
+                    "content": "对方撤回了一条消息",
+                    "recalled": False,
+                    "system": True,
+                },
             ],
         }
         chat = load_chat(_write_chat(data))
@@ -362,42 +430,69 @@ class TestAiCache(unittest.TestCase):
 
     def test_api_analyze_uses_cache_then_job(self):
         import app as appmod
+
         appmod.app.config["TESTING"] = True
         client = appmod.app.test_client()
         # 建立 session + 上传一个最小聊天文件
         client.get("/")
         with client.session_transaction() as sess:
             token = sess["csrf_token"]
-        chat_json = json.dumps({
-            "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
-            "statistics": {"senders": [{"uid": "u_self", "name": "我"},
-                                       {"uid": "u_other", "name": "对方"}],
-                           "totalMessages": 2},
-            "messages": [
-                {"id": "1", "timestamp": 1704067200000, "time": "2024-01-01 08:00:00",
-                 "sender": {"uid": "u_self", "name": "我"}, "content": "在吗"},
-                {"id": "2", "timestamp": 1704067260000, "time": "2024-01-01 08:01:00",
-                 "sender": {"uid": "u_other", "name": "对方"}, "content": "在的"},
-            ],
-        }, ensure_ascii=False).encode("utf-8")
-        r = client.post("/upload", data={"file": (io.BytesIO(chat_json), "chat.json")},
-                        headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+        chat_json = json.dumps(
+            {
+                "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
+                "statistics": {
+                    "senders": [{"uid": "u_self", "name": "我"}, {"uid": "u_other", "name": "对方"}],
+                    "totalMessages": 2,
+                },
+                "messages": [
+                    {
+                        "id": "1",
+                        "timestamp": 1704067200000,
+                        "time": "2024-01-01 08:00:00",
+                        "sender": {"uid": "u_self", "name": "我"},
+                        "content": "在吗",
+                    },
+                    {
+                        "id": "2",
+                        "timestamp": 1704067260000,
+                        "time": "2024-01-01 08:01:00",
+                        "sender": {"uid": "u_other", "name": "对方"},
+                        "content": "在的",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        r = client.post(
+            "/upload",
+            data={"file": (io.BytesIO(chat_json), "chat.json")},
+            headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token},
+        )
         self.assertEqual(r.status_code, 302)
         with client.session_transaction() as sess:
             uploaded_path = sess.get("filepath")
 
-        fake_result = {"self_emotion": "平静", "other_emotion": "快乐",
-                       "self_intensity": 5, "other_intensity": 7,
-                       "self_keywords": ["在吗"], "other_keywords": ["在的"],
-                       "overall_tone": "轻松愉快"}
+        fake_result = {
+            "self_emotion": "平静",
+            "other_emotion": "快乐",
+            "self_intensity": 5,
+            "other_intensity": 7,
+            "self_keywords": ["在吗"],
+            "other_keywords": ["在的"],
+            "overall_tone": "轻松愉快",
+        }
         cache_dir = Path(storemod.AI_CACHE_DIR)
         cache_before = set(cache_dir.glob("*")) if cache_dir.exists() else set()
         try:
             with mock.patch("analyzer.deepseek_client._call_api", return_value=fake_result) as m:
-                with mock.patch("analyzer.deepseek_client.is_api_configured", return_value=True), \
-                     mock.patch("webapp.api.is_api_configured", return_value=True):
-                    r = client.post("/api/analyze/emotion",
-                                    headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+                with (
+                    mock.patch("analyzer.deepseek_client.is_api_configured", return_value=True),
+                    mock.patch("webapp.api.is_api_configured", return_value=True),
+                ):
+                    r = client.post(
+                        "/api/analyze/emotion",
+                        headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token},
+                    )
                     body = r.get_json()
                     self.assertIn("job", body)
                     # 轮询直到任务结束
@@ -413,8 +508,10 @@ class TestAiCache(unittest.TestCase):
                     self.assertEqual(m.call_count, 1)
 
                     # 第二次请求应命中缓存，不再调用模型
-                    r2 = client.post("/api/analyze/emotion",
-                                     headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+                    r2 = client.post(
+                        "/api/analyze/emotion",
+                        headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token},
+                    )
                     b2 = r2.get_json()
                     self.assertTrue(b2.get("cached"))
                     self.assertIn("2024-01", b2["result"])
@@ -460,6 +557,7 @@ class TestQuotaAndThrottle(unittest.TestCase):
 
     def setUp(self):
         import analyzer.deepseek_client as dc
+
         self.dc = dc
         self._orig_interval = dc.CALL_MIN_INTERVAL
         dc.CALL_MIN_INTERVAL = 0.0  # 测试中关闭全局调用闸门，避免拖慢
@@ -478,7 +576,9 @@ class TestQuotaAndThrottle(unittest.TestCase):
     def test_tpm_transient_then_success(self):
         fake = mock.Mock()
         fake.chat.completions.create.side_effect = [
-            self._err(429, "Allocated quota exceeded"), self._ok_resp()]
+            self._err(429, "Allocated quota exceeded"),
+            self._ok_resp(),
+        ]
         with mock.patch.object(self.dc, "_get_client", return_value=fake):
             out = self.dc._call_api("s", "u", retry=2, tpm_wait=0.01)
         self.assertEqual(out, {"a": 1})
@@ -505,10 +605,12 @@ class TestQuotaAndThrottle(unittest.TestCase):
         """全局关闭 + 白名单只有 profile 时，emotion 走非思考：下发 temperature 与 disabled"""
         fake = mock.Mock()
         fake.chat.completions.create.return_value = self._ok_resp()
-        with mock.patch.object(self.dc, "THINKING_DEFAULT", False), \
-             mock.patch.object(self.dc, "THINKING_DIMS", frozenset({"profile"})), \
-             mock.patch.object(self.dc, "_SEND_THINKING_PARAM", True), \
-             mock.patch.object(self.dc, "_get_client", return_value=fake):
+        with (
+            mock.patch.object(self.dc, "THINKING_DEFAULT", False),
+            mock.patch.object(self.dc, "THINKING_DIMS", frozenset({"profile"})),
+            mock.patch.object(self.dc, "_SEND_THINKING_PARAM", True),
+            mock.patch.object(self.dc, "_get_client", return_value=fake),
+        ):
             self.dc._call_api("s", "u", tag="emotion")
             # 断言必须在 patch 内：thinking_enabled 读的是模块级配置，
             # 放到 with 外面会依赖本机 .env（CI 无 .env → 白名单为空 → 误报失败）
@@ -522,10 +624,12 @@ class TestQuotaAndThrottle(unittest.TestCase):
         """白名单维度 profile 开思考：不传 temperature（服务端会忽略），传 enabled"""
         fake = mock.Mock()
         fake.chat.completions.create.return_value = self._ok_resp()
-        with mock.patch.object(self.dc, "THINKING_DEFAULT", False), \
-             mock.patch.object(self.dc, "THINKING_DIMS", frozenset({"profile"})), \
-             mock.patch.object(self.dc, "_SEND_THINKING_PARAM", True), \
-             mock.patch.object(self.dc, "_get_client", return_value=fake):
+        with (
+            mock.patch.object(self.dc, "THINKING_DEFAULT", False),
+            mock.patch.object(self.dc, "THINKING_DIMS", frozenset({"profile"})),
+            mock.patch.object(self.dc, "_SEND_THINKING_PARAM", True),
+            mock.patch.object(self.dc, "_get_client", return_value=fake),
+        ):
             self.dc._call_api("s", "u", tag="profile")
             self.assertTrue(self.dc.thinking_enabled("profile"))
             self.assertFalse(self.dc.thinking_enabled("emotion"))
@@ -536,12 +640,16 @@ class TestQuotaAndThrottle(unittest.TestCase):
 
     def test_global_thinking_switch_covers_all_dims(self):
         """LLM_THINKING=enabled 时所有维度都开（白名单为空也不影响）"""
-        with mock.patch.object(self.dc, "THINKING_DEFAULT", True), \
-             mock.patch.object(self.dc, "THINKING_DIMS", frozenset()):
+        with (
+            mock.patch.object(self.dc, "THINKING_DEFAULT", True),
+            mock.patch.object(self.dc, "THINKING_DIMS", frozenset()),
+        ):
             for dim in ("emotion", "topics", "relationship", "habits", "profile"):
                 self.assertTrue(self.dc.thinking_enabled(dim))
-        with mock.patch.object(self.dc, "THINKING_DEFAULT", False), \
-             mock.patch.object(self.dc, "THINKING_DIMS", frozenset()):
+        with (
+            mock.patch.object(self.dc, "THINKING_DEFAULT", False),
+            mock.patch.object(self.dc, "THINKING_DIMS", frozenset()),
+        ):
             self.assertFalse(self.dc.thinking_enabled("profile"))
 
     def test_profile_budget_fits_chain_of_thought(self):
@@ -557,33 +665,37 @@ class TestQuotaAndThrottle(unittest.TestCase):
     def test_truncated_output_retries_without_thinking(self):
         """被截断时降级重试：宁可精度略降，也不让这个月从结果里消失"""
         truncated = mock.Mock()
-        truncated.choices = [mock.Mock(finish_reason="length",
-                                       message=mock.Mock(content='{"a": 1}'))]
+        truncated.choices = [mock.Mock(finish_reason="length", message=mock.Mock(content='{"a": 1}'))]
         truncated.usage = None
         ok = self._ok_resp()
         ok.choices[0].message.content = '{"self_emotion": "平静"}'
         fake = mock.Mock()
         fake.chat.completions.create.side_effect = [truncated, ok]
-        with mock.patch.object(self.dc, "THINKING_DEFAULT", True), \
-             mock.patch.object(self.dc, "THINKING_DIMS", frozenset()), \
-             mock.patch.object(self.dc, "_SEND_THINKING_PARAM", True), \
-             mock.patch.object(self.dc, "_get_client", return_value=fake):
+        with (
+            mock.patch.object(self.dc, "THINKING_DEFAULT", True),
+            mock.patch.object(self.dc, "THINKING_DIMS", frozenset()),
+            mock.patch.object(self.dc, "_SEND_THINKING_PARAM", True),
+            mock.patch.object(self.dc, "_get_client", return_value=fake),
+        ):
             out = self.dc._call_api("s", "u", tag="emotion", retry=0)
         self.assertEqual(out, {"self_emotion": "平静"}, "降级重试应拿到结果")
         calls = fake.chat.completions.create.call_args_list
         self.assertEqual(calls[0].kwargs["extra_body"], {"thinking": {"type": "enabled"}})
-        self.assertEqual(calls[1].kwargs["extra_body"], {"thinking": {"type": "disabled"}},
-                         "第二次必须关掉思考模式")
+        self.assertEqual(
+            calls[1].kwargs["extra_body"], {"thinking": {"type": "disabled"}}, "第二次必须关掉思考模式"
+        )
         self.assertIn("temperature", calls[1].kwargs)
 
     def test_non_deepseek_gateway_gets_no_thinking_param(self):
         """百炼等网关未显式配置思考模式时不发送 thinking 字段，避免非法参数"""
         fake = mock.Mock()
         fake.chat.completions.create.return_value = self._ok_resp()
-        with mock.patch.object(self.dc, "THINKING_DEFAULT", False), \
-             mock.patch.object(self.dc, "THINKING_DIMS", frozenset()), \
-             mock.patch.object(self.dc, "_SEND_THINKING_PARAM", False), \
-             mock.patch.object(self.dc, "_get_client", return_value=fake):
+        with (
+            mock.patch.object(self.dc, "THINKING_DEFAULT", False),
+            mock.patch.object(self.dc, "THINKING_DIMS", frozenset()),
+            mock.patch.object(self.dc, "_SEND_THINKING_PARAM", False),
+            mock.patch.object(self.dc, "_get_client", return_value=fake),
+        ):
             self.dc._call_api("s", "u", tag="profile")
         kw = fake.chat.completions.create.call_args.kwargs
         self.assertNotIn("extra_body", kw)
@@ -592,8 +704,10 @@ class TestQuotaAndThrottle(unittest.TestCase):
     def test_periods_abort_remaining_on_fatal(self):
         fake = mock.Mock()
         fake.chat.completions.create.side_effect = self._err(403, "Free allocated quota exceeded")
-        months = {f"2025-{m:02d}": [_msg("self", 1735689600000 + i * 2678400000, text="hi")]
-                  for m, i in [(1, 0), (2, 1), (3, 2), (4, 3), (5, 4)]}
+        months = {
+            f"2025-{m:02d}": [_msg("self", 1735689600000 + i * 2678400000, text="hi")]
+            for m, i in [(1, 0), (2, 1), (3, 2), (4, 3), (5, 4)]
+        }
         with mock.patch.object(self.dc, "_get_client", return_value=fake):
             with self.assertRaises(self.dc.QuotaExhaustedError):
                 self.dc._analyze_periods(months, "sys", lambda p, m: "prompt", max_tokens=1024)
@@ -606,19 +720,30 @@ class TestEmptyMonthSkipped(unittest.TestCase):
 
     def test_recalled_only_month_not_sent(self):
         import analyzer.deepseek_client as dc
-        sep_msg = _msg("self", 1704067200000, text="一月消息")   # 2024-01
+
+        sep_msg = _msg("self", 1704067200000, text="一月消息")  # 2024-01
         oct_recalled = _msg("other", 1706745600000, text="二月被撤回")  # 2024-02
         oct_recalled.recalled = True
-        chat = ChatData(chat_name="", self_name="我", other_name="对方",
-                        self_uid="self", other_uid="other",
-                        messages=[sep_msg, oct_recalled])
-        result = {"self_emotion": "平静", "other_emotion": "平静",
-                  "self_intensity": 5, "other_intensity": 5,
-                  "self_keywords": [], "other_keywords": [],
-                  "overall_tone": "平淡日常"}
+        chat = ChatData(
+            chat_name="",
+            self_name="我",
+            other_name="对方",
+            self_uid="self",
+            other_uid="other",
+            messages=[sep_msg, oct_recalled],
+        )
+        result = {
+            "self_emotion": "平静",
+            "other_emotion": "平静",
+            "self_intensity": 5,
+            "other_intensity": 5,
+            "self_keywords": [],
+            "other_keywords": [],
+            "overall_tone": "平淡日常",
+        }
         with mock.patch.object(dc, "_call_api", return_value=result) as m:
             out = dc.analyze_emotion(chat)
-        self.assertEqual(m.call_count, 1)          # 十月整月无效，未调用
+        self.assertEqual(m.call_count, 1)  # 十月整月无效，未调用
         self.assertIn("2024-01", out)
         self.assertNotIn("2024-02", out)
 
@@ -633,23 +758,25 @@ class TestMilestones(unittest.TestCase):
 
     def test_milestones(self):
         msgs = [
-            self._at("self", 2025, 1, 1, 21), self._at("other", 2025, 1, 1, 22),
+            self._at("self", 2025, 1, 1, 21),
+            self._at("other", 2025, 1, 1, 22),
             self._at("self", 2025, 1, 2, 10),
-            self._at("self", 2025, 1, 3, 3),    # 凌晨 3 点
-            self._at("other", 2025, 1, 3, 4),   # 双方都熬夜 → mutual_nights
+            self._at("self", 2025, 1, 3, 3),  # 凌晨 3 点
+            self._at("other", 2025, 1, 3, 4),  # 双方都熬夜 → mutual_nights
             self._at("self", 2025, 1, 10, 23),
             self._at("other", 2025, 1, 10, 23),
             self._at("self", 2025, 1, 10, 23),  # 峰值日 3 条
         ]
-        chat = ChatData(chat_name="", self_name="我", other_name="对方",
-                        self_uid="self", other_uid="other", messages=msgs)
+        chat = ChatData(
+            chat_name="", self_name="我", other_name="对方", self_uid="self", other_uid="other", messages=msgs
+        )
         ms = calc_milestones(chat)
         self.assertEqual(ms["first_day"], "2025-01-01")
         self.assertEqual(ms["last_day"], "2025-01-10")
         self.assertEqual(ms["active_days"], 4)
         self.assertEqual(ms["longest_streak"]["days"], 3)
-        self.assertEqual(ms["longest_silence"]["days"], 6)   # 01-03 → 01-10
-        self.assertEqual(ms["midnight_days"], 1)             # 01-03
+        self.assertEqual(ms["longest_silence"]["days"], 6)  # 01-03 → 01-10
+        self.assertEqual(ms["midnight_days"], 1)  # 01-03
         self.assertEqual(ms["midnight_msgs"], 2)
         self.assertEqual(ms["late_night_msgs"], 2)
         self.assertEqual(ms["mutual_nights"], 1)
@@ -657,8 +784,9 @@ class TestMilestones(unittest.TestCase):
         self.assertEqual(ms["busiest_month"]["month"], "2025-01")
 
     def test_milestones_empty(self):
-        chat = ChatData(chat_name="", self_name="我", other_name="对方",
-                        self_uid="self", other_uid="other", messages=[])
+        chat = ChatData(
+            chat_name="", self_name="我", other_name="对方", self_uid="self", other_uid="other", messages=[]
+        )
         self.assertEqual(calc_milestones(chat), {})
 
 
@@ -667,6 +795,7 @@ class TestUsageRecord(unittest.TestCase):
 
     def test_record_and_aggregate(self):
         import analyzer.usage as usage
+
         fd, tmp = tempfile.mkstemp(suffix=".json")
         os.close(fd)
         os.remove(tmp)  # 从空文件状态开始
@@ -695,39 +824,67 @@ class TestAnalyzeAll(unittest.TestCase):
 
     def test_analyze_all_flow(self):
         import app as appmod
+
         appmod.app.config["TESTING"] = True
         client = appmod.app.test_client()
         client.get("/")
         with client.session_transaction() as sess:
             token = sess["csrf_token"]
-        chat_json = json.dumps({
-            "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
-            "statistics": {"senders": [{"uid": "u_self", "name": "我"},
-                                       {"uid": "u_other", "name": "对方"}]},
-            "messages": [
-                {"id": "1", "timestamp": 1704067200000, "time": "2024-01-01 08:00:00",
-                 "sender": {"uid": "u_self", "name": "我"}, "content": "在吗"},
-                {"id": "2", "timestamp": 1704067260000, "time": "2024-01-01 08:01:00",
-                 "sender": {"uid": "u_other", "name": "对方"}, "content": "在的"},
-            ],
-        }, ensure_ascii=False).encode("utf-8")
-        r = client.post("/upload", data={"file": (io.BytesIO(chat_json), "chat.json")},
-                        headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+        chat_json = json.dumps(
+            {
+                "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
+                "statistics": {
+                    "senders": [{"uid": "u_self", "name": "我"}, {"uid": "u_other", "name": "对方"}]
+                },
+                "messages": [
+                    {
+                        "id": "1",
+                        "timestamp": 1704067200000,
+                        "time": "2024-01-01 08:00:00",
+                        "sender": {"uid": "u_self", "name": "我"},
+                        "content": "在吗",
+                    },
+                    {
+                        "id": "2",
+                        "timestamp": 1704067260000,
+                        "time": "2024-01-01 08:01:00",
+                        "sender": {"uid": "u_other", "name": "对方"},
+                        "content": "在的",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        r = client.post(
+            "/upload",
+            data={"file": (io.BytesIO(chat_json), "chat.json")},
+            headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token},
+        )
         self.assertEqual(r.status_code, 302)
         with client.session_transaction() as sess:
             uploaded_path = sess.get("filepath")
 
-        fake = {"self_emotion": "平静", "other_emotion": "快乐",
-                "self_intensity": 5, "other_intensity": 7,
-                "self_keywords": [], "other_keywords": [],
-                "overall_tone": "轻松愉快", "topics": [], "summary": "s"}
+        fake = {
+            "self_emotion": "平静",
+            "other_emotion": "快乐",
+            "self_intensity": 5,
+            "other_intensity": 7,
+            "self_keywords": [],
+            "other_keywords": [],
+            "overall_tone": "轻松愉快",
+            "topics": [],
+            "summary": "s",
+        }
         cache_dir = Path(storemod.AI_CACHE_DIR)
         cache_before = set(cache_dir.glob("*"))
         try:
-            with mock.patch("analyzer.deepseek_client._call_api", return_value=fake) as m, \
-                 mock.patch("webapp.api.is_api_configured", return_value=True):
-                r = client.post("/api/analyze-all",
-                                headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+            with (
+                mock.patch("analyzer.deepseek_client._call_api", return_value=fake) as m,
+                mock.patch("webapp.api.is_api_configured", return_value=True),
+            ):
+                r = client.post(
+                    "/api/analyze-all", headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token}
+                )
                 body = r.get_json()
                 self.assertIn("job", body)
                 deadline = time.time() + 20
@@ -744,8 +901,9 @@ class TestAnalyzeAll(unittest.TestCase):
                 self.assertGreaterEqual(calls_after_first, 5)  # 每维度至少一次
 
                 # 再跑一次：全部命中缓存，零新增调用
-                r2 = client.post("/api/analyze-all",
-                                 headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+                r2 = client.post(
+                    "/api/analyze-all", headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token}
+                )
                 b2 = r2.get_json()
                 s2 = {}
                 deadline = time.time() + 10
@@ -773,23 +931,66 @@ class TestPromptContract(unittest.TestCase):
 
     def test_field_names_present(self):
         from analyzer import prompts as P
+
         cases = [
-            (P.SYSTEM_PROMPT_EMOTION, ["self_emotion", "other_emotion", "self_intensity",
-                                       "other_intensity", "self_keywords", "other_keywords",
-                                       "overall_tone"]),
-            (P.SYSTEM_PROMPT_TOPICS, ["topics", "weight", "keywords", "summary",
-                                      "topic_shift_detected", "shift_description"]),
-            (P.SYSTEM_PROMPT_RELATIONSHIP, ["initiator_tendency", "initiator_ratio_self",
-                                            "interaction_style", "closeness_score",
-                                            "closeness_trend", "self_role", "other_role",
-                                            "relationship_summary"]),
-            (P.SYSTEM_PROMPT_HABITS, ["personality_tags", "common_phrases", "emoji_style",
-                                      "top_emojis", "sentence_length", "reply_speed",
-                                      "topic_jumping", "unique_traits"]),
-            (P.SYSTEM_PROMPT_PROFILE, ["overall_impression", "core_type", "strengths",
-                                       "weaknesses", "quirks", "signature_phrases",
-                                       "fun_facts", "scoring", "verdict",
-                                       "counter_evidence", "confidence"]),
+            (
+                P.SYSTEM_PROMPT_EMOTION,
+                [
+                    "self_emotion",
+                    "other_emotion",
+                    "self_intensity",
+                    "other_intensity",
+                    "self_keywords",
+                    "other_keywords",
+                    "overall_tone",
+                ],
+            ),
+            (
+                P.SYSTEM_PROMPT_TOPICS,
+                ["topics", "weight", "keywords", "summary", "topic_shift_detected", "shift_description"],
+            ),
+            (
+                P.SYSTEM_PROMPT_RELATIONSHIP,
+                [
+                    "initiator_tendency",
+                    "initiator_ratio_self",
+                    "interaction_style",
+                    "closeness_score",
+                    "closeness_trend",
+                    "self_role",
+                    "other_role",
+                    "relationship_summary",
+                ],
+            ),
+            (
+                P.SYSTEM_PROMPT_HABITS,
+                [
+                    "personality_tags",
+                    "common_phrases",
+                    "emoji_style",
+                    "top_emojis",
+                    "sentence_length",
+                    "reply_speed",
+                    "topic_jumping",
+                    "unique_traits",
+                ],
+            ),
+            (
+                P.SYSTEM_PROMPT_PROFILE,
+                [
+                    "overall_impression",
+                    "core_type",
+                    "strengths",
+                    "weaknesses",
+                    "quirks",
+                    "signature_phrases",
+                    "fun_facts",
+                    "scoring",
+                    "verdict",
+                    "counter_evidence",
+                    "confidence",
+                ],
+            ),
         ]
         for prompt, fields in cases:
             for f in fields:
@@ -798,6 +999,7 @@ class TestPromptContract(unittest.TestCase):
     def test_objectivity_and_humor_rules_present(self):
         """客观/幽默机制必须写进共用守则"""
         from analyzer import prompts as P
+
         for keyword in ("反例自查", "置信度", "证据优先", "损而不伤", "反套话黑名单"):
             self.assertIn(keyword, P._OBSERVER_CREED)
 
@@ -808,12 +1010,14 @@ class TestCacheLifecycle(unittest.TestCase):
     def test_cache_path_includes_prompt_fingerprint(self):
         """缓存键用提示词/格式指纹：改 prompt 或对话格式后旧缓存自动失效"""
         from analyzer.deepseek_client import PROMPT_FINGERPRINT
+
         path = storemod._cache_path("emotion", "deadbeef" * 2)
         self.assertIn(PROMPT_FINGERPRINT, path)
 
     def test_cache_path_separates_thinking_mode(self):
         """切换思考模式必须换键：否则开/关 thinking 后会命中另一模式的旧结果"""
         from webapp import store as storemod
+
         with mock.patch.object(storemod, "thinking_enabled", lambda d: d == "profile"):
             think_path = storemod._cache_path("profile", "hashX")
             plain_path = storemod._cache_path("emotion", "hashX")
@@ -826,6 +1030,7 @@ class TestCacheLifecycle(unittest.TestCase):
     def test_purge_removes_thinking_cache_too(self):
         """级联删除不看思考模式后缀，思考模式结果同样不会成为孤儿"""
         from webapp import store as storemod
+
         with mock.patch.object(storemod, "thinking_enabled", lambda d: True):
             storemod._write_cache("profile", "hashCCC", {"x": 1})
             path = storemod._cache_path("profile", "hashCCC")
@@ -855,30 +1060,49 @@ class TestJobDedup(unittest.TestCase):
     def test_reuses_running_job(self):
         import threading
         import app as appmod
+
         appmod.app.config["TESTING"] = True
         client = appmod.app.test_client()
         client.get("/")
         with client.session_transaction() as sess:
             token = sess["csrf_token"]
-        chat_json = json.dumps({
-            "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
-            "statistics": {"senders": [{"uid": "u_self", "name": "我"},
-                                       {"uid": "u_other", "name": "对方"}]},
-            "messages": [
-                {"id": "1", "timestamp": 1704067200000, "time": "2024-01-01 08:00:00",
-                 "sender": {"uid": "u_self", "name": "我"}, "content": "在吗"},
-            ],
-        }, ensure_ascii=False).encode("utf-8")
-        r = client.post("/upload", data={"file": (io.BytesIO(chat_json), "chat.json")},
-                        headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+        chat_json = json.dumps(
+            {
+                "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
+                "statistics": {
+                    "senders": [{"uid": "u_self", "name": "我"}, {"uid": "u_other", "name": "对方"}]
+                },
+                "messages": [
+                    {
+                        "id": "1",
+                        "timestamp": 1704067200000,
+                        "time": "2024-01-01 08:00:00",
+                        "sender": {"uid": "u_self", "name": "我"},
+                        "content": "在吗",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        r = client.post(
+            "/upload",
+            data={"file": (io.BytesIO(chat_json), "chat.json")},
+            headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token},
+        )
         with client.session_transaction() as sess:
             uploaded_path = sess.get("filepath")
         self.assertEqual(r.status_code, 302)
 
         release = threading.Event()
-        fake = {"self_emotion": "平静", "other_emotion": "平静",
-                "self_intensity": 5, "other_intensity": 5,
-                "self_keywords": [], "other_keywords": [], "overall_tone": "平淡日常"}
+        fake = {
+            "self_emotion": "平静",
+            "other_emotion": "平静",
+            "self_intensity": 5,
+            "other_intensity": 5,
+            "self_keywords": [],
+            "other_keywords": [],
+            "overall_tone": "平淡日常",
+        }
 
         def blocking(*a, **k):
             self.assertTrue(release.wait(15), "测试超时未放行")
@@ -887,13 +1111,15 @@ class TestJobDedup(unittest.TestCase):
         cache_dir = Path(storemod.AI_CACHE_DIR)
         cache_before = set(cache_dir.glob("*"))
         try:
-            with mock.patch("analyzer.deepseek_client._call_api", side_effect=blocking), \
-                 mock.patch("webapp.api.is_api_configured", return_value=True):
+            with (
+                mock.patch("analyzer.deepseek_client._call_api", side_effect=blocking),
+                mock.patch("webapp.api.is_api_configured", return_value=True),
+            ):
                 h = {"Origin": "http://localhost:5000", "X-CSRF-Token": token}
                 b1 = client.post("/api/analyze/emotion", headers=h).get_json()
                 b2 = client.post("/api/analyze/emotion", headers=h).get_json()
                 self.assertIn("job", b1)
-                self.assertEqual(b1["job"], b2["job"])   # 复用同一任务
+                self.assertEqual(b1["job"], b2["job"])  # 复用同一任务
                 self.assertTrue(b2.get("reused"))
             release.set()
             deadline = time.time() + 15
@@ -920,31 +1146,32 @@ class TestStratifiedProfileSample(unittest.TestCase):
     def test_profile_sample_spans_timeline(self):
         """样本量已按"准确性优先"上调（800 条），这里用 1600 条构造 stride=2 的场景"""
         import analyzer.deepseek_client as dc
+
         sample_size = 800
-        total = sample_size * 2          # 正好触发 stride=2 的抽稀
+        total = sample_size * 2  # 正好触发 stride=2 的抽稀
         msgs = []
-        for i in range(total):   # 每天一条
+        for i in range(total):  # 每天一条
             m = _msg("self", 1735689600000 + i * 86400000, text=f"消息{i}")
-            m.time_str = datetime.fromtimestamp(m.timestamp / 1000, tz=CST) \
-                            .strftime("%Y-%m-%d %H:%M:%S")
+            m.time_str = datetime.fromtimestamp(m.timestamp / 1000, tz=CST).strftime("%Y-%m-%d %H:%M:%S")
             msgs.append(m)
-        chat = ChatData(chat_name="", self_name="我", other_name="对方",
-                        self_uid="self", other_uid="other", messages=msgs)
+        chat = ChatData(
+            chat_name="", self_name="我", other_name="对方", self_uid="self", other_uid="other", messages=msgs
+        )
         captured = []
 
         def spy(system_prompt, user_content, **k):
             captured.append(user_content)
-            return None   # 不产生结果，只看 prompt
+            return None  # 不产生结果，只看 prompt
 
         with mock.patch.object(dc, "_call_api", side_effect=spy):
             dc.analyze_profile(chat)
 
-        self.assertEqual(len(captured), 1)   # other 一方无发言
+        self.assertEqual(len(captured), 1)  # other 一方无发言
         prompt = captured[0]
         self.assertIn("按时间均匀抽样覆盖整个时段", prompt)
-        self.assertIn("消息0", prompt)                    # 最早
-        self.assertIn(f"消息{total - 2}", prompt)         # 最晚（stride=2 的最后一个偶数下标）
-        self.assertNotIn("消息1\n", prompt)               # 奇数条目被抽稀
+        self.assertIn("消息0", prompt)  # 最早
+        self.assertIn(f"消息{total - 2}", prompt)  # 最晚（stride=2 的最后一个偶数下标）
+        self.assertNotIn("消息1\n", prompt)  # 奇数条目被抽稀
 
 
 class TestReuploadCacheLifecycle(unittest.TestCase):
@@ -952,11 +1179,15 @@ class TestReuploadCacheLifecycle(unittest.TestCase):
 
     def _upload(self, client, token, payload: dict, name="chat.json"):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        return client.post("/upload", data={"file": (io.BytesIO(data), name)},
-                           headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token})
+        return client.post(
+            "/upload",
+            data={"file": (io.BytesIO(data), name)},
+            headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token},
+        )
 
     def test_same_file_keeps_cache_different_file_purges(self):
         import app as appmod
+
         appmod.app.config["TESTING"] = True
         client = appmod.app.test_client()
         client.get("/")
@@ -964,11 +1195,15 @@ class TestReuploadCacheLifecycle(unittest.TestCase):
             token = sess["csrf_token"]
         chat_a = {
             "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
-            "statistics": {"senders": [{"uid": "u_self", "name": "我"},
-                                       {"uid": "u_other", "name": "对方"}]},
+            "statistics": {"senders": [{"uid": "u_self", "name": "我"}, {"uid": "u_other", "name": "对方"}]},
             "messages": [
-                {"id": "1", "timestamp": 1704067200000, "time": "2024-01-01 08:00:00",
-                 "sender": {"uid": "u_self", "name": "我"}, "content": "A内容"},
+                {
+                    "id": "1",
+                    "timestamp": 1704067200000,
+                    "time": "2024-01-01 08:00:00",
+                    "sender": {"uid": "u_self", "name": "我"},
+                    "content": "A内容",
+                },
             ],
         }
         chat_b = json.loads(json.dumps(chat_a))
@@ -984,7 +1219,7 @@ class TestReuploadCacheLifecycle(unittest.TestCase):
         # 重传同一文件：旧文件删除但缓存保留
         r2 = self._upload(client, token, chat_a)
         self.assertEqual(r2.status_code, 302)
-        self.assertFalse(os.path.exists(path_a))          # 旧文件已清理
+        self.assertFalse(os.path.exists(path_a))  # 旧文件已清理
         self.assertIsNotNone(storemod._read_cache("emotion", hash_a))  # 缓存还在
 
         # 换不同内容文件：旧哈希的缓存被联动清除

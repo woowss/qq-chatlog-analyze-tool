@@ -18,6 +18,7 @@
 
 这一层原来靠每次手工跑脚本验证，现在固化成测试，改模板或改路由都会立刻暴露问题。
 """
+
 import base64
 import hashlib
 import io
@@ -40,6 +41,7 @@ def _drop_temp_data_dir():
     """跑完把临时数据目录删掉（先关日志：否则我们的清理先跑，logging 的
     shutdown 又把 app.log 写回来，留下一堆空目录）"""
     import logging
+
     logging.shutdown()
     _shutil.rmtree(os.environ["QQCHAT_DATA_DIR"], ignore_errors=True)
 
@@ -64,9 +66,14 @@ import app as appmod  # noqa: E402
 
 
 def _emoji_count(text: str) -> int:
-    return sum(1 for ch in text
-               if 0x1F000 <= ord(ch) <= 0x1FAFF or 0x2600 <= ord(ch) <= 0x27BF
-               or 0x2B00 <= ord(ch) <= 0x2BFF or 0xFE0F == ord(ch))
+    return sum(
+        1
+        for ch in text
+        if 0x1F000 <= ord(ch) <= 0x1FAFF
+        or 0x2600 <= ord(ch) <= 0x27BF
+        or 0x2B00 <= ord(ch) <= 0x2BFF
+        or 0xFE0F == ord(ch)
+    )
 
 
 class TestPageSmoke(unittest.TestCase):
@@ -84,21 +91,27 @@ class TestPageSmoke(unittest.TestCase):
         msgs = []
         for i in range(40):
             who = "u_self" if i % 2 else "u_other"
-            msgs.append({
-                "id": str(i), "timestamp": base + i * 3600_000,
-                "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime((base + i * 3600_000) / 1000)),
-                "sender": {"uid": who, "name": "我" if who == "u_self" else "对方"},
-                "content": ["在吗", "在的", "今天好累", "早点睡", "晚安"][i % 5],
-            })
-        payload = json.dumps({
-            "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
-            "statistics": {"senders": [{"uid": "u_self", "name": "我"},
-                                       {"uid": "u_other", "name": "对方"}],
-                           "totalMessages": len(msgs)},
-            "messages": msgs,
-        }, ensure_ascii=False).encode("utf-8")
-        r = cls.client.post("/upload", data={"file": (io.BytesIO(payload), "chat.json")},
-                            headers=cls.headers)
+            msgs.append(
+                {
+                    "id": str(i),
+                    "timestamp": base + i * 3600_000,
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime((base + i * 3600_000) / 1000)),
+                    "sender": {"uid": who, "name": "我" if who == "u_self" else "对方"},
+                    "content": ["在吗", "在的", "今天好累", "早点睡", "晚安"][i % 5],
+                }
+            )
+        payload = json.dumps(
+            {
+                "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
+                "statistics": {
+                    "senders": [{"uid": "u_self", "name": "我"}, {"uid": "u_other", "name": "对方"}],
+                    "totalMessages": len(msgs),
+                },
+                "messages": msgs,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        r = cls.client.post("/upload", data={"file": (io.BytesIO(payload), "chat.json")}, headers=cls.headers)
         assert r.status_code == 302, f"上传失败: {r.status_code}"
         with cls.client.session_transaction() as sess:
             cls.filepath = sess.get("filepath")
@@ -111,15 +124,23 @@ class TestPageSmoke(unittest.TestCase):
         storemod._purge_chat_caches(cls.chat_hash)
 
     def test_pages_render_clean(self):
-        for path in ("/", "/dashboard", "/emotion", "/relationship",
-                     "/habits", "/topics", "/profile", "/report"):
+        for path in (
+            "/",
+            "/dashboard",
+            "/emotion",
+            "/relationship",
+            "/habits",
+            "/topics",
+            "/profile",
+            "/report",
+        ):
             with self.subTest(page=path):
                 r = self.client.get(path)
                 body = r.get_data(as_text=True)
                 self.assertEqual(r.status_code, 200, f"{path} 返回 {r.status_code}")
                 self.assertNotIn("Traceback", body)
                 self.assertEqual(_emoji_count(body), 0, f"{path} 出现了 emoji")
-                self.assertIn("data-theme", body)          # 主题脚本
+                self.assertIn("data-theme", body)  # 主题脚本
 
     def test_api_endpoints(self):
         self.assertEqual(self.client.get("/api/status").status_code, 200)
@@ -160,6 +181,7 @@ class TestPageSmoke(unittest.TestCase):
     def test_login_page_renders(self):
         """登录页此前没被任何用例覆盖：它不继承 base.html，模板出错不会被发现"""
         from webapp import security
+
         fresh = appmod.app.test_client()
         with mock.patch.object(security, "ACCESS_PASSWORD", "s3cret"):
             r = fresh.get("/login")
@@ -173,6 +195,7 @@ class TestPageSmoke(unittest.TestCase):
 
     def test_login_page_reports_error_without_traceback(self):
         from webapp import security
+
         fresh = appmod.app.test_client()
         with mock.patch.object(security, "ACCESS_PASSWORD", "s3cret"):
             r = fresh.post("/login", data={"password": "wrong"})

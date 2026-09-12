@@ -22,6 +22,7 @@ JSON（锁内读-改-写，串行化在 API 节奏上）；现在增量先进内
 5 秒内的连续调用合并成一次落盘。三个保底：get_usage() 读前冲刷、
 线程在 FLUSH_DELAY 后自动冲刷、进程正常退出时 atexit 冲刷。
 """
+
 import atexit
 import json
 import os
@@ -153,7 +154,7 @@ def _flush_locked() -> None:
 # 可用 LLM_PRICE_IN / LLM_PRICE_OUT 统一覆盖（换服务商时方便）。
 _PRICES = {
     "deepseek-flash": (2.0, 8.0),
-    "deepseek-chat": (2.0, 8.0),      # 旧名，官方已路由到 flash
+    "deepseek-chat": (2.0, 8.0),  # 旧名，官方已路由到 flash
     "deepseek-v4-pro": (9.0, 27.0),
 }
 
@@ -170,7 +171,7 @@ def _price_for(model: str) -> tuple:
     for key, price in _PRICES.items():
         if name.startswith(key):
             return price
-    return (0.0, 0.0)                 # 未知模型不瞎猜，费用显示为 0/不展示
+    return (0.0, 0.0)  # 未知模型不瞎猜，费用显示为 0/不展示
 
 
 def estimate_cost(prompt_tokens: int, completion_tokens: int, model: str) -> float:
