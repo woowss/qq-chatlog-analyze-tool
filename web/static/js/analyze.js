@@ -20,6 +20,7 @@
 // startAnalyze(dim, {refresh, onProgress(done,total), onDone(result), onError(msg)})
 // POST /api/analyze/<dim>：命中缓存立即回调；否则轮询后台任务进度
 function startAnalyze(dim, opts) {
+    opts.dim = dim;      // 轮询遇到 404 时用它回读磁盘缓存（见 pollAnalyzeJob）
     var url = '/api/analyze/' + dim + (opts.refresh ? '?refresh=1' : '');
     $.post(url, function(data) {
         if (data.error) { opts.onError(data.error); return; }
@@ -35,28 +36,76 @@ function startAnalyze(dim, opts) {
     });
 }
 
+// 轮询任务进度：指数退避 + 后台标签页降频。
+// 早先是固定 1.5s 的 setInterval：一次全量分析几分钟就是几百次请求，而且标签页被
+// 切到后台时浏览器本来就限流，继续按前台频率发只是白烧请求。现在起步 1s，最多 8s，
+// 回到前台立刻补查一次，让用户不必干等。
+var POLL_MIN_DELAY_MS = 1000;
+var POLL_MAX_DELAY_MS = 8000;
+
 function pollAnalyzeJob(jobId, opts) {
-    var timer = setInterval(function() {
+    var timer = null;
+    var delay = POLL_MIN_DELAY_MS;
+    var stopped = false;
+    opts.jobId = jobId;
+
+    function stop() {
+        stopped = true;
+        if (timer) { clearTimeout(timer); timer = null; }
+        document.removeEventListener('visibilitychange', onVisibilityChange);
+    }
+
+    function schedule() {
+        if (stopped) return;
+        var wait = document.hidden ? POLL_MAX_DELAY_MS * 2 : delay;
+        timer = setTimeout(tick, wait);
+        opts.timer = timer;
+    }
+
+    function onVisibilityChange() {
+        if (!document.hidden && !stopped) {     // 回到前台：立刻查一次
+            if (timer) { clearTimeout(timer); timer = null; }
+            tick();
+        }
+    }
+
+    function tick() {
+        if (stopped) return;
         $.get('/api/analyze-job/' + jobId, function(s) {
+            if (stopped) return;
             if (opts.onProgress) opts.onProgress(s.done || 0, s.total || 0, s.detail || '');
             if (s.status === 'done') {
-                clearInterval(timer);
+                stop();
                 opts.onDone(s.result);
             } else if (s.status === 'error') {
-                clearInterval(timer);
+                stop();
                 opts.onError(s.error || '分析失败');
             } else if (s.status === 'cancelled') {
-                clearInterval(timer);
+                stop();
                 opts.onError('分析已取消');
+            } else {
+                delay = Math.min(POLL_MAX_DELAY_MS, Math.round(delay * 1.5));
+                schedule();
             }
         }).fail(function(xhr) {
-            clearInterval(timer);
+            stop();
+            // 任务记录只在内存里（TTL 修剪 / 服务重启都会丢），但**已完成的维度结果已落盘**。
+            // 这里若直接把"任务不存在"当失败报出去，用户会以为分析白跑了并再点一次（重复付费）。
+            if (xhr && xhr.status === 404 && opts.dim) {
+                loadAnalysis(opts.dim, function(result) {
+                    if (result) opts.onDone(result);
+                    else opts.onError('任务不存在（服务可能已重启），请重新发起分析');
+                });
+                return;
+            }
             opts.onError((xhr.responseJSON && xhr.responseJSON.error) || '任务状态查询失败');
         });
-    }, 1500);
-    opts.timer = timer;
-    opts.jobId = jobId;
-    return timer;
+    }
+
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    opts.stopPolling = stop;
+    tick();
+    return stop;
 }
 
 // 一键全量分析（五个维度顺序执行，进度按维度汇报）

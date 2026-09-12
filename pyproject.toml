@@ -5,7 +5,10 @@ target-version = "py310"
 exclude = [".git", "__pycache__", "ai_cache", "stats_cache", "uploads", "flask_session", "logs", ".env"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W"]
+# E/F/W 是基础项；B（bugbear）与 C4（comprehension）专抓"看起来没问题"的逻辑坑，
+# 例如 zip 长度不匹配、可变默认参数、循环里做无用功——本次审查里
+# "zip 两个长度不同的列表"就是这么暴露出来的。
+select = ["E", "F", "W", "B", "C4"]
 
 [tool.ruff.lint.per-file-ignores]
 # 提示词是长中文文本，按列宽折行只会降低可读性且可能改变模型输入

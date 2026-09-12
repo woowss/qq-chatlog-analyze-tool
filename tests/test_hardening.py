@@ -55,6 +55,19 @@ if "QQCHAT_DATA_DIR" not in os.environ:
 # 专门验证增量缓存的用例会自行开启并指向临时目录。
 os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
 
+# 本进程的临时目录统一挪到数据目录下，两个好处：
+# 1) %TEMP% 只读受限的环境（沙箱、部分容器）里 tempfile.* 不再直接 PermissionError；
+# 2) 用例产生的临时json/图片/表情包都落在数据目录内，随测试隔离目录一起回收，
+#    不会在用户 %TEMP% 里留下上百个 qqchatlog-* 垃圾目录。
+_TMP_ROOT = os.path.join(os.environ["QQCHAT_DATA_DIR"], "tmp")
+os.makedirs(_TMP_ROOT, exist_ok=True)
+tempfile.tempdir = _TMP_ROOT
+
+# 别名与项目模块的导入都必须排在环境准备之后：提前导入 webapp.* 会连带导入 config，
+# 于是 QQCHAT_MONTH_CACHE / QQCHAT_DATA_DIR 被读成默认值（月份缓存意外开启）
+from webapp import jobs as jobsmod  # noqa: E402
+from webapp import security as securitymod  # noqa: E402
+from webapp import store as storemod  # noqa: E402
 from parser.qq_parser import Message, load_chat, split_by_month  # noqa: E402
 from analyzer.local_stats import calc_overview  # noqa: E402
 
@@ -197,7 +210,6 @@ class TestJobOverlapGuard(unittest.TestCase):
 
     def setUp(self):
         import app as appmod
-        self.appmod = appmod
         # 这些用例只关心任务编排，不能依赖本机 .env 是否配了 API Key（CI 没有 .env）
         self._patches = [
             mock.patch("analyzer.deepseek_client.is_api_configured", return_value=True),
@@ -228,12 +240,12 @@ class TestJobOverlapGuard(unittest.TestCase):
             p.stop()
         with self.client.session_transaction() as sess:
             path, chash = sess.get("filepath"), sess.get("chat_hash")
-        with self.appmod.JOBS_LOCK:
-            self.appmod.JOBS.clear()
+        with jobsmod.JOBS_LOCK:
+            jobsmod.JOBS.clear()
         if path and os.path.exists(path):
             os.remove(path)
         if chash:
-            self.appmod._purge_chat_caches(chash)
+            storemod._purge_chat_caches(chash)
 
     def _headers(self):
         return {"Origin": "http://localhost:5000", "X-CSRF-Token": self.token}
@@ -241,8 +253,8 @@ class TestJobOverlapGuard(unittest.TestCase):
     def _fake_running_job(self, dim):
         with self.client.session_transaction() as sess:
             sid, chash = sess.sid, sess.get("chat_hash")
-        with self.appmod.JOBS_LOCK:
-            self.appmod.JOBS["testjob"] = {
+        with jobsmod.JOBS_LOCK:
+            jobsmod.JOBS["testjob"] = {
                 "status": "running", "dim": dim, "done": 0, "total": 0, "cancel": False,
                 "chat_hash": chash, "sid": sid, "created": time.time(),
             }
@@ -290,29 +302,27 @@ class TestCacheAtomicity(unittest.TestCase):
     """缓存写入必须原子（临时文件 + replace），命中要续期 mtime"""
 
     def test_write_cache_leaves_no_tmp_and_is_readable(self):
-        import app as appmod
         try:
-            appmod._write_cache("emotion", "hashAtomic", {"a": 1})
-            path = appmod._cache_path("emotion", "hashAtomic")
+            storemod._write_cache("emotion", "hashAtomic", {"a": 1})
+            path = storemod._cache_path("emotion", "hashAtomic")
             self.assertTrue(os.path.exists(path))
             self.assertFalse(os.path.exists(path + ".tmp"))
-            self.assertEqual(appmod._read_cache("emotion", "hashAtomic"), {"a": 1})
+            self.assertEqual(storemod._read_cache("emotion", "hashAtomic"), {"a": 1})
         finally:
-            appmod._purge_chat_caches("hashAtomic")
+            storemod._purge_chat_caches("hashAtomic")
 
     def test_cache_hit_refreshes_mtime(self):
         """天天用的缓存不该在 30 天后因 mtime 过期被清理掉"""
-        import app as appmod
         try:
-            appmod._write_cache("topics", "hashTtl", {"a": 1})
-            path = appmod._cache_path("topics", "hashTtl")
+            storemod._write_cache("topics", "hashTtl", {"a": 1})
+            path = storemod._cache_path("topics", "hashTtl")
             old = time.time() - 40 * 86400
             os.utime(path, (old, old))
             self.assertLess(os.path.getmtime(path), time.time() - 30 * 86400)
-            self.assertIsNotNone(appmod._read_cache("topics", "hashTtl"))
+            self.assertIsNotNone(storemod._read_cache("topics", "hashTtl"))
             self.assertGreater(os.path.getmtime(path), time.time() - 60)
         finally:
-            appmod._purge_chat_caches("hashTtl")
+            storemod._purge_chat_caches("hashTtl")
 
 
 class TestLoginThrottle(unittest.TestCase):
@@ -320,20 +330,18 @@ class TestLoginThrottle(unittest.TestCase):
 
     def setUp(self):
         import app as appmod
-        self.appmod = appmod
         self.client = appmod.app.test_client()
-        with appmod._login_lock:
-            appmod._login_failures.clear()
+        with securitymod._login_lock:
+            securitymod._login_failures.clear()
 
     def tearDown(self):
-        with self.appmod._login_lock:
-            self.appmod._login_failures.clear()
+        with securitymod._login_lock:
+            securitymod._login_failures.clear()
 
     def test_repeated_failures_are_throttled(self):
-        import app as appmod
         from webapp import security as securitymod
         with mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"):
-            for _ in range(appmod.LOGIN_MAX_ATTEMPTS):
+            for _ in range(securitymod.LOGIN_MAX_ATTEMPTS):
                 r = self.client.post("/login", data={"password": "wrong"})
                 self.assertEqual(r.status_code, 200)      # 正常渲染错误提示
             r = self.client.post("/login", data={"password": "wrong"})
@@ -343,14 +351,13 @@ class TestLoginThrottle(unittest.TestCase):
             self.assertEqual(r.status_code, 429)
 
     def test_success_clears_failures(self):
-        import app as appmod
         from webapp import security as securitymod
         with mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"):
             self.client.post("/login", data={"password": "wrong"})
             r = self.client.post("/login", data={"password": "s3cret"})
             self.assertEqual(r.status_code, 302)
-            with appmod._login_lock:
-                self.assertEqual(appmod._login_failures, {})
+            with securitymod._login_lock:
+                self.assertEqual(securitymod._login_failures, {})
 
 
 class TestHardeningMisc(unittest.TestCase):

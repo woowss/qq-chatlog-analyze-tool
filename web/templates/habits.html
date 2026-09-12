@@ -126,7 +126,9 @@ $(function() {
                 return;
             }
             $('#fetchFacesMsg').text('已缓存 ' + res.available + ' / ' + res.total +
-                ' 个表情图（本次新增 ' + res.fetched + ' 个），刷新中…');
+                ' 个表情图（本次新增 ' + res.fetched + ' 个'
+                + (res.pending ? '，剩余 ' + res.pending + ' 个可再点一次继续抓' : '') +
+                '），刷新中…');
             window.location.reload();
         }).fail(function(xhr) {
             var msg = (xhr.responseJSON && xhr.responseJSON.error) || '抓取失败（可能没有联网）';

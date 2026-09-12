@@ -17,7 +17,9 @@
 """临时文件与缓存的生命周期回收
 
 生命周期分层（时间口径统一按 mtime / 缓存内的 _created）：
-- uploads/ 与 flask_session/：24 小时（原始聊天记录，敏感，尽快清）
+- uploads/ 与 flask_session/：24 小时（原始聊天记录，敏感，尽快清）。
+  注意 uploads/ 里不止有平铺的 JSON：看图所需的图片副本在 uploads/media/<哈希>/，
+  所以这一层必须**递归**回收（见 _purge_tree），否则图片副本会永远留在盘上。
 - ai_cache/ 与 stats_cache/：滑动 30 天 + 绝对 90 天双上限
 - 日志：按天轮转由 handler 负责，这里额外回收历史遗留的 5×5MB 式 app.log.N
   （换成按天保留后那些数字后缀文件不再被新 handler 认领，会永久占盘）。
@@ -77,13 +79,40 @@ def _purge_dir(directory: str, expired, name_prefix: str = "") -> int:
     return removed
 
 
+def _purge_tree(root: str, expired) -> int:
+    """递归回收 root 下过期的普通文件，并顺带清掉回收后变空的目录。
+
+    为什么不能用 _purge_dir：它只处理目录下的**普通文件**（os.path.isfile），
+    而 uploads/media/<chat_hash>/ 是子目录——整棵子树连同里面最敏感的图片本体
+    都会被跳过、永不回收，与"图片副本随 uploads/ 的 24 小时策略回收"的承诺相悖。
+    """
+    removed = 0
+    root_abs = os.path.abspath(root)
+    for dirpath, _dirnames, filenames in os.walk(root, topdown=False):
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            try:
+                if expired(path):
+                    os.remove(path)
+                    removed += 1
+            except OSError:
+                continue
+        if os.path.abspath(dirpath) != root_abs:
+            try:
+                os.rmdir(dirpath)     # 只删空目录：还有未过期内容时 rmdir 自然失败
+            except OSError:
+                pass
+    return removed
+
+
 def cleanup_old_files(max_age_seconds: int = 86400, cache_max_age: int = 30 * 86400,
                       cache_hard_max_age: int = 90 * 86400) -> int:
     """删除过期的临时文件与缓存；日志按天保留 LOG_RETENTION_DAYS 天"""
     now = time.time()
     cleaned = 0
     for directory in (UPLOAD_FOLDER, SESSION_FILE_DIR):
-        cleaned += _purge_dir(directory, lambda p: now - os.path.getmtime(p) > max_age_seconds)
+        cleaned += _purge_tree(
+            directory, lambda p: now - os.path.getmtime(p) > max_age_seconds)
     for directory in (AI_CACHE_DIR, STATS_CACHE_DIR):
         cleaned += _purge_dir(directory, lambda p: (
             now - os.path.getmtime(p) > cache_max_age
