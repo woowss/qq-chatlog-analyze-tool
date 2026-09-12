@@ -395,7 +395,7 @@ OpenAI SDK 的兼容接口。
 pip install -e ".[dev]"                      # 或 pip install -r requirements.txt
 python -m ruff check .                       # 代码检查（CI 同款）
 python -m ruff format .                      # 统一风格；CI 用 --check 卡住
-python -m unittest discover -s tests -v      # 全量单测（当前 237 个用例，含逐页冒烟、打包自检、会话后端自检）
+python -m unittest discover -s tests -v      # 全量单测（当前 460 个用例，含逐页冒烟、打包自检、会话后端自检）
 ```
 
 `ruff format` 有意排除了两处（见 `pyproject.toml` 的 `[tool.ruff.format] exclude`）：

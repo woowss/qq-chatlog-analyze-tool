@@ -12,7 +12,12 @@
 | echarts-wordcloud.min.js | echarts-wordcloud 2.1.0 | ISC | https://github.com/ecomfe/echarts-wordcloud |
 
 各文件头部自带许可证注释（`echarts-wordcloud.min.js` 是唯一的例外：上游产物里既没有
-wordcloud2.js 许可证附件（构建产物内声明，文件名必须保持原样）。
+许可证头也没有随附 LICENSE，所以按它 package.json 声明的 ISC 处理）。
+`echarts-wordcloud.min.js.LICENSE.txt` 是其打包的 wordcloud2.js 许可证附件
+（构建产物内声明，文件名必须保持原样）。
+
+完整许可证正文见 `LICENSES/` 目录（MIT / Apache-2.0 / ISC 各自的全文与覆盖范围表）。
+分发时这一目录随 `static/**/*` 一起进 wheel，满足 MIT/Apache-2.0 的随附要求。
 
 获取方式（升级时重新下载并核对版本）：
 
@@ -42,3 +47,9 @@ python tools/verify_vendor_sri.py --print    # 离线：按本地文件打印要
 
 最近一次核对（2026-09-12）：5 个文件从 `cdn.jsdelivr.net` 重新下载后与本地文件逐字节相同
 （sha256 也与 data.jsdelivr.com 公布的一致），模板里的 sha384 常量即取自这批字节。
+
+## 已知的小瑕疵
+
+`echarts-wordcloud.min.js` 末尾带一行 `//# sourceMappingURL=echarts-wordcloud.min.js.map`，
+但上游产物里没有这个 `.map` 文件（jsDelivr 上也没有）。浏览器开发者工具打开报告页时会打一条
+404，功能不受影响。**不要**为了消掉它去删这一行——那会改变文件字节，SRI 校验和随之失配。
