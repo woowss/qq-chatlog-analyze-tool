@@ -22,6 +22,13 @@ updates:
       python-minor-patch:
         applies-to: version-updates
         update-types: ["minor", "patch"]
+    # openai 的 major 明确不看：本项目只用 1.x 的接口形态（见 deepseek_client 的
+    # 重试/思考模式参数），而 Dependabot 开 major PR 时会顺手把 pyproject.toml 里的
+    # `openai>=1.61,<2` 放宽成 `<4`（2026-09 的 3.11.0 PR 就是这样）。越权放宽自己
+    # 写的版本上限，比漏掉一次更新危险得多，所以这里显式忽略 major。
+    ignore:
+      - dependency-name: "openai"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: "/"

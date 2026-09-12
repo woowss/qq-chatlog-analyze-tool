@@ -5,7 +5,7 @@
 > 「聊天记录只留在本机；AI 分析会把聊天文本片段发送到**你自己配置**的接口」，
 > 以 README「隐私与数据生命周期」与 `web/templates/index.html` 为准。
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use subagent-driven-development to implement plan task-by-task.
+> 本文档是历史实现计划，写给当时的实现者；保留原样以记录决策过程。
 
 **Goal:** 构建一个 Flask Web 应用，可导入 QQChatExporter JSON、执行本地统计 + DeepSeek API 分析、以 ECharts 可视化展示
 
@@ -138,7 +138,7 @@ class Message:
     """单条消息"""
     id: str
     timestamp: int          # 毫秒时间戳
-    time_str: str           # 格式化时间 "2025-09-16 21:56:49"
+    time_str: str           # 格式化时间 "2024-01-01 09:00:00"
     sender_name: str        # 发送者显示名
     sender_uid: str         # 发送者 UID
     text: str               # 纯文本内容（不含图片/表情标记）
@@ -290,7 +290,7 @@ CST = timezone(timedelta(hours=8))
 
 
 def calc_daily_counts(chat: ChatData) -> list[dict]:
-    """每日消息量时间序列，返回 [{"date": "2025-09-16", "self": 5, "other": 3}, ...]"""
+    """每日消息量时间序列，返回 [{"date": "2024-01-01", "self": 5, "other": 3}, ...]"""
     daily: dict[str, dict] = {}
     for msg in chat.messages:
         dt = datetime.fromtimestamp(msg.timestamp / 1000, tz=CST)

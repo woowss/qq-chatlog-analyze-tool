@@ -54,12 +54,12 @@ E:\qqchatlog\
 {
   "metadata": { "version": "5.5.64" },
   "chatInfo": { "name": "对方名", "type": "private", "selfName": "我" },
-  "statistics": { "totalMessages": 12404, "timeRange": {...}, "senders": [...] },
+  "statistics": { "totalMessages": 20000, "timeRange": {...}, "senders": [...] },
   "messages": [
     {
       "id": "msg_id",
-      "timestamp": 1758031009000,
-      "time": "2025-09-16 21:56:49",
+      "timestamp": 1704067200000,
+      "time": "2024-01-01 09:00:00",
       "sender": { "name": "昵称", "nickname": "备注" },
       "type": "type_1",
       "content": {
@@ -188,10 +188,10 @@ load_chat(path) -> ChatData
 - 使用 `openai` Python SDK（DeepSeek 完全兼容 OpenAI API 格式）
 
 **分段策略：**
-由于单次 API 调用无法处理全部消息（12,404 条消息 × 270 天），按**月**分段分析：
+由于单次 API 调用无法处理全部消息（20,000 条消息 × 180 天），按**月**分段分析：
 
 ```
-messages → 按月分组（约 9 组）→ 每组调 API → 合并汇总结果
+messages → 按月分组（约 6 组）→ 每组调 API → 合并汇总结果
 ```
 
 **模型参数设置：**
