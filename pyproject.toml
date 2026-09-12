@@ -33,6 +33,8 @@ classifiers = [
 dependencies = [
     "Flask>=3.1,<4",
     "Flask-Session>=0.8,<0.9",
+    # 会话后端：把 FileSystemCache 实例交给 SESSION_CACHELIB（原因见 app.py 里那段注释）
+    "cachelib>=0.13,<0.15",
     "openai>=1.61,<2",
     "jieba>=0.42,<0.43",
     "python-dotenv>=1.0,<2",

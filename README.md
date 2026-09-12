@@ -340,7 +340,8 @@ qq-chatlog-analyze-tool/
 
 ## 技术栈
 
-后端 Python 3.10+ 与 Flask 3，会话用 flask-session 存服务端文件；前端 Bootstrap 5.3.2、jQuery 3.7.1、
+后端 Python 3.10+ 与 Flask 3，会话用 Flask-Session 存服务端文件（cachelib 的 `FileSystemCache` 后端）；
+前端 Bootstrap 5.3.2、jQuery 3.7.1、
 ECharts 5.6.0（词云用 echarts-wordcloud 2.1.0），全部本地化随包分发；中文分词用 jieba；模型调用走
 OpenAI SDK 的兼容接口。
 
