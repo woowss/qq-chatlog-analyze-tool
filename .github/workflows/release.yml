@@ -11,12 +11,26 @@ name: release
 # 发布页只剩下 GitHub 自动生成的两个源码包，wheel 根本没挂上去）。人工关口保留在
 # "要不要打这个 tag"这一步；发布说明由 tag 源码与 CI 决定，不需要二次确认。
 #
+# 为什么还要 workflow_dispatch：tag 推送**只**在"这个 tag 第一次被推送"时才走到
+# `missing` 分支；已发布版本的附件按下面的规矩不许被自动覆盖（README 的安装链接与
+# sha256 都指向那一批产物）。但当发布物本身需要重做（例如历史脱敏后要重新出包，
+# 且已确认模型可见内容一字未变）时，得有一条**明示**的重建通道——那就是手动触发：
+#   Actions → release → Run workflow → 填 tag（如 v1.1.3）
+# 手动触发时才允许 `--clobber` 覆盖已发布附件并刷新说明里的 sha256；
+# 自动（tag 推送）路径遇到"已发布"依然大声失败。
+#
 # 刻意不使用第三方 release action：只用 actions/* 与 runner 自带的 gh，
 # 少一个供应链环节少一份风险。也不需要任何自定义 secret（用内置 GITHUB_TOKEN）。
 on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要重建附件的 tag（必须已存在，例如 v1.1.3）'
+        required: true
+        type: string
 
 permissions:
   contents: write        # 建 Release 与上传附件所需
@@ -24,26 +38,39 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      # tag 推送时用被推的 tag；手动触发时用输入值
+      TAG: ${{ inputs.tag || github.ref_name }}
+      # 手动触发 = 明示的重建；只有这种情形才允许覆盖已发布附件
+      REBUILD: ${{ github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
+      - name: 确认目标 tag 存在
+        run: |
+          echo "目标 tag: $TAG（手动重建=$REBUILD）"
+          git rev-parse --verify --quiet "refs/tags/$TAG^{commit}" >/dev/null \
+            || { echo "::error::tag $TAG 不存在"; exit 1; }
+
       # tag 与 pyproject 版本不一致时直接失败：否则会发出一个"名字叫 1.2.0、
       # 内容却是 1.1.0"的 Release，事后很难发现
       - name: 校验 tag 与 pyproject 版本一致
         run: |
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${TAG#v}"
           case "$tag" in
             [0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "::error::tag $GITHUB_REF_NAME 不是 vX.Y.Z 形式"; exit 1 ;;
+            *) echo "::error::tag $TAG 不是 vX.Y.Z 形式"; exit 1 ;;
           esac
           ver="$(python -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'])")"
           if [ "$tag" != "$ver" ]; then
-            echo "::error::tag $GITHUB_REF_NAME 与 pyproject 版本 $ver 不一致"; exit 1
+            echo "::error::tag $TAG 与 pyproject 版本 $ver 不一致"; exit 1
           fi
           echo "版本一致: $ver"
 
@@ -73,7 +100,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           {
-            echo "本页附件由 CI（\`.github/workflows/release.yml\`）从 tag \`$GITHUB_REF_NAME\` 的源码构建，"
+            echo "本页附件由 CI（\`.github/workflows/release.yml\`）从 tag \`$TAG\` 的源码构建，"
             echo "因此任何人都可以用同一 tag 复现，而不是维护者本机手工上传。"
             echo
             echo '### 校验和（sha256）'
@@ -85,7 +112,7 @@ jobs:
             echo '### 安装 / 升级'
             echo
             echo '```bash'
-            echo "pip install https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/qqchatlog-${GITHUB_REF_NAME#v}-py3-none-any.whl"
+            echo "pip install https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/qqchatlog-${TAG#v}-py3-none-any.whl"
             echo '```'
             echo
             echo '### 隐私说明'
@@ -98,29 +125,35 @@ jobs:
           #   · 没有 Release      → 直接建**已发布**的 Release（草稿对使用者不可见，
           #                        附件也下不到，见文件头说明）
           #   · 草稿（上一版遗留）→ 更新说明并覆盖附件，随后由下面的 --draft=false 发布
-          #   · 已发布            → 大声失败。绝不悄悄替换已发布版本的二进制：
+          #   · 已发布 + 手动触发 → 明示重建：刷新说明并覆盖附件（sha256 会随之更新）
+          #   · 已发布 + tag 推送 → 大声失败。绝不悄悄替换已发布版本的二进制：
           #     README 的安装链接与说明里的 sha256 都指向那一批产物，静默替换等于让
-          #     所有已下载/已校验过的人对不上账。要重建就先手动删 Release，或发新版本号。
-          state="$(gh release view "$GITHUB_REF_NAME" --json isDraft -q .isDraft 2>/dev/null || echo missing)"
+          #     所有已下载/已校验过的人对不上账。要重建就手动触发本 workflow。
+          state="$(gh release view "$TAG" --json isDraft -q .isDraft 2>/dev/null || echo missing)"
           case "$state" in
             missing)
-              gh release create "$GITHUB_REF_NAME" \
-                --title "$GITHUB_REF_NAME" \
+              gh release create "$TAG" \
+                --title "$TAG" \
                 --notes-file notes.md
               ;;
             true)
-              gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+              gh release edit "$TAG" --notes-file notes.md
               ;;
             *)
-              echo "::error::Release $GITHUB_REF_NAME 已发布，本 workflow 不覆盖已发布版本的附件。"
-              echo "若确实要重建：先手动删除该 Release，或发一个新的版本号。"
-              exit 1
+              if [ "$REBUILD" = "true" ]; then
+                echo "::notice::手动重建 $TAG：覆盖已发布附件并刷新校验和"
+                gh release edit "$TAG" --notes-file notes.md
+              else
+                echo "::error::Release $TAG 已发布，tag 推送不覆盖已发布版本的附件。"
+                echo "若确实要重建：在 Actions 页面手动运行 release workflow 并填 tag。"
+                exit 1
+              fi
               ;;
           esac
-          gh release upload "$GITHUB_REF_NAME" \
+          gh release upload "$TAG" \
             .tmp_dist/*.whl .tmp_dist/*.tar.gz .tmp_dist/SHA256SUMS.txt --clobber
           # 兜底：上一版遗留的草稿（或本次误建）在这里发布出去。附件已经挂好，
           # 这一步失败就说明发布页对使用者仍不可用，宁可让 job 红。
-          gh release edit "$GITHUB_REF_NAME" --draft=false
-          gh release view "$GITHUB_REF_NAME" --json isDraft,assets \
+          gh release edit "$TAG" --draft=false
+          gh release view "$TAG" --json isDraft,assets \
             -q '"draft=\(.isDraft) assets=\(.assets | length)"'
