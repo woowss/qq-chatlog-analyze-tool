@@ -44,8 +44,8 @@ PLACEHOLDER_UID_PREFIXES = ("未知", "unknown", "system")
 def is_placeholder_sender(uid: str, name: str = "") -> bool:
     """这个 sender 是不是导出器给系统类消息安排的"占位发言人"。
 
-    为什么必须单独判一次：占位 sender 的 system 标记并不齐全。实测某份数万条私聊导出里，
-    若干占位消息中就有 1 条没有 system 标记；群聊导出里占位 sender 若干，
+    为什么必须单独判一次：占位 sender 的 system 标记并不齐全。实测较大规模的私聊导出里，
+    若干占位消息中就有 1 条没有 system 标记；群聊导出里占位 sender 同样是若干条，
     且**全部**带标记。只要有一条漏标，它就会在群成员列表里变成一个"只说过一句话的幽灵成员"，
     进而在成员画像里被 AI 认真分析一遍——那比数字少一条难看得多。
 

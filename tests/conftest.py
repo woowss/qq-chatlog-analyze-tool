@@ -19,7 +19,7 @@
 为什么需要它（两次真实教训，都花了钱）：
 1. mock 打在 `group_client._call_api` 上，而三个群级维度走的是 `_analyze_periods`，
    它内部的 `_call_api` 取自 `deepseek_client` 的模块全局——补丁对月度维度无效，
-   一次"零成本验证"实际发出 十几次调用（数十万 tokens）；
+   一次"零成本验证"实际发出十几次调用（数十万 tokens）；
 2. 用例里 `POST /api/analyze/<dim>` 会**起后台任务**，请求返回 200 之后任务照跑，
    于是单元测试也能真的出网（数千 tokens）。
 

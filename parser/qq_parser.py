@@ -167,7 +167,7 @@ def multi_party_action(chat: "ChatData") -> str:
 
 # 第三方要"有实质发言"才认定成群聊：QQChatExporter 会给系统类消息安排占位
 # sender（name="系统消息"、uid 形如"未知…"），而这类条目的 system 标记并不齐全——
-# 实测某份数万条私聊导出里，若干占位消息中就有 1 条 type_23（商城表情）没有
+# 实测较大规模的私聊导出里，若干占位消息中就有 1 条 type_23（商城表情）没有
 # system 标记。若按"出现过就算一位"，正常私聊会被判成群聊直接拒收（这正是把
 # 判定口径收紧到 is_statistical + 设门槛的原因）。
 MULTI_PARTY_MIN_MESSAGES = 3

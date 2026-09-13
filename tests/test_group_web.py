@@ -231,7 +231,7 @@ class TestPrivatePagesUnaffected(GroupClientMixin, unittest.TestCase):
         """只验证"校验与缓存读取"这一层，**不真的发起分析**：
 
         早先这里 POST 了 /api/analyze/emotion，请求返回 200 之后后台任务照跑，
-        测试于是真的调用了 API（实测 数千 tokens）。发任务那条路径由 conftest 的
+        测试于是真的调用了 API（实测数千 tokens）。发任务那条路径由 conftest 的
         网络护栏兜底，用例本身则不该去碰它。
         """
         self.assertEqual(self.client.post("/api/analyze/notadim", headers=self.headers).status_code, 400)
