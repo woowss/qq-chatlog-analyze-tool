@@ -235,6 +235,13 @@ FLASK_PORT = _env_int("FLASK_PORT", 5000, 1, 65535)
 # 访问口令：设置后所有页面需先登录；绑定非回环地址时强制要求（否则拒绝启动）
 ACCESS_PASSWORD = os.getenv("ACCESS_PASSWORD", "").strip()
 
+# 登录失败限流：同一 IP 在窗口内失败达到上限后暂时拒绝（401/429），避免把服务绑到
+# 局域网或公网后被离线字典爆破。两个值都可调，因为**限流的计数器是按 remote_addr 计的**：
+# 反代或 NAT 之后所有请求共享同一个地址，一个人连续输错会把所有人一起锁在门外——
+# 那种部署要么把上限调大，要么在反代层自己限流（见 SECURITY.md 的"威胁模型"）。
+LOGIN_MAX_ATTEMPTS = _env_int("QQCHAT_LOGIN_MAX_ATTEMPTS", 5, 1, 1000)
+LOGIN_WINDOW_SECONDS = _env_int("QQCHAT_LOGIN_WINDOW_SECONDS", 300, 10, 86400)
+
 # 会话 cookie 的 Secure 标志：auto / true / false（大小写不敏感）。
 # auto（默认）= 非回环绑定时开启：明文 http 下 cookie 会裸奔过网，中间人拿到
 # session id 等于拿到登录态。之所以留 auto 而不是恒 true：本工具明确支持

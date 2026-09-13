@@ -252,6 +252,8 @@ QQ 的超级表情（吃糖、大怨种、菜汪之类）没有公开地址，�
 | `FLASK_PORT` | 5000 | 端口 |
 | `FLASK_DEBUG` | `false` | 调试模式与自动重载 |
 | `ACCESS_PASSWORD` | 空 | 访问口令，设置后所有页面需登录 |
+| `QQCHAT_LOGIN_MAX_ATTEMPTS` | 5 | 同一客户端地址允许的登录失败次数，超过即暂时拒绝（429 + `Retry-After`） |
+| `QQCHAT_LOGIN_WINDOW_SECONDS` | 300 | 上面那个次数对应的滑动窗口（秒）；反代/NAT 共享出口地址时把两者一起调大 |
 | `ALLOWED_ORIGINS` | 空 | 额外允许的浏览器来源主机，用局域网 IP 或域名访问时必填 |
 | `QQCHAT_COOKIE_SECURE` | `auto` | 会话 cookie 的 `Secure` 标志；`auto` = 非回环绑定时自动开启（此时需 https 才能保持登录态），明文 http 局域网访问需设为 `false` |
 | `SECRET_KEY` | 自动生成 | Session 签名密钥，留空则生成并持久化到数据目录下的 `.secret_key` |
@@ -326,7 +328,9 @@ AI 分析发送给**你自己配置的**接口，发送的内容包括：
 - 登录成功后轮换服务端 session id，旧 id 立即失效（防会话固定）；会话 cookie 带 `HttpOnly`、
   `SameSite=Lax`，并在非回环绑定时自动加 `Secure`（见 `QQCHAT_COOKIE_SECURE`）；
 - POST 请求同时校验 CSRF token 与 Origin，Origin 白名单不信任请求自带的 Host（防 DNS rebinding）；
-- 登录后的 `next=` 跳转只接受站内路径（含 `/\host` 这类反斜杠变体），登录接口对同一 IP 有失败限流；
+- 登录后的 `next=` 跳转只接受站内路径（含 `/\host` 这类反斜杠变体）；登录接口对同一客户端地址有
+  失败限流（默认 5 次 / 5 分钟，超限返回 429 并带 `Retry-After`，成功即清零）——反代/NAT 之后所有
+  请求共享一个地址，一个人输错会把所有人锁住，那种部署请调大 `QQCHAT_LOGIN_MAX_ATTEMPTS`；
 - 所有响应都带 `X-Content-Type-Options`、`X-Frame-Options`、`Referrer-Policy` 与同源 CSP，即便某处渲染漏了
   转义也拿不到跨站资源；
 - 导出的 HTML 报告会剥掉 CSRF token、把第三方资源换回 CDN（并带上 SRI `integrity` + `crossorigin`）、
