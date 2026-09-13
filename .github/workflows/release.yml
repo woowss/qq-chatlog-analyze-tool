@@ -1,11 +1,15 @@
 name: release
 
-# 打 tag（vX.Y.Z）就自动：校验版本一致 → 跑测试 → 构建 wheel/sdist → 挂到 Release **草稿**。
+# 打 tag（vX.Y.Z）就自动：校验版本一致 → 跑测试 → 构建 wheel/sdist → **发布** Release 并挂附件。
 #
 # 为什么要有这个 workflow：此前 Release 附件是维护者在本机手工构建上传的，
 # 第三方无法证明"附件与 tag 源码一致"——资产页的 sha256 只能证明下载没坏。
 # 改成 CI 从该 tag 构建后，任何人都能用同一 tag 复现同样的产物（见 README 的校验说明）。
-# 仍保留人工关口：默认建**草稿**，说明与"是否发布"由人确认后再点 Publish。
+#
+# 为什么不再留草稿：草稿的附件只有有权限的人能下载，而 README 的安装链接指向
+# `/releases/download/<tag>/…`——留草稿等于把一个下不到东西的链接发出去（实测踩过：
+# 发布页只剩下 GitHub 自动生成的两个源码包，wheel 根本没挂上去）。人工关口保留在
+# "要不要打这个 tag"这一步；发布说明由 tag 源码与 CI 决定，不需要二次确认。
 #
 # 刻意不使用第三方 release action：只用 actions/* 与 runner 自带的 gh，
 # 少一个供应链环节少一份风险。也不需要任何自定义 secret（用内置 GITHUB_TOKEN）。
@@ -64,7 +68,7 @@ jobs:
           sha256sum *.whl *.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: 建 Release 草稿并挂附件
+      - name: 建 Release 并挂附件
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -91,8 +95,9 @@ jobs:
             echo '完整变更见 `CHANGELOG.md`。'
           } > notes.md
           # 幂等 + 不覆盖已发布版本：
-          #   · 没有 Release      → 建草稿
-          #   · 草稿（含重跑）    → 更新说明并覆盖附件
+          #   · 没有 Release      → 直接建**已发布**的 Release（草稿对使用者不可见，
+          #                        附件也下不到，见文件头说明）
+          #   · 草稿（上一版遗留）→ 更新说明并覆盖附件，随后由下面的 --draft=false 发布
           #   · 已发布            → 大声失败。绝不悄悄替换已发布版本的二进制：
           #     README 的安装链接与说明里的 sha256 都指向那一批产物，静默替换等于让
           #     所有已下载/已校验过的人对不上账。要重建就先手动删 Release，或发新版本号。
@@ -101,8 +106,7 @@ jobs:
             missing)
               gh release create "$GITHUB_REF_NAME" \
                 --title "$GITHUB_REF_NAME" \
-                --notes-file notes.md \
-                --draft
+                --notes-file notes.md
               ;;
             true)
               gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
@@ -115,3 +119,8 @@ jobs:
           esac
           gh release upload "$GITHUB_REF_NAME" \
             .tmp_dist/*.whl .tmp_dist/*.tar.gz .tmp_dist/SHA256SUMS.txt --clobber
+          # 兜底：上一版遗留的草稿（或本次误建）在这里发布出去。附件已经挂好，
+          # 这一步失败就说明发布页对使用者仍不可用，宁可让 job 红。
+          gh release edit "$GITHUB_REF_NAME" --draft=false
+          gh release view "$GITHUB_REF_NAME" --json isDraft,assets \
+            -q '"draft=\(.isDraft) assets=\(.assets | length)"'
