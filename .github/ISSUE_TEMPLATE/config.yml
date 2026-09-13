@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 安全漏洞（请走私密通道，不要开公开 issue）
+    url: https://github.com/woowss/qq-chatlog-analyze-tool/security/advisories/new
+    about: 见 SECURITY.md；走私密报告能避免细节在修复前被公开
+  - name: 使用问题 / 配置疑问
+    url: https://github.com/woowss/qq-chatlog-analyze-tool#readme
+    about: 先看 README 的「快速开始」「配置项」「常见问题」「已知限制」四节

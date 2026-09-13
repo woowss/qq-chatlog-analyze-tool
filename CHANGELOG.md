@@ -5,6 +5,20 @@
 
 ---
 
+## 2026-09-13 · v1.1.2：测试竞态修复（无运行时行为变化）
+
+- 修掉群聊渲染用例的统计竞态：共享 fixture 的缓存被别的用例清掉时，后台统计结果会按设计被
+  丢弃（避免给已删除的聊天留下孤儿缓存），而 `wait_for_stats` 只在确实有线程在跑时才 join，
+  于是整类用例一起因为"没有统计数据"而红。新增 `tests/_stats.py` 的 `ensure_stats`
+  （等不到就当场同步补算），把"统计可用"从时序问题变成同步保证。
+- 社区与工程文件补齐：`CONTRIBUTING.md`、`CODE_OF_CONDUCT.md`、`.github/ISSUE_TEMPLATE/`、
+  `.github/PULL_REQUEST_TEMPLATE.md`；CI 的 `actions/checkout` 与 `actions/setup-python` 升到 v7。
+- 移除 `docs/index.html`（早期落地页，描述的还是旧架构；README 早已声明以其为准）。
+
+运行时与 v1.1.1 完全一致，**不需要回滚**；从 sdist 跑测试的人会拿到那份竞态修复。
+
+---
+
 ## 2026-09-13 · v1.1.1：三处隐私修复 + 公开前的脱敏
 
 ### 行为变更（建议升级）

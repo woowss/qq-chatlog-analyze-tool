@@ -99,7 +99,7 @@ AI 分析，而消息正文保持干净（文件名和占位符不会进入词�
 
 ```bash
 # 方式 A（推荐）：直接装 Release 里的 wheel，装完即得 qqchatlog 命令
-pip install https://github.com/woowss/qq-chatlog-analyze-tool/releases/download/v1.1.1/qqchatlog-1.1.1-py3-none-any.whl
+pip install https://github.com/woowss/qq-chatlog-analyze-tool/releases/download/v1.1.2/qqchatlog-1.1.2-py3-none-any.whl
 qqchatlog --version
 
 # 方式 B：从源码装成命令（想改代码就用可编辑安装）
@@ -480,7 +480,7 @@ pip install https://github.com/woowss/qq-chatlog-analyze-tool/releases/download/
 - 群聊与两人私聊都支持：群聊按成员分别统计（含互动矩阵、成员画像），私聊按「我 vs 对方」分析。
 - 群聊的成员画像默认只分析发言最多的 10 位（`QQCHAT_GROUP_AI_MAX_MEMBERS` 可调）；
   互动矩阵默认只保留前 30 位成员的格子，其余成员的活跃度与群总览仍然完整。
-- 群聊维度按"月 × 维度 + 人数"计费（例如 4 个月 × 3 个群级维度 + 10 位成员 = 22 次调用（示例），示例），
+- 群聊维度按"月 × 维度 + 人数"计费（例如 4 个月 × 3 个群级维度 + 10 位成员 = 22 次调用，示例），
   分析前页面上会给出预计调用次数。
 - 视频和文件本体不参与分析，只使用文件名与体积等元数据；图片可选做视觉理解。
 - QQ 超级表情的原图没有公开地址，需要自备表情包目录才能显示。
@@ -488,7 +488,6 @@ pip install https://github.com/woowss/qq-chatlog-analyze-tool/releases/download/
 - 大月份的分析较慢，实测约一年、数万条记录跑一个维度约 55 秒。
 - 统计与月份划分固定按北京时间（UTC+8）计算，不随系统时区变化。
 - 解析后的聊天数据会在内存中保留最近一份（数万条约几十 MB），第二次分析直接复用、不再重新解析。
-- `docs/index.html` 是早期的界面预览，内容与当前版本不一致，以本 README 为准。
 
 ## 许可证
 
