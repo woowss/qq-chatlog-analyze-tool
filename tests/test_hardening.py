@@ -402,6 +402,93 @@ class TestLoginThrottle(unittest.TestCase):
             with securitymod._login_lock:
                 self.assertEqual(securitymod._login_failures, {})
 
+    def test_retry_after_header_and_actionable_message(self):
+        """被限流时要告诉客户端还能等多久（Retry-After），页面提示也用同一份秒数"""
+        from webapp import security as securitymod
+
+        with mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"):
+            for _ in range(securitymod.LOGIN_MAX_ATTEMPTS):
+                self.client.post("/login", data={"password": "wrong"})
+            r = self.client.post("/login", data={"password": "wrong"})
+            self.assertEqual(r.status_code, 429)
+            retry = r.headers.get("Retry-After")
+            self.assertIsNotNone(retry, "429 必须带 Retry-After")
+            self.assertGreaterEqual(int(retry), 1)
+            self.assertLessEqual(int(retry), securitymod.LOGIN_WINDOW_SECONDS)
+            # 页面提示里的秒数与 Retry-After 一致，别让用户猜"稍后"是多久
+            self.assertIn(f"请 {retry} 秒后再试", r.get_data(as_text=True))
+
+    def test_window_expiry_lifts_throttle(self):
+        """窗口滑过去之后必须自动解除，否则被锁的人只能重启服务"""
+        from webapp import security as securitymod
+
+        clock = [1_000_000.0]
+        with (
+            mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"),
+            mock.patch.object(securitymod, "_now", lambda: clock[0]),
+        ):
+            for _ in range(securitymod.LOGIN_MAX_ATTEMPTS):
+                self.client.post("/login", data={"password": "wrong"})
+            self.assertEqual(self.client.post("/login", data={"password": "s3cret"}).status_code, 429)
+
+            # 还没到窗口边缘：仍然拒绝（边界内）
+            clock[0] += securitymod.LOGIN_WINDOW_SECONDS - 1
+            self.assertEqual(self.client.post("/login", data={"password": "s3cret"}).status_code, 429)
+
+            # 越过窗口：限流解除，正确口令可以登录
+            clock[0] += 2
+            r = self.client.post("/login", data={"password": "s3cret"})
+            self.assertEqual(r.status_code, 302)
+
+    def test_throttle_is_per_ip(self):
+        """限流按客户端地址计：一个人被锁不该把别人一起锁住"""
+        from webapp import security as securitymod
+
+        with mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"):
+            for _ in range(securitymod.LOGIN_MAX_ATTEMPTS):
+                self.client.post(
+                    "/login", data={"password": "wrong"}, environ_base={"REMOTE_ADDR": "10.0.0.9"}
+                )
+            blocked = self.client.post(
+                "/login", data={"password": "s3cret"}, environ_base={"REMOTE_ADDR": "10.0.0.9"}
+            )
+            self.assertEqual(blocked.status_code, 429)
+            # 同一时刻的另一个地址不受影响
+            other = self.client.post(
+                "/login", data={"password": "s3cret"}, environ_base={"REMOTE_ADDR": "10.0.0.10"}
+            )
+            self.assertEqual(other.status_code, 302)
+
+    def test_limit_is_configurable(self):
+        """上限/窗口来自 config，可被环境变量覆盖（反代/NAT 共享地址时要能调大）"""
+        from webapp import security as securitymod
+        from config import LOGIN_MAX_ATTEMPTS, LOGIN_WINDOW_SECONDS
+
+        self.assertGreaterEqual(LOGIN_MAX_ATTEMPTS, 1)
+        self.assertGreaterEqual(LOGIN_WINDOW_SECONDS, 10)
+
+        with (
+            mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"),
+            mock.patch.object(securitymod, "LOGIN_MAX_ATTEMPTS", 1),
+        ):
+            self.client.post("/login", data={"password": "wrong"})
+            self.assertEqual(self.client.post("/login", data={"password": "wrong"}).status_code, 429)
+
+    def test_failure_table_is_bounded(self):
+        """大量陌生地址扫描时，失败记录表必须有硬上限（否则内存随 IP 数无限涨）"""
+        from webapp import security as securitymod
+
+        clock = [1_000_000.0]
+        with mock.patch.object(securitymod, "_now", lambda: clock[0]):
+            for i in range(securitymod._LOGIN_FAILURES_MAX + 500):
+                securitymod._record_login_failure(f"203.0.113.{i % 256}-{i}")
+            with securitymod._login_lock:
+                self.assertLessEqual(len(securitymod._login_failures), securitymod._LOGIN_FAILURES_MAX)
+            # 淘汰的是最旧的条目：最近失败过的地址仍在表里，仍然被限流
+            for _ in range(securitymod.LOGIN_MAX_ATTEMPTS):
+                securitymod._record_login_failure("198.51.100.7")
+            self.assertFalse(securitymod._login_throttle_ok("198.51.100.7"))
+
 
 class TestHardeningMisc(unittest.TestCase):
     def test_session_cookie_flags(self):

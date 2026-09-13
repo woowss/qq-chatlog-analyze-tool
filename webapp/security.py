@@ -27,9 +27,9 @@ import threading
 import time
 from urllib.parse import urlparse
 
-from flask import abort, current_app, redirect, render_template, request, session, url_for
+from flask import abort, current_app, make_response, redirect, render_template, request, session, url_for
 
-from config import ACCESS_PASSWORD, ALLOWED_ORIGINS, FLASK_HOST
+from config import ACCESS_PASSWORD, ALLOWED_ORIGINS, FLASK_HOST, LOGIN_MAX_ATTEMPTS, LOGIN_WINDOW_SECONDS
 from analyzer.logger import get_logger
 
 logger = get_logger("app")
@@ -42,11 +42,20 @@ PUBLIC_ENDPOINTS = {"login", "static"}
 #: 消费点：ensure_csrf_token / require_login / views.log_request / cleanup.register。
 BYPASS_ENDPOINTS = frozenset({"health"})
 
-# 登录失败限流：同一 IP 在滑动窗口内失败达到上限后暂时拒绝，避免绑定局域网时被爆破
-LOGIN_MAX_ATTEMPTS = 5
-LOGIN_WINDOW_SECONDS = 300
+# 登录失败限流：同一 IP 在滑动窗口内失败达到上限后暂时拒绝，避免绑定局域网时被爆破。
+# 上限与窗口来自 config（`QQCHAT_LOGIN_MAX_ATTEMPTS` / `QQCHAT_LOGIN_WINDOW_SECONDS`），
+# 之所以可调：计数器按 remote_addr 计，反代或 NAT 之后所有请求共享一个地址，
+# 一个人连续输错会把所有人一起锁住（见 config.py 里那段注释）。
 _login_failures: dict[str, list[float]] = {}
 _login_lock = threading.Lock()
+#: 失败记录表的硬上限。窗口内的失败才计数，但扫描流量可以伪造大量**不同**地址，
+#: 只按"过期"清理的话表会一直涨；超过上限就按最近一次失败时间淘汰最旧的。
+_LOGIN_FAILURES_MAX = 1000
+
+
+def _now() -> float:
+    """当前时间（抽成函数，方便用例控制时间——不必真睡满一个窗口）"""
+    return time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +153,7 @@ def _guard_post():
 
 def _login_throttle_ok(ip: str) -> bool:
     """该 IP 是否仍允许尝试登录（只统计失败次数，成功即清零）"""
-    now = time.time()
+    now = _now()
     with _login_lock:
         stamps = [t for t in _login_failures.get(ip, []) if now - t < LOGIN_WINDOW_SECONDS]
         if stamps:
@@ -154,13 +163,30 @@ def _login_throttle_ok(ip: str) -> bool:
         return len(stamps) < LOGIN_MAX_ATTEMPTS
 
 
-def _record_login_failure(ip: str) -> None:
+def _login_retry_after(ip: str) -> int:
+    """被限流时还要等多少秒（喂给 429 的 Retry-After 与页面提示）"""
+    now = _now()
     with _login_lock:
-        _login_failures.setdefault(ip, []).append(time.time())
-        if len(_login_failures) > 1000:  # 防止字典随扫描流量无限增长
-            now = time.time()
+        stamps = [t for t in _login_failures.get(ip, []) if now - t < LOGIN_WINDOW_SECONDS]
+    if len(stamps) < LOGIN_MAX_ATTEMPTS:
+        return 0
+    # 最早那次失败滑出窗口时，窗口内只剩 MAX-1 次，限流自动解除
+    return max(1, int(LOGIN_WINDOW_SECONDS - (now - min(stamps))) + 1)
+
+
+def _record_login_failure(ip: str) -> None:
+    now = _now()
+    with _login_lock:
+        _login_failures.setdefault(ip, []).append(now)
+        if len(_login_failures) > _LOGIN_FAILURES_MAX:
+            # 先清过期条目；仍然超限说明失败来自大量**新鲜**地址（例如端口扫描），
+            # 就按最近一次失败时间淘汰最旧的，保证这张表有硬上限。
             for key in [k for k, v in _login_failures.items() if not v or now - v[-1] > LOGIN_WINDOW_SECONDS]:
                 _login_failures.pop(key, None)
+            overflow = len(_login_failures) - _LOGIN_FAILURES_MAX
+            if overflow > 0:
+                for key in sorted(_login_failures, key=lambda k: _login_failures[k][-1])[:overflow]:
+                    _login_failures.pop(key, None)
 
 
 def _clear_login_failures(ip: str) -> None:
@@ -246,11 +272,15 @@ def login():
     if request.method == "POST":
         ip = request.remote_addr or "127.0.0.1"
         if not _login_throttle_ok(ip):
-            logger.warning("登录尝试过于频繁，暂时拒绝 [%s]", ip)
-            return render_template(
-                "login.html",
-                error=f"尝试次数过多，请 {LOGIN_WINDOW_SECONDS // 60} 分钟后再试",
-            ), 429
+            wait = _login_retry_after(ip)
+            logger.warning("登录尝试过于频繁，暂时拒绝 [%s]（还需 %d 秒）", ip, max(1, wait))
+            # Retry-After 是给脚本/客户端看的（浏览器会忽略）；页面提示用同一份秒数，
+            # 免得用户只看到"请稍后再试"却不知道要等多久。
+            resp = make_response(
+                render_template("login.html", error=f"尝试次数过多，请 {max(1, wait)} 秒后再试"), 429
+            )
+            resp.headers["Retry-After"] = str(max(1, wait))
+            return resp
         # 登录接口自身豁免 CSRF（无 session 时先建 token）
         pwd = request.form.get("password", "")
         if hmac.compare_digest(pwd.encode("utf-8"), ACCESS_PASSWORD.encode("utf-8")):
