@@ -922,6 +922,10 @@ class TestVisionDigest(unittest.TestCase):
                 mock.patch.object(vision, "MEDIA_ROOT", tmp),
                 mock.patch.object(vision, "VISION_MIN_SIDE", 200),
                 mock.patch.object(vision, "_MEMO", {}),
+                # 磁盘缓存也必须落在本次用例的临时目录里：缓存键只由 chat_hash + 图片指纹决定，
+                # 用真实 ai_cache/ 的话，同一个数据目录跑第二遍时缓存已被上一遍写进去，
+                # 第一次断言 call_count == 1 就会变成 0（状态相关的假失败）。
+                mock.patch.object(vision, "AI_CACHE_DIR", os.path.join(tmp, "ai_cache")),
                 mock.patch(
                     "analyzer.deepseek_client._call_vision",
                     return_value="- 截图：在讨论选课\n- 照片：路边的小猫",
