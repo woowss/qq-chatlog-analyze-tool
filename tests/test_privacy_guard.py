@@ -47,8 +47,22 @@ ROOT = Path(__file__).resolve().parent.parent
 VENDOR_PREFIX = ("web/static/vendor/",)
 #: 只扫这些后缀（外加几个无后缀的配置文件）
 TEXT_SUFFIXES = {
-    ".py", ".md", ".txt", ".json", ".yml", ".yaml", ".toml", ".cfg", ".ini",
-    ".html", ".js", ".css", ".example", ".sh", ".ps1", ".in",
+    ".py",
+    ".md",
+    ".txt",
+    ".json",
+    ".yml",
+    ".yaml",
+    ".toml",
+    ".cfg",
+    ".ini",
+    ".html",
+    ".js",
+    ".css",
+    ".example",
+    ".sh",
+    ".ps1",
+    ".in",
 }
 TEXT_NAMES = {".gitattributes", ".gitignore", ".env.example"}
 #: 本地专用、被 .gitignore 排除的审计产物：不进仓库，也不该把本地文件名当成违规
@@ -60,6 +74,8 @@ MONEY_TOO_PRECISE = re.compile(r"\$\d+\.\d{3,}")
 MS_TIMESTAMP = re.compile(r"\b17\d{11}\b")
 #: 夹具时间戳上限：2025-04-01 UTC。晚于它的 13 位时间戳视为越界。
 FIXTURE_CEILING_MS = 1743465600000
+#: 守卫自身必须跳过：它必然要写出基线常量与说明，否则会自己命中自己
+SELF = Path(__file__).resolve()
 LATE_2025_DATE = re.compile(r"2025-(?:0[4-9]|1[0-2])-\d\d")
 
 RULES = (
@@ -72,15 +88,25 @@ RULES = (
 def _tracked_files():
     """优先问 git 要受版本控制的文件；没有 git（sdist 场景）就退化为目录遍历。"""
     try:
-        out = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT,
-                             capture_output=True, timeout=30)
+        out = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, timeout=30)
         if out.returncode == 0 and out.stdout:
             names = out.stdout.decode("utf-8", "replace").split("\0")
             return [ROOT / n for n in names if n]
     except (OSError, subprocess.SubprocessError):
         pass
-    skip_dirs = {".git", "__pycache__", "uploads", "ai_cache", "stats_cache",
-                 "logs", "dist", "build", ".venv", "node_modules", "vendor"}
+    skip_dirs = {
+        ".git",
+        "__pycache__",
+        "uploads",
+        "ai_cache",
+        "stats_cache",
+        "logs",
+        "dist",
+        "build",
+        ".venv",
+        "node_modules",
+        "vendor",
+    }
     files = []
     for path in sorted(ROOT.rglob("*")):
         if not path.is_file():
@@ -96,7 +122,7 @@ def _scan():
     problems = []
     for path in _tracked_files():
         rel = path.relative_to(ROOT).as_posix()
-        if rel.startswith(VENDOR_PREFIX) or path.name in LOCAL_ONLY:
+        if path.resolve() == SELF or rel.startswith(VENDOR_PREFIX) or path.name in LOCAL_ONLY:
             continue
         if path.suffix.lower() not in TEXT_SUFFIXES and path.name not in TEXT_NAMES:
             continue
@@ -131,8 +157,7 @@ class TestNoCorpusShapedValues(unittest.TestCase):
 
     def test_scan_actually_covers_files(self):
         """守卫本身别退化成"什么都没扫"（历史上有过扫描器静默失效的事故）"""
-        files = [p for p in _tracked_files()
-                 if p.relative_to(ROOT).as_posix().startswith("tests/")]
+        files = [p for p in _tracked_files() if p.relative_to(ROOT).as_posix().startswith("tests/")]
         self.assertGreater(len(files), 5, "扫描集合为空或过小，守卫失效")
 
     def test_rules_do_flag_the_shapes_they_claim(self):
