@@ -14,6 +14,9 @@
 - 社区与工程文件补齐：`CONTRIBUTING.md`、`CODE_OF_CONDUCT.md`、`.github/ISSUE_TEMPLATE/`、
   `.github/PULL_REQUEST_TEMPLATE.md`；CI 的 `actions/checkout` 与 `actions/setup-python` 升到 v7。
 - 移除 `docs/index.html`（早期落地页，描述的还是旧架构；README 早已声明以其为准）。
+- **发布流水线改为构建后直接发布**：此前只建**草稿**，而草稿的附件只有有权限的人能下载，
+  README 的 `releases/download/…` 安装链接因此指向一个下不到 wheel 的页面（v1.1.1 实测如此）。
+  现在 job 结束前会打印 `draft=false assets=N`，作为"附件确实挂上了"的凭据。
 
 运行时与 v1.1.1 完全一致，**不需要回滚**；从 sdist 跑测试的人会拿到那份竞态修复。
 
