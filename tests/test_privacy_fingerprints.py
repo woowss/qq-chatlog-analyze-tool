@@ -29,8 +29,10 @@ C. 2025-04 及之后的 `YYYY-MM-DD` 日期串，理由同 B；
 D. 文档里出现"非整千、非整 1024 的 5 位以上数字"（含 `12,4xx` 这种千分位写法）。
    真实统计量（消息总数、丢弃条数）就是长这样；合成示例一律写成 20,000 / 600000 这类量级；
 E. 32 位十六进制串（除下方登记的合成占位值）。真实导出里的 UID/媒体 md5 会以这个形状出现；
-F. 提交信息与环境上下文：只要 `.git` 可用，提交信息（含历史上的）也按 A–E 扫一遍——
-   本文件拦不住"人把真实值写进 commit message"这种最常见的漏法。
+F. 提交信息：只要 `.git` 可用，历史提交信息也按上面几条扫一遍——"把真实数字写进
+   commit message"是最常见的漏法。注意**提交信息不套用规则 D**：`7971891` 这种
+   全数字的 7 位串在信息里通常是 commit SHA 前缀或 issue 号，与"统计量"形状无法区分，
+   硬套只会制造噪音（A/B/C/E 这几条在信息里没有歧义，照常生效）。
 
 扫描集合是 `git ls-files`（没有 .git 时退化为目录遍历，供 sdist 内的用例使用）；
 `web/static/vendor/` 是第三方库，跳过。
@@ -147,8 +149,11 @@ def _big_number_hits(line: str) -> list:
     return hits
 
 
-def _text_problems(rel: str, text: str, is_doc: bool) -> list:
-    """返回 [(规则名, 行号)]，只报位置不报内容。"""
+def _text_problems(rel: str, text: str, is_doc: bool, allow_big_numbers: bool = True) -> list:
+    """返回 [(规则名, 行号)]，只报位置不报内容。
+
+    allow_big_numbers=False 用于提交信息：那里 SHA 前缀/issue 号与"统计量"形状无法区分。
+    """
     problems = []
     for lineno, line in enumerate(text.splitlines(), 1):
         if MONEY.search(line):
@@ -159,7 +164,7 @@ def _text_problems(rel: str, text: str, is_doc: bool) -> list:
                 break
         if LATE_2025_DATE.search(line):
             problems.append(("C 日期串晚于夹具基线", lineno))
-        if is_doc and _big_number_hits(line):
+        if is_doc and allow_big_numbers and _big_number_hits(line):
             problems.append(("D 疑似真实统计量（大额非整圆数字）", lineno))
         for m in HEX32.finditer(line):
             if m.group(0) not in SYNTHETIC_HEX32:
@@ -190,7 +195,11 @@ def _scan_files() -> list:
 
 
 def _scan_messages() -> list:
-    """规则 F：提交信息也按同一套形状扫（没有 .git 时返回空）。"""
+    """规则 F：提交信息按 A/B/C/E 扫（没有 .git 时返回空）。
+
+    刻意不套规则 D：提交信息里的全数字短串通常是 commit SHA 前缀（如 `7971891`）或 issue 号，
+    与"真实统计量"形状无法区分，套上只会天天误报。
+    """
     try:
         out = subprocess.run(
             ["git", "log", "--all", "--format=%H%x00%B%x00"], cwd=ROOT, capture_output=True, timeout=60
@@ -203,7 +212,7 @@ def _scan_messages() -> list:
     problems = []
     for i in range(0, len(parts) - 1, 2):
         sha, body = parts[i].strip(), parts[i + 1]
-        for name, lineno in _text_problems("commit", body, is_doc=True):
+        for name, lineno in _text_problems("commit", body, is_doc=True, allow_big_numbers=False):
             problems.append((name, f"commit {sha[:8]}", lineno))
     return problems
 
@@ -270,6 +279,15 @@ class TestNoCorpusShapedValues(unittest.TestCase):
         other = "13579bdf" * 4
         self.assertIsNotNone(HEX32.search(other), "规则 E 匹配失效")
         self.assertNotIn(other, SYNTHETIC_HEX32, "规则 E 白名单越界")
+
+        # 规则 F 的刻意取舍：提交信息里"全数字短串"（SHA 前缀 / issue 号）不算违规，
+        # 但同一串出现在文档正文里要报——那里没有 SHA 语义。
+        sha_like = "1234567"
+        self.assertFalse(
+            _text_problems("commit", f"docs: fix in {sha_like}", True, allow_big_numbers=False),
+            "规则 F 误报提交信息里的 SHA 前缀",
+        )
+        self.assertTrue(_text_problems("docs/x.md", f"总数 {sha_like} 条", True), "规则 D 漏报文档正文")
 
 
 if __name__ == "__main__":
