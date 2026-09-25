@@ -242,37 +242,47 @@ def _startup_report() -> bool:
 SHUTDOWN_GRACE_SECONDS = float(os.getenv("QQCHAT_SHUTDOWN_GRACE_SECONDS") or 5)
 
 
-def _install_shutdown_handler() -> None:
-    """Ctrl+C / SIGTERM 优雅关闭：先停止派发新的付费调用，再退出。
+def _on_shutdown_signal(signum, _frame) -> None:
+    """中断信号处理器：先停止派发新的付费调用，再退出。
 
-    默认行为是收到信号立刻打断进程：分析线程池里"已经排上队"的月份照发不误——
-    钱花掉了，结果却随进程一起消失；正在跑的那一个月也拿不回来。这里换成两段式：
+    提成模块级函数（而不是留在 _install_shutdown_handler 里的闭包）是为了可测：
+    用例可以直接调用它，不必真的给进程发信号（那样会打断测试进程本身）。
 
+    两段式：
     1. 置位全局关闭标志。分析循环在每个派发点检查它，于是不再启动新月份，
        已经完成的月份结果照常落盘（月份级缓存在每个月完成时就写了）；
     2. 最多等 SHUTDOWN_GRACE_SECONDS 秒让进行中的那一个月收尾，然后抛
        KeyboardInterrupt —— Werkzeug 的 serve_forever 会吞掉它并关闭服务器，
        退出流程与原来一致。
 
+    **第二次信号立即退出**：不加这条判断时，重复 Ctrl+C 会不断重新进入本函数，
+    每次都睡满 GRACE（信号会打断 sleep 并重新派发），用户看到的是"按了没反应"，
+    最后只能去杀进程——那正是这段等待想避免的事。用户明确催第二次时，
+    就说明他不打算再等了，此时进行中的那个月照旧拿不回来，没必要再拖。
+
     顺带把 token 用量落盘（它按天累计在内存里，进程被硬杀就丢了）。
     """
-
-    def _handler(signum, _frame):
-        request_shutdown()
-        logger.warning(
-            "收到中断信号（%s）：不再发起新的分析请求，最多等 %.0f 秒让进行中的月份收尾"
-            "（可用 QQCHAT_SHUTDOWN_GRACE_SECONDS=0 关掉这段等待）",
-            signum,
-            SHUTDOWN_GRACE_SECONDS,
-        )
+    if not request_shutdown():
+        logger.warning("再次收到中断信号（%s）：立即退出，不再等待进行中的月份", signum)
         flush_usage()
-        if SHUTDOWN_GRACE_SECONDS > 0:
-            time.sleep(SHUTDOWN_GRACE_SECONDS)
         raise KeyboardInterrupt
+    logger.warning(
+        "收到中断信号（%s）：不再发起新的分析请求，最多等 %.0f 秒让进行中的月份收尾"
+        "（再按一次 Ctrl+C 可立即退出；也可用 QQCHAT_SHUTDOWN_GRACE_SECONDS=0 关掉这段等待）",
+        signum,
+        SHUTDOWN_GRACE_SECONDS,
+    )
+    flush_usage()
+    if SHUTDOWN_GRACE_SECONDS > 0:
+        time.sleep(SHUTDOWN_GRACE_SECONDS)
+    raise KeyboardInterrupt
 
+
+def _install_shutdown_handler() -> None:
+    """把中断处理器挂到 SIGINT / SIGTERM 上（行为见 _on_shutdown_signal）"""
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            signal.signal(sig, _handler)
+            signal.signal(sig, _on_shutdown_signal)
         except (ValueError, OSError, AttributeError):
             # 非主线程、或平台不支持该信号：保持默认行为即可，不影响启动
             continue

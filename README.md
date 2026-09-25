@@ -164,6 +164,8 @@ python app.py      # 方式 C，等价入口
 
 `Ctrl+C`／`SIGTERM` 是**优雅停止**：收到信号后不再派发新的月份调用，最多等 5 秒让进行中的那个月收尾，
 已完成月份的结果照常落盘（默认行为见 `QQCHAT_SHUTDOWN_GRACE_SECONDS`），随后退出。
+等不下去就**再按一次** `Ctrl+C`，第二次信号立即退出、不再等待（进行中那个月的结果会丢，
+但已完成的月份仍在缓存里，重跑不会重复付费）。
 
 探活/编排用 `/health`：只回一行 `ok`，不建会话、不要求登录、不写日志，可以放心让反代每秒探一次。
 
@@ -259,7 +261,7 @@ QQ 的超级表情（吃糖、大怨种、菜汪之类）没有公开地址，�
 | `SECRET_KEY` | 自动生成 | Session 签名密钥，留空则生成并持久化到数据目录下的 `.secret_key` |
 | `QQCHAT_MAX_UPLOAD_MB` | 50 | 单次上传体积上限；超长聊天的 JSON 逼近该值时可调大 |
 | `QQCHAT_JOB_TTL_SECONDS` | 900 | 内存任务记录的存活时间 |
-| `QQCHAT_SHUTDOWN_GRACE_SECONDS` | 5 | `Ctrl+C` 后留给进行中月份的收尾秒数；设 `0` 恢复"按下就退出" |
+| `QQCHAT_SHUTDOWN_GRACE_SECONDS` | 5 | `Ctrl+C` 后留给进行中月份的收尾秒数；期间再按一次 `Ctrl+C` 立即退出；设 `0` 恢复"按下就退出" |
 | `QQCHAT_GROUP_CHAT` | `auto` | 多人记录的处置：`auto` 按群聊分析（默认）、`off` 回到"直接拒收"、`two_party` 按「我 vs 其他人」两分类归并 |
 | `QQCHAT_ALLOW_MULTI_PARTY` | `false` | 旧开关，等价于 `QQCHAT_GROUP_CHAT=two_party`（优先级低于新变量） |
 | `QQCHAT_GROUP_AI_MAX_MEMBERS` | 10 | 成员画像最多分析几位（按发言量取前 N，自己必定入选） |

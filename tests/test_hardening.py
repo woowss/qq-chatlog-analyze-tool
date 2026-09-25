@@ -24,6 +24,7 @@ import io
 import json
 import os
 import re
+import signal
 import sys
 import tempfile
 import time
@@ -655,6 +656,66 @@ class TestLogout(unittest.TestCase):
             page = self.client.get("/")
         self.assertIn("退出登录", page.get_data(as_text=True))
         self.assertIn('action="/logout"', page.get_data(as_text=True))
+
+
+class TestShutdownSignal(unittest.TestCase):
+    """中断信号：第一次留 grace 让进行中的月份收尾，第二次立即退出
+
+    反向验证：把 app._on_shutdown_signal 里 `if not request_shutdown()` 那个分支删掉，
+    第二条用例立刻变红（它会再睡满一个 grace，用户看起来像"按了没反应"）。
+    """
+
+    def setUp(self):
+        from analyzer import shutdown as shutdownmod
+
+        shutdownmod.reset_shutdown()
+
+    def tearDown(self):
+        from analyzer import shutdown as shutdownmod
+
+        shutdownmod.reset_shutdown()
+
+    def test_first_signal_sets_flag_waits_then_interrupts(self):
+        import app as appmod
+        from analyzer import shutdown as shutdownmod
+
+        with (
+            mock.patch.object(appmod, "SHUTDOWN_GRACE_SECONDS", 5.0),
+            mock.patch.object(appmod.time, "sleep") as slept,
+            mock.patch.object(appmod, "flush_usage") as flushed,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                appmod._on_shutdown_signal(signal.SIGINT, None)
+            slept.assert_called_once_with(5.0)
+            flushed.assert_called_once()
+        self.assertTrue(shutdownmod.shutdown_requested(), "第一次信号必须置位标志（停止派发新调用）")
+
+    def test_second_signal_exits_without_waiting(self):
+        import app as appmod
+        from analyzer import shutdown as shutdownmod
+
+        shutdownmod.request_shutdown()  # 模拟"用户已经按过一次"
+        with (
+            mock.patch.object(appmod, "SHUTDOWN_GRACE_SECONDS", 5.0),
+            mock.patch.object(appmod.time, "sleep") as slept,
+            mock.patch.object(appmod, "flush_usage") as flushed,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                appmod._on_shutdown_signal(signal.SIGINT, None)
+            slept.assert_not_called()
+            flushed.assert_called_once()  # 用量仍要落盘：这次是真的要走了
+
+    def test_zero_grace_skips_waiting_entirely(self):
+        """QQCHAT_SHUTDOWN_GRACE_SECONDS=0 是既有的"按下就退出"退路，不能被改坏"""
+        import app as appmod
+
+        with (
+            mock.patch.object(appmod, "SHUTDOWN_GRACE_SECONDS", 0.0),
+            mock.patch.object(appmod.time, "sleep") as slept,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                appmod._on_shutdown_signal(signal.SIGTERM, None)
+            slept.assert_not_called()
 
 
 class TestHardeningMisc(unittest.TestCase):
