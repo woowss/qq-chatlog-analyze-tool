@@ -180,12 +180,13 @@ MULTI_PARTY_MIN_SHARE = 0.005
 
 
 def _statistical_sender_counts(chat: "ChatData") -> dict:
-    """统计口径下的发言者 → 条数（只算真正会进分析与统计的消息）"""
-    counts: dict[str, int] = {}
-    for m in chat.messages:
-        if m.sender_uid and is_statistical(m):
-            counts[m.sender_uid] = counts.get(m.sender_uid, 0) + 1
-    return counts
+    """统计口径下的发言者 → 条数（只算真正会进分析与统计的消息）。
+
+    走 ChatData.sender_counts() 的实例级缓存：多人防线、拒收文案里的占比、以及
+    "谁是对方"三处都要这份计数，原先各遍历一遍——数万条消息下是两到四遍全量。
+    返回的是缓存对象本身，调用方只读。
+    """
+    return chat.sender_counts()
 
 
 def _multi_party_offenders(chat: "ChatData") -> list[tuple[str, int]]:
@@ -312,10 +313,30 @@ class ChatData:
     #: 私聊，而导出器早就写明这是群。判定顺序见 multi_party_action。
     chat_type: str = ""
     _participants_cache: Optional[list] = field(default=None, repr=False, compare=False)
+    #: 统计口径下的 发言者 uid → 条数。多人防线、拒收文案里的占比、"谁是对方"三处共用。
+    _sender_counts_cache: Optional[dict] = field(default=None, repr=False, compare=False)
 
     def statistical(self) -> list["Message"]:
         """参与统计与分析的消息子集（过滤系统/撤回/转发）"""
         return [m for m in self.messages if is_statistical(m)]
+
+    def sender_counts(self) -> dict:
+        """统计口径下的 发言者 uid → 条数（结果缓存在本对象上）。
+
+        这份计数有三处消费点：多人防线的门槛判定（_multi_party_offenders）、
+        拒收报错的占比文案、以及"谁是对方"（取发言最多的一方）。原先各调一次
+        _statistical_sender_counts，数万条消息就是两到四遍全量遍历。
+        与 months()/participants() 同样的安全前提：解析完成后 messages 不再变动。
+
+        返回的是缓存对象**本身**——调用方只读，不要就地改（那会污染后续判定）。
+        """
+        if self._sender_counts_cache is None:
+            counts: dict[str, int] = {}
+            for m in self.messages:
+                if m.sender_uid and is_statistical(m):
+                    counts[m.sender_uid] = counts.get(m.sender_uid, 0) + 1
+            self._sender_counts_cache = counts
+        return self._sender_counts_cache
 
     def participants(self) -> list[Participant]:
         """参与者身份列表（按发言条数降序，显示名已唯一化），结果缓存在本对象上。

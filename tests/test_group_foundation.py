@@ -307,6 +307,26 @@ class TestParticipantIdentity(unittest.TestCase):
         ]
         self.assertEqual([p.uid for p in _chat(msgs).participants()], ["uA"])
 
+    def test_sender_counts_are_cached_and_share_one_traversal(self):
+        """多人防线、拒收文案的占比、"谁是对方"三处共用一份计数
+
+        原先每处各调一次 _statistical_sender_counts，数万条消息要全量遍历两到四遍。
+        这里同时钉住两件事：结果与逐条重算一致，且第二次拿到的是同一份对象。
+        """
+        import parser.qq_parser as qp
+        from dataclasses import fields as dc_fields
+
+        msgs = _bulk_chat_messages("uA", "我", 3) + _bulk_chat_messages("uB", "他", 2)
+        chat = _chat(msgs)
+        self.assertIsNone(chat._sender_counts_cache, "初始为 None，不该在构造时就计算")
+        first = chat.sender_counts()
+        self.assertEqual(first, {"uA": 3, "uB": 2})
+        self.assertIs(first, chat.sender_counts(), "第二次调用必须复用同一份（同 months() 的约定）")
+        self.assertIs(first, qp._statistical_sender_counts(chat), "判定的三处消费点必须命中同一份缓存")
+        # 声明成字段而不是 setattr 动态挂载：读代码的人能一眼看到谁往对象上挂了什么
+        self.assertIn("_sender_counts_cache", {f.name for f in dc_fields(ChatData)})
+        self.assertNotIn("_sender_counts_cache", repr(chat))
+
 
 def _bulk_chat_messages(uid: str, name: str, count: int) -> list:
     """直接造 Message 列表（与 _bulk 的 JSON 版本区分开，避免混淆两种夹具）
