@@ -166,42 +166,84 @@ def _guard_post():
 # ---------------------------------------------------------------------------
 
 
-def _login_throttle_ok(ip: str) -> bool:
-    """该 IP 是否仍允许尝试登录（只统计失败次数，成功即清零）"""
-    now = _now()
-    with _login_lock:
-        stamps = [t for t in _login_failures.get(ip, []) if now - t < LOGIN_WINDOW_SECONDS]
-        if stamps:
-            _login_failures[ip] = stamps
-        else:
-            _login_failures.pop(ip, None)
-        return len(stamps) < LOGIN_MAX_ATTEMPTS
+def _prune_locked(ip: str, now: float) -> list:
+    """（调用方须持 _login_lock）该地址在窗口内的失败时间戳，顺带清掉过期条目"""
+    stamps = [t for t in _login_failures.get(ip, []) if now - t < LOGIN_WINDOW_SECONDS]
+    if stamps:
+        _login_failures[ip] = stamps
+    else:
+        _login_failures.pop(ip, None)
+    return stamps
 
 
-def _login_retry_after(ip: str) -> int:
-    """被限流时还要等多少秒（喂给 429 的 Retry-After 与页面提示）"""
-    now = _now()
-    with _login_lock:
-        stamps = [t for t in _login_failures.get(ip, []) if now - t < LOGIN_WINDOW_SECONDS]
+def _retry_after_locked(stamps: list, now: float) -> int:
+    """（调用方须持 _login_lock）被限流时还要等多少秒（喂给 429 与页面提示）"""
     if len(stamps) < LOGIN_MAX_ATTEMPTS:
         return 0
     # 最早那次失败滑出窗口时，窗口内只剩 MAX-1 次，限流自动解除
     return max(1, int(LOGIN_WINDOW_SECONDS - (now - min(stamps))) + 1)
 
 
-def _record_login_failure(ip: str) -> None:
+def _enforce_table_limit_locked(now: float) -> None:
+    """（调用方须持 _login_lock）失败记录表的硬上限。
+
+    窗口内的失败才计数，但扫描流量可以伪造大量**不同**地址，只按"过期"清理的话
+    表会一直涨；超过上限就先清过期条目，仍然超限说明失败来自大量**新鲜**地址
+    （例如端口扫描），于是按最近一次失败时间淘汰最旧的，保证这张表有硬上限。
+    """
+    if len(_login_failures) <= _LOGIN_FAILURES_MAX:
+        return
+    for key in [k for k, v in _login_failures.items() if not v or now - v[-1] > LOGIN_WINDOW_SECONDS]:
+        _login_failures.pop(key, None)
+    overflow = len(_login_failures) - _LOGIN_FAILURES_MAX
+    if overflow > 0:
+        for key in sorted(_login_failures, key=lambda k: _login_failures[k][-1])[:overflow]:
+            _login_failures.pop(key, None)
+
+
+def _register_login_attempt(ip: str) -> int:
+    """占用一次登录尝试：**在同一把锁内**判超限并当场记下这次尝试。
+
+    返回 0 表示可以继续校验口令；否则返回还应等待的秒数（调用方回 429 + Retry-After）。
+
+    为什么必须一次加锁完成：原先"判超限"（_login_throttle_ok）与"记失败"
+    （_record_login_failure）是两次独立加锁，N 个并发请求会同时看到"还没到上限"、
+    各自记一次才超限——实际允许的尝试次数变成 上限 + N - 1，而那正是暴力破解最想要的
+    窗口。开发服务器默认多线程，"并发请求恰好同时到达"不是理论问题。
+    """
     now = _now()
     with _login_lock:
-        _login_failures.setdefault(ip, []).append(now)
-        if len(_login_failures) > _LOGIN_FAILURES_MAX:
-            # 先清过期条目；仍然超限说明失败来自大量**新鲜**地址（例如端口扫描），
-            # 就按最近一次失败时间淘汰最旧的，保证这张表有硬上限。
-            for key in [k for k, v in _login_failures.items() if not v or now - v[-1] > LOGIN_WINDOW_SECONDS]:
-                _login_failures.pop(key, None)
-            overflow = len(_login_failures) - _LOGIN_FAILURES_MAX
-            if overflow > 0:
-                for key in sorted(_login_failures, key=lambda k: _login_failures[k][-1])[:overflow]:
-                    _login_failures.pop(key, None)
+        stamps = _prune_locked(ip, now)
+        if len(stamps) >= LOGIN_MAX_ATTEMPTS:
+            return _retry_after_locked(stamps, now)
+        stamps.append(now)
+        _login_failures[ip] = stamps
+        _enforce_table_limit_locked(now)
+        return 0
+
+
+def _login_throttle_ok(ip: str) -> bool:
+    """该 IP 是否仍允许尝试登录（只读查询；真正的占用走 _register_login_attempt）"""
+    now = _now()
+    with _login_lock:
+        return len(_prune_locked(ip, now)) < LOGIN_MAX_ATTEMPTS
+
+
+def _login_retry_after(ip: str) -> int:
+    """被限流时还要等多少秒（只读查询）"""
+    now = _now()
+    with _login_lock:
+        return _retry_after_locked(_prune_locked(ip, now), now)
+
+
+def _record_login_failure(ip: str) -> None:
+    """记一次失败（保持既有语义：调用方已经自行判过超限）"""
+    now = _now()
+    with _login_lock:
+        stamps = _prune_locked(ip, now)
+        stamps.append(now)
+        _login_failures[ip] = stamps
+        _enforce_table_limit_locked(now)
 
 
 def _clear_login_failures(ip: str) -> None:
@@ -316,15 +358,17 @@ def login():
     error = None
     if request.method == "POST":
         ip = request.remote_addr or "127.0.0.1"
-        if not _login_throttle_ok(ip):
-            wait = _login_retry_after(ip)
-            logger.warning("登录尝试过于频繁，暂时拒绝 [%s]（还需 %d 秒）", ip, max(1, wait))
+        # 一次加锁内完成"判超限 + 记下这次尝试"：拆成两步会留下并发窗口，
+        # 让实际允许的尝试次数变成 上限 + 并发数（见 _register_login_attempt）。
+        wait = _register_login_attempt(ip)
+        if wait:
+            logger.warning("登录尝试过于频繁，暂时拒绝 [%s]（还需 %d 秒）", ip, wait)
             # Retry-After 是给脚本/客户端看的（浏览器会忽略）；页面提示用同一份秒数，
             # 免得用户只看到"请稍后再试"却不知道要等多久。
             resp = make_response(
-                render_template("login.html", error=f"尝试次数过多，请 {max(1, wait)} 秒后再试"), 429
+                render_template("login.html", error=f"尝试次数过多，请 {wait} 秒后再试"), 429
             )
-            resp.headers["Retry-After"] = str(max(1, wait))
+            resp.headers["Retry-After"] = str(wait)
             return resp
         # 登录接口自身豁免 CSRF（无 session 时先建 token）
         pwd = request.form.get("password", "")
@@ -345,7 +389,8 @@ def login():
                 safe_next = url_for("index")
             logger.info("登录成功 [%s]", ip)
             return redirect(safe_next)
-        _record_login_failure(ip)
+        # 这次尝试在上面已经记下了（_register_login_attempt），这里只报告失败——
+        # 再记一次会让一次输入算两次失败，用户更早被锁在门外。
         error = "口令错误，请重试"
         logger.warning("登录失败 [%s]", ip)
     return render_template("login.html", error=error)

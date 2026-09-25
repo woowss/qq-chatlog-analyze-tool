@@ -27,6 +27,7 @@ import re
 import signal
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -475,6 +476,37 @@ class TestLoginThrottle(unittest.TestCase):
         ):
             self.client.post("/login", data={"password": "wrong"})
             self.assertEqual(self.client.post("/login", data={"password": "wrong"}).status_code, 429)
+
+    def test_concurrent_attempts_cannot_exceed_the_limit(self):
+        """判超限与记下尝试必须在**同一把锁内**完成。
+
+        反向验证：把 _register_login_attempt 换回"先 _login_throttle_ok、
+        再 _record_login_failure"的两步写法，本条立刻变红——那种写法下所有并发请求
+        都会看到"还没到上限"，于是放行的次数等于并发数而不是上限。
+        """
+        from webapp import security as securitymod
+
+        attempts = securitymod.LOGIN_MAX_ATTEMPTS + 8
+        barrier = threading.Barrier(attempts)
+        outcomes: list[int] = []
+        collect_lock = threading.Lock()
+
+        def one_attempt():
+            barrier.wait()  # 让所有线程尽量同时进入
+            allowed = 0 if securitymod._register_login_attempt("198.51.100.99") == 0 else 1
+            with collect_lock:
+                outcomes.append(allowed)
+
+        threads = [threading.Thread(target=one_attempt) for _ in range(attempts)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(
+            outcomes.count(0),
+            securitymod.LOGIN_MAX_ATTEMPTS,
+            "并发下放行的尝试次数必须正好等于上限",
+        )
 
     def test_failure_table_is_bounded(self):
         """大量陌生地址扫描时，失败记录表必须有硬上限（否则内存随 IP 数无限涨）"""
