@@ -302,51 +302,64 @@ def _group_context(stats: dict) -> dict:
     }
 
 
-def dashboard():
-    """总览仪表盘"""
+def _render_by_mode(group_template: str, private_template: str, private_context):
+    """按当前记录类型渲染页面：群聊走群模板与群上下文，私聊走私模板与页面自己的上下文。
+
+    这七个页面原先各自抄一遍"取统计 → 拿不到就跳首页 → 判断群聊 → 选模板"。抄漏一处
+    的后果不是报错，而是**群聊记录渲染了私聊模板**：页面看起来完全正常，数字的含义
+    却全错了（群聊里没有"对方"这个人）。收成一份之后，新增页面不可能漏掉这个分支。
+
+    `private_context` 收的是**函数**而不是 dict：它可能很贵（词频要跑 jieba、
+    表情原图要读缓存），而群聊页面根本用不到它——先算好再丢掉纯属浪费。
+    """
     stats, redir = _require_stats()
     if redir:
         return redir
     if _is_group():
-        return render_template("group_dashboard.html", **_group_context(stats))
-    return render_template(
+        return render_template(group_template, **_group_context(stats))
+    return render_template(private_template, **private_context(stats))
+
+
+def dashboard():
+    """总览仪表盘"""
+    return _render_by_mode(
+        "group_dashboard.html",
         "dashboard.html",
-        overview=stats["overview"],
-        daily_counts=stats.get("daily_counts"),
-        hourly_dist=stats.get("hourly_dist"),
-        weekly_dist=stats.get("weekly_dist"),
-        length_stats=stats.get("length_stats"),
-        exchange_rounds=stats.get("exchange_rounds"),
-        milestones=stats.get("milestones"),
-        chat_name=session.get("chat_name"),
-        # 只在 two_party（旧逃生阀）下渲染一条如实提示；正常私聊时模板不会输出任何东西，
-        # 因此私聊页面渲染结果逐字节不变（tests/test_group_foundation.py 有对照用例）。
-        chat_mode=session.get("chat_mode", "private"),
+        lambda stats: {
+            "overview": stats["overview"],
+            "daily_counts": stats.get("daily_counts"),
+            "hourly_dist": stats.get("hourly_dist"),
+            "weekly_dist": stats.get("weekly_dist"),
+            "length_stats": stats.get("length_stats"),
+            "exchange_rounds": stats.get("exchange_rounds"),
+            "milestones": stats.get("milestones"),
+            "chat_name": session.get("chat_name"),
+            # 只在 two_party（旧逃生阀）下渲染一条如实提示；正常私聊时模板不会输出任何东西，
+            # 因此私聊页面渲染结果逐字节不变（tests/test_group_foundation.py 有对照用例）。
+            "chat_mode": session.get("chat_mode", "private"),
+        },
     )
 
 
 def emotion():
     """情绪分析页"""
-    stats, redir = _require_stats()
-    if redir:
-        return redir
-    if _is_group():
-        return render_template("group_emotion.html", **_group_context(stats))
-    return render_template("emotion.html", overview=stats["overview"])
+    return _render_by_mode(
+        "group_emotion.html",
+        "emotion.html",
+        lambda stats: {"overview": stats["overview"]},
+    )
 
 
 def relationship():
     """人际关系页"""
-    stats, redir = _require_stats()
-    if redir:
-        return redir
-    if _is_group():
-        return render_template("group_relations.html", **_group_context(stats))
-    return render_template(
+    return _render_by_mode(
+        "group_relations.html",
         "relationship.html",
-        overview=stats["overview"],
-        response_time=stats.get("response_time"),
-        exchange_rounds=stats.get("exchange_rounds"),
+        lambda stats: {
+            "overview": stats["overview"],
+            "response_time": stats.get("response_time"),
+            "exchange_rounds": stats.get("exchange_rounds"),
+        },
     )
 
 
@@ -376,73 +389,67 @@ def _face_assets(stats: dict, chat_hash: str) -> tuple[dict, dict, bool]:
 
 
 def habits():
-    """个人习惯页"""
-    stats, redir = _require_stats()
-    if redir:
-        return redir
-    if _is_group():
-        # 群聊不做表情原图映射：那一套是"我和对方"的两人对比视图，群里用成员活跃度表达
-        return render_template("group_activity.html", **_group_context(stats))
-    chat_hash = session.get("chat_hash", "")
-    stats = store._stats_with_word_freq(stats, chat_hash)
-    emojis, images, faces_on = _face_assets(stats, chat_hash)
-    return render_template(
-        "habits.html",
-        overview=stats["overview"],
-        face_stats=stats.get("face_stats") or {},
-        face_emoji=emojis,
-        face_images=images,
-        face_images_enabled=faces_on,
-        length_stats=stats.get("length_stats"),
-        weekly_activity=stats.get("weekly_activity"),
-        word_freq=stats.get("word_freq"),
-    )
+    """个人习惯页（群聊时是成员活跃页，不做表情原图映射：那一套是"我和对方"的两人对比视图）"""
+
+    def _private(stats):
+        chat_hash = session.get("chat_hash", "")
+        stats = store._stats_with_word_freq(stats, chat_hash)
+        emojis, images, faces_on = _face_assets(stats, chat_hash)
+        return {
+            "overview": stats["overview"],
+            "face_stats": stats.get("face_stats") or {},
+            "face_emoji": emojis,
+            "face_images": images,
+            "face_images_enabled": faces_on,
+            "length_stats": stats.get("length_stats"),
+            "weekly_activity": stats.get("weekly_activity"),
+            "word_freq": stats.get("word_freq"),
+        }
+
+    return _render_by_mode("group_activity.html", "habits.html", _private)
 
 
 def topics():
     """话题趋势页"""
-    stats, redir = _require_stats()
-    if redir:
-        return redir
-    if _is_group():
-        return render_template("group_topics.html", **_group_context(stats))
-    return render_template("topics.html", overview=stats["overview"])
+    return _render_by_mode(
+        "group_topics.html",
+        "topics.html",
+        lambda stats: {"overview": stats["overview"]},
+    )
 
 
 def profile():
     """AI 人物锐评页"""
-    stats, redir = _require_stats()
-    if redir:
-        return redir
-    if _is_group():
-        return render_template("group_profiles.html", **_group_context(stats))
-    return render_template("profile.html", overview=stats["overview"])
+    return _render_by_mode(
+        "group_profiles.html",
+        "profile.html",
+        lambda stats: {"overview": stats["overview"]},
+    )
 
 
 def report():
     """全篇报告导出页"""
-    stats, redir = _require_stats()
-    if redir:
-        return redir
-    if _is_group():
-        return render_template("group_report.html", **_group_context(stats))
-    stats = store._stats_with_word_freq(stats, session.get("chat_hash", ""))
-    emojis, images, _faces_on = _face_assets(stats, session.get("chat_hash", ""))
-    return render_template(
-        "report.html",
-        overview=stats["overview"],
-        daily_counts=stats.get("daily_counts"),
-        hourly_dist=stats.get("hourly_dist"),
-        weekly_dist=stats.get("weekly_dist"),
-        length_stats=stats.get("length_stats"),
-        face_stats=stats.get("face_stats") or {},
-        face_emoji=emojis,
-        face_images=images,
-        response_time=stats.get("response_time"),
-        exchange_rounds=stats.get("exchange_rounds"),
-        weekly_activity=stats.get("weekly_activity"),
-        word_freq=stats.get("word_freq"),
-    )
+
+    def _private(stats):
+        chat_hash = session.get("chat_hash", "")
+        stats = store._stats_with_word_freq(stats, chat_hash)
+        emojis, images, _faces_on = _face_assets(stats, chat_hash)
+        return {
+            "overview": stats["overview"],
+            "daily_counts": stats.get("daily_counts"),
+            "hourly_dist": stats.get("hourly_dist"),
+            "weekly_dist": stats.get("weekly_dist"),
+            "length_stats": stats.get("length_stats"),
+            "face_stats": stats.get("face_stats") or {},
+            "face_emoji": emojis,
+            "face_images": images,
+            "response_time": stats.get("response_time"),
+            "exchange_rounds": stats.get("exchange_rounds"),
+            "weekly_activity": stats.get("weekly_activity"),
+            "word_freq": stats.get("word_freq"),
+        }
+
+    return _render_by_mode("group_report.html", "report.html", _private)
 
 
 def face_image(key: str):
