@@ -99,7 +99,7 @@ AI 分析，而消息正文保持干净（文件名和占位符不会进入词�
 
 ```bash
 # 方式 A（推荐）：直接装 Release 里的 wheel，装完即得 qqchatlog 命令
-pip install https://github.com/woowss/qq-chatlog-analyze-tool/releases/download/v1.1.3/qqchatlog-1.1.3-py3-none-any.whl
+pip install https://github.com/woowss/qq-chatlog-analyze-tool/releases/download/v1.2.0/qqchatlog-1.2.0-py3-none-any.whl
 qqchatlog --version
 
 # 方式 B：从源码装成命令（想改代码就用可编辑安装）
@@ -406,8 +406,12 @@ OpenAI SDK 的兼容接口。
 pip install -e ".[dev]"                      # 或 pip install -r requirements.txt
 python -m ruff check .                       # 代码检查（CI 同款）
 python -m ruff format .                      # 统一风格；CI 用 --check 卡住
-python -m unittest discover -s tests -v      # 全量单测（当前 501 个用例，含逐页冒烟、打包自检、会话后端自检）
+python -m unittest discover -s tests -v      # 全量单测（含逐页冒烟、打包自检、会话后端自检）
 ```
+
+用例数**刻意不写在这份文档里**：写死了就得每加一条用例同步改一次，而漏改的表现仅仅是
+"README 说了个过时的数字"——此前已经漂移过两次，且没有守卫能发现。数量以这条命令输出里的
+`Ran N tests` 为准。
 
 `ruff format` 有意排除了两处（见 `pyproject.toml` 的 `[tool.ruff.format] exclude`）：
 `analyzer/prompts.py`（提示词按"一段一行"手工排版，格式化只会把它改成括号 + 链）与 `docs/`

@@ -8,6 +8,8 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # 卡住挂起的作业：默认 6 小时才杀，一个卡住的 job 会把整条流水线占满
+    timeout-minutes: 30
     strategy:
       # 不 fail-fast：一个版本红就把其余三个取消，等于放弃"到底哪些版本真的受影响"
       # 这条信息（曾因此把一个只在 3.10 上暴露的竞态误读成"测试通过后被取消"）。
@@ -19,6 +21,12 @@ jobs:
         python-version: ["3.10", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
+        with:
+          # 提交信息形状守卫（tests/test_privacy_fingerprints.py）默认扫最近 300 个提交，
+          # 而 checkout 的默认深度是 **1**：浅克隆下 `git log --all -n 300` 只看得到
+          # HEAD，这条守卫在 PR 上等于空跑（全量口径在每周的 audit.yml 里）。
+          # 50 足够覆盖一次 PR 的全部提交，代价只有几十 KB 的历史。
+          fetch-depth: 50
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v7

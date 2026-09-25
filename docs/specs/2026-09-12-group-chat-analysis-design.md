@@ -411,7 +411,7 @@ README 与 `.env.example` 同批更新（新增 4 个群聊环境变量、"已�
 | M2 AI 层 | 完成 | 30 |
 | M3 前端 + 集成 | 完成 | 15 |
 | M4 收尾 | 完成 | — |
-| 合计 | **426 passed / 160 subtests**（2026-09-12 当时的数字；用例数此后只增，现状以 README 与 `python -m unittest discover -s tests` 的输出为准） | 既有用例 0 失败 |
+| 合计 | **426 passed / 160 subtests**（2026-09-12 当时的数字；用例数此后只增，现状以 `python -m unittest discover -s tests` 的输出为准——README 刻意不再写死这个数） | 既有用例 0 失败 |
 
 **不变量**（全程每步复核）：私聊提示词指纹 `b6c5074dc226` 与月份键 `0f3ab19c7d2e4a5b6c7d8e`（示例值）
 逐字节未变；私聊 8 个页面渲染与 M3 前逐字节一致（唯一有意变更：上传页的会话缓存清理列表）。
