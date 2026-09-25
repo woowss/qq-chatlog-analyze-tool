@@ -397,15 +397,21 @@ def login():
 
 
 def logout():
-    """退出登录：清空服务端会话内容，并让浏览器丢弃会话 cookie。
+    """退出登录：作废服务端会话（连旧 sid 的存储一起删掉）。
 
     只接受 POST 且必须过 `_guard_post()`（Origin + CSRF）：
 
     - 不接受 GET，因为登出是**改状态**的操作，而任意第三方页面都能用
       `<img src="http://127.0.0.1:5000/logout">` 触发它（登出 CSRF 危害有限，
       但本项目的口径是"改状态就过 _guard_post"，这里不开口子）；
-    - `session.clear()` 只清了服务端内容，浏览器上的 sid 还在，所以显式
-      `delete_cookie`。会话文件仍会被 24 小时回收，但那不是用户能依赖的时点。
+    - 只 `session.clear()` 不够：它清掉的是服务端**内容**，浏览器上的 sid 原样保留，
+      那份（现在是空的）会话文件还会躺在盘上直到 24 小时回收——用户点了"退出登录"，
+      却指望不了"这个会话从此不存在"。所以这里显式轮换 sid：`regenerate()` 会删掉
+      旧 sid 的存储并下发一个新的空会话，旧 cookie 即使被别人捡走也指不到任何东西。
+    - 轮换之后**不再**额外 `delete_cookie`：`save_session` 会为新 sid 下发 cookie，
+      与显式删除争同一个响应头，结果只取决于先后（后写的生效）。而"旧 sid 已作废"
+      这件事已经由上面的存储删除保证，留一个全新的匿名会话反而是对的
+      （登录页需要的 CSRF token 也随新会话重新生成，旧的 token 一并失效）。
 
     注意这里**不**清登录失败限流的计数：登出本身与该地址的失败历史无关。
     """
@@ -415,10 +421,13 @@ def logout():
 
     ip = request.remote_addr or "127.0.0.1"
     session.clear()
+    # regenerate() 内部用 `if session:` 判空，而只剩 _permanent 的空会话是 falsy：
+    # 不先放一份内容，轮换会被静默跳过（登录路径踩过同一个坑，见 _regenerate_session_id）。
+    # 放 CSRF token 而不是别的标记：登出之后的登录页本来就需要一份新的。
+    session["csrf_token"] = secrets.token_hex(32)
+    _regenerate_session_id()
     logger.info("已退出登录 [%s]", ip)
-    response = redirect(url_for("index"))
-    response.delete_cookie(current_app.config.get("SESSION_COOKIE_NAME") or "session")
-    return response
+    return redirect(url_for("index"))
 
 
 def register(app):

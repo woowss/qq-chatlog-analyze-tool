@@ -634,6 +634,47 @@ class TestExpiredSessionResponses(unittest.TestCase):
         self.assertEqual(r.status_code, 302)
         self.assertIn("/login", r.headers.get("Location", ""))
 
+    def test_every_json_endpoint_is_registered_under_the_api_prefix(self):
+        """返回 JSON 的端点必须挂在 /api/ 下，否则会话过期时会退化成 302
+
+        为什么值得一条守卫：上面那三条 401 用例靠的是 `wants_json()` 判"这个请求
+        期望 JSON"，而它对陌生客户端只有一个依据——**路径前缀**（`Accept` 与
+        `X-Requested-With` 都不能指望脚本带）。于是"新加的 JSON 端点写在 /api/ 之外"
+        就是一颗静默的雷：功能全都正常，只有会话过期时才发作，而发作的样子是
+        "轮询拿着 undefined 一直轮下去"（见 security.wants_json 的注释）。
+        这里把这条不变量变成 CI 能发现的事，而不是等下一次排查。
+
+        判据取"视图函数定义在 webapp/api.py 里"，而不是给每个端点打标记：标记会忘，
+        定义文件不会。下面那条计数断言保证过滤条件真的匹配到了东西——
+        万一将来 Flask 把视图包一层、`getsourcefile` 不再指向 api.py，这里会**响亮
+        地红**，而不是安静地一条都不查。
+        """
+        import inspect
+
+        import app as appmod
+        from webapp import api as apimod
+
+        api_file = os.path.abspath(inspect.getsourcefile(apimod))
+        checked = []
+        for rule in appmod.app.url_map.iter_rules():
+            view = appmod.app.view_functions[rule.endpoint]
+            source = inspect.getsourcefile(view) or ""
+            if os.path.abspath(source) != api_file:
+                continue
+            checked.append(rule.rule)
+            with self.subTest(endpoint=rule.endpoint, path=rule.rule):
+                self.assertTrue(
+                    rule.rule.startswith("/api/"),
+                    f"webapp/api.py 的端点 {rule.endpoint} 注册在 {rule.rule}：JSON 端点必须在"
+                    " /api/ 下，否则会话过期时它拿到的是 302（前端会静默无限轮询）而不是 401",
+                )
+        self.assertGreaterEqual(
+            len(checked),
+            8,
+            f"只匹配到 {len(checked)} 个 api 模块的端点：守卫的过滤条件可能失效了"
+            "（预期是 /api/ 下的全部 JSON 端点）",
+        )
+
 
 class TestLogout(unittest.TestCase):
     """登出：只接受 POST + CSRF，且真的同时清掉服务端会话与浏览器 cookie
@@ -669,18 +710,41 @@ class TestLogout(unittest.TestCase):
         self.assertIsNotNone(matched, "登录后的页面必须带上 CSRF token（base.html 注入）")
         return matched.group(1)
 
-    def test_post_logout_clears_session_and_cookie(self):
+    def test_post_logout_invalidates_the_old_server_side_session(self):
+        """登出必须让旧 sid **连服务端存储一起**作废，而不只是清空内容
+
+        反向验证：把 security.logout 里的 _regenerate_session_id() 去掉，第一条断言
+        立刻变红（旧 sid 的存储在盘上原样躺着，直到 24 小时回收——用户点了"退出登录"，
+        却指望不了"这个会话从此不存在"）。
+        """
+        import app as appmod
+
         token = self._login()
+        cookie_name = appmod.app.config.get("SESSION_COOKIE_NAME") or "session"
+        iface = appmod.app.session_interface
+        old_cookie = self.client.get_cookie(cookie_name)
+        self.assertIsNotNone(old_cookie, "前提：登录后浏览器手上有会话 cookie")
+        old_sid = self.client.get_cookie(cookie_name).value
+        # 会话 cookie 没开签名（app.py 未设 SESSION_USE_SIGNER），cookie 值就是 sid
+        old_store_id = iface._get_store_id(old_sid)
+        self.assertIsNotNone(
+            iface.cache.get(old_store_id), "前提：登录后服务端确实存着这份会话（否则下面验了个空）"
+        )
+
         with mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"):
             resp = self.client.post("/logout", data={"csrf_token": token})
             self.assertEqual(resp.status_code, 302)
-            set_cookie = resp.headers.get("Set-Cookie", "")
-            self.assertIn("session=", set_cookie, "登出要显式让浏览器丢弃会话 cookie")
-            self.assertIn("Max-Age=0", set_cookie)
+            self.assertIsNone(
+                iface.cache.get(old_store_id),
+                "登出必须删掉旧 sid 的服务端存储：只清内容的话，那份文件还要在盘上躺到回收",
+            )
             # 首页只看登录态（/dashboard 还会因"没有统计数据"而跳首页，不适合当探针）
             after = self.client.get("/")
         self.assertEqual(after.status_code, 302, "登出后受保护页面必须重新要求登录")
         self.assertIn("/login", after.headers.get("Location", ""))
+        new_cookie = self.client.get_cookie(cookie_name)
+        self.assertIsNotNone(new_cookie, "登出后应当拿到一个新的匿名会话 cookie")
+        self.assertNotEqual(new_cookie.value, old_sid, "登出应当轮换 sid，而不是留着同一个")
 
     def test_get_logout_is_rejected(self):
         """登出是改状态的操作：GET 能被任意第三方页面的 <img src="/logout"> 触发"""

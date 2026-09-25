@@ -330,7 +330,9 @@ AI 分析发送给**你自己配置的**接口，发送的内容包括：
 - 服务默认只绑定回环地址；绑定非回环地址时若未设置 `ACCESS_PASSWORD` 则拒绝启动；
 - 登录成功后轮换服务端 session id，旧 id 立即失效（防会话固定）；会话 cookie 带 `HttpOnly`、
   `SameSite=Lax`，并在非回环绑定时自动加 `Secure`（见 `QQCHAT_COOKIE_SECURE`）；
-  导航栏的「退出登录」（设了口令才出现）只接受 POST + CSRF，会同时清掉服务端会话与浏览器 cookie；
+  导航栏的「退出登录」（设了口令才出现）只接受 POST + CSRF，并会**作废服务端会话**：
+  旧 session id 的存储连同内容一起删掉，浏览器拿到的是一个全新的匿名会话——旧 cookie
+  即使被别人拿到也指不到任何东西（不是"只清内容、文件还躺在盘上等回收"）；
   会话过期时 API 回 401 JSON 而不是把人重定向去登录页（否则前端只会拿到一页 HTML）；
 - POST 请求同时校验 CSRF token 与 Origin，Origin 白名单不信任请求自带的 Host（防 DNS rebinding）；
 - 登录后的 `next=` 跳转只接受站内路径（含 `/\host` 这类反斜杠变体）；登录接口对同一客户端地址有
