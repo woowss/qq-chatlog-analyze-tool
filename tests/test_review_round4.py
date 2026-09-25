@@ -452,10 +452,20 @@ class TestAssetCacheBusting(unittest.TestCase):
         cls.client = appmod.app.test_client()
 
     def test_own_assets_carry_version(self):
-        body = self.client.get("/").get_data(as_text=True)
-        self.assertRegex(body, r"css/style\.css\?v=\d+")
-        self.assertRegex(body, r"js/charts\.js\?v=\d+")
-        self.assertRegex(body, r"js/analyze\.js\?v=\d+")
+        """自有 JS/CSS 必须带 ?v= 破缓存，否则用户会长期跑到旧脚本。
+
+        首页**不再加载图表脚本**（上传页没有图表，见 test_smoke 的逐页断言），
+        所以这里分两处看：渲染出的首页验证 CSS，base.html 源码验证那两个图表脚本
+        仍然挂着版本参数——少一个 `?v=`，改了前端却还在跑旧 JS，页面会直接不可用。
+        """
+        index = self.client.get("/").get_data(as_text=True)
+        self.assertRegex(index, r"css/style\.css\?v=\d+")
+
+        base = (Path(__file__).resolve().parent.parent / "web" / "templates" / "base.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(base, r"js/charts\.js'\) \}\}\?v=\{\{ asset_v \}\}")
+        self.assertRegex(base, r"js/analyze\.js'\) \}\}\?v=\{\{ asset_v \}\}")
 
     def test_vendor_assets_keep_their_own_filenames(self):
         body = self.client.get("/").get_data(as_text=True)

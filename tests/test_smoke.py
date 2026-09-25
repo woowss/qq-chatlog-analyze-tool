@@ -152,6 +152,23 @@ class TestPageSmoke(unittest.TestCase):
                 self.assertIn(f"sha384-{digest}", body, f"{path.name} 的 SRI 常量没出现在报告页")
         self.assertIn("crossorigin", body, "SRI 缺少 crossorigin，跨源资源会被跳过校验")
 
+    def test_upload_page_skips_chart_scripts_but_analysis_pages_keep_them(self):
+        """上传页没有图表：不该为它解析 MB 级的 ECharts 与两个自有脚本。
+
+        反向验证：把 index.html 里那个 `{% block chart_scripts %}{% endblock %}`
+        删掉，本条前半段立刻变红；反过来把 base.html 的块清空，后半段变红。
+        """
+        index = self.client.get("/").get_data(as_text=True)
+        self.assertIn("vendor/jquery.min.js", index, "上传表单要用 jQuery，它不能被一起省掉")
+        self.assertNotIn("echarts.min.js", index, "上传页没有图表，不该加载 ECharts")
+        self.assertNotIn("js/analyze.js", index)
+        self.assertNotIn("js/charts.js", index)
+
+        dash = self.client.get("/dashboard").get_data(as_text=True)
+        self.assertIn("vendor/echarts.min.js", dash, "画图的页面必须仍然拿到图表脚本")
+        self.assertRegex(dash, r"js/charts\.js\?v=\d+")
+        self.assertRegex(dash, r"js/analyze\.js\?v=\d+")
+
     def test_missing_session_redirects_home(self):
         fresh = appmod.app.test_client()
         fresh.get("/")

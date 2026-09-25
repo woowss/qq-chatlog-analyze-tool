@@ -36,10 +36,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     {# 自有 JS/CSS 带版本参数破缓存：vendor/ 的文件名自带版本，自有文件没有 #}
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v={{ asset_v }}">
     <script src="{{ url_for('static', filename='vendor/jquery.min.js') }}"></script>
+    {# 图表脚本只有真正画图的页面才需要：上传页一个图都没有，加载 ECharts（MB 级）
+       纯属浪费解析时间。默认全给，只有 index.html 把它覆盖成空块。
+       jQuery 不放进这个块：上传页的表单提交要用它。 #}
+    {% block chart_scripts %}
     <script src="{{ url_for('static', filename='vendor/echarts.min.js') }}"></script>
     <script src="{{ url_for('static', filename='vendor/echarts-wordcloud.min.js') }}"></script>
     <script src="{{ url_for('static', filename='js/charts.js') }}?v={{ asset_v }}"></script>
     <script src="{{ url_for('static', filename='js/analyze.js') }}?v={{ asset_v }}"></script>
+    {% endblock %}
     {% block head %}{% endblock %}
 </head>
 <body>
