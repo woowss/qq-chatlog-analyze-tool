@@ -204,6 +204,9 @@ hr { border-color: var(--divider); opacity: 1; }
 .navbar-toggler { border-color: var(--border); }
 
 .nav-actions { display: flex; align-items: center; gap: .5rem; }
+/* 退出登录是 POST 表单（GET 登出可被任意页面的 <img> 触发），
+   这里只把 form 拉平进 nav-actions 的 flex 行，别让默认的块级盒子把按钮挤下去 */
+.nav-logout { display: inline-flex; margin: 0; }
 .nav-status { font-size: .78rem; color: var(--text-secondary); display: flex; align-items: center; gap: .4rem; }
 .status-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
 .status-dot.ok { background: var(--success); }

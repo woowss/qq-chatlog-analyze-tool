@@ -23,6 +23,7 @@
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -580,6 +581,80 @@ class TestExpiredSessionResponses(unittest.TestCase):
             r = self.client.get("/dashboard")
         self.assertEqual(r.status_code, 302)
         self.assertIn("/login", r.headers.get("Location", ""))
+
+
+class TestLogout(unittest.TestCase):
+    """登出：只接受 POST + CSRF，且真的同时清掉服务端会话与浏览器 cookie
+
+    反向验证：把 security.logout 里的 session.clear() 删掉 → 第一条红；
+    把路由的 methods 改成 ["GET", "POST"] → 第二条红。
+    """
+
+    def setUp(self):
+        import app as appmod
+
+        self.client = appmod.app.test_client()
+        with securitymod._login_lock:
+            securitymod._login_failures.clear()
+
+    def tearDown(self):
+        with securitymod._login_lock:
+            securitymod._login_failures.clear()
+
+    def _login(self) -> str:
+        """登录并返回页面上真实注入的 CSRF token。
+
+        刻意不用 client.session_transaction() 取 token：登录态下它读到的是空会话，
+        退出上下文时还会把这份空会话**回写**，于是后续请求变成未登录——
+        这正是本用例最初踩到的假失败。像浏览器一样从页面里取，不给会话加副作用。
+        """
+        with mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"):
+            resp = self.client.post("/login", data={"password": "s3cret"})
+            self.assertEqual(resp.status_code, 302, "前提：先登录成功")
+            page = self.client.get("/")
+        self.assertEqual(page.status_code, 200, "前提：登录后能打开首页")
+        matched = re.search(r"window\.CSRF_TOKEN = \"([0-9a-f]+)\"", page.get_data(as_text=True))
+        self.assertIsNotNone(matched, "登录后的页面必须带上 CSRF token（base.html 注入）")
+        return matched.group(1)
+
+    def test_post_logout_clears_session_and_cookie(self):
+        token = self._login()
+        with mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"):
+            resp = self.client.post("/logout", data={"csrf_token": token})
+            self.assertEqual(resp.status_code, 302)
+            set_cookie = resp.headers.get("Set-Cookie", "")
+            self.assertIn("session=", set_cookie, "登出要显式让浏览器丢弃会话 cookie")
+            self.assertIn("Max-Age=0", set_cookie)
+            # 首页只看登录态（/dashboard 还会因"没有统计数据"而跳首页，不适合当探针）
+            after = self.client.get("/")
+        self.assertEqual(after.status_code, 302, "登出后受保护页面必须重新要求登录")
+        self.assertIn("/login", after.headers.get("Location", ""))
+
+    def test_get_logout_is_rejected(self):
+        """登出是改状态的操作：GET 能被任意第三方页面的 <img src="/logout"> 触发"""
+        with mock.patch.object(securitymod, "ACCESS_PASSWORD", ""):
+            resp = self.client.get("/logout")
+        self.assertEqual(resp.status_code, 405)
+
+    def test_logout_without_csrf_is_rejected(self):
+        self._login()
+        with mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"):
+            resp = self.client.post("/logout")
+            self.assertEqual(resp.status_code, 400)
+            # 用首页判定登录态：/dashboard 在没有统计数据时会按设计跳回首页（302），
+            # 拿它当"是否还登录着"的探针会得出错误结论。
+            still_in = self.client.get("/")
+        self.assertEqual(still_in.status_code, 200, "CSRF 失败时不该真的把登录态清掉")
+
+    def test_logout_button_appears_only_when_password_is_set(self):
+        plain = self.client.get("/")
+        self.assertNotIn("退出登录", plain.get_data(as_text=True), "没设口令时导航栏不该出现退出按钮")
+
+        self._login()
+        with mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"):
+            page = self.client.get("/")
+        self.assertIn("退出登录", page.get_data(as_text=True))
+        self.assertIn('action="/logout"', page.get_data(as_text=True))
 
 
 class TestHardeningMisc(unittest.TestCase):

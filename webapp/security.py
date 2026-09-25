@@ -82,8 +82,13 @@ def ensure_csrf_token():
 
 
 def inject_csrf_token():
-    """向所有模板注入 csrf_token，供表单与 AJAX 请求使用"""
-    return {"csrf_token": session.get("csrf_token", "")}
+    """向所有模板注入 csrf_token，供表单与 AJAX 请求使用
+
+    顺带注入 auth_enabled：导航栏只应在**真的设了口令**时才渲染"退出登录"。
+    没设口令时模板不输出任何东西，于是各页面的渲染结果与加这个按钮之前逐字节一致
+    （私聊 8 页有对照用例钉着）。
+    """
+    return {"csrf_token": session.get("csrf_token", ""), "auth_enabled": bool(ACCESS_PASSWORD)}
 
 
 def _check_csrf() -> bool:
@@ -346,6 +351,31 @@ def login():
     return render_template("login.html", error=error)
 
 
+def logout():
+    """退出登录：清空服务端会话内容，并让浏览器丢弃会话 cookie。
+
+    只接受 POST 且必须过 `_guard_post()`（Origin + CSRF）：
+
+    - 不接受 GET，因为登出是**改状态**的操作，而任意第三方页面都能用
+      `<img src="http://127.0.0.1:5000/logout">` 触发它（登出 CSRF 危害有限，
+      但本项目的口径是"改状态就过 _guard_post"，这里不开口子）；
+    - `session.clear()` 只清了服务端内容，浏览器上的 sid 还在，所以显式
+      `delete_cookie`。会话文件仍会被 24 小时回收，但那不是用户能依赖的时点。
+
+    注意这里**不**清登录失败限流的计数：登出本身与该地址的失败历史无关。
+    """
+    guard = _guard_post()
+    if guard:
+        return guard
+
+    ip = request.remote_addr or "127.0.0.1"
+    session.clear()
+    logger.info("已退出登录 [%s]", ip)
+    response = redirect(url_for("index"))
+    response.delete_cookie(current_app.config.get("SESSION_COOKIE_NAME") or "session")
+    return response
+
+
 def register(app):
     """把防护挂钩到 Flask 实例（保持原始注册顺序）"""
     app.before_request(ensure_csrf_token)
@@ -353,3 +383,4 @@ def register(app):
     app.after_request(add_security_headers)
     app.context_processor(inject_csrf_token)
     app.add_url_rule("/login", "login", login, methods=["GET", "POST"])
+    app.add_url_rule("/logout", "logout", logout, methods=["POST"])
