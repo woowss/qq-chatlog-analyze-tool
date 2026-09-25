@@ -23,7 +23,8 @@ pip install -r requirements.txt
 pip install ruff==0.16.6                          # 与 CI 固定同一版本
 ```
 
-Python 3.10–3.14 都在 CI 矩阵里，3.10 是最低线（唯一的分支差异是标准库有没有 `tomllib`）。
+CI 矩阵跑 Python 3.10 / 3.12 / 3.13 / 3.14（**没有 3.11**：唯一的分支差异是标准库有没有
+`tomllib`，3.10 与 3.12 已经把两侧都覆盖了）。3.10 是最低支持线。
 
 ## 提交前请全跑一遍
 
@@ -52,7 +53,10 @@ python -m ruff format --check .
 ## 发布流程
 
 打 tag `vX.Y.Z`（必须与 `pyproject.toml` 的 version 一致）→ `.github/workflows/release.yml`
-从该 tag 构建 wheel 与 sdist 并挂到**草稿** Release → 人工确认后点 Publish。
+从该 tag 跑全量单测、构建 wheel 与 sdist、生成 SHA256SUMS，并**直接发布**为 Release。
+不留草稿：草稿的附件只有有权限的人能下载，README 里的安装链接会指向一个下不到 wheel 的页面
+（v1.1.1 实测踩过）。已发布版本的附件**不会被覆盖**——重复推送同一 tag 会大声失败；
+确需重建（例如补附件）时用 workflow_dispatch 手动指定 tag，那是唯一一条明示的重建通道。
 不要手工上传发布件：附件必须能由 tag 复现。
 
 ## 安全
