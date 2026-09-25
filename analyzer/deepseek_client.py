@@ -274,22 +274,49 @@ _run_calls_lock = threading.Lock()
 #: 是否处在"一次运行"之内。上限只约束有明确起点与终点的运行；
 #: 直接调用 analyze_* 的脚本与工具没有这个边界，不该被它掐断（也没有"这次"可言）。
 _run_active = False
+#: 正在进行的运行数（>0 表示还有 run 边界没结束）。重叠运行**共享**同一份额度：
+#: 第二个 begin_run 不清零，否则两次点击各拿一份额度、总量可达上限的 N 倍。
+_run_depth = 0
 
 
 def begin_run() -> None:
-    """开始一次分析运行：调用计数清零。
+    """开始一次分析运行：**只有当前没有运行在跑时**才把计数清零。
 
     "一次运行" = 单个维度的分析，或"一键全量"的整个循环（后者只清零一次，
-    所以上限覆盖全部维度）。生产路径由 webapp.jobs 的两个入口调用。
+    所以上限覆盖全部维度）。生产路径由 webapp.jobs 的两个入口调用，并必须与
+    end_run() 配对（那两个入口放在 finally 里）。
+
+    为什么要数深度而不是每次清零：上限的承诺是"一次点击不会悄悄花超"。两个运行
+    重叠时（同进程里点了两次、或全量任务没结束又发起单维度）各自清零等于把额度
+    放大 N 倍，而且先开始的那个会因为计数被重置而失去约束——它的花费再也不会
+    被卡住。现在后开始的那个只是**加入**正在进行的额度：谁先开始谁定义这份预算，
+    总发出请求数始终 ≤ 上限。
 
     计数是**进程级**的而不是线程局部的：月份调用发生在并发线程池里，线程局部计数
     跨不过去。代价是同一进程内两个并发分析共享这一个上限——单机工具里这种并发很
     少见，换来的是"无论怎么触发，总量都不会悄悄翻倍"。
     """
-    global _run_calls, _run_active
+    global _run_calls, _run_active, _run_depth
     with _run_calls_lock:
-        _run_calls = 0
+        if _run_depth == 0:
+            _run_calls = 0
+        _run_depth += 1
         _run_active = True
+
+
+def end_run() -> None:
+    """结束一次运行；最后一个结束的调用把"运行中"收回 False。
+
+    必须与 begin_run() 成对（webapp.jobs 用 finally 保证）。漏掉一次的后果不是
+    "少减一个数"：_run_depth 会永远 >0，此后每次 begin_run 都不再清零，上限会
+    悄悄变成"进程启动以来的累计"。多调一次则由下面的夹取兜住，不会变成负数。
+    """
+    global _run_active, _run_depth
+    with _run_calls_lock:
+        if _run_depth > 0:
+            _run_depth -= 1
+        if _run_depth == 0:
+            _run_active = False
 
 
 def calls_used() -> int:

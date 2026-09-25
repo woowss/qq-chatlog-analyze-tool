@@ -539,6 +539,12 @@ class TestQuotaAndThrottle(unittest.TestCase):
 
     def tearDown(self):
         self.dc.CALL_MIN_INTERVAL = self._orig_interval
+        # 运行边界是**进程级**状态：用例之间必须归零。否则一条用例漏了 end_run()，
+        # 表现会是"下一条用例顺序相关的假失败"，而不是直接暴露在漏掉的那条上
+        # （本轮改 begin_run 语义时就踩了一次）。
+        self.dc._run_depth = 0
+        self.dc._run_calls = 0
+        self.dc._run_active = False
 
     def test_run_call_cap_aborts_and_resets(self):
         """LLM_MAX_CALLS_PER_RUN 是花费上限：超限抛致命错误（走既有的中止路径）
@@ -558,10 +564,79 @@ class TestQuotaAndThrottle(unittest.TestCase):
                 self.dc._call_api("s", "u")
             self.assertEqual(fake.chat.completions.create.call_count, 2, "超限后不该再发出请求")
 
-            # 新的一次运行：额度重新开始（否则第二次点击会被上一次的计数连坐）
+            # 新的一次运行：额度重新开始（否则第二次点击会被上一次的计数连坐）。
+            # end_run() 不能省：运行边界没结束就再 begin_run 属于「重叠运行」，
+            # 那种情况下**不**清零（否则两次点击各拿一份额度，总量可达上限的 N 倍），
+            # 见 test_overlapping_runs_share_one_budget。
+            self.dc.end_run()
+            self.dc.begin_run()
+            try:
+                self.dc._call_api("s", "u")
+            finally:
+                self.dc.end_run()
+            self.assertEqual(fake.chat.completions.create.call_count, 3)
+
+    def test_overlapping_runs_share_one_budget(self):
+        """运行 A 还有额度没结束时，运行 B 只能**加入**同一份额度，不能再拿一份
+
+        反向验证：把 begin_run() 改回「每次都 _run_calls = 0」（或删掉 _run_depth 判断），
+        本条立刻变红——旧行为下 B 开始时会清零，于是 A 花满 2 次、B 再花 2 次，
+        总量变成上限的 2 倍。注意必须在 A **已经花掉额度且没结束**时才开始 B：
+        若两次 begin_run 都发生在花钱之前，两种实现的结果是一样的（都会在第 3 次被拦），
+        这条用例就失去鉴别力——第一版就是这么写的，被对照实验抓出来了。
+        """
+        fake = mock.Mock()
+        fake.chat.completions.create.return_value = self._ok_resp()
+        with (
+            mock.patch.object(self.dc, "MAX_CALLS_PER_RUN", 2),
+            mock.patch.object(self.dc, "_get_client", return_value=fake),
+        ):
+            self.dc.begin_run()  # 运行 A
+            try:
+                self.dc._call_api("s", "u")
+                self.dc._call_api("s", "u")
+                with self.assertRaises(self.dc.QuotaExhaustedError):
+                    self.dc._call_api("s", "u")  # A 的额度用完了
+
+                self.dc.begin_run()  # 运行 B：A 还没结束 = 重叠运行
+                try:
+                    with self.assertRaises(self.dc.QuotaExhaustedError):
+                        self.dc._call_api("s", "u")
+                    self.assertEqual(
+                        fake.chat.completions.create.call_count,
+                        2,
+                        "B 各自清零的话，这里会再发出 2 次请求（总量 4 = 上限翻倍）",
+                    )
+                finally:
+                    self.dc.end_run()
+            finally:
+                self.dc.end_run()
+
+    def test_run_boundary_is_released_when_the_run_ends(self):
+        """运行结束后上限必须交还给「没有运行」的状态，不再粘住后续直接调用
+
+        反向验证：把 end_run() 里收缩 _run_active 的那两行删掉，本条立刻变红——
+        那正是「跑过一次 Web 任务后，同进程里再直接调 analyze_* 会被上一次的计数
+        掐断」的旧行为（_run_active 一旦置上就永不复位）。
+        """
+        fake = mock.Mock()
+        fake.chat.completions.create.return_value = self._ok_resp()
+        with (
+            mock.patch.object(self.dc, "MAX_CALLS_PER_RUN", 1),
+            mock.patch.object(self.dc, "_get_client", return_value=fake),
+        ):
             self.dc.begin_run()
             self.dc._call_api("s", "u")
-            self.assertEqual(fake.chat.completions.create.call_count, 3)
+            self.dc.end_run()
+            self.assertFalse(self.dc._run_active, "运行结束必须把边界收回")
+
+            for _ in range(3):
+                self.dc._call_api("s", "u")
+            self.assertEqual(
+                fake.chat.completions.create.call_count,
+                4,
+                "运行边界已结束：直接调用没有「这次」可言，不该被上限掐断",
+            )
 
     def test_run_call_cap_counts_retries_too(self):
         """限流重试同样占用服务商配额，所以按"发出的请求数"计，而不是"成功调用数\""""

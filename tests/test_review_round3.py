@@ -243,6 +243,35 @@ class TestJobSurvivesFileCleanup(unittest.TestCase):
         self.assertEqual(job["status"], "error")
         self.assertIn("已被清理", job["error"])
 
+    def test_run_boundary_is_released_on_every_exit_path(self):
+        """begin_run/end_run 必须成对：漏掉的后果是 LLM_MAX_CALLS_PER_RUN 变成
+        「进程启动以来的累计」，之后每次 begin_run 都不再清零，正常分析也会被掐断。
+
+        反向验证：删掉 _run_job（或 _run_analyze_all）finally 里的 end_run()，
+        本条立刻变红。这里刻意走「文件已被清理」这条**提前 return** 的出口——
+        它是 finally 最容易被漏掉的那一类路径。
+
+        断言用"相对进入前"的口径而不是绝对值：这个计数器是进程级的，别的用例可能
+        已经把它留在某个状态上，绝对断言会变成顺序相关的假失败。
+        """
+        from analyzer import deepseek_client as dc
+
+        depth_before = dc._run_depth
+        active_before = dc._run_active
+        missing = os.path.join(_TMP_ROOT, "definitely-not-here-boundary.json")
+
+        job_id = "job-boundary-single"
+        self._register(job_id)
+        jobsmod._run_job(job_id, "emotion", missing, "deadbeefcafe0001")
+        self.assertEqual(dc._run_depth, depth_before, "_run_job 退出时必须释放自己占用的运行边界")
+        self.assertEqual(dc._run_active, active_before, "_run_job 不该把「运行中」粘住")
+
+        job_id = "job-boundary-all"
+        self._register(job_id)
+        jobsmod._run_analyze_all(job_id, missing, "deadbeefcafe0002", False)
+        self.assertEqual(dc._run_depth, depth_before, "_run_analyze_all 退出时必须释放运行边界")
+        self.assertEqual(dc._run_active, active_before, "_run_analyze_all 不该把「运行中」粘住")
+
 
 class TestSaveAndHashIntegrity(unittest.TestCase):
     """上传流落盘：要么给出完整文件的哈希，要么报错——绝不返回半截结果"""

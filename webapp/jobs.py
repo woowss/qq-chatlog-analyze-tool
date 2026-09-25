@@ -39,6 +39,7 @@ from analyzer.deepseek_client import (
     analyze_habits,
     analyze_profile,
     begin_run,
+    end_run,
 )
 from analyzer.group_client import GROUP_DIMENSIONS
 from analyzer.logger import get_logger
@@ -264,6 +265,11 @@ def _run_job(job_id: str, dimension: str, filepath: str, chat_hash: str) -> None
     except Exception as e:
         logger.error("%s 失败: %s", dim_name, e)
         _fail_job(job_id, f"AI 分析失败: {e}")
+    finally:
+        # 与 begin_run 配对（即使中途 return/抛异常也要释放）：漏掉的后果是
+        # _run_depth 永远 >0，之后每次 begin_run 都不再清零，LLM_MAX_CALLS_PER_RUN
+        # 会悄悄变成"进程启动以来的累计"，把正常的一次分析也掐断。
+        end_run()
 
 
 def _run_analyze_all(
@@ -350,3 +356,6 @@ def _run_analyze_all(
     except Exception as e:
         logger.error("一键全量分析失败: %s", e)
         _fail_job(job_id, f"AI 分析失败: {e}")
+    finally:
+        # 与 _run_job 同理：全量循环里的 return（配额/花费上限中止）也必须释放运行边界
+        end_run()
