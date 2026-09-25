@@ -399,6 +399,27 @@ _FINGERPRINT_ENV_KEYS = (
     "LLM_VISION_MIN_SIDE",
 )
 
+#: 群聊提示词指纹的**绝对值**（默认配置下实测值）。成本等级与私聊那份完全相同：
+#: 它进群聊维度缓存文件名与群聊月份缓存键，一变就等于让所有既有群聊用户为同样的
+#: 对话重新付费。私聊那条 pin 覆盖不到它——群聊缓存里嵌的是另一个值。
+#:
+#: 历史：群聊功能落地（2026-09）时为 5f1f7bb3c0ce（旧公式，按 getsource 原文哈希）；
+#: 同月哈希对象改为 AST 归一后现值为 a8e00d5ae5ca。**旧值仍然是有效凭据**：它负责
+#: 读取"AST 归一之前"写下的群聊缓存并迁移（见 tests/test_privacy_guards.py 的
+#: TestFingerprintMigration），所以两边都必须继续可复现。
+PINNED_GROUP_FINGERPRINT = "a8e00d5ae5ca"
+
+#: 旧公式下的群聊指纹取值，作用同上：改它的后果是所有既有群聊用户的旧缓存读不到。
+PINNED_LEGACY_GROUP_FINGERPRINT = "5f1f7bb3c0ce"
+
+#: 会让群聊指纹绝对值对不上的环境变量。与私聊那份**各自独立**：私聊多一个视觉参数，
+#: 群聊多两个群聊预算（两者的常量元组本来就不同）。
+_GROUP_FINGERPRINT_ENV_KEYS = (
+    "PROMPT_CACHE_SALT",
+    "LLM_GROUP_MAX_DIALOG_CHARS",
+    "LLM_GROUP_MEMBER_MIN_LINES",
+)
+
 
 class TestPrivateFingerprintIsolation(unittest.TestCase):
     """私聊提示词指纹：取值不变，且不受新增 SYSTEM_PROMPT_* 常量影响"""
@@ -523,6 +544,88 @@ class TestPrivateFingerprintIsolation(unittest.TestCase):
         from analyzer import deepseek_client as dc
 
         self.assertEqual(dc._month_key("SYS", "USER"), dc._month_key("SYS", "USER", dc.PROMPT_FINGERPRINT))
+
+
+class TestGroupFingerprintIsolation(unittest.TestCase):
+    """群聊提示词指纹：与私聊同等成本，因此要有同等强度的护栏
+
+    少了这一类用例，"改了群聊提示词却没换键"或"让 ruff format 重排了群聊格式化函数"
+    这两件事在 CI 上都不会出声，而代价是把既有群聊用户的维度缓存与月份缓存全部作废
+    （宽限期后被孤儿回收，下次分析全量重新付费）。
+    """
+
+    def test_group_fingerprint_absolute_value_is_pinned(self):
+        """绝对值断言：当前值与**旧公式**的取值都必须继续可复现"""
+        from analyzer import group_client as gc
+
+        overrides = sorted(
+            k for k in os.environ if k in _GROUP_FINGERPRINT_ENV_KEYS or k.startswith("LLM_MAX_TOKENS_")
+        )
+        if overrides:
+            self.skipTest(
+                "本机设置了影响群聊指纹的环境变量 %s：绝对值必然与默认配置不同，"
+                "跳过以免误报（CI 无这些变量，会严格执行）" % overrides
+            )
+        self.assertEqual(
+            gc.GROUP_PROMPT_FINGERPRINT,
+            PINNED_GROUP_FINGERPRINT,
+            "群聊提示词指纹变了。它进群聊维度缓存文件名与群聊月份缓存键，一变就等于让所有"
+            "既有群聊用户在下次分析时重新付费。若确属有意改动，请同步更新本用例的"
+            "PINNED_GROUP_FINGERPRINT，并在 CHANGELOG 写明这一点。",
+        )
+        self.assertEqual(
+            gc.GROUP_PROMPT_FINGERPRINT_LEGACY,
+            PINNED_LEGACY_GROUP_FINGERPRINT,
+            "旧公式的群聊指纹变了：它是「读取并迁移旧群聊缓存」的唯一凭据。改它的后果是"
+            "所有既有群聊用户的旧缓存都读不到，也就是让他们为同样的分析重新付费。",
+        )
+
+    def test_group_prompt_change_moves_group_fingerprint_only(self):
+        """改群聊提示词：群聊键必须变，私聊键必须一个字节都不动
+
+        两个方向都要验。只验一侧的话，"群聊提示词被塞进 analyzer/prompts.py"这类
+        改动会让私聊缓存整体作废，而那条路径的代价（所有私聊用户重新付费）最贵。
+        """
+        import analyzer.group_prompts as gp
+        from analyzer import deepseek_client as dc
+        from analyzer import group_client as gc
+
+        names = [n for n in sorted(dir(gp)) if n.startswith("GROUP_SYSTEM_PROMPT_")]
+        self.assertTrue(names, "群聊提示词常量名单不该为空（否则这条用例什么都没验）")
+        private_before = dc._prompt_fingerprint()
+        with mock.patch.object(gp, names[0], "完全不同的群聊提示词"):
+            self.assertNotEqual(
+                gc.group_prompt_fingerprint(),
+                gc.GROUP_PROMPT_FINGERPRINT,
+                "改了群聊提示词却不算进群聊指纹：旧缓存会顶着新提示词的名义被命中",
+            )
+            self.assertEqual(
+                dc._prompt_fingerprint(),
+                private_before,
+                "群聊提示词只能影响群聊指纹：一旦渗进私聊指纹，全部私聊缓存作废（重新付费）",
+            )
+
+    def test_group_env_inputs_really_change_the_group_fingerprint(self):
+        """跳过名单的下界要有依据：里面每个变量都必须真的参与群聊指纹"""
+        from analyzer import group_client as gc
+
+        base = gc.group_prompt_fingerprint()
+        with mock.patch.dict(os.environ, {"PROMPT_CACHE_SALT": "probe-group"}):
+            self.assertNotEqual(gc.group_prompt_fingerprint(), base, "PROMPT_CACHE_SALT 应参与群聊指纹")
+        with mock.patch.object(gc, "GROUP_MAX_DIALOG_CHARS", gc.GROUP_MAX_DIALOG_CHARS + 1):
+            self.assertNotEqual(
+                gc.group_prompt_fingerprint(), base, "LLM_GROUP_MAX_DIALOG_CHARS 应参与群聊指纹"
+            )
+        with mock.patch.object(gc, "GROUP_MEMBER_MIN_LINES", gc.GROUP_MEMBER_MIN_LINES + 1):
+            self.assertNotEqual(
+                gc.group_prompt_fingerprint(), base, "LLM_GROUP_MEMBER_MIN_LINES 应参与群聊指纹"
+            )
+        with mock.patch.dict(
+            gc.MAX_TOKENS_BY_DIM, {"group_emotion": gc.MAX_TOKENS_BY_DIM["group_emotion"] + 1}
+        ):
+            self.assertNotEqual(
+                gc.group_prompt_fingerprint(), base, "LLM_MAX_TOKENS_GROUP_EMOTION 应参与群聊指纹"
+            )
 
 
 class TestPrivateStatsShapeFrozen(unittest.TestCase):
