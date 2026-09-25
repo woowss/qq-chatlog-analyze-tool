@@ -183,7 +183,10 @@ class TestMonthManifestBatching(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="qqchatlog-manifest-")
         self.addCleanup(_shutil.rmtree, self.tmp, ignore_errors=True)
-        self._orig_dir = dc._MONTH_CACHE_DIR
+        # 模块级状态读/写都打在 owns 它的模块上（deepseek_client 的重导出只是值拷贝）
+        from analyzer import month_cache as mc
+
+        self._orig_dir = mc._MONTH_CACHE_DIR
         dc.configure_month_cache(self.tmp)
         self.addCleanup(lambda: dc.configure_month_cache(self._orig_dir))
 

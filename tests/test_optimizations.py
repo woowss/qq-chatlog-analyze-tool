@@ -215,7 +215,11 @@ class TestMonthIncrementalCache(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="qqchatlog-monthcache-")
         self.addCleanup(_shutil.rmtree, self.tmp, ignore_errors=True)
-        self._orig_dir = dc._MONTH_CACHE_DIR
+        # 模块级状态读/写都打在 owns 它的模块上：deepseek_client 里的同名名字只是
+        # 搬迁瞬间的值拷贝（见 analyzer/month_cache.py 的模块说明）
+        from analyzer import month_cache as mc
+
+        self._orig_dir = mc._MONTH_CACHE_DIR
         dc.configure_month_cache(self.tmp)
         self.addCleanup(lambda: dc.configure_month_cache(self._orig_dir))
 

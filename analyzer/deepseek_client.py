@@ -14,7 +14,23 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 #
-"""DeepSeek API 调用封装"""
+"""DeepSeek API 调用封装
+
+本模块负责**API 层**：客户端复用、调用闸门与限流冷却、错误分类与重试、思考模式、
+各维度的执行体（逐月并发/取消/配额中止），以及进缓存的提示词指纹。
+
+拆出去的两块（2026-09 从本文件切分；纯搬迁，指纹逐字节未变）：
+- analyzer/dialog.py       对话构建（把消息压成喂模型的文本）与它自己那套格式化常量；
+- analyzer/month_cache.py  月份级增量缓存（内容寻址键 + manifest 引用计数 + 孤儿回收）。
+
+为什么拆：本文件曾一次扛八件事、1500 多行，改一处调用节奏要翻遍全文才能确定没有碰到
+缓存键。为什么**不能**顺手改名：dialog 里那 5 个函数的源码进 PROMPT_FINGERPRINT，
+改名/改注释/被 ruff format 重排都会让所有既有用户的私聊缓存失效、重新付费——
+tests/test_group_foundation.py 的 PINNED_PRIVATE_FINGERPRINT 会让这种改动在 CI 上变红。
+
+两者仍从本模块**再导出**，既有调用点（app.py / webapp / tools / tests）不必改；
+但模块级状态的打桩要打在 owns 它的模块上（见下方导入处的说明）。
+"""
 
 import concurrent.futures
 import hashlib
@@ -23,10 +39,8 @@ import json
 import os
 import threading
 import time
-from collections import Counter
-from datetime import datetime
 from functools import partial
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Optional
 
 from openai import OpenAI
 
@@ -41,17 +55,62 @@ from config import (
     env_number,
     parse_bool,
 )
-from parser.qq_parser import CST, MEDIA_KINDS, ChatData, is_statistical, split_by_month
+from parser.qq_parser import ChatData, is_statistical, split_by_month
 from analyzer.logger import get_logger, mask_name
 from analyzer.shutdown import shutdown_requested
 from analyzer.usage import record_call
-from analyzer.local_stats import SESSION_GAP_MS, is_session_start
+from analyzer.local_stats import SESSION_GAP_MS
 from analyzer.prompts import (
     SYSTEM_PROMPT_EMOTION,
     SYSTEM_PROMPT_TOPICS,
     SYSTEM_PROMPT_RELATIONSHIP,
     SYSTEM_PROMPT_HABITS,
     SYSTEM_PROMPT_PROFILE,
+)
+
+# —— 下面两个模块是从本文件拆出去的。这里全部重导出：app.py / webapp / tools / tests
+#    既有的 `from analyzer.deepseek_client import configure_month_cache` 这类调用点不必改。
+#
+#    两条必须知道的约定：
+#    ① 进 PROMPT_FINGERPRINT 的 5 个函数（_build_dialog / _message_line / _fit_lines /
+#       _conversation_stats / _short_time）**函数名不可改**，而且它们正文里引用到的全局名
+#       也一起被冻住了（例如 _build_dialog 里调用的 _has_content / _vision_digest）——
+#       getsource 的返回值参与哈希，改名字或改注释都会让所有既有用户的私聊缓存失效、重新付费。
+#    ② **模块级状态**（month_cache._MONTH_CACHE_DIR 等）必须打桩在 owns 它的模块上：
+#       这里的重导出只是搬迁瞬间的值拷贝，改它不影响那边的逻辑。
+from analyzer.dialog import (
+    MAX_DIALOG_CHARS,
+    RELATIVE_MARK_MINUTES,
+    TIME_MARK_MINUTES,
+    _build_dialog,
+    _conversation_stats,
+    _fit_lines,
+    _has_content,
+    _message_line,
+    _short_time,
+    _vision_digest,
+)
+
+# 月份缓存的名字**为兼容而再导出**：app.py 用 configure_month_cache，webapp/cleanup 用
+# sweep_orphan_month_cache，webapp/store 用 purge_month_cache，测试还直接读 _MONTH_CACHE_LOCK /
+# MONTH_CACHE_GRACE_SECONDS 这些模块级状态。写成 `X as X` 是表达"这是有意的再导出"的
+# 标准写法（静态检查据此不再把它当"导入了没用"）。
+# 但**状态**的读写请打桩在 analyzer.month_cache 上：这里的 `_MONTH_CACHE_DIR` 之类只是
+# 搬迁瞬间的值拷贝（字符串/数值），改它不会影响那边的逻辑。
+from analyzer.month_cache import (
+    MONTH_CACHE_GRACE_SECONDS as MONTH_CACHE_GRACE_SECONDS,
+    _MONTH_CACHE_LOCK as _MONTH_CACHE_LOCK,
+    _last_write_warning as _last_write_warning,
+    _manifest_path as _manifest_path,
+    _month_key,
+    _read_month_cache,
+    _record_month_usage,
+    _referenced_keys_locked as _referenced_keys_locked,
+    _write_month_cache,
+    configure_month_cache as configure_month_cache,
+    month_cache_path as month_cache_path,
+    purge_month_cache as purge_month_cache,
+    sweep_orphan_month_cache as sweep_orphan_month_cache,
 )
 
 logger = get_logger("deepseek")
@@ -70,12 +129,6 @@ _PRIVATE_PROMPT_NAMES = (
     "SYSTEM_PROMPT_TOPICS",
 )
 
-
-# 单月对话文本上限（字符数）。**准确性优先**：默认 60 万字符（约 25-30 万 tokens），
-# 足以装下绝大多数月份的全部消息（实测：最长那个月会逼近这个上限），
-# 因此正常情况下不会触发抽样；只有极端月份（几十万条）才会等间隔抽样并注明。
-# 想省钱可在 .env 里调小 LLM_MAX_DIALOG_CHARS。
-MAX_DIALOG_CHARS = int(env_number("LLM_MAX_DIALOG_CHARS", 600_000, 1000, 2_000_000))
 
 # 限流节奏默认值按服务商自适应：官方 DeepSeek（并发上限 2500）可以快得多，
 # 而阿里云百炼的 TPM 是按主账号聚合的，必须保守。两个值都可用环境变量覆盖。
@@ -307,222 +360,6 @@ def _get_client() -> Optional[OpenAI]:
     return _CLIENT
 
 
-def _fit_lines(lines: list[str], max_chars: int) -> list[str]:
-    """把消息行压到 max_chars 以内：先等间隔抽样，再按需从尾部截断。
-
-    等间隔抽样能尽量保留整月的对话分布，而不是只留最新的消息。
-    """
-    if not lines:
-        return []
-    total = sum(len(line) + 1 for line in lines)
-    if total <= max_chars:
-        return lines
-
-    # 1) 等间隔抽样
-    step = max(1, (total + max_chars - 1) // max_chars)
-    sampled = lines[::step]
-    if len(sampled) < 3 and len(lines) > 3:
-        sampled = lines[-30:]
-    total = sum(len(line) + 1 for line in sampled)
-    if total <= max_chars:
-        return sampled
-
-    # 2) 仍超限（如存在单条超长消息）：从尾部逐条截断
-    kept: list[str] = []
-    used = 0
-    for line in reversed(sampled):
-        if used + len(line) + 1 > max_chars:
-            if not kept and line:
-                kept.append(line[:max_chars])
-            break
-        used += len(line) + 1
-        kept.append(line)
-    return list(reversed(kept))
-
-
-def _has_content(m) -> bool:
-    """消息是否有可喂给模型的内容（正文或图片/表情/文件/转发/回复等信号）"""
-    return (
-        bool(m.text)
-        or m.has_image
-        or m.is_reply
-        or bool(m.media_kind)
-        or bool(m.face_names)
-        or bool(m.face_ids)
-    )
-
-
-def _short_time(time_str: str) -> str:
-    """把 '2024-01-01 08:00:00' 压缩为 '01-01 08:00'，省 token 且同月内信息无损失"""
-    return time_str[5:16] if len(time_str) >= 16 else time_str
-
-
-def _conversation_stats(messages: list, self_uid: str = "") -> dict:
-    """喂给模型作参考的本地事实：最活跃小时、回复间隔中位数、谁更常开启话题。
-
-    这些都能在本地精确算出，直接写进统计头，模型就不必"猜"（也减少幻觉）。
-    """
-    hours: Counter = Counter()
-    gaps: list[float] = []
-    last = None
-    sessions = 0
-    self_opened = 0
-    for m in messages:
-        hours[datetime.fromtimestamp(m.timestamp / 1000, tz=CST).hour] += 1
-        if last is None or is_session_start(last.timestamp, m.timestamp):
-            sessions += 1
-            if self_uid and m.sender_uid == self_uid:
-                self_opened += 1
-        elif last.sender_uid != m.sender_uid:
-            gap = (m.timestamp - last.timestamp) / 1000
-            if 0 < gap <= 3600 * 6:
-                gaps.append(gap)
-        last = m
-    return {
-        "peak_hour": hours.most_common(1)[0][0] if hours else None,
-        "median_gap": sorted(gaps)[len(gaps) // 2] if gaps else None,
-        "sessions": sessions,
-        "self_opened": self_opened,
-    }
-
-
-# 时间戳只在"新的一段"（间隔超过该分钟数）或换人时打印；段内小间隔用 (+3m) 紧凑标注。
-# 原格式每行固定 18 字符（时间 + 昵称），短句为主的聊天里能占到 60–73% 的字符预算。
-TIME_MARK_MINUTES = 30
-RELATIVE_MARK_MINUTES = 2
-TIME_MARK_MS = TIME_MARK_MINUTES * 60 * 1000
-
-
-def _gap_mark(gap_ms: int) -> str:
-    """把间隔压成 (+3m)/(+2h)/(+1d) 这类紧凑标记"""
-    minutes = gap_ms // 60000
-    if minutes < 60:
-        return f"(+{minutes}m)"
-    if minutes < 60 * 24:
-        return f"(+{minutes // 60}h)"
-    return f"(+{minutes // (60 * 24)}d)"
-
-
-def _message_line(m, name: str, prev_uid: Optional[str] = None, prev_ts: Optional[int] = None) -> str:
-    """单条消息 → 对话行。
-
-    打印规则（相同信息量、更省字符）：
-    - 首条 / 与上一条间隔 ≥ TIME_MARK_MINUTES / 换人 → 打印 `[01-01 08:00] 昵称:`
-    - 段内同人连发 → 只打印正文；段内换人 → 只打印 `昵称(+间隔):`
-    """
-    body = m.text or ""
-    marks = []
-    if m.has_image:
-        marks.append("图片")
-    if m.is_reply:
-        marks.append("回复")
-    if m.media_kind:
-        # 文件/视频/转发/红包/表情气泡/Markdown：带短标签，让模型知道这里发生过什么
-        kind = MEDIA_KINDS.get(m.media_kind, m.media_kind)
-        marks.append(f"{kind}:{m.media_label}" if m.media_label else kind)
-    if m.face_names:
-        marks.append("表情:" + "、".join(m.face_names[:4]))
-
-    first = prev_uid is None or prev_ts is None
-    gap_ms = 0 if first else max(0, m.timestamp - prev_ts)
-    changed = first or m.sender_uid != prev_uid
-    # 段内小间隔不值得标注（阈值以下留空）
-    mark = _gap_mark(gap_ms) if gap_ms >= RELATIVE_MARK_MINUTES * 60000 else ""
-
-    # 三种打印形态（信息量相同，但字符数递减）：
-    #   跨段/间隔够大 → `[01-01 08:00] 昵称:`   换人时靠时间戳认出"这是新的一段"
-    #   段内换人      → `昵称(+3m):`            省掉时间，只留"谁说的、隔了多久"
-    #   段内同人连发  → `(+3m):`                连昵称都省掉，间隔太小则什么都不印
-    if first or gap_ms >= TIME_MARK_MS:
-        prefix = f"[{_short_time(m.time_str)}] {name}:"
-    elif changed:
-        prefix = f"{name}{mark}:"
-    else:
-        prefix = f"{mark}:" if mark else ""
-
-    if marks:
-        mark = "[" + ", ".join(marks) + "]"
-        text = f"{body} {mark}".strip() if body else mark
-    else:
-        text = body
-    return f"{prefix} {text}".strip() if prefix and text else (prefix or text)
-
-
-def _build_dialog(
-    messages: list,
-    self_uid: str,
-    self_name: str,
-    other_name: str,
-    max_chars: Optional[int] = MAX_DIALOG_CHARS,
-    chat_hash: str = "",
-    vision_label: str = "",
-) -> str:
-    """构建喂给模型的对话内容：统计头（含本地事实）+ 压缩后的对话行 + 图片摘要。
-
-    统计头给模型全貌（即使抽样截断也能知道真实消息量），并附上本地精确算出的
-    事实（条数、图片数、最活跃时段、回复中位数、谁更常开启话题、对话段数），
-    避免模型凭样本"数数"。
-
-    vision_label 非空时会尝试附上该批消息的图片摘要（见 analyzer/vision.py）：
-    摘要按图片指纹缓存，同一批图只花一次视觉调用，5 个维度共用。
-    """
-    valid = [m for m in messages if _has_content(m) and is_statistical(m)]
-    if not valid:
-        return ""
-    total = len(valid)
-    self_n = sum(1 for m in valid if m.sender_uid == self_uid)
-    other_n = total - self_n
-    images = sum(1 for m in valid if m.has_image)
-
-    lines: list[str] = []
-    prev_uid: Optional[str] = None
-    prev_ts: Optional[int] = None
-    for m in valid:
-        lines.append(
-            _message_line(m, self_name if m.sender_uid == self_uid else other_name, prev_uid, prev_ts)
-        )
-        prev_uid, prev_ts = m.sender_uid, m.timestamp
-    original_n = len(lines)
-    if max_chars:
-        lines = _fit_lines(lines, max_chars)
-
-    parts = [f"共 {total} 条消息（我方 {self_n} 条 / 对方 {other_n} 条，图片 {images} 张）"]
-    stats = _conversation_stats(valid, self_uid)
-    if stats["peak_hour"] is not None:
-        parts.append(f"最活跃时段约 {stats['peak_hour']} 时")
-    if stats["median_gap"] is not None:
-        parts.append(f"回复间隔中位数约 {int(stats['median_gap'])} 秒")
-    if stats["sessions"]:
-        parts.append(f"共 {stats['sessions']} 段对话（间隔超 {TIME_MARK_MINUTES} 分钟算新的一段）")
-        if self_uid:
-            ratio = round(stats["self_opened"] / stats["sessions"] * 100)
-            parts.append(f"其中我方先开口 {ratio}%、对方 {100 - ratio}%")
-    head = "统计：" + "，".join(parts)
-    if len(lines) < original_n:
-        head += f"，因篇幅限制展示其中 {len(lines)} 条（等间隔抽样，覆盖整月分布）"
-    dialog = f"{head}。\n\n" + "\n".join(lines)
-
-    digest = _vision_digest(valid, chat_hash, vision_label)
-    if digest:
-        dialog += f"\n\n图片内容摘要（由视觉模型识别，供参考）：\n{digest}"
-    return dialog
-
-
-def _vision_digest(messages: list, chat_hash: str, label: str) -> str:
-    """图片摘要：未开启/无图/失败都返回空串，绝不影响文本分析主流程"""
-    if not label:
-        return ""
-    try:
-        from analyzer import vision
-
-        return vision.digest(messages, chat_hash=chat_hash, label=label)
-    except QuotaExhaustedError:
-        raise  # 额度耗尽要中止整体任务，不能悄悄吞掉
-    except Exception as e:
-        logger.warning("图片摘要失败（继续纯文本分析）: %s", e)
-        return ""
-
-
 def _prompt_fingerprint(salt: "str | None" = None) -> str:
     """提示词 + 对话格式的指纹，参与缓存键。
 
@@ -609,277 +446,6 @@ def fingerprint_for_dimension(dim: str) -> str:
 
 # 思考模式的最低输出预算：思维链 token 也计入 max_tokens，低于这个值必然截断
 THINKING_MIN_TOKENS = 4096
-
-
-# ---------------------------------------------------------------------------
-# 月份级缓存（增量分析）
-# ---------------------------------------------------------------------------
-# 维度级缓存以"整份文件哈希"为键：导出文件只要多一个月，历史月份会全部重跑。
-# 月份级缓存改用内容寻址键（模型 + 提示词指纹 + 系统提示词 + 该月对话文本），
-# 于是重新导出同一段对话时历史月份直接命中，只为新增月份付费。
-#
-# 清理：每个聊天文件对应 manifest_{chat_hash}.json，记录它用过哪些月份文件；
-# 该聊天被替换/删除时删掉 manifest，并只回收"没有其他 manifest 引用"的月份文件，
-# 从而保留"不留孤儿敏感数据"的隐私属性。
-_MONTH_CACHE_DIR = ""
-_MONTH_CACHE_LOCK = threading.Lock()
-# manifest 已引用月份的进程级缓存：{manifest 文件名: (mtime, keys)}。
-# _referenced_keys_locked 会被 purge（每次上传）与 sweep（定期清理）调用，原实现
-# 每次都要把目录下所有 manifest 完整读一遍再做 json.loads——分析过的聊天越多越慢。
-# 这里缓存结果并用 mtime 校验：文件没被改过（stat 比"读文件 + 解析"便宜一个量级）
-# 就直接复用。写 manifest 的那一处会同步更新缓存，不依赖 mtime 精度。
-# 受 _MONTH_CACHE_LOCK 保护。
-_MANIFEST_KEYS: dict[str, tuple[float, set]] = {}
-# 缓存写失败的告警去抖（磁盘满时每次调用都会失败，不能每次刷一行）
-_WRITE_WARN_INTERVAL = 300.0
-_last_write_warning = [0.0]
-# 无引用的月份缓存先留一段宽限期：上传新文件时的级联清理不能顺手删掉
-# "同一段对话的历史月份"，否则增量分析就失去意义。孤儿文件由定期清理回收。
-MONTH_CACHE_GRACE_SECONDS = env_number("LLM_MONTH_CACHE_GRACE_HOURS", 24, 0, 24 * 30) * 3600
-
-
-def configure_month_cache(directory: str) -> None:
-    """由应用层注入缓存目录；传空字符串即关闭月份级缓存"""
-    global _MONTH_CACHE_DIR
-    _MONTH_CACHE_DIR = directory or ""
-    # 目录换了，上一个目录的 manifest 缓存必须丢弃（键只是文件名，会张冠李戴）
-    with _MONTH_CACHE_LOCK:
-        _MANIFEST_KEYS.clear()
-
-
-def _month_key(system_prompt: str, user_content: str, fingerprint: "str | None" = None) -> str:
-    """月份缓存的键：任何影响该月输出的因素（模型/提示词/格式/对话文本）都进哈希。
-
-    fingerprint 默认取私聊指纹（既有行为，键值与升级前完全一致）；群聊维度传
-    group_prompt_fingerprint()，两类月份的缓存互不干扰——私聊月份也不会因为
-    新增群聊提示词而变成"无引用"被回收。
-    """
-    digest = hashlib.sha256()
-    for part in (DEEPSEEK_MODEL, fingerprint or PROMPT_FINGERPRINT, system_prompt, user_content):
-        digest.update(part.encode("utf-8"))
-        digest.update(b"\x00")
-    return digest.hexdigest()[:20]
-
-
-def month_cache_path(key: str) -> str:
-    return os.path.join(_MONTH_CACHE_DIR, f"month_{key}.json")
-
-
-def _manifest_path(chat_hash: str) -> str:
-    return os.path.join(_MONTH_CACHE_DIR, f"manifest_{chat_hash}.json")
-
-
-def _read_month_cache(key: str) -> Optional[dict]:
-    if not _MONTH_CACHE_DIR:
-        return None
-    path = month_cache_path(key)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if isinstance(data, dict):
-        data.pop("_created", None)  # 元数据不进调用方拿到的结果
-    try:
-        os.utime(path, None)  # 命中即续期，避免常用缓存被 30 天 TTL 回收
-    except OSError:
-        pass
-    return data if isinstance(data, dict) else None
-
-
-def _warn_write_failure(what: str, path: str, err: OSError) -> None:
-    """缓存落盘失败必须出声。
-
-    静默吞掉 OSError 的后果不是"少一个文件"，而是月份缓存与 manifest 从此写不进去：
-    用户以为命中了缓存，实际上每个月都在重复付费，且界面上完全看不出来。
-    磁盘满时会高频失败，所以按 5 分钟去抖，避免刷爆日志。
-    """
-    now = time.monotonic()
-    if now - _last_write_warning[0] < _WRITE_WARN_INTERVAL:
-        return
-    _last_write_warning[0] = now
-    logger.warning("%s写入失败（缓存不生效，可能重复调用 API）: %s (%s)", what, path, err)
-
-
-def _write_month_cache(key: str, result: dict) -> None:
-    if not _MONTH_CACHE_DIR:
-        return
-    path = month_cache_path(key)
-    tmp = f"{path}.tmp"
-    try:
-        # _created 是"绝对 90 天"硬上限的依据（cleanup 读它）。缺了它就只能按 mtime 判，
-        # 而 mtime 在每次命中时被续期（见 _read_month_cache）——含聊天原句引用的这族
-        # 缓存会因此无限期留存。读侧会把它 pop 掉，调用方拿到的结果不变。
-        # 放在**最前面**写：清理任务只扫文件头就能取到，不必整份解析这些最敏感的月份文件
-        # （见 webapp.store.read_created_at）。
-        payload = dict(result) if isinstance(result, dict) else {"result": result}
-        payload.pop("_created", None)
-        # 目录可能被用户按 README 的指引删掉来"彻底清除数据"，而服务还开着：
-        # 这里不补目录，月份缓存从此再也写不进去，增量分析静默失效（每月重复付费）。
-        os.makedirs(_MONTH_CACHE_DIR, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"_created": time.time(), **payload}, f, ensure_ascii=False)
-        os.replace(tmp, path)
-    except OSError as e:
-        _warn_write_failure("月份缓存", path, e)
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-
-
-def _record_month_usage(chat_hash: str, keys: "Iterable[str]") -> None:
-    """把这一批用到的月份缓存记进该聊天的 manifest，供级联清理做引用计数。
-
-    调用方按"一次分析"批量传入（见 _analyze_periods）：原先每完成一个月就
-    「读 manifest → 改 → 写回」，24 个月就是 48 次文件 I/O，而写进去的内容
-    只是同一个集合在变大。现在整个维度只读一次、写一次。
-    """
-    if not _MONTH_CACHE_DIR or not chat_hash:
-        return
-    new_keys = set(keys)
-    if not new_keys:
-        return
-    path = _manifest_path(chat_hash)
-    name = os.path.basename(path)
-    with _MONTH_CACHE_LOCK:
-        data: dict = {}
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                data = loaded
-        except (OSError, json.JSONDecodeError):
-            pass
-        merged = set(data.get("months") or [])
-        merged |= new_keys
-        data["months"] = sorted(merged)
-        data["updated"] = time.time()
-        # setdefault 语义：绝对上限看的是"首次创建"，重写 manifest 不该把它续期。
-        # 重排到最前面写，让清理任务只扫文件头就能取到（见 webapp.store.read_created_at）。
-        data["_created"] = data.get("_created") or time.time()
-        payload = {"_created": data.pop("_created"), **data}
-        tmp = f"{path}.tmp"
-        try:
-            # 同 _write_month_cache：manifest 写不进去 = 这些月份文件会变成"无引用"，
-            # 宽限期后被孤儿回收删掉，增量分析白跑。
-            os.makedirs(_MONTH_CACHE_DIR, exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False)
-            os.replace(tmp, path)
-        except OSError as e:
-            # manifest 写不进去同样只影响"重新导出时能否复用历史月份"，
-            # 但会让增量分析静默失效（每次都全量付费），所以也要出声
-            _warn_write_failure("月份缓存 manifest", path, e)
-            _MANIFEST_KEYS.pop(name, None)
-        else:
-            _MANIFEST_KEYS[name] = (os.path.getmtime(path), set(data["months"]))
-
-
-def purge_month_cache(chat_hash: str) -> int:
-    """删除该聊天的 manifest，并回收不再被任何 manifest 引用的月份缓存。
-
-    这里必须带 **宽限期**：上传新文件时会立刻触发本函数，而"新文件其实是同一段
-    对话又多了几个月"恰恰是最需要复用月份缓存的场景——立刻删除会让增量分析失效。
-    因此只回收"无引用 **且** 已超过 MONTH_CACHE_GRACE_SECONDS 未被动过"的文件；
-    换成完全不同的对话时，旧的月份文件也会在宽限期后被 sweep_orphan_month_cache 收走。
-    """
-    if not _MONTH_CACHE_DIR or not chat_hash:
-        return 0
-    path = _manifest_path(chat_hash)
-    name = os.path.basename(path)
-
-    removed = 0
-    with _MONTH_CACHE_LOCK:
-        mine = _manifest_keys_locked(name)
-        others = _referenced_keys_locked(exclude=name)
-        now = time.time()
-        for key in mine - others:
-            target = month_cache_path(key)
-            try:
-                if now - os.path.getmtime(target) < MONTH_CACHE_GRACE_SECONDS:
-                    continue  # 宽限期内：留给增量分析复用
-                os.remove(target)
-                removed += 1
-            except OSError:
-                pass
-    try:
-        os.remove(path)
-    except OSError:
-        pass
-    with _MONTH_CACHE_LOCK:
-        _MANIFEST_KEYS.pop(name, None)
-    return removed
-
-
-def _manifest_keys_locked(name: str) -> set:
-    """（调用方须持有 _MONTH_CACHE_LOCK）单个 manifest 引用的月份 key 集合
-
-    带 mtime 缓存：manifest 只由本模块写，写路径会同步刷缓存，所以命中时直接用。
-    """
-    path = os.path.join(_MONTH_CACHE_DIR, name)
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        _MANIFEST_KEYS.pop(name, None)
-        return set()
-    cached = _MANIFEST_KEYS.get(name)
-    if cached is not None and cached[0] == mtime:
-        return cached[1]
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            keys = set(json.load(f).get("months") or [])
-    except (OSError, json.JSONDecodeError):
-        keys = set()
-    _MANIFEST_KEYS[name] = (mtime, keys)
-    return keys
-
-
-def _referenced_keys_locked(exclude: str = "") -> set:
-    """（调用方须持有 _MONTH_CACHE_LOCK）所有 manifest 引用到的月份 key"""
-    keys: set = set()
-    try:
-        names = os.listdir(_MONTH_CACHE_DIR)
-    except OSError:
-        return keys
-    live = {n for n in names if n.startswith("manifest_")}
-    for name in live:
-        if name == exclude:
-            continue
-        keys |= _manifest_keys_locked(name)
-    # 目录里已经没有的 manifest，其缓存条目顺手清掉，避免随历史会话无限增长
-    if len(_MANIFEST_KEYS) > len(live):
-        for stale in [n for n in _MANIFEST_KEYS if n not in live]:
-            _MANIFEST_KEYS.pop(stale, None)
-    return keys
-
-
-def sweep_orphan_month_cache() -> int:
-    """回收"已无 manifest 引用且超过宽限期"的月份缓存（定期清理时调用）"""
-    if not _MONTH_CACHE_DIR:
-        return 0
-    removed = 0
-    with _MONTH_CACHE_LOCK:
-        referenced = _referenced_keys_locked()
-        now = time.time()
-        try:
-            names = os.listdir(_MONTH_CACHE_DIR)
-        except OSError:
-            return 0
-        for name in names:
-            if not name.startswith("month_") or not name.endswith(".json"):
-                continue
-            key = name[len("month_") : -len(".json")]
-            if key in referenced:
-                continue
-            target = os.path.join(_MONTH_CACHE_DIR, name)
-            try:
-                if now - os.path.getmtime(target) >= MONTH_CACHE_GRACE_SECONDS:
-                    os.remove(target)
-                    removed += 1
-            except OSError:
-                continue
-    return removed
 
 
 def thinking_budget_warnings() -> list[str]:

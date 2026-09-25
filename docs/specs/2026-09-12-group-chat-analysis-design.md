@@ -71,6 +71,9 @@
 - `analyzer/deepseek_client.py`：`_build_dialog` / `_message_line` / `_fit_lines` / `_conversation_stats` /
   `_short_time` / `_analyze_periods` / `_analyze_person` / `analyze_*`。
   （这些函数的源码进私聊指纹，改一处 = 全量缓存作废，见 I4。）
+  > 2026-09 更新：这些函数仍在"不动清单"里，但**位置变了**——前 5 个已随对话构建整体搬到
+  > `analyzer/dialog.py`（纯搬迁，`PROMPT_FINGERPRINT` 逐字节未变，由 pin 用例钉住）。
+  > 要改它们请去那个文件；`deepseek_client` 只是再导出。
 - `analyzer/prompts.py`：5 个既有 `SYSTEM_PROMPT_*` 文本与 `_INPUT_NOTES` / `_OBSERVER_CREED`。
 - 7 个私聊模板：除 `base.html` 的加法式条件外不改。
 - `web/static/js/charts.js` / `analyze.js`：既有函数不改（只新增文件）。
