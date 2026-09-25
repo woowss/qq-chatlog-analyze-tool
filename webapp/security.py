@@ -27,7 +27,17 @@ import threading
 import time
 from urllib.parse import urlparse
 
-from flask import abort, current_app, make_response, redirect, render_template, request, session, url_for
+from flask import (
+    abort,
+    current_app,
+    jsonify,
+    make_response,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 
 from config import ACCESS_PASSWORD, ALLOWED_ORIGINS, FLASK_HOST, LOGIN_MAX_ATTEMPTS, LOGIN_WINDOW_SECONDS
 from analyzer.logger import get_logger
@@ -221,6 +231,25 @@ def _is_loopback() -> bool:
     return (FLASK_HOST or "").strip().lower() in ("127.0.0.1", "localhost", "::1")
 
 
+def wants_json() -> bool:
+    """该请求是否期望 JSON 响应（AJAX / fetch）。
+
+    同一个口径服务两处：上传接口回 302 还是回 JSON，以及**会话过期时该回 401
+    还是回 302**。后者必须是 401——浏览器里的 jQuery 会静默跟随 302 去拿登录页，
+    于是"请求成功、返回了一页 HTML"：发起分析的那条路径会报"未知响应格式"，
+    轮询任务的那条路径读到 `s.status === undefined` 便继续排下一次轮询，
+    **静默无限轮询**下去。两种症状都像"服务坏了"，真实原因只是会话过期。
+
+    `/api/` 前缀一律算期望 JSON，不依赖客户端有没有声明——脚本调用方常常不带
+    Accept，而它们最需要的是一个能判定的状态码。
+    """
+    if request.path.startswith("/api/"):
+        return True
+    return request.headers.get("X-Requested-With") == "fetch" or "application/json" in (
+        request.headers.get("Accept") or ""
+    )
+
+
 def require_login():
     """未登录时重定向到登录页；未设置口令则不启用（仅限回环绑定）"""
     if not ACCESS_PASSWORD:
@@ -239,6 +268,17 @@ def require_login():
         return None
     if session.get("auth_ok"):
         return None
+    if wants_json():
+        logger.info("API 请求遇到过期会话，回 401: %s %s", request.method, request.path)
+        return (
+            jsonify(
+                {
+                    "error": "会话已过期（长期未操作会被自动回收），请刷新页面（F5）重新登录",
+                    "auth": False,
+                }
+            ),
+            401,
+        )
     return redirect(url_for("login", next=request.path or "/"))
 
 

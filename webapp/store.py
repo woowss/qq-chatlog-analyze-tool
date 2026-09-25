@@ -573,6 +573,11 @@ def _write_cache(dimension: str, chat_hash: str, result) -> None:
     tmp = f"{path}.tmp"
     payload = {"_created": time.time(), "result": result}
     try:
+        # 目录必须在这里补建，不能只在 create_app() 里建一次就假定它永远在：
+        # README 教用户"删掉 ai_cache/ 即可彻底清除数据"，而服务可能还开着——
+        # 那种情况下这里不补目录，此后**每一次**写入都会静默失败，
+        # 用户以为在命中缓存，实际每个月、每个维度都在重复付费（只有日志知道）。
+        os.makedirs(AI_CACHE_DIR, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
         os.replace(tmp, path)

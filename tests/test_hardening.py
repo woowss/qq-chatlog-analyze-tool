@@ -489,6 +489,98 @@ class TestLoginThrottle(unittest.TestCase):
                 securitymod._record_login_failure("198.51.100.7")
             self.assertFalse(securitymod._login_throttle_ok("198.51.100.7"))
 
+    def test_write_cache_survives_a_deleted_cache_dir(self):
+        """README 教用户"删掉 ai_cache/ 即可彻底清除数据"，而服务可能还开着。
+
+        缓存目录被删后写入方必须自愈：不补目录的后果不是"少一个文件"，而是此后
+        **每一次**写入都静默失败——用户以为在命中缓存，实际每个月、每个维度都在
+        重复付费，界面上完全看不出来。
+        """
+        import shutil
+
+        storemod._write_cache("emotion", "hashNoDir", {"a": 1})
+        shutil.rmtree(storemod.AI_CACHE_DIR, ignore_errors=True)
+        self.assertFalse(os.path.isdir(storemod.AI_CACHE_DIR), "前提：目录确实没了")
+        try:
+            storemod._write_cache("emotion", "hashNoDir", {"a": 2})
+            path = storemod._cache_path("emotion", "hashNoDir")
+            self.assertTrue(os.path.exists(path), "缓存目录被删后必须自动重建")
+            self.assertEqual(storemod._read_cache("emotion", "hashNoDir"), {"a": 2})
+        finally:
+            storemod._purge_chat_caches("hashNoDir")
+
+    def test_month_cache_survives_a_deleted_cache_dir(self):
+        """月份缓存与 manifest 同理：写不进去就等于增量分析整体失效。"""
+        import shutil
+
+        from analyzer import deepseek_client as dc
+
+        with tempfile.TemporaryDirectory() as d:
+            cache = os.path.join(d, "ai_cache")
+            dc.configure_month_cache(cache)
+            try:
+                dc._write_month_cache("nodir0000001", {"x": 1})
+                dc._record_month_usage("hashNoDirChat", ["nodir0000001"])
+                shutil.rmtree(cache, ignore_errors=True)
+
+                dc._write_month_cache("nodir0000002", {"x": 2})
+                dc._record_month_usage("hashNoDirChat", ["nodir0000002"])
+
+                self.assertTrue(os.path.isdir(cache), "月份缓存目录必须自愈重建")
+                self.assertEqual(dc._read_month_cache("nodir0000002"), {"x": 2})
+                self.assertIn("nodir0000002", json.load(open(dc._manifest_path("hashNoDirChat")))["months"])
+            finally:
+                dc.configure_month_cache("")
+
+
+class TestExpiredSessionResponses(unittest.TestCase):
+    """会话过期时，API 与页面要走不同的响应形态——混用会让前端"看起来像服务坏了"。
+
+    反向验证：把 security.require_login 里的 wants_json() 分支删掉，
+    前两条用例立刻变红（它们会拿到 302 而不是 401）。
+    """
+
+    def setUp(self):
+        import app as appmod
+
+        self.client = appmod.app.test_client()
+
+    def test_api_get_with_expired_session_returns_401_json(self):
+        from webapp import security as securitymod
+
+        with mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"):
+            r = self.client.get("/api/analyze-job/deadbeef")
+        self.assertEqual(r.status_code, 401, "API 不能回 302：jQuery 会静默跟随拿到一页登录表单")
+        self.assertNotEqual(r.status_code, 302)
+        body = r.get_json()
+        self.assertTrue(body.get("auth") is False)
+        self.assertIn("刷新", body.get("error", ""))
+
+    def test_api_post_with_expired_session_returns_401_json(self):
+        from webapp import security as securitymod
+
+        with mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"):
+            r = self.client.post("/api/analyze/emotion")
+        self.assertEqual(r.status_code, 401)
+        self.assertIn("error", r.get_json())
+
+    def test_ajax_upload_with_expired_session_returns_401_json(self):
+        """上传页的表单提交是 fetch + X-Requested-With，同样不该收到 HTML 登录页"""
+        from webapp import security as securitymod
+
+        with mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"):
+            r = self.client.post("/upload", headers={"X-Requested-With": "fetch"})
+        self.assertEqual(r.status_code, 401)
+
+    def test_plain_page_request_still_redirects_to_login(self):
+        """浏览器直接访问页面时仍应 302 到登录页——这条不能被上面的改动误伤"""
+        from webapp import security as securitymod
+
+        with mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"):
+            r = self.client.get("/dashboard")
+        self.assertEqual(r.status_code, 302)
+        self.assertIn("/login", r.headers.get("Location", ""))
+
 
 class TestHardeningMisc(unittest.TestCase):
     def test_session_cookie_flags(self):

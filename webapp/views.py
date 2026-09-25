@@ -26,7 +26,7 @@ from config import LOG_REDACT_NAMES, MAX_CONTENT_LENGTH, UPLOAD_FOLDER
 from analyzer.deepseek_client import is_api_configured
 from analyzer.logger import get_logger, mask_name
 from webapp import store
-from webapp.security import BYPASS_ENDPOINTS, _guard_post
+from webapp.security import BYPASS_ENDPOINTS, _guard_post, wants_json
 from web import ASSET_VERSION
 
 logger = get_logger("app")
@@ -223,10 +223,12 @@ def upload():
 
 
 def _wants_json() -> bool:
-    """AJAX 上传（带选中的导出目录）走 JSON 响应，普通表单提交仍走 302 跳转"""
-    return request.headers.get("X-Requested-With") == "fetch" or "application/json" in (
-        request.headers.get("Accept") or ""
-    )
+    """AJAX 上传（带选中的导出目录）走 JSON 响应，普通表单提交仍走 302 跳转。
+
+    判定口径与"会话过期时该回 401 还是 302"共用 security.wants_json()，
+    两处必须一致：否则会出现"上传接口认为自己在回 JSON、而登录守卫却给它 302"。
+    """
+    return wants_json()
 
 
 def upload_too_large(error):

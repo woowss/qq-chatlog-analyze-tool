@@ -654,6 +654,9 @@ def _write_month_cache(key: str, result: dict) -> None:
         # （见 webapp.store.read_created_at）。
         payload = dict(result) if isinstance(result, dict) else {"result": result}
         payload.pop("_created", None)
+        # 目录可能被用户按 README 的指引删掉来"彻底清除数据"，而服务还开着：
+        # 这里不补目录，月份缓存从此再也写不进去，增量分析静默失效（每月重复付费）。
+        os.makedirs(_MONTH_CACHE_DIR, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"_created": time.time(), **payload}, f, ensure_ascii=False)
         os.replace(tmp, path)
@@ -698,6 +701,9 @@ def _record_month_usage(chat_hash: str, keys: "Iterable[str]") -> None:
         payload = {"_created": data.pop("_created"), **data}
         tmp = f"{path}.tmp"
         try:
+            # 同 _write_month_cache：manifest 写不进去 = 这些月份文件会变成"无引用"，
+            # 宽限期后被孤儿回收删掉，增量分析白跑。
+            os.makedirs(_MONTH_CACHE_DIR, exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False)
             os.replace(tmp, path)

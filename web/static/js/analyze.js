@@ -162,9 +162,12 @@ function loadAnalysis(dim, cb) {
         var parsed = null;
         try { parsed = raw ? JSON.parse(raw) : null; } catch (e) { parsed = null; }
         if (parsed) { cb(parsed); return; }
+        // 服务端给了人话就直接用它（例如会话过期时的"请刷新页面重新登录"），
+        // 比报一个裸 HTTP 状态码更可执行。
+        var serverMsg = xhr && xhr.responseJSON && xhr.responseJSON.error;
         if (status && status !== 404) {
-            showLoadWarning('读取分析结果失败（HTTP ' + status + '），请刷新页面重试；'
-                + '已生成的结果不会丢失，重跑也会命中缓存。');
+            showLoadWarning(serverMsg || ('读取分析结果失败（HTTP ' + status + '），请刷新页面重试；'
+                + '已生成的结果不会丢失，重跑也会命中缓存。'));
         }
         cb(null);
     });
