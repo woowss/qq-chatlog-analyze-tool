@@ -24,9 +24,11 @@ thinking_enabled / _save_stats ...）——测试打桩请打在 webapp.store �
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 from collections import deque
+from typing import Optional
 
 from flask import session
 
@@ -235,6 +237,49 @@ def vision_enabled() -> bool:
     return vision.VISION_ENABLED and vision.VISION_MAX_PER_MONTH > 0
 
 
+#: `_created` 的有界扫描窗口：文件头与文件尾各读这么多字节。
+#:
+#: 为什么不干脆整份 json.load：这个值唯一的消费方是清理任务，而清理挂在
+#: before_request 上（每小时随请求去抖触发一次），ai_cache/ 里体积最大的恰好就是
+#: month_*.json（整月分析结果）。为了取一个浮点数把最敏感也最大的文件在请求线程里
+#: 解析一遍，是拿用户的响应时间换一件本可以只看几十字节的事。
+#:
+#: 写入方都刻意把 `_created` 放在**最前面**（维度缓存 / 统计 / 图片摘要 / manifest），
+#: 但历史遗留的月份缓存把它写在了**末尾**，所以两头各扫一次才能全覆盖。
+_CREATED_WINDOW = 8192
+_CREATED_RE = re.compile(rb'"_created"\s*:\s*([0-9.eE+-]+)')
+
+
+def read_created_at(path: str) -> Optional[float]:
+    """取缓存文件的首次写入时间；没有或读不到就返回 None，由调用方决定回退口径。
+
+    头部命中时要求匹配**没有贴着缓冲区末尾**：贴着就说明数值被窗口切断了，
+    此时按截断前的部分解析会算出一个错误的时间（可能把新文件判成远古文件而提前删除）。
+    尾部窗口锚在 EOF，取到的值必然是完整的。
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            head = f.read(_CREATED_WINDOW)
+            tail = b""
+            if size > _CREATED_WINDOW:
+                f.seek(size - _CREATED_WINDOW)
+                tail = f.read(_CREATED_WINDOW)
+    except OSError:
+        return None
+    for blob, anchored_end in ((head, False), (tail, True)):
+        match = _CREATED_RE.search(blob)
+        if not match:
+            continue
+        if not anchored_end and match.end() >= len(blob):
+            continue  # 被窗口切断：交给尾部窗口处理
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
 def _stats_path(chat_hash: str) -> str:
     return os.path.join(STATS_CACHE_DIR, f"stats_{chat_hash}.json")
 
@@ -269,6 +314,10 @@ def _load_stats(chat_hash: str, expect_mode: str = STATS_MODE_PRIVATE):
         os.utime(_stats_path(chat_hash), None)
     except OSError:
         pass
+    # _created 是"绝对 90 天"硬上限的依据，只给清理任务看：命中续期 mtime 之后，
+    # 判定过期全靠它。摘掉再返回，调用方拿到的形状与加这个字段之前完全一致
+    # （与月份缓存的读取口径相同，见 deepseek_client._read_month_cache）。
+    data.pop("_created", None)
     return data
 
 
@@ -279,11 +328,17 @@ def _save_stats(chat_hash: str, stats: dict, mode: str = STATS_MODE_PRIVATE) -> 
     path = _stats_path(chat_hash)
     tmp = f"{path}.tmp"
     payload = dict(stats)
+    payload.pop("_created", None)  # 不让调用方塞进来的值生效：首次创建时间只认盘上那份
     payload["mode"] = mode
     payload["_v"] = GROUP_STATS_SCHEMA_VERSION if mode == STATS_MODE_GROUP else STATS_SCHEMA_VERSION
+    # 统计是确定性的，重算/补算（词频懒算后回写）都会重写同一个文件；
+    # 绝对上限看的是**首次**创建时间，所以这里必须保留盘上已有的值——
+    # 否则"每次查看词频就把 90 天硬上限往后推一格"，与 README 的保留承诺相反。
+    created = read_created_at(path) or time.time()
     try:
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
+            # _created 放最前面，让清理任务只扫文件头就能拿到它（见 read_created_at）
+            json.dump({"_created": created, **payload}, f, ensure_ascii=False)
         os.replace(tmp, path)
     except OSError as e:
         logger.warning("统计缓存写入失败: %s", e)

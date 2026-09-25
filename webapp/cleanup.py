@@ -28,7 +28,6 @@
 "长期开着不上传"的实例又漏了。现在同时由启动与每个请求（去抖）触发。
 """
 
-import json
 import os
 import time
 
@@ -45,19 +44,21 @@ from config import (
 from analyzer.deepseek_client import sweep_orphan_month_cache
 from analyzer.logger import get_logger
 from webapp.security import BYPASS_ENDPOINTS
+from webapp.store import read_created_at
 
 logger = get_logger("app")
 
 
 def _cache_created_at(path: str) -> float:
-    """缓存的创建时间：新格式写在 _created 字段里，旧格式回退到 mtime"""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict) and isinstance(data.get("_created"), (int, float)):
-            return float(data["_created"])
-    except (OSError, json.JSONDecodeError):
-        pass
+    """缓存的创建时间：新格式写在 _created 字段里，旧格式回退到 mtime。
+
+    取法走 store 的有界扫描（只读文件头/尾各 8KB），不在这里整份 json.load：
+    清理是挂在 before_request 上的，而 ai_cache/ 里最大的就是那些含整月结果的
+    month_*.json——为了一个时间戳把它们全量解析，代价由碰巧触发清理的那个请求付。
+    """
+    created = read_created_at(path)
+    if created is not None:
+        return created
     try:
         return os.path.getmtime(path)
     except OSError:

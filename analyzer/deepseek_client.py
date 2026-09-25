@@ -650,10 +650,12 @@ def _write_month_cache(key: str, result: dict) -> None:
         # _created 是"绝对 90 天"硬上限的依据（cleanup 读它）。缺了它就只能按 mtime 判，
         # 而 mtime 在每次命中时被续期（见 _read_month_cache）——含聊天原句引用的这族
         # 缓存会因此无限期留存。读侧会把它 pop 掉，调用方拿到的结果不变。
+        # 放在**最前面**写：清理任务只扫文件头就能取到，不必整份解析这些最敏感的月份文件
+        # （见 webapp.store.read_created_at）。
         payload = dict(result) if isinstance(result, dict) else {"result": result}
-        payload.setdefault("_created", time.time())
+        payload.pop("_created", None)
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
+            json.dump({"_created": time.time(), **payload}, f, ensure_ascii=False)
         os.replace(tmp, path)
     except OSError as e:
         _warn_write_failure("月份缓存", path, e)
@@ -690,12 +692,14 @@ def _record_month_usage(chat_hash: str, keys: "Iterable[str]") -> None:
         merged |= new_keys
         data["months"] = sorted(merged)
         data["updated"] = time.time()
-        # setdefault：绝对上限看的是"首次创建"，重写 manifest 不该把它续期
-        data.setdefault("_created", time.time())
+        # setdefault 语义：绝对上限看的是"首次创建"，重写 manifest 不该把它续期。
+        # 重排到最前面写，让清理任务只扫文件头就能取到（见 webapp.store.read_created_at）。
+        data["_created"] = data.get("_created") or time.time()
+        payload = {"_created": data.pop("_created"), **data}
         tmp = f"{path}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False)
+                json.dump(payload, f, ensure_ascii=False)
             os.replace(tmp, path)
         except OSError as e:
             # manifest 写不进去同样只影响"重新导出时能否复用历史月份"，
