@@ -155,6 +155,92 @@ class TestParserRobustness(unittest.TestCase):
         self.assertEqual(chat.self_uid, "u_self")
         self.assertEqual(chat.messages[0].sender_uid, "u_self")
 
+    def test_placeholder_sender_that_comes_first_does_not_become_the_other(self):
+        """文件里先出现的占位 sender 不许顶掉真实对话方
+
+        旧实现取"文件中第一个非自己的 sender"，而导出文件常混入占位 sender
+        （name 形如"系统消息"、uid 形如"未知…"）：它只要排在真实对话方之前，
+        "对方"就指错人——条数、回复速度、锐评全部静默失真，界面看不出任何异常。
+        现在按统计口径下的发言条数定，所以这条用例钉的是"条数多的一方赢，
+        与出现顺序无关"。
+
+        反向验证：把 load_chat 里定 other_uid 的那段改回"取第一个非自己"，
+        本条立刻变红。
+        """
+        data = {
+            "chatInfo": {"name": "某人", "selfUid": "u_self", "selfName": "我"},
+            "statistics": {
+                "senders": [
+                    {"uid": "未知用户", "name": "系统消息"},
+                    {"uid": "u_self", "name": "我"},
+                    {"uid": "u_other", "name": "某人"},
+                ]
+            },
+            "messages": [
+                # 占位 sender 排在**最前面**，但只有 1 条；真实对话方在后面且更多
+                {
+                    "id": "1",
+                    "timestamp": 1704067200000,
+                    "time": "2024-01-01 08:00:00",
+                    "sender": {"uid": "未知用户", "name": "系统消息"},
+                    "content": "占位",
+                },
+                {
+                    "id": "2",
+                    "timestamp": 1704067260000,
+                    "time": "2024-01-01 08:01:00",
+                    "sender": {"uid": "u_other", "name": "某人"},
+                    "content": "真实对话方一",
+                },
+                {
+                    "id": "3",
+                    "timestamp": 1704067320000,
+                    "time": "2024-01-01 08:02:00",
+                    "sender": {"uid": "u_other", "name": "某人"},
+                    "content": "真实对话方二",
+                },
+            ],
+        }
+        chat = load_chat(_write_chat(data))
+        self.assertEqual(len(chat.sender_counts()), 2, "前提：除自己外有两位发言者")
+        self.assertEqual(chat.other_uid, "u_other", "发言更多的一方才是「对方」，与出现顺序无关")
+
+    def test_consumers_do_not_mutate_the_shared_counts_cache(self):
+        """消费点不许就地改 `sender_counts()` 返回的那份 dict
+
+        它是**缓存对象本身**（三处消费点共用，见 ChatData.sender_counts 的注释）。
+        就地改（"把 self 摘掉再看最大"那种写法）会污染后续判定，而且症状极其隐蔽：
+        多人防线与"谁是对方"会按被改过的计数工作。这里在整份加载流程跑完之后，
+        用完全独立的遍历重算一遍条数，与缓存对象比对。
+
+        反向验证：在 load_chat 的 any 一处写成 `counts.pop(self_uid, None)`，本条变红。
+        """
+        data = {
+            "chatInfo": {"name": "某人", "selfUid": "u_self", "selfName": "我"},
+            "statistics": {"senders": [{"uid": "u_self", "name": "我"}, {"uid": "u_other", "name": "某人"}]},
+            "messages": [
+                {
+                    "id": str(i),
+                    "timestamp": 1704067200000 + i * 60000,
+                    "time": "2024-01-01 08:00:00",
+                    "sender": {"uid": "u_self" if i % 2 else "u_other", "name": "x"},
+                    "content": f"第 {i} 条",
+                }
+                for i in range(1, 7)
+            ],
+        }
+        chat = load_chat(_write_chat(data))
+
+        expected: dict = {}
+        for m in chat.messages:
+            if m.sender_uid and is_statistical(m):
+                expected[m.sender_uid] = expected.get(m.sender_uid, 0) + 1
+        self.assertEqual(
+            chat.sender_counts(),
+            expected,
+            "加载流程的消费点改动了共享的计数缓存：多人防线与「谁是对方」会按被污染的计数工作",
+        )
+
 
 class TestResponseTime(unittest.TestCase):
     def test_only_cross_sender_gaps_counted(self):

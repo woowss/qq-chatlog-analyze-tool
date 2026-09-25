@@ -429,6 +429,29 @@ class TestCacheAtomicity(unittest.TestCase):
             finally:
                 dc.configure_month_cache("")
 
+    def test_stats_write_survives_the_cache_path_being_a_file(self):
+        """`stats_cache/` 那个位置被一个同名文件占住时：记一条日志就算了，不许抛给请求层
+
+        与上面两条同一个主题（README 教用户直接删这些目录），但失败形态不同：目录删掉
+        可以自愈重建，位置被文件占住则**建不出来**。这条路径曾在 try 外面
+        （makedirs 先于 try），FileExistsError 会一路穿到请求层，表现为"统计页 500"——
+        与真实原因毫不相干的症状。
+
+        反向验证：把 _save_stats 里的 os.makedirs 挪回 try 外面，本条立刻变红。
+        """
+        from webapp import store as storemod
+
+        with tempfile.TemporaryDirectory() as d:
+            blocked = os.path.join(d, "stats_cache")
+            with open(blocked, "w", encoding="utf-8") as f:
+                f.write("这个位置被一个文件占住了")
+            with mock.patch.object(storemod, "STATS_CACHE_DIR", blocked):
+                try:
+                    storemod._save_stats("hashBlocked", {"overview": {"a": 1}})
+                except OSError as e:  # pragma: no cover - 失败即说明修复被回退
+                    self.fail(f"写统计缓存失败时不该把异常抛给调用方/请求层：{e}")
+            self.assertTrue(os.path.isfile(blocked), "我们不该为了写入去删掉用户占住这个位置的文件")
+
 
 class TestLoginThrottle(unittest.TestCase):
     """绑定局域网时口令不能无限爆破"""

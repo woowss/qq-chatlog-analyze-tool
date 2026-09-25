@@ -329,7 +329,6 @@ def _load_stats(chat_hash: str, expect_mode: str = STATS_MODE_PRIVATE):
 def _save_stats(chat_hash: str, stats: dict, mode: str = STATS_MODE_PRIVATE) -> None:
     if not chat_hash:
         return
-    os.makedirs(STATS_CACHE_DIR, exist_ok=True)
     path = _stats_path(chat_hash)
     tmp = f"{path}.tmp"
     payload = dict(stats)
@@ -341,6 +340,11 @@ def _save_stats(chat_hash: str, stats: dict, mode: str = STATS_MODE_PRIVATE) -> 
     # 否则"每次查看词频就把 90 天硬上限往后推一格"，与 README 的保留承诺相反。
     created = read_created_at(path) or time.time()
     try:
+        # 目录补建必须在 try 里、与 _write_cache 同一层：README 教用户"删掉 stats_cache/
+        # 即可彻底清除数据"，而服务可能还开着（重建的目录随后被删、或那个位置被一个
+        # 同名文件占住）。放在 try 外面时 FileExistsError 会一路穿到请求层，
+        # 变成"统计页 500"这种与真实原因毫不相干的症状。
+        os.makedirs(STATS_CACHE_DIR, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
             # _created 放最前面，让清理任务只扫文件头就能拿到它（见 read_created_at）
             json.dump({"_created": created, **payload}, f, ensure_ascii=False)
