@@ -71,6 +71,15 @@ def inspect(path: str, show_names: bool) -> int:
     # ---------- 1. 格式 ----------
     print("\n【格式】")
     print("  顶层字段：", "、".join(sorted(raw)) or "<空>")
+    # 不是导出文件就先说清楚再退出。下面的 load_chat 会抛 ValueError，而那个异常在
+    # "群聊被拒收就临时放行再试一次"的分支里会被再抛一次、直接变成 Traceback——
+    # 用户拿着一份不确定的文件来体检，看到的应该是一句人话。
+    missing = [k for k in ("chatInfo", "messages") if k not in raw]
+    if missing:
+        print("\n【结论】")
+        print(f"  这不是 QQChatExporter 的导出文件：缺少顶层字段 {'、'.join(missing)}")
+        print("  解析器要求 chatInfo 与 messages 同时存在；请确认选对了文件或重新导出。")
+        return 1
     info = raw.get("chatInfo") or {}
     print(f"  chatInfo.type = {info.get('type') or '<缺失>'}（group 表示导出器自报群聊）")
     print(
@@ -115,10 +124,16 @@ def inspect(path: str, show_names: bool) -> int:
         chat = qp.load_chat(path)  # 用当前配置真实跑一遍（可能抛"群聊拒收"）
         parse_note = "按当前配置解析成功"
     except ValueError as e:
-        # 拒收是预期结果之一：把闸门临时打开再解析一次，才能看清这份文件的全貌
+        # 拒收是预期结果之一：把闸门临时打开再解析一次，才能看清这份文件的全貌。
+        # 但"再试一次"也可能失败（例如双方身份无法确定），那时同样要给人话而不是堆栈。
         parse_note = f"当前配置下拒收：{e}"
-        with _ready(True):
-            chat = qp.load_chat(path)
+        try:
+            with _ready(True):
+                chat = qp.load_chat(path)
+        except ValueError as e2:
+            print("\n【结论】")
+            print(f"  这份文件无法解析：{e2}")
+            return 1
     elapsed_parse = time.time() - t0
     mode = qp.group_chat_mode()
     offenders = qp._multi_party_offenders(chat)

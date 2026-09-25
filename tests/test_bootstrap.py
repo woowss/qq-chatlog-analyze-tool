@@ -71,6 +71,31 @@ class TestDataDirBootstrap(unittest.TestCase):
         self.assertTrue(Path(first, "tmp").is_dir(), "tempfile 根应指向数据目录下的 tmp/")
         self.assertTrue(os.access(first, os.W_OK))
 
+    def test_ambient_security_env_is_neutralized(self):
+        """开发机 shell 里的环境变量不能改变被测行为
+
+        实测过的坑：shell 里留着 ACCESS_PASSWORD=s3cret，505 条里红了 78 条，清一色是
+        "页面被跳到登录页"，与代码改动无关。所以 bootstrap 必须把这些清掉（= CI 的前提），
+        需要非默认值的用例自己显式打桩。
+        """
+        with mock.patch.dict(
+            os.environ,
+            {"ACCESS_PASSWORD": "s3cret", "QQCHAT_GROUP_CHAT": "off", "QQCHAT_MONTH_CACHE": "1"},
+        ):
+            cleared = _bootstrap.neutralize_ambient_env()
+        self.assertIn("ACCESS_PASSWORD", cleared)
+        self.assertIn("QQCHAT_GROUP_CHAT", cleared)
+        self.assertNotIn("ACCESS_PASSWORD", os.environ)
+        self.assertNotIn("QQCHAT_GROUP_CHAT", os.environ)
+        # 月份缓存被清掉之后由 bootstrap 定死为 0（不是留给 .env 决定）
+        bootstrap()
+        self.assertEqual(os.environ["QQCHAT_MONTH_CACHE"], "0")
+
+    def test_neutralize_reports_nothing_when_environment_is_clean(self):
+        for name in _bootstrap._AMBIENT_KEYS_TO_CLEAR:
+            os.environ.pop(name, None)
+        self.assertEqual(_bootstrap.neutralize_ambient_env(), [])
+
 
 class TestLlmNetworkGuard(unittest.TestCase):
     """真实 LLM 调用护栏：unittest 下同样要拦住没有 Key 的出网"""

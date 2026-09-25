@@ -157,11 +157,45 @@ def _drop_data_dir(path: str) -> None:
     shutil.rmtree(path, ignore_errors=True)
 
 
+#: 这些环境变量会改变**被测行为**，而 CI 上它们一个都不存在。开发机的 shell 里若留着
+#: 其中一个（例如为了本地跑带口令的实例而 export ACCESS_PASSWORD），整套用例会跟着变：
+#: 实测过一次——shell 里留着 `ACCESS_PASSWORD=s3cret`，505 条里红了 78 条，清一色是
+#: "页面被跳到登录页"，与任何代码改动都无关，很容易被误读成"这轮改动把应用改坏了"。
+#: 这里统一清掉，让"本机 = CI"成为**前提**，而不是靠开发者记得 unset。
+#: 需要非默认值的用例请显式打桩（登录/限流相关用例本来就是这么做的），
+#: 这样"这条用例依赖什么前提"写在用例里，而不是藏在环境里。
+_AMBIENT_KEYS_TO_CLEAR = (
+    "ACCESS_PASSWORD",  # 设了口令 → 所有页面都要登录
+    "ALLOWED_ORIGINS",  # 影响 POST 的 Origin 校验
+    "FLASK_HOST",  # 回环与否决定：非回环+无口令直接 503、Secure cookie 的 auto 判定
+    "QQCHAT_COOKIE_SECURE",  # Secure cookie 的显式覆盖
+    "LOG_REDACT_NAMES",  # 日志脱敏（有源码级守卫用例依赖默认开）
+    "QQCHAT_GROUP_CHAT",  # 私聊轨 / 群聊轨 / 两方归并——会整类改变断言
+    "QQCHAT_ALLOW_MULTI_PARTY",  # 上面那个的旧别名
+    "QQCHAT_FACE_IMAGES",  # 打开会影响习惯页/报告页的渲染
+    "QQCHAT_MEDIA_DIR",  # 影响"图片理解是否可用"
+    "QQCHAT_LOGIN_MAX_ATTEMPTS",  # 限流用例写死了默认值
+    "QQCHAT_LOGIN_WINDOW_SECONDS",
+    "QQCHAT_MONTH_CACHE",  # 下面会 setdefault 成 0（增量缓存会破坏"调用次数"断言的确定性）
+)
+
+
+def neutralize_ambient_env() -> list:
+    """清掉会改变被测行为的"环境类"变量；返回实际清掉的名字（供用例断言）
+
+    必须在 import config / webapp / analyzer **之前**调用：那些模块在 import 期就把值读走了
+    （这正是每个测试文件都要先 `from _bootstrap import bootstrap; bootstrap()` 的原因）。
+    """
+    return [name for name in _AMBIENT_KEYS_TO_CLEAR if os.environ.pop(name, None) is not None]
+
+
 def bootstrap() -> str:
     """准备数据目录并装护栏；返回本次进程的数据目录
 
     幂等：同一进程内多次调用只做一次（unittest discover 会 import 多个测试文件）。
     """
+    neutralize_ambient_env()
+
     data_dir = os.environ.get("QQCHAT_DATA_DIR", "").strip()
     if not data_dir:
         data_dir = _make_data_dir()
@@ -177,7 +211,9 @@ def bootstrap() -> str:
 
     # 月份缓存会跨用例复用同一份月份内容，使"调用次数"断言失去确定性；
     # 需要它的用例会自行开启并指向临时目录。
-    os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
+    # （用赋值而不是 setdefault：neutralize_ambient_env 已经把它清掉，这里要把值**定死**，
+    # 否则开发机 .env 里的 QQCHAT_MONTH_CACHE=1 会让同一批用例在本机红。）
+    os.environ["QQCHAT_MONTH_CACHE"] = "0"
 
     install_llm_network_guard()
     return data_dir

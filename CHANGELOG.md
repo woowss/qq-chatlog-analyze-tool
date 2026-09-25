@@ -24,6 +24,11 @@
   "一键全量"）允许发出的请求数，超限即中止剩余任务并保留已完成部分。按真正发出的
   HTTP 请求计（含重试），命中缓存的月份不计入。
 - **上传页不再加载 ECharts 与两个自有脚本**（那一页没有图表）。改为在真正画图的页面加载。
+- **`tools/inspect_chat.py` 面对非导出文件不再抛异常**：以前任何不是 QQChatExporter 导出的
+  文件都会走"群聊被拒收就临时放行再试一次"的分支，把同一个 `ValueError` 再抛一次变成
+  Traceback。而"不确定这份文件是什么格式"恰恰是这个工具最常见的用法，现在它会打印
+  "缺少顶层字段 chatInfo/messages" 并以退出码 1 结束（`tests/test_inspect_chat.py` 钉住契约：
+  私聊/群聊导出 → 0，坏文件 → 1 且不含 Traceback）。
 - `stats_cache/` 从此带 `_created` 时间戳：README 承诺的"绝对 90 天"此前对它不生效
   （只有滑动 30 天），因为该目录的缓存从不写这个字段、而命中又会续期 mtime。
   老的统计缓存仍可读（缺字段就按 mtime 判，与之前一致）。
@@ -63,6 +68,12 @@
 - 仓库卫生：`temp/` 进 `.gitignore`（它是本地 `ruff check .` 必红的根因，也是
   `git add -A` 会误收的本机杂物）；README 用例数、CONTRIBUTING 的 CI 矩阵与发布流程、
   群聊设计文档里重复的"（示例值）"等三处与现状不符的描述一并修正。
+- **测试不再受开发机 shell 的环境变量影响**：`tests/_bootstrap.py` 会先清掉
+  `ACCESS_PASSWORD` / `QQCHAT_GROUP_CHAT` / `LOG_REDACT_NAMES` 这类"会改变被测行为"的
+  环境变量（CI 上它们一个都不存在），并把月份缓存定死为关。踩到的实例：shell 里留着
+  `ACCESS_PASSWORD=s3cret` 时 505 条里红了 78 条，清一色是"页面被跳到登录页"，
+  与代码改动无关——很容易被误读成"这轮改动把应用改坏了"。需要非默认值的用例请显式打桩。
+- 新增 `tests/test_inspect_chat.py`（CLI 契约）与 `tests/test_bootstrap.py` 的两条环境隔离用例。
 
 ---
 
