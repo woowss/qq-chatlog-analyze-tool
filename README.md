@@ -223,6 +223,7 @@ QQ 的超级表情（吃糖、大怨种、菜汪之类）没有公开地址，�
 | `LLM_CALL_MIN_INTERVAL` | 官方 0.5 / 其它 3 | 两次调用最小间隔（秒） |
 | `LLM_MAX_DIALOG_CHARS` | 600000 | 单月对话文本上限（字符） |
 | `LLM_MAX_TOKENS_<维度>` | 32k / 锐评 49k | 按维度覆盖输出预算，如 `LLM_MAX_TOKENS_PROFILE=65536`；截断报错时调这里 |
+| `LLM_MAX_CALLS_PER_RUN` | 0（不限） | 一次运行（单维度或"一键全量"）允许发出的请求数上限，超限即中止剩余任务并保留已完成部分；按真正发出的请求计（含重试），命中缓存的月份不计入 |
 | `LLM_THINKING` | 官方端点开启 | `disabled` 关闭思考模式 |
 | `LLM_THINKING_DIMS` | 空 | 只对指定维度开启，逗号分隔 |
 | `LLM_PRICE_IN` / `LLM_PRICE_OUT` | 按模型内置 | 费用估算单价（元/百万 tokens） |

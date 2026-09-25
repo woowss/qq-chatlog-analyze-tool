@@ -37,6 +37,7 @@ from config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_MODEL,
     DEEPSEEK_BASE_URL,
+    env_int,
     env_number,
     parse_bool,
 )
@@ -186,6 +187,67 @@ def _set_cooldown(seconds: float) -> None:
 class QuotaExhaustedError(RuntimeError):
     """配额类致命错误：套餐耗尽/欠费，或 TPM 限流多次等待后仍未恢复。
     重试已无意义，上层应中止剩余任务并保留部分结果。"""
+
+
+# ---------------------------------------------------------------------------
+# 本次运行的调用次数硬上限（默认 0 = 不限）
+# ---------------------------------------------------------------------------
+# 存在理由是"意外花费"：月份级并发 + 成员画像按人计费，一旦参数配错（月数算错、
+# 群成员上限调得过大），一次点击就可能发出远超预期的付费请求，而界面上当时看不出异常。
+# 超限走既有的 QuotaExhaustedError 路径——中止剩余任务、已完成的部分照常保留
+# （月份级与成员级结果都已落盘，重跑不会重复付费）。
+#
+# 默认 0（不限）是刻意的：几年私聊 × 5 个维度本来就能上千次调用，给一个默认上限
+# 等于把正常用法掐断。想要护栏就在 .env 里设一个自己算得清的值。
+MAX_CALLS_PER_RUN = env_int("LLM_MAX_CALLS_PER_RUN", 0, 0, 1_000_000)
+
+_run_calls = 0
+_run_calls_lock = threading.Lock()
+#: 是否处在"一次运行"之内。上限只约束有明确起点与终点的运行；
+#: 直接调用 analyze_* 的脚本与工具没有这个边界，不该被它掐断（也没有"这次"可言）。
+_run_active = False
+
+
+def begin_run() -> None:
+    """开始一次分析运行：调用计数清零。
+
+    "一次运行" = 单个维度的分析，或"一键全量"的整个循环（后者只清零一次，
+    所以上限覆盖全部维度）。生产路径由 webapp.jobs 的两个入口调用。
+
+    计数是**进程级**的而不是线程局部的：月份调用发生在并发线程池里，线程局部计数
+    跨不过去。代价是同一进程内两个并发分析共享这一个上限——单机工具里这种并发很
+    少见，换来的是"无论怎么触发，总量都不会悄悄翻倍"。
+    """
+    global _run_calls, _run_active
+    with _run_calls_lock:
+        _run_calls = 0
+        _run_active = True
+
+
+def calls_used() -> int:
+    """本次运行已发出的请求数（供界面与排查读取）"""
+    with _run_calls_lock:
+        return _run_calls
+
+
+def _count_call() -> int:
+    """记一次即将发出的请求；超过 LLM_MAX_CALLS_PER_RUN 时抛出致命错误。
+
+    每次**真正发出的 HTTP 请求**都算一次（含限流/网络错误的重试）：那些重试同样
+    占用服务商配额，按"请求数"而不是"成功调用数"来卡才是花费上限该有的口径。
+    """
+    global _run_calls
+    with _run_calls_lock:
+        _run_calls += 1
+        used = _run_calls
+        active = _run_active
+    if active and MAX_CALLS_PER_RUN and used > MAX_CALLS_PER_RUN:
+        raise QuotaExhaustedError(
+            f"本次分析已发出 {used} 次请求，超过 LLM_MAX_CALLS_PER_RUN={MAX_CALLS_PER_RUN} 的上限，"
+            "剩余任务已中止。已完成的部分照常保留（月份级与成员级结果都已落盘，重跑不会重复付费）。"
+            "要跑完就把该值调大，或设为 0 关闭这道上限。"
+        )
+    return used
 
 
 def _is_plan_exhausted(e: Exception) -> bool:
@@ -858,6 +920,10 @@ def _request_with_retry(
     """
     tpm_hits = 0
     for attempt in range(max_attempts):
+        # 计费闸门放在 try **之外**：上限错误不能被下面的"错误分类与退避"当成网络抖动
+        # 去重试（那会白白多等几秒，还会把上限再撞几次）。重试循环里的每一次尝试
+        # 都算一次请求——限流重试同样占用服务商配额。
+        _count_call()
         try:
             _pace()
             resp = client.chat.completions.create(**build_params())

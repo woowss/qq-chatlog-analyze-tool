@@ -540,6 +540,63 @@ class TestQuotaAndThrottle(unittest.TestCase):
     def tearDown(self):
         self.dc.CALL_MIN_INTERVAL = self._orig_interval
 
+    def test_run_call_cap_aborts_and_resets(self):
+        """LLM_MAX_CALLS_PER_RUN 是花费上限：超限抛致命错误（走既有的中止路径）
+
+        反向验证：把 _count_call() 从 _request_with_retry 里删掉，本条立刻变红。
+        """
+        fake = mock.Mock()
+        fake.chat.completions.create.return_value = self._ok_resp()
+        with (
+            mock.patch.object(self.dc, "MAX_CALLS_PER_RUN", 2),
+            mock.patch.object(self.dc, "_get_client", return_value=fake),
+        ):
+            self.dc.begin_run()
+            self.dc._call_api("s", "u")
+            self.dc._call_api("s", "u")
+            with self.assertRaises(self.dc.QuotaExhaustedError):
+                self.dc._call_api("s", "u")
+            self.assertEqual(fake.chat.completions.create.call_count, 2, "超限后不该再发出请求")
+
+            # 新的一次运行：额度重新开始（否则第二次点击会被上一次的计数连坐）
+            self.dc.begin_run()
+            self.dc._call_api("s", "u")
+            self.assertEqual(fake.chat.completions.create.call_count, 3)
+
+    def test_run_call_cap_counts_retries_too(self):
+        """限流重试同样占用服务商配额，所以按"发出的请求数"计，而不是"成功调用数\""""
+        fake = mock.Mock()
+        fake.chat.completions.create.side_effect = [
+            self._err(429, "rate limit"),
+            self._ok_resp(),
+        ]
+        with (
+            mock.patch.object(self.dc, "MAX_CALLS_PER_RUN", 1),
+            mock.patch.object(self.dc, "_get_client", return_value=fake),
+        ):
+            self.dc.begin_run()
+            with self.assertRaises(self.dc.QuotaExhaustedError):
+                self.dc._call_api("s", "u", tpm_wait=0.01)
+            self.assertEqual(
+                fake.chat.completions.create.call_count,
+                1,
+                "第一次 429 已计 1 次，重试前就应被上限拦下（不再发出第二个请求）",
+            )
+
+    def test_run_call_cap_is_inactive_outside_a_run(self):
+        """上限属于"一次运行"：直接调用 analyze_*/_call_api 的脚本没有这个边界，
+        不该被它掐断（webapp.jobs 的两个入口才负责 begin_run）"""
+        fake = mock.Mock()
+        fake.chat.completions.create.return_value = self._ok_resp()
+        with (
+            mock.patch.object(self.dc, "MAX_CALLS_PER_RUN", 1),
+            mock.patch.object(self.dc, "_run_active", False),
+            mock.patch.object(self.dc, "_get_client", return_value=fake),
+        ):
+            for _ in range(3):
+                self.dc._call_api("s", "u")
+            self.assertEqual(fake.chat.completions.create.call_count, 3)
+
     def test_tpm_retries_then_raises(self):
         fake = mock.Mock()
         fake.chat.completions.create.side_effect = self._err(429, "Allocated quota exceeded")

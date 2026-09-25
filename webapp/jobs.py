@@ -38,6 +38,7 @@ from analyzer.deepseek_client import (
     analyze_relationship,
     analyze_habits,
     analyze_profile,
+    begin_run,
 )
 from analyzer.group_client import GROUP_DIMENSIONS
 from analyzer.logger import get_logger
@@ -211,6 +212,9 @@ def _stop_requested(job_id: str) -> bool:
 def _run_job(job_id: str, dimension: str, filepath: str, chat_hash: str) -> None:
     """后台线程执行分析：更新进度、支持取消、成功后写磁盘缓存"""
     dim_name = DIMENSION_NAMES.get(dimension, dimension)
+    # 一次运行 = 这一个维度：把调用计数清零，让 LLM_MAX_CALLS_PER_RUN 从 0 起算。
+    # 命中缓存的月份不发请求、不计入，所以上限只约束真正花钱的部分。
+    begin_run()
     try:
         # 会话文件可能在"发起任务"与"后台线程开工"之间被 24 小时清理收走
         # （uploads/ 按 mtime 回收）。不特判的话它只是一个 FileNotFoundError，
@@ -270,6 +274,9 @@ def _run_analyze_all(
 
     is_group 默认 False（私聊维度集）：既有调用点与老测试不带这个参数时行为完全不变。
     """
+    # 整个全量循环只清一次计数：这样 LLM_MAX_CALLS_PER_RUN 覆盖的是"一次点击的全量"，
+    # 而不是每个维度各自一份额度（那样 5 个维度会把它放大 5 倍）。
+    begin_run()
     try:
         # 同 _run_job：全量任务可能排在文件被清理之后才开工
         if not os.path.exists(filepath):
