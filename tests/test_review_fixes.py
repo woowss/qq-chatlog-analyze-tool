@@ -308,10 +308,10 @@ class TestFingerprintRobustness(unittest.TestCase):
         self.assertNotEqual(fp1, dc.PROMPT_FINGERPRINT)
 
     def test_grace_hours_env_invalid_does_not_crash(self):
-        import analyzer.deepseek_client as dc
+        import config
 
         with mock.patch.dict(os.environ, {"LLM_MONTH_CACHE_GRACE_HOURS": "abc"}):
-            val = dc._env_number("LLM_MONTH_CACHE_GRACE_HOURS", 24, 0, 720)
+            val = config.env_number("LLM_MONTH_CACHE_GRACE_HOURS", 24, 0, 720)
         self.assertEqual(val, 24)  # 回退默认而不是 ValueError 崩在 import
 
 

@@ -81,7 +81,35 @@ LOG_FILE = os.path.join(LOG_DIR, "app.log")
 TOKEN_USAGE_FILE = os.getenv("TOKEN_USAGE_FILE", "").strip() or str(DATA_DIR / "logs" / "token_usage.json")
 
 
-def _env_int(name: str, default: int, low: int, high: int) -> int:
+# ---------------------------------------------------------------------------
+# 环境变量解析助手（**公开 API**）
+# ---------------------------------------------------------------------------
+# 为什么是公开名而不是 _env_*：它们本来就跨模块使用——analyzer/deepseek_client 与
+# analyzer/group_client 读数值参数，parser/qq_parser 读 QQCHAT_ALLOW_MULTI_PARTY。
+# 下划线会让"这个模块的私有实现"与"全项目共用的解析口径"这两个事实互相打架，
+# 于是每个模块各写一份，写法随之漂移（真实发生过：LLM_THINKING 自己认 enabled，
+# 别处的布尔解析不认）。统一在这里，口径只有一份。
+
+
+def parse_bool(raw: str, default: bool = False) -> bool:
+    """把环境变量写法归一为布尔：留空取 default，其余只认 1/true/yes/on。
+
+    单独暴露"解析一个字符串"的入口，是因为个别开关历史上支持比这更宽的写法
+    （`LLM_THINKING` 认 enabled/disabled），调用方可以先把它们归一成本函数认的值，
+    而不是再写一份词表。
+    """
+    text = (raw or "").strip().lower()
+    if not text:
+        return default
+    return text in ("1", "true", "yes", "on")
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    """布尔环境变量：留空取默认值；任何写法都归约为真/假，不会崩"""
+    return parse_bool(os.getenv(name, ""), default)
+
+
+def env_int(name: str, default: int, low: int, high: int) -> int:
     """读取整型环境变量：非法值不再让应用崩在 import 阶段，而是回退默认值并提示"""
     raw = (os.getenv(name, "") or "").strip()
     if not raw:
@@ -97,15 +125,28 @@ def _env_int(name: str, default: int, low: int, high: int) -> int:
     return value
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    """布尔环境变量：留空取默认值；任何写法都归约为真/假，不会崩"""
-    raw = (os.getenv(name, "") or "").strip().lower()
+def env_number(name: str, default: float, low: float, high: float) -> float:
+    """读取浮点环境变量（并发数、间隔秒数这类参数历史上就允许小数）。
+
+    与 env_int 的差别只在类型；两者都做"非法/越界就回退默认并出声"，
+    所以调用方不必自己 try/except——那是原先各处重复实现、且失败通道各不相同
+    （有的写 stderr，有的走 logger，排查时不知道该看哪里）的根源。
+    """
+    raw = (os.getenv(name, "") or "").strip()
     if not raw:
         return default
-    return raw in ("1", "true", "yes", "on")
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"[WARN] {name}={raw!r} 不是数字，已回退为 {default}", file=sys.stderr)
+        return default
+    if not low <= value <= high:
+        print(f"[WARN] {name}={value} 超出范围 [{low}, {high}]，已回退为 {default}", file=sys.stderr)
+        return default
+    return value
 
 
-def _env_choice(name: str, default: str, allowed: tuple) -> str:
+def env_choice(name: str, default: str, allowed: tuple) -> str:
     """枚举型环境变量：非法值回退默认并提示（避免拼错时静默按默认值生效）"""
     raw = (os.getenv(name, "") or "").strip().lower()
     if not raw:
@@ -118,17 +159,17 @@ def _env_choice(name: str, default: str, allowed: tuple) -> str:
 
 # 单次上传体积上限（MB）：超长聊天（实测数万条私聊）导出的 JSON 可达数十 MB，逼近默认上限，
 # 撞上限制时 Flask 直接回 413，用户只看到"上传失败"却不知为何，所以留一个可调口子。
-MAX_CONTENT_LENGTH = _env_int("QQCHAT_MAX_UPLOAD_MB", 50, 1, 4096) * 1024 * 1024
+MAX_CONTENT_LENGTH = env_int("QQCHAT_MAX_UPLOAD_MB", 50, 1, 4096) * 1024 * 1024
 
 
 # 日志隐私闭环：按天轮转并只保留 N 天（轮转文件由 handler 自行删除，
 # 历史遗留的 5×5MB 式 app.log.1/.2 由启动/定期清理按时间回收）。
-LOG_RETENTION_DAYS = _env_int("LOG_RETENTION_DAYS", 7, 1, 90)
+LOG_RETENTION_DAYS = env_int("LOG_RETENTION_DAYS", 7, 1, 90)
 # 日志里的昵称/原始文件名默认脱敏：昵称与导出文件名常含真实称呼，属于敏感数据；
 # 本地排查问题时可在 .env 设 LOG_REDACT_NAMES=false 恢复原文。
-LOG_REDACT_NAMES = _env_bool("LOG_REDACT_NAMES", True)
+LOG_REDACT_NAMES = env_bool("LOG_REDACT_NAMES", True)
 # 内存任务表条目的存活时间（结果早已落盘缓存，内存只服务轮询）
-JOB_TTL_SECONDS = _env_int("QQCHAT_JOB_TTL_SECONDS", 900, 60, 86400)
+JOB_TTL_SECONDS = env_int("QQCHAT_JOB_TTL_SECONDS", 900, 60, 86400)
 
 # ---------------------------------------------------------------------------
 # 群聊（多人记录）—— 默认自动识别：3 位以上有实质发言者按群聊分析；off 回到私聊两分类行为
@@ -136,17 +177,17 @@ JOB_TTL_SECONDS = _env_int("QQCHAT_JOB_TTL_SECONDS", 900, 60, 86400)
 # 互动矩阵的成员上限：矩阵是成员数×成员数的二维数组，100 人就是 1 万个格子，
 # 落盘缓存、模板渲染与前端图表都会跟着膨胀。超出时只保留发言最多的前 N 位
 # （其余成员的发言仍计入活跃度与群总览，只是不进矩阵）。
-GROUP_MATRIX_MEMBERS = _env_int("QQCHAT_GROUP_MATRIX_MEMBERS", 30, 3, 200)
+GROUP_MATRIX_MEMBERS = env_int("QQCHAT_GROUP_MATRIX_MEMBERS", 30, 3, 200)
 # "同时在线聊天"的判定窗口（分钟）：窗口内出现过的不同发言者数的峰值，
 # 用来近似"群里同时有几个人在聊"。窗口太大失去意义，太小会把接力聊天拆散。
-GROUP_PEAK_WINDOW_MINUTES = _env_int("QQCHAT_GROUP_PEAK_WINDOW_MINUTES", 10, 1, 120)
+GROUP_PEAK_WINDOW_MINUTES = env_int("QQCHAT_GROUP_PEAK_WINDOW_MINUTES", 10, 1, 120)
 # 成员画像最多分析几位（按发言量取前 N，自己必定入选）。群越大成本越高：
 # 每位成员一次调用、独立 prompt，所以默认只取前 10 位，其余成员仍计入本地统计与群级分析。
-GROUP_AI_MAX_MEMBERS = _env_int("QQCHAT_GROUP_AI_MAX_MEMBERS", 10, 1, 50)
+GROUP_AI_MAX_MEMBERS = env_int("QQCHAT_GROUP_AI_MAX_MEMBERS", 10, 1, 50)
 
 # 月份级增量缓存开关（默认开）：重新导出同一段对话时只为新增月份付费。
 # 关掉后行为回到"整份文件哈希"的维度级缓存。
-MONTH_CACHE_ENABLED = _env_bool("QQCHAT_MONTH_CACHE", True)
+MONTH_CACHE_ENABLED = env_bool("QQCHAT_MONTH_CACHE", True)
 
 # ---------------------------------------------------------------------------
 # 图片理解（视觉）：让模型"看"聊天里的截图/照片/表情包
@@ -157,19 +198,19 @@ MONTH_CACHE_ENABLED = _env_bool("QQCHAT_MONTH_CACHE", True)
 MEDIA_ROOT = os.getenv("QQCHAT_MEDIA_DIR", "").strip()
 # 视觉开关：默认开（deepseek-flash 原生支持图片输入）。
 # 关掉即完全不上传图片，回到纯文本分析。
-VISION_ENABLED = _env_bool("LLM_VISION", True)
+VISION_ENABLED = env_bool("LLM_VISION", True)
 # 每月最多送几张图：每张最多 1024 tokens（官方按约 1300x1300 折算）。
 # 准确性优先：默认 20 张（约 2 万 tokens/月，成本可忽略），能覆盖更多截图与表情包。
-VISION_MAX_PER_MONTH = _env_int("LLM_VISION_MAX_PER_MONTH", 20, 0, 50)
+VISION_MAX_PER_MONTH = env_int("LLM_VISION_MAX_PER_MONTH", 20, 0, 50)
 # 送图清晰度：high 保留原图（截图里的字才看得清）；low 压到 512x512（更省 token）
 VISION_DETAIL = os.getenv("LLM_VISION_DETAIL", "high").strip().lower() or "high"
 # 太小的图基本是表情包/缩略图，跳过以省 token（按最长边像素判断）
-VISION_MIN_SIDE = _env_int("LLM_VISION_MIN_SIDE", 200, 0, 4000)
+VISION_MIN_SIDE = env_int("LLM_VISION_MIN_SIDE", 200, 0, 4000)
 # 单张图片体积上限（官方 base64 上限 32 MiB，这里留一半余量）
-VISION_MAX_BYTES = _env_int("LLM_VISION_MAX_BYTES", 12 * 1024 * 1024, 65536, 32 * 1024 * 1024)
+VISION_MAX_BYTES = env_int("LLM_VISION_MAX_BYTES", 12 * 1024 * 1024, 65536, 32 * 1024 * 1024)
 # 一次摘要请求的图片总体积上限：官方请求体上限 48 MiB，而 base64 会膨胀约 1/3，
 # 所以原始字节控制在 32 MiB 以内（图片按顺序贪心装入，装不下的留到下次）
-VISION_MAX_TOTAL_BYTES = _env_int(
+VISION_MAX_TOTAL_BYTES = env_int(
     "LLM_VISION_MAX_TOTAL_BYTES", 32 * 1024 * 1024, 1024 * 1024, 32 * 1024 * 1024
 )
 
@@ -180,10 +221,10 @@ VISION_MAX_TOTAL_BYTES = _env_int(
 # 打开后可手动触发一次抓取：经典黄脸走 Qzone 的公开表情 CDN，商城表情用导出文件
 # 自带的地址；QQ 超级表情（吃糖/大怨种…）没有公开地址，只能靠本地已有的表情包文件。
 FACE_CACHE_DIR = os.getenv("FACE_CACHE_DIR", "").strip() or str(DATA_DIR / "face_cache")
-FACE_IMAGES_ENABLED = _env_bool("QQCHAT_FACE_IMAGES", False)
+FACE_IMAGES_ENABLED = env_bool("QQCHAT_FACE_IMAGES", False)
 # 一次抓取的上限与超时：失败逐条跳过，抓不到就继续用 emoji/文字
-FACE_FETCH_LIMIT = _env_int("QQCHAT_FACE_FETCH_LIMIT", 300, 1, 2000)
-FACE_FETCH_TIMEOUT = _env_int("QQCHAT_FACE_FETCH_TIMEOUT", 6, 1, 60)
+FACE_FETCH_LIMIT = env_int("QQCHAT_FACE_FETCH_LIMIT", 300, 1, 2000)
+FACE_FETCH_TIMEOUT = env_int("QQCHAT_FACE_FETCH_TIMEOUT", 6, 1, 60)
 
 
 def _load_or_create_secret() -> str:
@@ -226,11 +267,11 @@ SECRET_KEY = _load_or_create_secret()
 
 # 调试模式开关：默认关闭（避免暴露 Werkzeug 调试器导致任意代码执行风险），
 # 本地开发时可设环境变量 FLASK_DEBUG=true 开启自动重载
-FLASK_DEBUG = _env_bool("FLASK_DEBUG", False)
+FLASK_DEBUG = env_bool("FLASK_DEBUG", False)
 
 # 绑定地址与端口：默认仅本机。Windows 上 5000 常被 AirPlay/Hyper-V 占用，可改 FLASK_PORT
 FLASK_HOST = os.getenv("FLASK_HOST", "127.0.0.1").strip() or "127.0.0.1"
-FLASK_PORT = _env_int("FLASK_PORT", 5000, 1, 65535)
+FLASK_PORT = env_int("FLASK_PORT", 5000, 1, 65535)
 
 # 访问口令：设置后所有页面需先登录；绑定非回环地址时强制要求（否则拒绝启动）
 ACCESS_PASSWORD = os.getenv("ACCESS_PASSWORD", "").strip()
@@ -239,15 +280,15 @@ ACCESS_PASSWORD = os.getenv("ACCESS_PASSWORD", "").strip()
 # 局域网或公网后被离线字典爆破。两个值都可调，因为**限流的计数器是按 remote_addr 计的**：
 # 反代或 NAT 之后所有请求共享同一个地址，一个人连续输错会把所有人一起锁在门外——
 # 那种部署要么把上限调大，要么在反代层自己限流（见 SECURITY.md 的"威胁模型"）。
-LOGIN_MAX_ATTEMPTS = _env_int("QQCHAT_LOGIN_MAX_ATTEMPTS", 5, 1, 1000)
-LOGIN_WINDOW_SECONDS = _env_int("QQCHAT_LOGIN_WINDOW_SECONDS", 300, 10, 86400)
+LOGIN_MAX_ATTEMPTS = env_int("QQCHAT_LOGIN_MAX_ATTEMPTS", 5, 1, 1000)
+LOGIN_WINDOW_SECONDS = env_int("QQCHAT_LOGIN_WINDOW_SECONDS", 300, 10, 86400)
 
 # 会话 cookie 的 Secure 标志：auto / true / false（大小写不敏感）。
 # auto（默认）= 非回环绑定时开启：明文 http 下 cookie 会裸奔过网，中间人拿到
 # session id 等于拿到登录态。之所以留 auto 而不是恒 true：本工具明确支持
 # "局域网明文 http + ALLOWED_ORIGINS"的用法，而 Secure cookie 在 http 下根本
 # 不会被浏览器回传，恒 true 会让那类部署"登录成功却立刻被弹回登录页"。
-COOKIE_SECURE = _env_choice("QQCHAT_COOKIE_SECURE", "auto", ("auto", "true", "false"))
+COOKIE_SECURE = env_choice("QQCHAT_COOKIE_SECURE", "auto", ("auto", "true", "false"))
 
 # 额外允许的浏览器来源主机名（逗号分隔），用于局域网/自定义域名访问。
 # POST 的 Origin 校验默认只放行回环地址与 FLASK_HOST（不再信任请求自带的 Host，

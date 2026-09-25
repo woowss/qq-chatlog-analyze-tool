@@ -30,7 +30,16 @@ from typing import Any, Callable, Iterable, Optional
 
 from openai import OpenAI
 
-from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL, DEEPSEEK_BASE_URL
+# 环境变量解析统一走 config 的公开助手：口径只有一份（留空取默认、非法/越界回退并出声）。
+# 这里原先自己实现过一份 _env_number，与 config 的 _env_int 逻辑相同、失败通道却不同
+# （一个写 logger、一个写 stderr），排查"我明明设了参数为什么没生效"时不知道该看哪里。
+from config import (
+    DEEPSEEK_API_KEY,
+    DEEPSEEK_MODEL,
+    DEEPSEEK_BASE_URL,
+    env_number,
+    parse_bool,
+)
 from parser.qq_parser import CST, MEDIA_KINDS, ChatData, is_statistical, split_by_month
 from analyzer.logger import get_logger, mask_name
 from analyzer.shutdown import shutdown_requested
@@ -61,37 +70,21 @@ _PRIVATE_PROMPT_NAMES = (
 )
 
 
-def _env_number(name: str, default: float, low: float, high: float) -> float:
-    """环境变量数值校验：非法/越界不再让任务在并发池里抛 ValueError，而是回退并告警"""
-    raw = (os.getenv(name, "") or "").strip()
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        logger.warning("%s=%r 不是数字，已回退为 %s", name, raw, default)
-        return default
-    if not low <= value <= high:
-        logger.warning("%s=%s 超出范围 [%s, %s]，已回退为 %s", name, value, low, high, default)
-        return default
-    return value
-
-
 # 单月对话文本上限（字符数）。**准确性优先**：默认 60 万字符（约 25-30 万 tokens），
 # 足以装下绝大多数月份的全部消息（实测：最长那个月会逼近这个上限），
 # 因此正常情况下不会触发抽样；只有极端月份（几十万条）才会等间隔抽样并注明。
 # 想省钱可在 .env 里调小 LLM_MAX_DIALOG_CHARS。
-MAX_DIALOG_CHARS = int(_env_number("LLM_MAX_DIALOG_CHARS", 600_000, 1000, 2_000_000))
+MAX_DIALOG_CHARS = int(env_number("LLM_MAX_DIALOG_CHARS", 600_000, 1000, 2_000_000))
 
 # 限流节奏默认值按服务商自适应：官方 DeepSeek（并发上限 2500）可以快得多，
 # 而阿里云百炼的 TPM 是按主账号聚合的，必须保守。两个值都可用环境变量覆盖。
 _OFFICIAL = "api.deepseek.com" in DEEPSEEK_BASE_URL.lower()
 _DEFAULT_INTERVAL = 0.5 if _OFFICIAL else 3.0
 _DEFAULT_CONCURRENCY = 6 if _OFFICIAL else 2
-CONCURRENCY = int(_env_number("LLM_CONCURRENCY", _DEFAULT_CONCURRENCY, 1, 64))
+CONCURRENCY = int(env_number("LLM_CONCURRENCY", _DEFAULT_CONCURRENCY, 1, 64))
 # 全局请求平滑：两次 API 调用之间的最小间隔（秒）。注意 _pace() 是串行闸门，
 # N 次调用的排队下限是 (N-1)×该值，所以它直接决定多月份分析的墙钟时间。
-CALL_MIN_INTERVAL = float(_env_number("LLM_CALL_MIN_INTERVAL", _DEFAULT_INTERVAL, 0.0, 60.0))
+CALL_MIN_INTERVAL = float(env_number("LLM_CALL_MIN_INTERVAL", _DEFAULT_INTERVAL, 0.0, 60.0))
 # 单次 API 请求超时（秒）：准确性优先后单月 prompt 可达十几万 tokens、思考模式输出
 # 也可能很长，120s 偏紧（大月份实测 14s，但留足余量更稳）
 REQUEST_TIMEOUT = 300
@@ -148,8 +141,13 @@ MAX_TOKENS_BY_DIM = {dim: _max_tokens(dim, default) for dim, default in _DEFAULT
 # "思维链吃光预算 → finish_reason=length → 结果丢弃"的老问题。
 # - LLM_THINKING=disabled 可整体关掉；LLM_THINKING_DIMS=a,b 可只给指定维度开；
 # - 非官方网关（如百炼）不认识该字段：未显式配置时不发送，避免被严格网关判为非法参数。
+#
+# 这个开关历来还认 enabled/disabled（README 与 CHANGELOG 都这么写过），比共用的
+# parse_bool 词表宽。所以先归一成 true/false 再交给它——统一解析口径不该顺手改掉
+# 一个既有开关的语义（把 enabled 读成假，等于用户设了思考模式却静默失去它）。
 _THINKING_ENV = (os.getenv("LLM_THINKING", "") or "").strip().lower()
-THINKING_DEFAULT = _THINKING_ENV in ("1", "true", "yes", "on", "enabled") if _THINKING_ENV else _OFFICIAL
+_THINKING_NORMALIZED = {"enabled": "true", "disabled": "false"}.get(_THINKING_ENV, _THINKING_ENV)
+THINKING_DEFAULT = parse_bool(_THINKING_NORMALIZED, _OFFICIAL)
 THINKING_DIMS = frozenset(
     s.strip().lower() for s in (os.getenv("LLM_THINKING_DIMS", "") or "").split(",") if s.strip()
 )
@@ -575,7 +573,7 @@ _WRITE_WARN_INTERVAL = 300.0
 _last_write_warning = [0.0]
 # 无引用的月份缓存先留一段宽限期：上传新文件时的级联清理不能顺手删掉
 # "同一段对话的历史月份"，否则增量分析就失去意义。孤儿文件由定期清理回收。
-MONTH_CACHE_GRACE_SECONDS = _env_number("LLM_MONTH_CACHE_GRACE_HOURS", 24, 0, 24 * 30) * 3600
+MONTH_CACHE_GRACE_SECONDS = env_number("LLM_MONTH_CACHE_GRACE_HOURS", 24, 0, 24 * 30) * 3600
 
 
 def configure_month_cache(directory: str) -> None:

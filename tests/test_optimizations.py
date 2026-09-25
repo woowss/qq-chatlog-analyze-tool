@@ -375,23 +375,43 @@ class TestConfigHardening(unittest.TestCase):
     """非法配置不再让应用/任务崩在难以理解的地方"""
 
     def test_env_number_falls_back(self):
+        # 数值解析助手已经统一到 config（原先 deepseek_client 自己实现了一份，
+        # 与 config 的 env_int 逻辑相同、失败通道却不同）。
+        import config
+
         with mock.patch.dict(os.environ, {"LLM_CONCURRENCY": "0"}):
-            self.assertEqual(dc._env_number("LLM_CONCURRENCY", 6, 1, 64), 6)
+            self.assertEqual(config.env_number("LLM_CONCURRENCY", 6, 1, 64), 6)
         with mock.patch.dict(os.environ, {"LLM_CONCURRENCY": "abc"}):
-            self.assertEqual(dc._env_number("LLM_CONCURRENCY", 6, 1, 64), 6)
+            self.assertEqual(config.env_number("LLM_CONCURRENCY", 6, 1, 64), 6)
         with mock.patch.dict(os.environ, {"LLM_CONCURRENCY": "4"}):
-            self.assertEqual(dc._env_number("LLM_CONCURRENCY", 6, 1, 64), 4)
+            self.assertEqual(config.env_number("LLM_CONCURRENCY", 6, 1, 64), 4)
+
+    def test_bool_parsing_is_shared_and_unchanged(self):
+        """一份词表：留空取默认，1/true/yes/on 为真，其余为假
+
+        LLM_THINKING 额外认 enabled/disabled 是**它自己**在调用前归一（见
+        deepseek_client._THINKING_NORMALIZED），共用词表不因此放宽——
+        否则 QQCHAT_ALLOW_MULTI_PARTY=enabled 这种写法会从"假"静默变成"真"。
+        """
+        import config
+
+        with mock.patch.dict(os.environ, {"QQCHAT_T_BOOL": "yes"}):
+            self.assertTrue(config.env_bool("QQCHAT_T_BOOL", False))
+        with mock.patch.dict(os.environ, {"QQCHAT_T_BOOL": "enabled"}):
+            self.assertFalse(config.env_bool("QQCHAT_T_BOOL", False), "共用词表不含 enabled")
+        with mock.patch.dict(os.environ, {"QQCHAT_T_BOOL": ""}):
+            self.assertTrue(config.env_bool("QQCHAT_T_BOOL", True), "留空取默认值")
 
     def test_port_validation(self):
         import config
 
-        self.assertEqual(config._env_int("FLASK_PORT", 5000, 1, 65535), 5000)  # 当前环境未设置
+        self.assertEqual(config.env_int("FLASK_PORT", 5000, 1, 65535), 5000)  # 当前环境未设置
         with mock.patch.dict(os.environ, {"FLASK_PORT": "abc"}):
-            self.assertEqual(config._env_int("FLASK_PORT", 5000, 1, 65535), 5000)
+            self.assertEqual(config.env_int("FLASK_PORT", 5000, 1, 65535), 5000)
         with mock.patch.dict(os.environ, {"FLASK_PORT": "99999"}):
-            self.assertEqual(config._env_int("FLASK_PORT", 5000, 1, 65535), 5000)
+            self.assertEqual(config.env_int("FLASK_PORT", 5000, 1, 65535), 5000)
         with mock.patch.dict(os.environ, {"FLASK_PORT": "5001"}):
-            self.assertEqual(config._env_int("FLASK_PORT", 5000, 1, 65535), 5001)
+            self.assertEqual(config.env_int("FLASK_PORT", 5000, 1, 65535), 5001)
 
     def test_thinking_budget_conflict_is_reported(self):
         """开了思考模式但预算不足时必须告警（这类组合会 100% 截断丢结果）"""

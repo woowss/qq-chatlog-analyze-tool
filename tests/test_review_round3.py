@@ -161,7 +161,7 @@ class TestSecureCookiePolicy(unittest.TestCase):
         with mock.patch.dict(os.environ, {"QQCHAT_COOKIE_SECURE": "banana"}):
             with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
                 self.assertEqual(
-                    configmod._env_choice("QQCHAT_COOKIE_SECURE", "auto", ("auto", "true", "false")),
+                    configmod.env_choice("QQCHAT_COOKIE_SECURE", "auto", ("auto", "true", "false")),
                     "auto",
                 )
         self.assertIn("QQCHAT_COOKIE_SECURE", err.getvalue())

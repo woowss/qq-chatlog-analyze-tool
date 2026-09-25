@@ -40,7 +40,7 @@ import inspect
 import os
 from typing import Callable, Optional
 
-from config import GROUP_AI_MAX_MEMBERS
+from config import GROUP_AI_MAX_MEMBERS, env_number
 from parser.qq_parser import ChatData, is_statistical
 from parser.group_identity import Participant
 from analyzer import group_prompts as gp
@@ -49,7 +49,6 @@ from analyzer.deepseek_client import (
     QuotaExhaustedError,
     _analyze_periods,
     _call_api,
-    _env_number,
     _fit_lines,
     _has_content,
     _message_line,
@@ -61,9 +60,9 @@ from analyzer.logger import mask_name
 
 #: 单个群聊月的对话文本上限（字符）。默认与私聊同档（准确性优先），
 #: 想省钱可在 .env 里调小 LLM_GROUP_MAX_DIALOG_CHARS。
-GROUP_MAX_DIALOG_CHARS = int(_env_number("LLM_GROUP_MAX_DIALOG_CHARS", 600_000, 1000, 2_000_000))
+GROUP_MAX_DIALOG_CHARS = int(env_number("LLM_GROUP_MAX_DIALOG_CHARS", 600_000, 1000, 2_000_000))
 #: 成员感知抽样时每位成员的保底条数（防止低频成员被整段丢掉）
-GROUP_MEMBER_MIN_LINES = int(_env_number("LLM_GROUP_MEMBER_MIN_LINES", 20, 1, 500))
+GROUP_MEMBER_MIN_LINES = int(env_number("LLM_GROUP_MEMBER_MIN_LINES", 20, 1, 500))
 #: 成员画像的单人样本上限（与私聊锐评同档：按时间均匀抽样覆盖整个时段）
 MEMBER_PROFILE_SAMPLES = 800
 #: 单条 prompt 里展示的互动"Top 对"数量（三张矩阵各取前 N 对，太长反而淹没重点）

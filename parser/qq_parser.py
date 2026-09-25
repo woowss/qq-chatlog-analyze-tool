@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from config import env_bool
 from parser.group_identity import Participant, collect_participants, unique_display_names
 
 # 北京时间固定偏移，供月份分组与本地统计共用，避免口径不一致
@@ -103,8 +104,12 @@ def _allow_multi_party() -> bool:
 
     新口径统一由 group_chat_mode() 表达；本函数只保留"旧变量怎么解析"这唯一一处，
     作为 two_party 模式的别名来源。旧文档与旧用户配置都指向这个变量，不能删。
+
+    解析走 config.env_bool：这个变量原先自己写了一份词表（1/true/yes/on），
+    与别处的布尔解析各写各的，正是"口径漂移"的起点。词表没有任何放宽——
+    同一批写法仍然是真、其余仍然是假，所以既有配置的行为逐字不变。
     """
-    return (os.getenv("QQCHAT_ALLOW_MULTI_PARTY", "") or "").strip().lower() in ("1", "true", "yes", "on")
+    return env_bool("QQCHAT_ALLOW_MULTI_PARTY", False)
 
 
 #: 群聊轨是否已经可以对外服务。**这是"多人导出不再拒收"的唯一闸门**。
