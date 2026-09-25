@@ -37,6 +37,7 @@ import json
 import os
 import re
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -354,6 +355,227 @@ class TestFingerprintMigration(unittest.TestCase):
                 self.assertEqual(text, "旧指纹写下的图片摘要", "旧键里的摘要必须照常返回")
                 self.assertTrue(os.path.exists(vision._cache_path("hashMigrate03", key)), "应改名到当前键")
                 self.assertFalse(os.path.exists(legacy_path), "改名而不是复制：不留第二份图片描述")
+
+    def test_legacy_group_dimension_cache_is_read_and_migrated(self):
+        """群聊维度的缓存文件名里嵌的是**群聊**指纹：私聊那条用例覆盖不到它
+
+        群聊维度（member_profiles 等）走 fingerprint_for_dimension 的群聊分支，
+        旧键同样要认、要改名、要不留第二份。
+        """
+        from analyzer import group_client as gc
+        from webapp import store
+
+        self.assertNotEqual(
+            gc.GROUP_PROMPT_FINGERPRINT,
+            gc.GROUP_PROMPT_FINGERPRINT_LEGACY,
+            "前提：群聊新旧指纹确实不同",
+        )
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(store, "AI_CACHE_DIR", d):
+                chat_hash = "hashMigrateGroup"
+                result = {"members": ["旧指纹写下的群聊结果"]}
+                legacy_path = store._cache_path("member_profiles", chat_hash, legacy=True)
+                current_path = store._cache_path("member_profiles", chat_hash)
+                self.assertNotEqual(legacy_path, current_path, "前提：群聊维度确实落在群聊指纹上")
+                self.assertIn(gc.GROUP_PROMPT_FINGERPRINT_LEGACY, legacy_path)
+                with open(legacy_path, "w", encoding="utf-8") as f:
+                    json.dump({"_created": 1.0, "result": result}, f, ensure_ascii=False)
+
+                self.assertEqual(
+                    store._read_cache("member_profiles", chat_hash),
+                    result,
+                    "旧群聊指纹命名的缓存必须照常命中，否则群聊用户为同样的分析重新付费",
+                )
+                self.assertTrue(os.path.exists(current_path), "命中旧文件后应当改名到当前键")
+                self.assertFalse(os.path.exists(legacy_path), "改名而不是复制：不留第二份敏感内容")
+
+    def test_legacy_group_month_cache_is_read_and_migrated(self):
+        """群聊月份缓存键里也是群聊指纹：旧键读到即迁移，并按**当前键**记进 manifest"""
+        from analyzer import deepseek_client as dc
+        from analyzer import group_client as gc
+        from analyzer import month_cache as mc
+
+        with tempfile.TemporaryDirectory() as d:
+            mc.configure_month_cache(d)
+            try:
+                prompt = "以下是某月的群聊对话数据：\n\n[01-01 08:00] 小明: 在吗"
+                group_fp = gc.GROUP_PROMPT_FINGERPRINT
+                new_key = mc._month_key("SYS", prompt, group_fp)
+                legacy_key = mc._month_key("SYS", prompt, gc.GROUP_PROMPT_FINGERPRINT_LEGACY)
+                self.assertNotEqual(new_key, legacy_key, "前提：群聊新旧指纹给出的键确实不同")
+                self.assertNotEqual(
+                    new_key,
+                    mc._month_key("SYS", prompt),
+                    "前提：群聊月份键与私聊月份键不是同一个键（两类缓存互不干扰）",
+                )
+                with open(mc.month_cache_path(legacy_key), "w", encoding="utf-8") as f:
+                    json.dump({"_created": 1.0, "group_emotion": "平静"}, f, ensure_ascii=False)
+
+                calls = []
+
+                def fake_api(*_a, **_kw):
+                    calls.append(1)
+                    return {"group_emotion": "不该被调用"}
+
+                with mock.patch.object(dc, "_call_api", side_effect=fake_api):
+                    out = dc._analyze_periods(
+                        {"2024-01": []},
+                        "SYS",
+                        lambda _p, _m: prompt,
+                        max_tokens=16,
+                        tag="group_emotion",
+                        chat_hash="hashMigrateGroup2",
+                        fingerprint=group_fp,
+                    )
+                self.assertEqual(calls, [], "旧键里的群聊月份结果可用时不该再调用 API")
+                self.assertEqual(out["2024-01"]["group_emotion"], "平静")
+                self.assertTrue(os.path.exists(mc.month_cache_path(new_key)), "应改名到当前键")
+                self.assertFalse(os.path.exists(mc.month_cache_path(legacy_key)))
+                manifest = json.load(io.open(mc._manifest_path("hashMigrateGroup2"), encoding="utf-8"))
+                self.assertIn(new_key, manifest["months"], "迁移后必须按当前键记账，否则会被当孤儿删掉")
+            finally:
+                mc.configure_month_cache("")
+
+
+class TestCascadePurgeReachesMonthCache(unittest.TestCase):
+    """级联清理要在**同一次**调用里回收该聊天的月份缓存
+
+    反向验证：把 store._purge_chat_caches 里的 purge_month_cache 挪回目录遍历之后，
+    test_purge_removes_grace_expired_month_files_of_that_chat 立刻变红。
+
+    为什么要专门钉住：生产环境 _MONTH_CACHE_DIR 就是 AI_CACHE_DIR（app.py 里
+    configure_month_cache 收到的正是这个目录），而 manifest_{chat_hash}.json 也放在
+    那里，并且**会被整段匹配认成"这个聊天的文件"**。清理循环若先跑，manifest 先被
+    删掉，purge_month_cache 就再也读不到"这个聊天引用过哪些月份"，那些含聊天原句
+    引用的月份文件只能等下一次 sweep_orphan_month_cache（最长一小时；进程若就此
+    停止则要等下次启动）——用户已经看到"派生缓存已清理"，盘上却还留着。
+    注意 tests/_bootstrap.py 把 QQCHAT_MONTH_CACHE 定死为 0，所以这个组合
+    （月份缓存目录 == ai_cache/）只有显式 configure 才能覆盖到。
+    """
+
+    def test_purge_removes_grace_expired_month_files_of_that_chat(self):
+        from analyzer import month_cache as mc
+        from webapp import store
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(store, "AI_CACHE_DIR", d):
+                mc.configure_month_cache(d)  # 生产口径：月份缓存目录就是 ai_cache/
+                try:
+                    chat_hash = "hashCascade01"
+                    key = mc._month_key("SYS", "USER-级联清理")
+                    path = mc.month_cache_path(key)
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump({"_created": 1.0, "self_emotion": "平静"}, f, ensure_ascii=False)
+                    mc._record_month_usage(chat_hash, [key])
+                    os.utime(path, (1.0, 1.0))  # 推过宽限期：这个文件本该被同步回收
+
+                    store._purge_chat_caches(chat_hash)
+
+                    self.assertFalse(
+                        os.path.exists(path),
+                        "该聊天的月份缓存必须随本次级联清理一起消失（它含聊天原句引用）："
+                        "留到定期 sweep 才删，等于「删了聊天，敏感摘要还在盘上」",
+                    )
+                    self.assertFalse(
+                        os.path.exists(mc._manifest_path(chat_hash)),
+                        "manifest 是月份缓存的元数据，同样要清掉",
+                    )
+                finally:
+                    mc.configure_month_cache("")
+
+    def test_purge_keeps_month_files_still_referenced_by_another_chat(self):
+        """反向：仍被别的聊天引用的月份文件不能被顺手删掉（删了要重新付费）"""
+        from analyzer import month_cache as mc
+        from webapp import store
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(store, "AI_CACHE_DIR", d):
+                mc.configure_month_cache(d)
+                try:
+                    shared = mc._month_key("SYS", "USER-共享月份")
+                    path = mc.month_cache_path(shared)
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump({"_created": 1.0, "x": 1}, f, ensure_ascii=False)
+                    os.utime(path, (1.0, 1.0))
+                    mc._record_month_usage("hashCascadeKeep", [shared])
+                    mc._record_month_usage("hashCascadeDrop", [shared])
+
+                    store._purge_chat_caches("hashCascadeDrop")
+
+                    self.assertTrue(os.path.exists(path), "仍被另一个聊天引用的月份缓存必须留下")
+                finally:
+                    mc.configure_month_cache("")
+
+
+class TestCacheRetentionFailsClosed(unittest.TestCase):
+    """读不到时间的缓存按「该回收」处理，而不是「当它是刚创建的」
+
+    反向验证：把 cleanup._cache_created_at 的 except 分支改回 return time.time()，
+    或把 _cache_expired 的 getmtime 失败改回"异常抛出去、由调用方跳过"，
+    下面两条立刻变红。
+
+    方向为什么重要：这两个目录装的是含聊天内容的派生数据（月份整段结果、图片描述）。
+    "判不出来就保留"等于给这类文件发了一张永久居留证，而它的生命周期本来有硬上限；
+    反过来"判不出来就尝试删"最坏只是删不掉，调用方会留一行告警。
+    """
+
+    def test_unreadable_timestamps_degrade_to_epoch_not_now(self):
+        """_created 与 mtime 都读不到时，取到的必须是 epoch（远古），不是 now（刚建）"""
+        from webapp import cleanup as cleanupmod
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "emotion_deadbeef_deepseek-chat_abcdef123456.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("{}")
+            with (
+                mock.patch.object(cleanupmod, "read_created_at", lambda _p: None),
+                mock.patch.object(cleanupmod.os.path, "getmtime", side_effect=OSError("读不到")),
+            ):
+                self.assertEqual(
+                    cleanupmod._cache_created_at(path),
+                    0.0,
+                    "取不到任何时间时必须当作远古文件（fail-closed），而不是当作刚创建"
+                    "（那会让它永远逃过回收）",
+                )
+
+    def test_cache_with_unreadable_mtime_is_reclaimed(self):
+        """端到端：ai_cache/ 里读不到 mtime 的文件要在本次清理里被真正删掉
+
+        走完整的 cleanup_old_files()，只把**目标文件**的 getmtime 打桩成失败，
+        其余路径仍用真实实现（否则会把上传目录、日志目录的判定一起打坏）。
+        """
+        from webapp import cleanup as cleanupmod
+        from webapp import store
+
+        with tempfile.TemporaryDirectory() as d:
+            with (
+                mock.patch.object(cleanupmod, "AI_CACHE_DIR", d),
+                mock.patch.object(store, "AI_CACHE_DIR", d),
+            ):
+                target = os.path.join(d, "emotion_deadbeef_deepseek-chat_abcdef123456.json")
+                with open(target, "w", encoding="utf-8") as f:
+                    json.dump({"_created": 1.0, "result": {"month_title": "旧结果"}}, f, ensure_ascii=False)
+                # 「刚写过」的那个文件不能被连带删掉：清理只该回收过期内容
+                fresh = os.path.join(d, "emotion_feedface_deepseek-chat_abcdef123456.json")
+                with open(fresh, "w", encoding="utf-8") as f:
+                    json.dump({"_created": time.time(), "result": {}}, f, ensure_ascii=False)
+
+                real_getmtime = os.path.getmtime
+                target_abs = os.path.abspath(target)
+
+                def flaky_getmtime(path, _real=real_getmtime, _target=target_abs):
+                    if os.path.abspath(path) == _target:
+                        raise OSError("模拟：时间读不出来")
+                    return _real(path)
+
+                with mock.patch.object(cleanupmod.os.path, "getmtime", flaky_getmtime):
+                    cleanupmod.cleanup_old_files()
+
+                self.assertFalse(
+                    os.path.exists(target),
+                    "读不到时间的缓存文件必须被尝试回收（含聊天内容的派生数据不能永驻）",
+                )
+                self.assertTrue(os.path.exists(fresh), "同一轮清理不得误伤刚写入的缓存")
 
 
 class TestNonLoopbackFailClosed(unittest.TestCase):

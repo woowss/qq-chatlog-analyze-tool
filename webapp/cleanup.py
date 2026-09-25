@@ -55,6 +55,11 @@ def _cache_created_at(path: str) -> float:
     取法走 store 的有界扫描（只读文件头/尾各 8KB），不在这里整份 json.load：
     清理是挂在 before_request 上的，而 ai_cache/ 里最大的就是那些含整月结果的
     month_*.json——为了一个时间戳把它们全量解析，代价由碰巧触发清理的那个请求付。
+
+    两个时间都取不到时返回 0.0（epoch）而不是 time.time()：方向很重要——判成
+    "刚刚创建"等于让一个读不到时间的缓存文件**永远**逃过回收，而这里装的是含聊天
+    内容的派生数据；判成"远古"只是让上层尝试删一次，删不掉会留下告警（见
+    _purge_dir/_purge_tree 对 OSError 的兜底）。
     """
     created = read_created_at(path)
     if created is not None:
@@ -62,7 +67,7 @@ def _cache_created_at(path: str) -> float:
     try:
         return os.path.getmtime(path)
     except OSError:
-        return time.time()
+        return 0.0
 
 
 def _purge_dir(directory: str, expired, name_prefix: str = "") -> int:
@@ -134,10 +139,17 @@ def cleanup_old_files(
         cleaned += _purge_tree(directory, _older_than(now, max_age_seconds))
 
     def _cache_expired(path: str) -> bool:
-        """缓存的双上限：滑动 30 天（按 mtime，命中即续期）+ 绝对 90 天（按 _created）"""
-        return (
-            now - os.path.getmtime(path) > cache_max_age or now - _cache_created_at(path) > cache_hard_max_age
-        )
+        """缓存的双上限：滑动 30 天（按 mtime，命中即续期）+ 绝对 90 天（按 _created）
+
+        取不到 mtime 时按"该回收"处理（fail-closed）：这两个目录装的是含聊天内容的
+        派生数据，判不出来的正确方向是尝试删掉并留一行日志，而不是当作新文件永远
+        留下。删不掉由调用方兜住（_purge_dir/_purge_tree 都捕获 OSError 并跳过）。
+        """
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return True
+        return now - mtime > cache_max_age or now - _cache_created_at(path) > cache_hard_max_age
 
     for directory in (AI_CACHE_DIR, STATS_CACHE_DIR):
         cleaned += _purge_dir(directory, _cache_expired)

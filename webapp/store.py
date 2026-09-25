@@ -530,10 +530,22 @@ def _purge_chat_caches(chat_hash: str) -> int:
     with _CHAT_CACHE_LOCK:
         _CHAT_CACHE.clear()
     removed = 0
+    # 月份级缓存必须排在目录遍历**之前**：manifest_{chat_hash}.json 就躺在
+    # AI_CACHE_DIR 里（生产环境 configure_month_cache 收到的就是这个目录），而它正是
+    # purge_month_cache 判断"哪些月份文件只属于这个聊天"的唯一依据。若让遍历先跑，
+    # 整段匹配会顺手删掉 manifest（它确实属于这个聊天），purge_month_cache 随后读到
+    # 空集合，那些含聊天原句引用的月份文件就逃过本次同步回收，只能等下一次
+    # sweep_orphan_month_cache（最多一小时；进程若就此停止则要等下次启动）。
+    # 放在前面之后遍历仍是兜底：月份缓存关掉（_MONTH_CACHE_DIR=""）后残留的
+    # manifest 依旧会被它清掉。
+    removed += purge_month_cache(chat_hash)
     try:
         entries = os.listdir(AI_CACHE_DIR)
     except OSError:
-        return 0
+        # 列不出目录不等于"这次清理到此为止"：统计缓存、图片副本与上面的月份文件
+        # 都还要回收。早退会让它们（含聊天内容描述）留在盘上，而调用方与界面
+        # 已经按"已清理"对外报告了。
+        entries = []
     for name in entries:
         if _cache_belongs_to(name, chat_hash):
             try:
@@ -551,8 +563,7 @@ def _purge_chat_caches(chat_hash: str) -> int:
         pass  # 本来就没有，属正常情形，不必报
     except OSError as e:
         logger.warning("统计缓存删除失败（可能仍残留敏感内容）: %s (%s)", _stats_path(chat_hash), e)
-    # 月份级缓存：删 manifest，并回收不再被其他聊天引用的月份文件
-    removed += purge_month_cache(chat_hash)
+    # 月份级缓存已在函数开头处理（顺序原因见那里的注释）：这里不再重复调用。
     # 看图用的图片副本（uploads/media/<chat_hash>/）：源文件都换了/没了，
     # 派生出来的图片本体必须一起走，否则它只受"24 小时 mtime 回收"约束，
     # 而在那之前一直是盘上最敏感的一批数据。
