@@ -192,6 +192,9 @@ class Participant:
 
 - `python -m pytest -q`：306 passed / 80 subtests → **338 passed / 91 subtests**（新增 32 个用例，既有用例 0 改动、0 失败）。
 - `PROMPT_FINGERPRINT`：`b6c5074dc226` → `b6c5074dc226`（逐字节一致，私聊维度缓存与月份缓存全部继续命中）。
+  > 这是 M0 当时的前后对比，不是"永远等于这个值"：此后提示词与输出预算改过，现值由
+  > `tests/test_group_foundation.py` 的 `PINNED_PRIVATE_FINGERPRINT` 记录并钉死——
+  > 要查"现在是多少"看那里，别照抄本节（照抄会让读者以为代码错了）。
 - 私聊月份键样本：`0f3ab19c7d2e4a5b6c7d8e`（示例值；改写前后一致即命中）。
 - `ruff check` / `ruff format --check`：全通过。
 

@@ -347,14 +347,109 @@ class TestChatDataCompatibility(unittest.TestCase):
         self.assertEqual(list(chat.months()), ["2025-03"])
 
 
+#: 私聊提示词指纹的**绝对值**（默认配置下实测值）。
+#:
+#: 为什么要钉死一个字面量：这个值同时进维度缓存文件名与月份缓存键，它一变，
+#: 所有既有用户的私聊分析缓存（含月份级增量缓存）就全部不再命中——用户下次分析
+#: 要**重新为同样的对话付费**。所以"指纹变了"必须是代码评审里**看得见**的一件事，
+#: 而不是 CI 静默放过。
+#:
+#: 改这个值的前提：① 确实改了提示词/对话格式/进哈希的常量或预算；
+#: ② CHANGELOG 里写明"会让既有缓存在宽限期后被回收，用户需重新分析"。
+#: 只更新数字而不写 CHANGELOG，等于把一笔用户成本藏进测试改动里。
+#: 历史：M0（2026-09-12）实测为 b6c5074dc226；此后提示词与输出预算改过，现值如右。
+PINNED_PRIVATE_FINGERPRINT = "26bf952fe772"
+
+#: 会让上面那个绝对值必然对不上的环境变量（它们都通过常量进哈希）。
+#: 本机配了其中任何一个，说明这位开发者正在用非默认预算/视觉参数跑测试——
+#: 那时跳过而不是误报。CI 是干净环境，那里永远严格执行。
+_FINGERPRINT_ENV_KEYS = (
+    "PROMPT_CACHE_SALT",
+    "LLM_MAX_DIALOG_CHARS",
+    "LLM_VISION_DETAIL",
+    "LLM_VISION_MAX_PER_MONTH",
+    "LLM_VISION_MIN_SIDE",
+)
+
+
 class TestPrivateFingerprintIsolation(unittest.TestCase):
     """私聊提示词指纹：取值不变，且不受新增 SYSTEM_PROMPT_* 常量影响"""
+
+    def test_private_fingerprint_absolute_value_is_pinned(self):
+        """绝对值断言：指纹一变就红，逼着改动者面对"用户要为缓存重新付费"这件事"""
+        from analyzer import deepseek_client as dc
+
+        overrides = sorted(
+            k for k in os.environ if k in _FINGERPRINT_ENV_KEYS or k.startswith("LLM_MAX_TOKENS_")
+        )
+        if overrides:
+            self.skipTest(
+                "本机设置了影响指纹的环境变量 %s：绝对值必然与默认配置不同，"
+                "跳过以免误报（CI 无这些变量，会严格执行）" % overrides
+            )
+        self.assertEqual(
+            dc.PROMPT_FINGERPRINT,
+            PINNED_PRIVATE_FINGERPRINT,
+            "私聊提示词指纹变了。它进维度缓存文件名与月份缓存键，一变就等于让所有既有用户"
+            "在下次分析时重新付费（月份缓存会在宽限期后被孤儿回收）。若确属有意改动，"
+            "请同步更新本用例的 PINNED_PRIVATE_FINGERPRINT，并在 CHANGELOG 写明这一点。",
+        )
+
+    def test_every_listed_env_input_really_changes_the_fingerprint(self):
+        """名单的**下界**要有依据：里面每个变量都必须真的参与哈希。
+
+        名单一旦多出一个不相干的变量，绝对值用例就会为它白白放宽适用面（开发者只是
+        设了个无关参数，指纹断言却静默跳过）；少一个则会让那位开发者拿到一条假红。
+        这里逐个把它们改掉，验证指纹确实跟着变。
+        """
+        import analyzer.vision as vision
+        from analyzer import deepseek_client as dc
+
+        base = dc._prompt_fingerprint()
+        cases = [
+            ("LLM_MAX_DIALOG_CHARS", mock.patch.object(dc, "MAX_DIALOG_CHARS", dc.MAX_DIALOG_CHARS + 1)),
+            ("LLM_VISION_DETAIL", mock.patch.object(vision, "VISION_DETAIL", "low")),
+            ("LLM_VISION_MAX_PER_MONTH", mock.patch.object(vision, "VISION_MAX_PER_MONTH", 7)),
+            ("LLM_VISION_MIN_SIDE", mock.patch.object(vision, "VISION_MIN_SIDE", 123)),
+            ("PROMPT_CACHE_SALT", mock.patch.dict(os.environ, {"PROMPT_CACHE_SALT": "probe"})),
+        ]
+        for name, patcher in cases:
+            with patcher:
+                self.assertNotEqual(dc._prompt_fingerprint(), base, "%s 应当参与提示词指纹" % name)
+        with mock.patch.dict(dc.MAX_TOKENS_BY_DIM, {"profile": dc.MAX_TOKENS_BY_DIM["profile"] + 1}):
+            self.assertNotEqual(dc._prompt_fingerprint(), base, "LLM_MAX_TOKENS_PROFILE 应当参与提示词指纹")
+        with mock.patch.object(vision, "VISION_SYSTEM", vision.VISION_SYSTEM + "（探测）"):
+            self.assertNotEqual(dc._prompt_fingerprint(), base, "视觉 system prompt 应当参与提示词指纹")
+
+    def test_source_moves_do_not_change_the_fingerprint(self):
+        """搬迁不改指纹：进哈希的是**函数自身源码**，不是它在哪个文件里。
+
+        这条是重构的安全绳。它同时也是警告：改名、改注释、改 docstring、被
+        ruff format 重排——这些都在 getsource 的返回范围内，会让指纹变化。
+        """
+        import inspect
+
+        from analyzer import deepseek_client as dc
+
+        funcs = (dc._build_dialog, dc._message_line, dc._fit_lines, dc._conversation_stats, dc._short_time)
+        for f in funcs:
+            src = inspect.getsource(f)
+            module_path = inspect.getsourcefile(f)
+            self.assertNotIn(
+                module_path,
+                src,
+                "%s 的源码里不含模块路径，因此把它搬到别的文件不会换键" % f.__name__,
+            )
+            self.assertTrue(
+                src.lstrip().startswith("def "), "%s 的源码以 def 行起始（含名字与 docstring）" % f.__name__
+            )
 
     def test_explicit_list_matches_legacy_dir_order(self):
         """显式名单必须与旧实现 sorted(dir(prompts)) 的项与顺序逐一致
 
         这是"零值变更"的证明：指纹函数其余部分未动，输入清单又完全相同，
-        所以 PROMPT_FINGERPRINT 与升级前一致（实测均为 b6c5074dc226），
+        所以新增群聊提示词不会让私聊指纹发生变化（当前绝对值见
+        test_private_fingerprint_absolute_value_is_pinned，那里是唯一记录它的地方），
         既有私聊维度缓存与月份缓存全部继续命中。
         """
         import analyzer.prompts as prompts
