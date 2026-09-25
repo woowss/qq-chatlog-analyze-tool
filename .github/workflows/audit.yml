@@ -1,0 +1,54 @@
+name: dependency audit
+
+# 为什么**不**挂在 push/PR 上：requirements.txt 里出现新 CVE 与本次改动无关，
+# 让它在 PR 上变红只会训练大家习惯性忽略红叉。依赖版本由 Dependabot 每周开 PR 跟，
+# 这里负责另一件事——"已经装到用户机器上的那一套，现在有没有已知漏洞"，
+# 所以按周跑，并顺手复核一次全历史的提交信息形状（那个口径太重，不该塞进每个 PR）。
+on:
+  schedule:
+    # 每周一 03:17 UTC（错开整点，别和别人的定时任务挤在一起）
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+jobs:
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Audit pinned runtime dependencies
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          # 审 requirements.txt（精确锁定）而不是 pyproject 的范围声明：
+          # 范围里允许的组合太多，报出来的往往不是本仓库实际会装到的那一套。
+          pip-audit -r requirements.txt
+
+  full-history-fingerprints:
+    # 指纹守卫平时只扫最近若干个提交（见 tests/test_privacy_fingerprints.py）；
+    # 这里打开全量口径，等价于升级前 `git log --all` 的覆盖范围。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # 全历史扫描需要完整的提交历史，默认的浅克隆不够
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Scan every commit message for corpus-shaped values
+        env:
+          QQCHAT_SCAN_ALL_COMMITS: "1"
+        run: python -m unittest discover -s tests -p "test_privacy_fingerprints.py" -v

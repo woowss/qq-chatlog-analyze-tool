@@ -29,15 +29,19 @@ C. 2025-04 及之后的 `YYYY-MM-DD` 日期串，理由同 B；
 D. 文档里出现"非整千、非整 1024 的 5 位以上数字"（含 `12,4xx` 这种千分位写法）。
    真实统计量（消息总数、丢弃条数）就是长这样；合成示例一律写成 20,000 / 600000 这类量级；
 E. 32 位十六进制串（除下方登记的合成占位值）。真实导出里的 UID/媒体 md5 会以这个形状出现；
-F. 提交信息：只要 `.git` 可用，历史提交信息也按上面几条扫一遍——"把真实数字写进
+F. 提交信息：只要 `.git` 可用，提交信息也按上面几条扫一遍——"把真实数字写进
    commit message"是最常见的漏法。注意**提交信息不套用规则 D**：`7971891` 这种
    全数字的 7 位串在信息里通常是 commit SHA 前缀或 issue 号，与"统计量"形状无法区分，
    硬套只会制造噪音（A/B/C/E 这几条在信息里没有歧义，照常生效）。
 
 扫描集合是 `git ls-files`（没有 .git 时退化为目录遍历，供 sdist 内的用例使用）；
-`web/static/vendor/` 是第三方库，跳过。
+`web/static/vendor/` 是第三方库，跳过。提交信息那半边默认只扫**最近 N 个**提交
+（`QQCHAT_SCAN_COMMIT_DEPTH`，默认 300）：它挡的是新提交，而全历史扫描的成本随历史
+线性增长、还要在每个 PR 的测试里跑一遍。要复核全历史就设 `QQCHAT_SCAN_ALL_COMMITS=1`
+（`.github/workflows/audit.yml` 的定时任务即如此），那样才等价于升级前 `git log --all` 的全量口径。
 """
 
+import os
 import re
 import subprocess
 import sys
@@ -194,24 +198,47 @@ def _scan_files() -> list:
     return problems
 
 
-def _scan_messages() -> list:
-    """规则 F：提交信息按 A/B/C/E 扫（没有 .git 时返回空）。
+#: 提交信息扫描的默认深度（最近多少个提交，跨所有 ref）。
+#:
+#: 为什么默认不是全历史：这条规则要防的是**新**提交里混进真实数据的形状，而全历史
+#: 每次跑都要把仓库里所有 commit 的正文读出来并逐行过正则，成本随历史线性增长
+#: （这条守卫会自动出现在每个 PR 的测试里）。已经入库的历史在入库当时就被它挡过一遍，
+#: 仓库还做过一次 `git filter-repo` 全历史清洗（见 CHANGELOG）。
+#:
+#: 需要复核全历史时设 QQCHAT_SCAN_ALL_COMMITS=1（.github/workflows/audit.yml 的
+#: 定时任务就是这么跑的），或调大 QQCHAT_SCAN_COMMIT_DEPTH。
+_COMMIT_SCAN_DEPTH = int(os.getenv("QQCHAT_SCAN_COMMIT_DEPTH", "300") or 300)
 
-    刻意不套规则 D：提交信息里的全数字短串通常是 commit SHA 前缀（如 `7971891`）或 issue 号，
-    与"真实统计量"形状无法区分，套上只会天天误报。
-    """
+
+def _scan_all_commits() -> bool:
+    """本次是否扫描全历史（定时任务/人工复核用）"""
+    return os.getenv("QQCHAT_SCAN_ALL_COMMITS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _commit_bodies() -> list:
+    """[(sha, 提交信息正文)] —— 范围见 _COMMIT_SCAN_DEPTH（没有 .git 时返回空）"""
+    args = ["git", "log", "--all"]
+    if not _scan_all_commits():
+        args += ["-n", str(_COMMIT_SCAN_DEPTH)]
+    args += ["--format=%H%x00%B%x00"]
     try:
-        out = subprocess.run(
-            ["git", "log", "--all", "--format=%H%x00%B%x00"], cwd=ROOT, capture_output=True, timeout=60
-        )
+        out = subprocess.run(args, cwd=ROOT, capture_output=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return []
     if out.returncode != 0:
         return []
     parts = out.stdout.decode("utf-8", "replace").split("\0")
+    return [(parts[i].strip(), parts[i + 1]) for i in range(0, len(parts) - 1, 2)]
+
+
+def _scan_messages() -> list:
+    """规则 F：提交信息按 A/B/C/E 扫。
+
+    刻意不套规则 D：提交信息里的全数字短串通常是 commit SHA 前缀（如 `7971891`）或 issue 号，
+    与"真实统计量"形状无法区分，套上只会天天误报。
+    """
     problems = []
-    for i in range(0, len(parts) - 1, 2):
-        sha, body = parts[i].strip(), parts[i + 1]
+    for sha, body in _commit_bodies():
         for name, lineno in _text_problems("commit", body, is_doc=True, allow_big_numbers=False):
             problems.append((name, f"commit {sha[:8]}", lineno))
     return problems
@@ -242,6 +269,23 @@ class TestNoCorpusShapedValues(unittest.TestCase):
         """守卫本身别退化成"什么都没扫"（历史上有过扫描器静默失效的事故）"""
         files = [p for p in _tracked_files() if p.relative_to(ROOT).as_posix().startswith("tests/")]
         self.assertGreater(len(files), 5, "扫描集合为空或过小，守卫失效")
+
+    def test_commit_scan_still_covers_head(self):
+        """收敛成"最近 N 个提交"之后，必须仍覆盖当前提交。
+
+        没有这条，范围一旦配错（深度写成 0、或 git 参数被改坏），提交信息那半边守卫
+        就会安静地什么都不扫——而"守卫静默失效"正是这个文件存在的理由之一。
+        """
+        bodies = _commit_bodies()
+        if not bodies:
+            self.skipTest("当前目录不是 git 检出（sdist 场景），提交信息扫描不适用")
+        head = (
+            subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, timeout=30)
+            .stdout.decode("utf-8", "replace")
+            .strip()
+        )
+        self.assertTrue(head, "应当能取到 HEAD")
+        self.assertIn(head, {sha for sha, _ in bodies}, "有界扫描必须包含 HEAD 那一条提交")
 
     def test_rules_do_flag_the_shapes_they_claim(self):
         """负向对照：五条规则必须真的能命中各自的目标形状
