@@ -30,6 +30,18 @@ tests/test_group_foundation.py 的 PINNED_PRIVATE_FINGERPRINT 会让这种改动
 
 两者仍从本模块**再导出**，既有调用点（app.py / webapp / tools / tests）不必改；
 但模块级状态的打桩要打在 owns 它的模块上（见下方导入处的说明）。
+
+命名约定（三条，都是被缓存键逼出来的）：
+1. **进指纹的 5 个函数不能改名**，而且它们正文里引用到的全局名也一起被冻住
+   （_has_content / _vision_digest / _fit_lines / _message_line 等）——理由见 dialog.py
+   的文件说明。下划线在这里不表示"私有"，而是"这个名字参与缓存键"。
+2. 跨模块使用的下划线名（`_analyze_periods` / `_call_api` / `_clamp_int` /
+   `_normalize_topic_weights` / `store._chat_hash` 等）**刻意保留原名**：它们同时是
+   测试的 patch 目标（约二十处，含 6 个测试文件），改名是纯外观收益却要全仓改动，
+   而改漏一处的表现是"打桩没生效"（真调 API 或静默命中真实缓存），代价远大于收益。
+   读代码时请按"约定俗成的内部 API"理解这些名字。
+3. 拆模块时的再导出写成 `X as X`：静态检查据此不再把它当"导入了没用"，
+   也让"哪些名字是对外契约"一眼可见。
 """
 
 import ast

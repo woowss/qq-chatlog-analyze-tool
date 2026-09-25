@@ -330,6 +330,8 @@ AI 分析发送给**你自己配置的**接口，发送的内容包括：
 - 服务默认只绑定回环地址；绑定非回环地址时若未设置 `ACCESS_PASSWORD` 则拒绝启动；
 - 登录成功后轮换服务端 session id，旧 id 立即失效（防会话固定）；会话 cookie 带 `HttpOnly`、
   `SameSite=Lax`，并在非回环绑定时自动加 `Secure`（见 `QQCHAT_COOKIE_SECURE`）；
+  导航栏的「退出登录」（设了口令才出现）只接受 POST + CSRF，会同时清掉服务端会话与浏览器 cookie；
+  会话过期时 API 回 401 JSON 而不是把人重定向去登录页（否则前端只会拿到一页 HTML）；
 - POST 请求同时校验 CSRF token 与 Origin，Origin 白名单不信任请求自带的 Host（防 DNS rebinding）；
 - 登录后的 `next=` 跳转只接受站内路径（含 `/\host` 这类反斜杠变体）；登录接口对同一客户端地址有
   失败限流（默认 5 次 / 5 分钟，超限返回 429 并带 `Retry-After`，成功即清零）——反代/NAT 之后所有
@@ -355,7 +357,9 @@ qq-chatlog-analyze-tool/
 │   ├── local_stats.py         # 本地统计（私聊）
 │   ├── group_stats.py         # 群聊本地统计：成员活跃度、三张互动矩阵、群里程碑
 │   ├── group_client.py        # 群聊 AI：对话构建、成员感知抽样、四个群聊维度
-│   ├── deepseek_client.py     # 接口调用、月份级缓存、图片摘要注入
+│   ├── deepseek_client.py     # API 层：接口调用、限流与重试、思考模式、各维度执行体、提示词指纹
+│   ├── dialog.py              # 对话构建：把消息压成喂模型的文本（进指纹，改名/改注释会作废缓存）
+│   ├── month_cache.py         # 月份级增量缓存：内容寻址键、manifest 引用计数、孤儿回收
 │   ├── vision.py              # 图片理解：挑图、摘要、缓存
 │   ├── face_emoji.py          # 表情名到 Unicode emoji
 │   ├── face_images.py         # 表情原图：本地表情包 / 联网抓取 / 缓存
@@ -402,7 +406,7 @@ OpenAI SDK 的兼容接口。
 pip install -e ".[dev]"                      # 或 pip install -r requirements.txt
 python -m ruff check .                       # 代码检查（CI 同款）
 python -m ruff format .                      # 统一风格；CI 用 --check 卡住
-python -m unittest discover -s tests -v      # 全量单测（当前 468 个用例，含逐页冒烟、打包自检、会话后端自检）
+python -m unittest discover -s tests -v      # 全量单测（当前 501 个用例，含逐页冒烟、打包自检、会话后端自检）
 ```
 
 `ruff format` 有意排除了两处（见 `pyproject.toml` 的 `[tool.ruff.format] exclude`）：
