@@ -51,6 +51,7 @@ from analyzer.deepseek_client import (
     _call_api,
     _fit_lines,
     _has_content,
+    _hashed_source,
     _message_line,
     _vision_digest,
     logger,
@@ -541,12 +542,16 @@ GROUP_DIMENSIONS: dict = {
 }
 
 
-def group_prompt_fingerprint(salt: "str | None" = None) -> str:
+def group_prompt_fingerprint(salt: "str | None" = None, normalize: bool = True) -> str:
     """群聊提示词与格式的指纹，参与群聊的月份缓存键与维度缓存文件名。
 
     与私聊指纹**完全独立**：私聊那份按名单哈希 analyzer/prompts.py 的常量，
     这里哈希 analyzer/group_prompts.py 的全部常量 + 群聊自己的格式化函数源码 + 群聊常量。
     两边互不影响，因此新增/修改群聊提示词不会作废任何私聊缓存（那会让用户重新付费）。
+
+    normalize 的含义与私聊那份一致（见 deepseek_client._hashed_source）：
+    True = 源码归一到 AST（注释/空白/格式重排不再换键），False = 复现旧的原文公式，
+    只用于算 GROUP_PROMPT_FINGERPRINT_LEGACY 以读取旧缓存。
 
     源码不可读时（frozen/打包）降级为函数名占位，并提示用 PROMPT_CACHE_SALT 手动换键。
     """
@@ -572,7 +577,7 @@ def group_prompt_fingerprint(salt: "str | None" = None) -> str:
     )
     fmt_funcs = (build_group_dialog, _fit_group_lines, _interaction_digest, _member_facts, _member_context)
     try:
-        parts += [inspect.getsource(f) for f in fmt_funcs]
+        parts += [_hashed_source(f) if normalize else inspect.getsource(f) for f in fmt_funcs]
     except (OSError, TypeError):
         parts += [f"<source-unavailable:{f.__name__}>" for f in fmt_funcs]
         logger.warning(
@@ -585,3 +590,5 @@ def group_prompt_fingerprint(salt: "str | None" = None) -> str:
 
 
 GROUP_PROMPT_FINGERPRINT = group_prompt_fingerprint()
+#: 旧公式（按 getsource 原文哈希）的取值：只为读取 AST 归一之前写下的群聊缓存
+GROUP_PROMPT_FINGERPRINT_LEGACY = group_prompt_fingerprint(normalize=False)

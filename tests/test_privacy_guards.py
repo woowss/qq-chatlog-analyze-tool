@@ -210,6 +210,152 @@ class TestStatsCacheCreatedGuard(unittest.TestCase):
             self.assertIsNone(store.read_created_at(os.path.join(d, "不存在.json")))
 
 
+class TestFingerprintMigration(unittest.TestCase):
+    """指纹公式从"源码原文"改成"AST 归一"时，既有缓存必须继续可用并迁移到新键。
+
+    这是"改公式不能让用户重新付费"的唯一保障。反向验证：把 _read_cache 里的旧键回退
+    分支删掉 → 维度缓存那条红；把 _analyze_periods 的 _keys_for 回退删掉 → 月份那条红。
+    """
+
+    def test_legacy_dimension_cache_is_read_and_migrated(self):
+        from webapp import store
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(store, "AI_CACHE_DIR", d):
+                chat_hash = "hashMigrate01"
+                result = {"month_title": "《旧指纹写下的结果》"}
+                legacy_path = store._cache_path("emotion", chat_hash, legacy=True)
+                current_path = store._cache_path("emotion", chat_hash)
+                self.assertNotEqual(legacy_path, current_path, "前提：新旧指纹确实不同")
+                with open(legacy_path, "w", encoding="utf-8") as f:
+                    json.dump({"_created": 1.0, "result": result}, f, ensure_ascii=False)
+
+                self.assertEqual(
+                    store._read_cache("emotion", chat_hash),
+                    result,
+                    "旧指纹命名的缓存必须照常命中，否则用户为同样的分析重新付费",
+                )
+                self.assertTrue(os.path.exists(current_path), "命中旧文件后应当改名到当前键")
+                self.assertFalse(os.path.exists(legacy_path), "改名而不是复制：不留第二份敏感内容")
+
+    def test_legacy_month_cache_is_read_and_migrated(self):
+        from analyzer import deepseek_client as dc
+        from analyzer import month_cache as mc
+
+        with tempfile.TemporaryDirectory() as d:
+            mc.configure_month_cache(d)
+            try:
+                prompt = "以下是某月的对话数据：\n\n[01-01 08:00] 我: 在吗"
+                new_key = mc._month_key("SYS", prompt)
+                legacy_key = mc._month_key("SYS", prompt, dc.PROMPT_FINGERPRINT_LEGACY)
+                self.assertNotEqual(new_key, legacy_key, "前提：新旧指纹给出的键确实不同")
+                with open(mc.month_cache_path(legacy_key), "w", encoding="utf-8") as f:
+                    json.dump({"_created": 1.0, "self_emotion": "平静"}, f, ensure_ascii=False)
+
+                calls = []
+
+                def fake_api(*_a, **_kw):
+                    calls.append(1)
+                    return {"self_emotion": "不该被调用"}
+
+                with mock.patch.object(dc, "_call_api", side_effect=fake_api):
+                    out = dc._analyze_periods(
+                        {"2024-01": []},
+                        "SYS",
+                        lambda _p, _m: prompt,
+                        max_tokens=16,
+                        tag="emotion",
+                        chat_hash="hashMigrate02",
+                    )
+                self.assertEqual(calls, [], "旧键里的月份结果可用时不该再调用 API")
+                self.assertEqual(out["2024-01"]["self_emotion"], "平静")
+                self.assertTrue(os.path.exists(mc.month_cache_path(new_key)), "应改名到当前键")
+                self.assertFalse(os.path.exists(mc.month_cache_path(legacy_key)))
+                # 迁移后的新键必须被 manifest 记账，否则宽限期后会被当孤儿删掉（白付费）
+                manifest = json.load(io.open(mc._manifest_path("hashMigrate02"), encoding="utf-8"))
+                self.assertIn(new_key, manifest["months"])
+            finally:
+                mc.configure_month_cache("")
+
+    def test_ast_normalization_ignores_comments_and_formatting(self):
+        """AST 归一只丢与模型输入无关的差异，逻辑改动照样换键
+
+        三个变体用**同名**的嵌套函数：函数名也在 AST 里，不同名会被判为"逻辑变了"，
+        那是刻意的行为（改名 = 换键），不是这条用例要验的东西。
+        嵌套还顺带覆盖了 dedent：getsource 给的是带缩进的片段，不 dedent 会解析失败
+        并静默退回原文。
+        """
+        from analyzer.deepseek_client import _hashed_source
+
+        def make_with_comment():
+            def sample(x):
+                # 这条注释不该影响哈希
+                return x + 1
+
+            return sample
+
+        def make_without_comment():
+            def sample(x):
+                return x + 1
+
+            return sample
+
+        def make_with_other_logic():
+            def sample(x):
+                return x + 2
+
+            return sample
+
+        commented = make_with_comment()
+        plain = make_without_comment()
+        other = make_with_other_logic()
+        self.assertEqual(commented.__name__, plain.__name__, "前提：三个变体同名（改名本来就该换键）")
+        self.assertEqual(
+            _hashed_source(commented),
+            _hashed_source(plain),
+            "注释与空白不应影响指纹（否则改个错别字就要用户重新付费）",
+        )
+        self.assertNotEqual(
+            _hashed_source(plain),
+            _hashed_source(other),
+            "逻辑变了必须换键：否则新格式会顶着旧缓存返回",
+        )
+        dump = _hashed_source(plain)
+        self.assertIn("FunctionDef", dump, "返回值应当是 ast.dump 的形态，而不是退回的原文")
+        self.assertNotIn("return x + 1", dump, "AST dump 里不会保留原始代码文本")
+
+    def test_legacy_vision_digest_is_read_and_migrated(self):
+        """图片摘要的键里也含指纹：公式一改，既有摘要缓存同样不能丢。
+
+        直接驱动 vision.digest（而不是手工重演 os.replace）：摘要缓存的键、改名、
+        以及"不再调模型"三件事要一起验。迁移一旦失效，这里会走到 _call_vision——
+        测试环境没有 API Key，它返回空串，于是断言失败而不是真的出网。
+        """
+        from analyzer import vision
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(vision, "AI_CACHE_DIR", d):
+                images = [{"key": "img-fingerprint-1", "path": "x", "size": 1, "mime": "image/png"}]
+                key = vision._images_key(images)
+                legacy_key = vision._images_key(images, legacy=True)
+                self.assertNotEqual(key, legacy_key, "前提：新旧指纹给出的键确实不同")
+                legacy_path = vision._cache_path("hashMigrate03", legacy_key)
+                with open(legacy_path, "w", encoding="utf-8") as f:
+                    json.dump({"_created": 1.0, "digest": "旧指纹写下的图片摘要"}, f, ensure_ascii=False)
+
+                with (
+                    mock.patch.object(vision, "available", lambda *_a, **_kw: True),
+                    mock.patch.object(vision, "pick_images", lambda *_a, **_kw: images),
+                    mock.patch.object(vision, "_memo_get", lambda *_a, **_kw: None),
+                    mock.patch.object(vision, "_memo_put", lambda *_a, **_kw: None),
+                ):
+                    text = vision.digest([], chat_hash="hashMigrate03", label="测试")
+
+                self.assertEqual(text, "旧指纹写下的图片摘要", "旧键里的摘要必须照常返回")
+                self.assertTrue(os.path.exists(vision._cache_path("hashMigrate03", key)), "应改名到当前键")
+                self.assertFalse(os.path.exists(legacy_path), "改名而不是复制：不留第二份图片描述")
+
+
 class TestNonLoopbackFailClosed(unittest.TestCase):
     """非回环绑定又没设口令 = 零认证：必须拒绝服务，绝不敞开放行"""
 

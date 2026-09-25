@@ -377,8 +377,16 @@ class TestChatDataCompatibility(unittest.TestCase):
 #: 改这个值的前提：① 确实改了提示词/对话格式/进哈希的常量或预算；
 #: ② CHANGELOG 里写明"会让既有缓存在宽限期后被回收，用户需重新分析"。
 #: 只更新数字而不写 CHANGELOG，等于把一笔用户成本藏进测试改动里。
-#: 历史：M0（2026-09-12）实测为 b6c5074dc226；此后提示词与输出预算改过，现值如右。
-PINNED_PRIVATE_FINGERPRINT = "26bf952fe772"
+#:
+#: 历史：M0（2026-09-12）实测 b6c5074dc226；此后提示词与输出预算改过，到 2026-09
+#: 为 26bf952fe772；同月哈希对象从"源码原文"改为"源码的 AST 归一"（见 _hashed_source），
+#: 现值如下。**旧值仍然有效**：它是 LEGACY 常量，用来读取旧指纹命名的缓存并迁移，
+#: 所以那次公式变更没有让任何人为同样的分析重新付费（有专门的用例钉住迁移）。
+PINNED_PRIVATE_FINGERPRINT = "f4bd6aa06d52"
+
+#: 旧公式（按 getsource 原文哈希）的取值。它必须继续可复现——降低它的唯一方式是
+#: 让"旧缓存读不到"，也就是让用户重新付费。改动它同样要写 CHANGELOG。
+PINNED_LEGACY_PRIVATE_FINGERPRINT = "26bf952fe772"
 
 #: 会让上面那个绝对值必然对不上的环境变量（它们都通过常量进哈希）。
 #: 本机配了其中任何一个，说明这位开发者正在用非默认预算/视觉参数跑测试——
@@ -413,6 +421,12 @@ class TestPrivateFingerprintIsolation(unittest.TestCase):
             "私聊提示词指纹变了。它进维度缓存文件名与月份缓存键，一变就等于让所有既有用户"
             "在下次分析时重新付费（月份缓存会在宽限期后被孤儿回收）。若确属有意改动，"
             "请同步更新本用例的 PINNED_PRIVATE_FINGERPRINT，并在 CHANGELOG 写明这一点。",
+        )
+        self.assertEqual(
+            dc.PROMPT_FINGERPRINT_LEGACY,
+            PINNED_LEGACY_PRIVATE_FINGERPRINT,
+            "旧公式的指纹变了：它是「读取并迁移旧缓存」的唯一凭据。改它的后果是所有既有"
+            "用户的旧缓存都读不到，也就是让他们为同样的分析重新付费。",
         )
 
     def test_every_listed_env_input_really_changes_the_fingerprint(self):

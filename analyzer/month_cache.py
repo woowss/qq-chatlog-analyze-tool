@@ -99,6 +99,30 @@ def _month_key(system_prompt: str, user_content: str, fingerprint: "str | None" 
     return digest.hexdigest()[:20]
 
 
+def migrate_month_cache(old_key: str, new_key: str) -> bool:
+    """把"旧指纹写下的"月份缓存改名到新键，返回是否真的迁移了。
+
+    读到旧键的缓存时调用（见 deepseek_client._analyze_periods）：结果本身完全可用，
+    但文件名仍是旧键。**改名而不是复制**——这些文件含聊天原文引用，留两份等于把敏感
+    内容的留存翻倍。改名之后调用方会把**新键**记进 manifest，否则它会成为"无引用"
+    的文件，在宽限期后被孤儿回收删掉（用户为它付过钱）。
+
+    目标已存在时删掉旧的：内容等价（同一段对话 + 同一套提示词），新的那份才是被记账的。
+    """
+    if not _MONTH_CACHE_DIR or not old_key or old_key == new_key:
+        return False
+    src, dst = month_cache_path(old_key), month_cache_path(new_key)
+    try:
+        if os.path.exists(dst):
+            os.remove(src)
+            return False
+        os.replace(src, dst)
+        return True
+    except OSError as e:
+        _warn_write_failure("月份缓存迁移", dst, e)
+        return False
+
+
 def month_cache_path(key: str) -> str:
     return os.path.join(_MONTH_CACHE_DIR, f"month_{key}.json")
 

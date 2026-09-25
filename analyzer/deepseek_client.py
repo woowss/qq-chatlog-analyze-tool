@@ -32,11 +32,13 @@ tests/test_group_foundation.py 的 PINNED_PRIVATE_FINGERPRINT 会让这种改动
 但模块级状态的打桩要打在 owns 它的模块上（见下方导入处的说明）。
 """
 
+import ast
 import concurrent.futures
 import hashlib
 import inspect
 import json
 import os
+import textwrap
 import threading
 import time
 from functools import partial
@@ -108,6 +110,7 @@ from analyzer.month_cache import (
     _referenced_keys_locked as _referenced_keys_locked,
     _write_month_cache,
     configure_month_cache as configure_month_cache,
+    migrate_month_cache,
     month_cache_path as month_cache_path,
     purge_month_cache as purge_month_cache,
     sweep_orphan_month_cache as sweep_orphan_month_cache,
@@ -360,7 +363,39 @@ def _get_client() -> Optional[OpenAI]:
     return _CLIENT
 
 
-def _prompt_fingerprint(salt: "str | None" = None) -> str:
+def _hashed_source(func) -> str:
+    """取函数源码用于哈希：归一到 AST 形态（丢注释/空白/引号风格，保留逻辑）。
+
+    为什么不再直接哈希原始源码：那样连"注释里改一个错别字"或"被 ruff format 重排"
+    都会换掉指纹，而指纹一变，用户就要为**同样的对话**重新付费分析一遍。AST 恰好把
+    "与喂给模型的东西无关的差异"去掉，同时保留原有保证——真正影响模型输入的改动
+    必然改变 AST。
+
+    dedent 是必需的：getsource 返回的是带原始缩进的片段，嵌套函数的源码直接喂给
+    ast.parse 会 IndentationError（踩过：解析失败会静默退回原文，于是"注释不该影响
+    哈希"这条保证在某些函数上悄悄失效）。解析仍失败时退回原文**并出声**，
+    不让降级无声无息。
+
+    注意 docstring 仍在 AST 里（它是函数体的一部分），改文档字符串依然会换键；
+    函数**名**同样在 AST 里，所以改名也会换键——这正是缓存契约要的效果
+    （也意味着那 5 个函数不能顺手改名）。这个方向的保守是可接受的：
+    宁可多失效一次，也不要"改了格式却继续命中旧缓存"。
+    读不到源码时交给调用方统一降级（编译/打包环境）。
+    """
+    src = inspect.getsource(func)
+    try:
+        return ast.dump(ast.parse(textwrap.dedent(src)))
+    except (SyntaxError, ValueError) as e:
+        logger.warning(
+            "提示词指纹：%s 的源码无法解析成 AST（%s），该类回退为原文哈希——"
+            "这意味着它的注释/格式改动也会换键",
+            getattr(func, "__name__", func),
+            e,
+        )
+        return src
+
+
+def _prompt_fingerprint(salt: "str | None" = None, normalize: bool = True) -> str:
     """提示词 + 对话格式的指纹，参与缓存键。
 
     以前靠手工维护 PROMPT_VERSION：改了 prompt 或抓取/抽样逻辑却忘了 bump，
@@ -377,6 +412,9 @@ def _prompt_fingerprint(salt: "str | None" = None) -> str:
     取值仍然在调用时从 analyzer.prompts 现取（而不是 import 期把字符串绑进元组）：
     这样"改了提示词文本必须换指纹"这条既有保证不受影响（tests 里有用例靠打桩
     prompts 模块来验证它），也让运行时热改提示词同样能反映到指纹上。
+
+    normalize=False 复现"按原始源码哈希"的旧公式，只用来算 PROMPT_FINGERPRINT_LEGACY
+    （读旧缓存、读到就迁移，见 month_cache.month_keys 与 webapp.store._read_cache）。
 
     源码不可读时（frozen/编译打包，inspect.getsource 抛 OSError）降级为
     函数名占位——提示词改动仍然会失效缓存，但格式逻辑改动不会，
@@ -415,7 +453,7 @@ def _prompt_fingerprint(salt: "str | None" = None) -> str:
     )
     fmt_funcs = (_build_dialog, _message_line, _fit_lines, _conversation_stats, _short_time)
     try:
-        parts += [inspect.getsource(f) for f in fmt_funcs]
+        parts += [_hashed_source(f) if normalize else inspect.getsource(f) for f in fmt_funcs]
     except (OSError, TypeError):
         parts += [f"<source-unavailable:{f.__name__}>" for f in fmt_funcs]
         logger.warning(
@@ -429,6 +467,9 @@ def _prompt_fingerprint(salt: "str | None" = None) -> str:
 
 
 PROMPT_FINGERPRINT = _prompt_fingerprint()
+#: 旧公式（按 getsource 原文哈希）的取值。只用于"读旧缓存并迁移"：
+#: 用 AST 归一之后，所有既有用户的缓存都是以这个值命名的，直接换键等于让他们重新付费。
+PROMPT_FINGERPRINT_LEGACY = _prompt_fingerprint(normalize=False)
 
 
 def fingerprint_for_dimension(dim: str) -> str:
@@ -442,6 +483,15 @@ def fingerprint_for_dimension(dim: str) -> str:
     if dim in group_client.GROUP_DIMENSIONS:
         return group_client.GROUP_PROMPT_FINGERPRINT
     return PROMPT_FINGERPRINT
+
+
+def legacy_fingerprint_for_dimension(dim: str) -> str:
+    """该维度"旧公式"的指纹：只用来读 AST 归一之前写下的缓存（读到即迁移）。"""
+    from analyzer import group_client
+
+    if dim in group_client.GROUP_DIMENSIONS:
+        return group_client.GROUP_PROMPT_FINGERPRINT_LEGACY
+    return PROMPT_FINGERPRINT_LEGACY
 
 
 # 思考模式的最低输出预算：思维链 token 也计入 max_tokens，低于这个值必然截断
@@ -734,6 +784,27 @@ def _analyze_periods(
         # 用户点了取消，或进程正在关闭（Ctrl+C）：都不该再往外发新请求
         return shutdown_requested() or bool(should_cancel and should_cancel())
 
+    def _keys_for(prompt: str) -> list:
+        """该月 prompt 对应的缓存键：[(当前指纹的)键] 或 [当前键, 旧指纹的键]。
+
+        第二个键是为了读取"AST 归一之前"写下的月份缓存。不这么做的话，指纹公式一改，
+        所有既有用户的月份缓存全部不再命中——他们会为**同一段对话**重新付一次钱，
+        而这次改动本身与提示词、与对话内容都无关。
+        """
+        current_fp = fingerprint or PROMPT_FINGERPRINT
+        keys = [_month_key(system_prompt, prompt, fingerprint)]
+        legacy_fp = None
+        if fingerprint is None:
+            legacy_fp = PROMPT_FINGERPRINT_LEGACY
+        else:
+            from analyzer import group_client  # 延迟导入：group_client 在模块级 import 本模块
+
+            if fingerprint == group_client.GROUP_PROMPT_FINGERPRINT:
+                legacy_fp = group_client.GROUP_PROMPT_FINGERPRINT_LEGACY
+        if legacy_fp and legacy_fp != current_fp:
+            keys.append(_month_key(system_prompt, prompt, legacy_fp))
+        return keys
+
     def _work(period: str, msgs: list) -> tuple[str, Optional[dict]]:
         # 已被排入线程池但尚未开始执行时取消：直接跳过，不产生 API 调用
         if _cancel_requested():
@@ -742,8 +813,18 @@ def _analyze_periods(
             prompt = make_prompt(period, msgs)
             if not prompt.strip():
                 return period, None
-            key = _month_key(system_prompt, prompt, fingerprint)
+            keys = _keys_for(prompt)
+            key = keys[0]
             result = _read_month_cache(key)
+            if result is None and len(keys) > 1:
+                result = _read_month_cache(keys[1])
+                if result is not None:
+                    # 旧键里的结果照常可用：改名到当前键，并按**当前键**记账（下面 used_keys），
+                    # 否则新文件会成为"无引用"，宽限期后被孤儿回收删掉。
+                    if migrate_month_cache(keys[1], key):
+                        logger.info("%s 命中旧指纹的月份缓存，已迁移到当前键", period)
+                    else:
+                        logger.info("%s 命中旧指纹的月份缓存", period)
             if result is not None:
                 logger.info("%s 命中月份缓存，跳过 API 调用", period)
             else:

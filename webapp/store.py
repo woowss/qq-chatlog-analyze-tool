@@ -47,7 +47,12 @@ from analyzer.local_stats import (
     calc_milestones,
 )
 from analyzer.group_stats import compute_group_stats
-from analyzer.deepseek_client import fingerprint_for_dimension, purge_month_cache, thinking_enabled
+from analyzer.deepseek_client import (
+    fingerprint_for_dimension,
+    legacy_fingerprint_for_dimension,
+    purge_month_cache,
+    thinking_enabled,
+)
 from analyzer.logger import get_logger
 
 logger = get_logger("app")
@@ -482,7 +487,7 @@ def _stats_with_word_freq(stats: dict, chat_hash: str):
 # ---------------------------------------------------------------------------
 
 
-def _cache_path(dimension: str, chat_hash: str) -> str:
+def _cache_path(dimension: str, chat_hash: str, legacy: bool = False) -> str:
     # 键含提示词/格式指纹：由 SYSTEM_PROMPT_* 与对话格式化函数自动哈希而来，改了提示词或
     # 输入格式后旧缓存自动失效（不再依赖人工 bump 版本号）。**按维度取**：群聊维度用群聊
     # 指纹，私聊维度用私聊指纹——这样新增/修改群聊提示词不会让私聊缓存文件名发生变化
@@ -490,9 +495,15 @@ def _cache_path(dimension: str, chat_hash: str) -> str:
     # 键含思考模式：同一模型开关 thinking 前后的结果差异很大，必须分开存放，
     # 否则切换 LLM_THINKING(_DIMS) 后会命中另一种模式的旧结果（看起来"没区别"）。
     # 非思考模式不加后缀，保持既有缓存键兼容。
+    #
+    # legacy=True 给出"旧指纹公式"下的文件名：指纹改为 AST 归一之后，既有用户的缓存
+    # 仍叫那个名字。_read_cache 会先按当前键找、找不到再看旧键，读到就改名（迁移），
+    # 于是这次公式变更不会让任何人为同样的分析重新付费。
     suffix = "_think" if thinking_enabled(dimension) else ""
-    fingerprint = fingerprint_for_dimension(dimension)
-    return os.path.join(AI_CACHE_DIR, f"{dimension}_{chat_hash}_{DEEPSEEK_MODEL}_{fingerprint}{suffix}.json")
+    pick = legacy_fingerprint_for_dimension if legacy else fingerprint_for_dimension
+    return os.path.join(
+        AI_CACHE_DIR, f"{dimension}_{chat_hash}_{DEEPSEEK_MODEL}_{pick(dimension)}{suffix}.json"
+    )
 
 
 def _cache_belongs_to(name: str, chat_hash: str) -> bool:
@@ -557,8 +568,8 @@ def _purge_chat_caches(chat_hash: str) -> int:
     return removed
 
 
-def _read_cache(dimension: str, chat_hash: str):
-    path = _cache_path(dimension, chat_hash)
+def _load_cache_file(path: str):
+    """读一个维度缓存文件（不含任何回退逻辑）：读不到返回 None"""
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -573,6 +584,31 @@ def _read_cache(dimension: str, chat_hash: str):
         os.utime(path, None)
     except OSError:
         pass
+    return data
+
+
+def _read_cache(dimension: str, chat_hash: str):
+    """读维度缓存；当前指纹下没有时，看一眼"旧指纹"写的同名文件并迁移过来。
+
+    指纹公式从"源码原文"改成 AST 归一之后，既有用户的缓存文件名仍是旧指纹。
+    不认那份的话，他们每一次分析都要重新付费——而这次公式变更与提示词、与对话
+    内容都毫无关系。读到旧文件就 os.replace 到当前键：既完成迁移，又不留重复的
+    敏感内容（这些缓存含聊天原文引用）。
+    """
+    data = _load_cache_file(_cache_path(dimension, chat_hash))
+    if data is not None:
+        return data
+    legacy_path = _cache_path(dimension, chat_hash, legacy=True)
+    if legacy_path == _cache_path(dimension, chat_hash):
+        return None  # 两个指纹相同（没有历史包袱的干净环境），不必多查一次
+    data = _load_cache_file(legacy_path)
+    if data is not None:
+        try:
+            os.replace(legacy_path, _cache_path(dimension, chat_hash))
+            logger.info("命中旧指纹的维度缓存并迁移到当前键: %s", dimension)
+        except OSError as e:
+            # 迁移失败不影响这次的结果（已经在 data 里了）；下次读还会再看到旧文件
+            logger.warning("维度缓存迁移失败（结果仍可用，只是留在旧文件名下）: %s", e)
     return data
 
 

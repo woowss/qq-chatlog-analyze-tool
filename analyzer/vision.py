@@ -255,12 +255,18 @@ def pick_images(msgs: list, limit: int = None, chat_hash: str = "") -> list[dict
     return picked
 
 
-def _images_key(images: list[dict]) -> str:
-    """摘要缓存键：图片指纹（md5）+ 顺序 + 模型/系统提示词/清晰度都要进哈希"""
+def _images_key(images: list[dict], legacy: bool = False) -> str:
+    """摘要缓存键：图片指纹（md5）+ 顺序 + 模型/系统提示词/清晰度都要进哈希。
+
+    legacy=True 用"旧指纹公式"（源码原文版）的取值：图片摘要的键里也含
+    PROMPT_FINGERPRINT，指纹公式一改，既有用户的摘要缓存就不再命中——那些摘要也是
+    付费调出来的，所以要能读回来（见 digest 里的迁移）。
+    """
     from analyzer import deepseek_client as dc  # 延迟导入，避免循环依赖
 
+    fingerprint = dc.PROMPT_FINGERPRINT_LEGACY if legacy else dc.PROMPT_FINGERPRINT
     digest = hashlib.sha256()
-    for part in (dc.DEEPSEEK_MODEL, dc.PROMPT_FINGERPRINT, VISION_SYSTEM, VISION_DETAIL):
+    for part in (dc.DEEPSEEK_MODEL, fingerprint, VISION_SYSTEM, VISION_DETAIL):
         digest.update(str(part).encode("utf-8"))
         digest.update(b"\x00")
     for img in images:
@@ -325,8 +331,22 @@ def digest(msgs: list, chat_hash: str = "", label: str = "") -> str:
     hit = _memo_get(key)
     if hit is not None:
         return hit
-    path = _cache_path(chat_hash or "nohash", key)
+    chat_id = chat_hash or "nohash"
+    path = _cache_path(chat_id, key)
     cached = _read_cache(path)
+    if cached is None:
+        # 指纹公式改成 AST 归一之前，摘要文件用的是旧键。摘要同样是付费调用出来的，
+        # 所以认旧键并改名过来（改名而不是复制：这些文件含图片描述，不留第二份）。
+        legacy_key = _images_key(images, legacy=True)
+        if legacy_key != key:
+            legacy_path = _cache_path(chat_id, legacy_key)
+            cached = _read_cache(legacy_path)
+            if cached is not None:
+                try:
+                    os.replace(legacy_path, path)
+                    logger.info("命中旧指纹的图片摘要缓存并迁移到当前键（%d 张）", len(images))
+                except OSError as e:
+                    logger.warning("图片摘要缓存迁移失败（结果仍可用）: %s", e)
     if cached is not None:
         _memo_put(key, cached)
         return cached
