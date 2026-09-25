@@ -367,6 +367,68 @@ class TestCacheAtomicity(unittest.TestCase):
         finally:
             storemod._purge_chat_caches("hashTtl")
 
+    def test_purge_matches_chat_hash_as_a_whole_segment(self):
+        """隐私删除路径必须整段匹配，不能靠子串
+
+        子串匹配两个方向都能错：漏删（命名格式一变、子串不再出现，含聊天内容摘要的
+        缓存留在盘上，而用户以为已经清干净）与误删（顺手删掉另一个聊天的缓存）。
+        """
+        target = "0123456789abcdef"
+        self.assertTrue(storemod._cache_belongs_to(f"emotion_{target}_deepseek-flash_abc123.json", target))
+        self.assertTrue(storemod._cache_belongs_to(f"vision_{target}_deadbeef.json", target))
+        self.assertFalse(
+            storemod._cache_belongs_to(f"emotion_x{target}y_deepseek-flash_abc123.json", target),
+            "哈希只是别人文件名的一部分时不该被删",
+        )
+        self.assertFalse(
+            storemod._cache_belongs_to("emotion_fedcba9876543210_deepseek-flash_abc123.json", target),
+            "另一个聊天的缓存不该被删",
+        )
+
+    def test_write_cache_survives_a_deleted_cache_dir(self):
+        """README 教用户"删掉 ai_cache/ 即可彻底清除数据"，而服务可能还开着。
+
+        缓存目录被删后写入方必须自愈：不补目录的后果不是"少一个文件"，而是此后
+        **每一次**写入都静默失败——用户以为在命中缓存，实际每个月、每个维度都在
+        重复付费，界面上完全看不出来。
+        """
+        import shutil
+
+        storemod._write_cache("emotion", "hashNoDir", {"a": 1})
+        shutil.rmtree(storemod.AI_CACHE_DIR, ignore_errors=True)
+        self.assertFalse(os.path.isdir(storemod.AI_CACHE_DIR), "前提：目录确实没了")
+        try:
+            storemod._write_cache("emotion", "hashNoDir", {"a": 2})
+            path = storemod._cache_path("emotion", "hashNoDir")
+            self.assertTrue(os.path.exists(path), "缓存目录被删后必须自动重建")
+            self.assertEqual(storemod._read_cache("emotion", "hashNoDir"), {"a": 2})
+        finally:
+            storemod._purge_chat_caches("hashNoDir")
+
+    def test_month_cache_survives_a_deleted_cache_dir(self):
+        """月份缓存与 manifest 同理：写不进去就等于增量分析整体失效。"""
+        import shutil
+
+        from analyzer import deepseek_client as dc
+
+        with tempfile.TemporaryDirectory() as d:
+            cache = os.path.join(d, "ai_cache")
+            dc.configure_month_cache(cache)
+            try:
+                dc._write_month_cache("nodir0000001", {"x": 1})
+                dc._record_month_usage("hashNoDirChat", ["nodir0000001"])
+                shutil.rmtree(cache, ignore_errors=True)
+
+                dc._write_month_cache("nodir0000002", {"x": 2})
+                dc._record_month_usage("hashNoDirChat", ["nodir0000002"])
+
+                self.assertTrue(os.path.isdir(cache), "月份缓存目录必须自愈重建")
+                self.assertEqual(dc._read_month_cache("nodir0000002"), {"x": 2})
+                manifest = json.load(io.open(dc._manifest_path("hashNoDirChat"), encoding="utf-8"))
+                self.assertIn("nodir0000002", manifest["months"])
+            finally:
+                dc.configure_month_cache("")
+
 
 class TestLoginThrottle(unittest.TestCase):
     """绑定局域网时口令不能无限爆破"""
@@ -522,49 +584,6 @@ class TestLoginThrottle(unittest.TestCase):
             for _ in range(securitymod.LOGIN_MAX_ATTEMPTS):
                 securitymod._record_login_failure("198.51.100.7")
             self.assertFalse(securitymod._login_throttle_ok("198.51.100.7"))
-
-    def test_write_cache_survives_a_deleted_cache_dir(self):
-        """README 教用户"删掉 ai_cache/ 即可彻底清除数据"，而服务可能还开着。
-
-        缓存目录被删后写入方必须自愈：不补目录的后果不是"少一个文件"，而是此后
-        **每一次**写入都静默失败——用户以为在命中缓存，实际每个月、每个维度都在
-        重复付费，界面上完全看不出来。
-        """
-        import shutil
-
-        storemod._write_cache("emotion", "hashNoDir", {"a": 1})
-        shutil.rmtree(storemod.AI_CACHE_DIR, ignore_errors=True)
-        self.assertFalse(os.path.isdir(storemod.AI_CACHE_DIR), "前提：目录确实没了")
-        try:
-            storemod._write_cache("emotion", "hashNoDir", {"a": 2})
-            path = storemod._cache_path("emotion", "hashNoDir")
-            self.assertTrue(os.path.exists(path), "缓存目录被删后必须自动重建")
-            self.assertEqual(storemod._read_cache("emotion", "hashNoDir"), {"a": 2})
-        finally:
-            storemod._purge_chat_caches("hashNoDir")
-
-    def test_month_cache_survives_a_deleted_cache_dir(self):
-        """月份缓存与 manifest 同理：写不进去就等于增量分析整体失效。"""
-        import shutil
-
-        from analyzer import deepseek_client as dc
-
-        with tempfile.TemporaryDirectory() as d:
-            cache = os.path.join(d, "ai_cache")
-            dc.configure_month_cache(cache)
-            try:
-                dc._write_month_cache("nodir0000001", {"x": 1})
-                dc._record_month_usage("hashNoDirChat", ["nodir0000001"])
-                shutil.rmtree(cache, ignore_errors=True)
-
-                dc._write_month_cache("nodir0000002", {"x": 2})
-                dc._record_month_usage("hashNoDirChat", ["nodir0000002"])
-
-                self.assertTrue(os.path.isdir(cache), "月份缓存目录必须自愈重建")
-                self.assertEqual(dc._read_month_cache("nodir0000002"), {"x": 2})
-                self.assertIn("nodir0000002", json.load(open(dc._manifest_path("hashNoDirChat")))["months"])
-            finally:
-                dc.configure_month_cache("")
 
 
 class TestExpiredSessionResponses(unittest.TestCase):

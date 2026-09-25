@@ -495,6 +495,19 @@ def _cache_path(dimension: str, chat_hash: str) -> str:
     return os.path.join(AI_CACHE_DIR, f"{dimension}_{chat_hash}_{DEEPSEEK_MODEL}_{fingerprint}{suffix}.json")
 
 
+def _cache_belongs_to(name: str, chat_hash: str) -> bool:
+    """文件名是否属于该聊天：按 `_` 切段后**整段**比较，而不是子串匹配。
+
+    这是隐私删除路径，子串匹配两个方向都能错：漏删（命名格式变了、子串不再出现，
+    含聊天内容摘要的缓存就留在盘上，而用户以为已经清干净）与误删（哈希段恰好是
+    另一个哈希的一部分，顺手删了别人的缓存）。两种缓存的命名都把 chat_hash
+    作为一个完整段：维度缓存 `{dim}_{hash}_{model}_{指纹}.json`、
+    图片摘要 `vision_{hash}_{key}.json`。
+    """
+    stem = name[: -len(".json")] if name.endswith(".json") else name
+    return chat_hash in stem.split("_")
+
+
 def _purge_chat_caches(chat_hash: str) -> int:
     """删除某聊天文件的全部缓存（跨版本/模型）。聊天源文件被删时联动调用，
     避免派生的分析结果（含聊天内容摘要）成为孤儿残留。"""
@@ -511,7 +524,7 @@ def _purge_chat_caches(chat_hash: str) -> int:
     except OSError:
         return 0
     for name in entries:
-        if f"_{chat_hash}_" in name:
+        if _cache_belongs_to(name, chat_hash):
             try:
                 os.remove(os.path.join(AI_CACHE_DIR, name))
                 removed += 1
