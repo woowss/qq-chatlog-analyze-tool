@@ -809,5 +809,61 @@ class TestGhostLiveRefsDoNotBlockExplicitDelete(unittest.TestCase):
             )
 
 
+# ---------------------------------------------------------------------------
+# 批 10：提示词指纹必须**跨 Python 版本**稳定
+# ---------------------------------------------------------------------------
+class TestFingerprintIsStableAcrossPythonVersions(unittest.TestCase):
+    """同一份源码在任何受支持的 Python 上必须得到同一个指纹。
+
+    真实事故：指纹原先哈希 `ast.dump` 的输出，而 CPython 3.13 起 `ast.dump` 多了
+    `show_empty` 且默认 False——空字段（`returns=None`、`type_params=[]`）不再被打印，
+    3.12 及更早则会全打出来。后果有两条，都在 CI 上现形：① 3.10/3.12 的"指纹绝对值"
+    用例必红（四个版本只过两个）；② 用户换一个 Python 版本，维度缓存与月份缓存的键
+    全变，**同一份聊天要重新付费**。指纹的全部意义是"同样输入同样键"，版本相关直接
+    把它打穿。修法是自写的 `_canonical_ast`：只取节点类型名与非空语义字段、字段名排序。
+    """
+
+    def test_new_empty_fields_do_not_change_the_canonical_form(self):
+        """给每个节点挂一个"未来版本新增的可选空字段"，规范串必须一字不变。
+
+        这正是 3.13 那类变化的形状（新字段 + 空值）。少了这条守卫，指纹会随解释器
+        版本漂移，而症状只在别的 Python 上出现——开发机（3.14）永远看不到。
+        """
+        import ast as _ast
+
+        tree = _ast.parse("def f(x, y=1):\n    return [i for i in x if i]\n")
+        before = dc._canonical_ast(tree)
+        for node in _ast.walk(tree):
+            node._fields = tuple(node._fields) + ("qqchat_future_optional",)
+            node.qqchat_future_optional = []
+        self.assertEqual(before, dc._canonical_ast(tree), "新增的空字段不该换键")
+
+    def test_field_order_does_not_matter(self):
+        """字段顺序也不该影响结果（版本间 `_fields` 顺序可能不同）。"""
+        import ast as _ast
+
+        tree = _ast.parse("def f(a):\n    return a + 1\n")
+        before = dc._canonical_ast(tree)
+        for node in _ast.walk(tree):
+            node._fields = tuple(reversed(node._fields))
+        self.assertEqual(before, dc._canonical_ast(tree))
+
+    def test_semantic_changes_still_move_the_fingerprint(self):
+        """反向：真正的语义改动**必须**换键，否则缓存会拿旧结果冒充新口径。"""
+        import ast as _ast
+
+        a = _ast.parse("def f(x):\n    return x + 1\n")
+        b = _ast.parse("def f(x):\n    return x + 2\n")
+        self.assertNotEqual(dc._canonical_ast(a), dc._canonical_ast(b))
+
+    def test_comments_and_reformatting_do_not_move_the_fingerprint(self):
+        """本轮引入 AST 归一的初衷：改注释/重排不该让用户重新付费。"""
+        import ast as _ast
+
+        a = _ast.parse("def f(x):\n    # 说明\n    return x\n")
+        b = _ast.parse("def f(x):\n\n    return    x\n")
+        self.assertEqual(dc._canonical_ast(a), dc._canonical_ast(b))
+
+
 if __name__ == "__main__":
     unittest.main()

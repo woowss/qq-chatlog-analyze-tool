@@ -389,7 +389,13 @@ class TestChatDataCompatibility(unittest.TestCase):
 #: 代价**已在 CHANGELOG 写明**：既有私聊用户下次跑五个维度会重新付费。
 #: 被换出去的 f4bd6aa06d52 压进了 deepseek_client.PRIVATE_FINGERPRINT_GENERATIONS，
 #: 因此它不是"消失"，而是变成链条里可读可迁的一代——下一次换代时老用户仍能沿链搬回。
-PINNED_PRIVATE_FINGERPRINT = "83f7b5eaa608"
+#:
+#: 再换代：23fa36bc1d2a —— 归一化从 `ast.dump` 换成自写的规范折叠（_canonical_ast）。
+#: 原因是 `ast.dump` 的输出**随 Python 版本变**（3.13 起默认不再打印空字段），
+#: 于是同一份源码在 3.10/3.12 与 3.13/3.14 上得到两个不同的指纹：CI 里低版本那两个
+#: 用例必红，而用户换个 Python 版本就要为同一份聊天重新付费。**83f7b5eaa608 从未发布**
+#: （它只存在于本轮未提交的改动里），所以这一换是零成本，没有任何用户为它付过钱。
+PINNED_PRIVATE_FINGERPRINT = "23fa36bc1d2a"
 
 #: 旧公式（按 getsource 原文哈希）的取值。它必须继续可复现——降低它的唯一方式是
 #: 让"旧缓存读不到"，也就是让用户重新付费。改动它同样要写 CHANGELOG。
@@ -421,7 +427,10 @@ _FINGERPRINT_ENV_KEYS = (
 #: 输入变了就必须换键——继续命中旧键等于让新口径下的结论配不上旧样本。
 #: 代价：既有群聊用户下次分析群聊维度时重付一次（成员画像是每人一次调用）。
 #: 旧凭据 5f1f7bb3c0ce 不受影响：它已改为字面量冻结，不再随源码浮动。
-PINNED_GROUP_FINGERPRINT = "f9b8b7d70e13"
+#:
+#: 第三次换代（归一化改自写规范折叠，见上面 PINNED_PRIVATE_FINGERPRINT 那段说明）：
+#: f9b8b7d70e13 → 30c7d6356e3a。同样是"从未发布过"的值，零成本。
+PINNED_GROUP_FINGERPRINT = "30c7d6356e3a"
 
 #: 旧公式下的群聊指纹取值，作用同上：改它的后果是所有既有群聊用户的旧缓存读不到。
 PINNED_LEGACY_GROUP_FINGERPRINT = "5f1f7bb3c0ce"

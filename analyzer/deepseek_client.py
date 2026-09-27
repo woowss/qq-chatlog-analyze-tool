@@ -458,10 +458,21 @@ def _hashed_source(func) -> str:
     （也意味着那 5 个函数不能顺手改名）。这个方向的保守是可接受的：
     宁可多失效一次，也不要"改了格式却继续命中旧缓存"。
     读不到源码时交给调用方统一降级（编译/打包环境）。
+
+    **为什么不用 `ast.dump()`**：它的输出**随 Python 版本变**。CPython 3.13 起
+    `ast.dump` 多了 `show_empty` 参数且默认 `False`——空字段（`returns=None`、
+    `type_params=[]` 之类）不再被打印，而 3.12 及更早会把它们全打出来。于是同一份
+    源码在 3.10/3.12 与 3.13/3.14 上得到**两个不同的指纹**，后果有两条：
+    ① CI 里 3.10 与 3.12 的"指纹绝对值"用例必红（本轮就撞上了，四个版本只过两个）；
+    ② 用户换一个 Python 版本，维度缓存与月份缓存的键全变，**同一份聊天要重新付费**。
+    指纹的全部意义就是"同样的输入得到同样的键"，版本相关性直接把它打穿。
+    所以这里自己把 AST 折叠成规范串：只取节点类型名与**非空**语义字段，字段名排序。
+    新版本新增的可选空字段会被跳过（正是 3.13 起 `ast.dump` 的行为），语义改动照旧换键，
+    而"改注释/重排/换引号不换键"这条原有保证完全保留。
     """
     src = inspect.getsource(func)
     try:
-        return ast.dump(ast.parse(textwrap.dedent(src)))
+        return _canonical_ast(ast.parse(textwrap.dedent(src)))
     except (SyntaxError, ValueError) as e:
         logger.warning(
             "提示词指纹：%s 的源码无法解析成 AST（%s），该类回退为原文哈希——"
@@ -470,6 +481,28 @@ def _hashed_source(func) -> str:
             e,
         )
         return src
+
+
+def _canonical_ast(node) -> str:
+    """把 AST 折叠成**跨 Python 版本稳定**的规范字符串（见 _hashed_source 的说明）。
+
+    规则只有三条，都是为了"同一份源码在任何受支持的 Python 上得到同一个串"：
+    - 节点类型名 + 字段名（**排序**，不依赖 `_fields` 的顺序）；
+    - `None` / 空列表 / 空串一律**省略**——新版本新增的可选空字段因此不影响结果；
+    - 子节点递归折叠，常量与非 AST 值走 repr。
+    不引入任何版本相关的排序或格式（例如不依赖 ast.dump 的括号与缩进风格）。
+    """
+    if isinstance(node, ast.AST):
+        parts = [type(node).__name__]
+        for field in sorted(getattr(node, "_fields", ())):
+            value = getattr(node, field, None)
+            if value is None or value == [] or value == "":
+                continue
+            parts.append(f"{field}={_canonical_ast(value)}")
+        return "(" + " ".join(parts) + ")"
+    if isinstance(node, (list, tuple)):
+        return "[" + " ".join(_canonical_ast(item) for item in node) + "]"
+    return repr(node)
 
 
 def _prompt_fingerprint(salt: "str | None" = None, normalize: bool = True) -> str:
