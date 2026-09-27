@@ -278,6 +278,56 @@ class TestFingerprintMigration(unittest.TestCase):
             finally:
                 mc.configure_month_cache("")
 
+    def test_month_cache_walks_every_generation_not_just_the_first(self):
+        """月份缓存在**链里两代**上都必须命中并迁移，不能只试链头那一代。
+
+        读侧原先写的是 `if result is None and len(keys) > 1: _read_month_cache(keys[1])`
+        ——只碰一个下标。这在"每族只有一代旧键"时是对的，但
+        legacy_fingerprints_for_dimension 泛化成链之后读侧没跟着改：链里第二代之后的
+        键永远读不到，用户为同一段对话再付一次钱，而这次改动与内容毫无关系。
+        私聊压进"中位数换代"那一代之后链里真有两代，这个潜伏问题才变成活问题。
+        所以这里直接钉住"最老那代也要能迁回来"。
+        """
+        from analyzer import deepseek_client as dc
+        from analyzer import month_cache as mc
+
+        chain = dc.legacy_fingerprints_for_dimension("emotion")
+        self.assertGreaterEqual(len(chain), 2, "前提：私聊链里至少两代，否则本用例什么都没验")
+
+        with tempfile.TemporaryDirectory() as d:
+            mc.configure_month_cache(d)
+            try:
+                prompt = "以下是某月的对话数据：\n\n[01-01 08:00] 我: 在吗"
+                new_key = mc._month_key("SYS", prompt)
+                oldest_fp = chain[-1]
+                oldest_key = mc._month_key("SYS", prompt, oldest_fp)
+                self.assertNotEqual(oldest_key, new_key, "前提：最老一代的键与当前键确实不同")
+                # 只写**最老**那代：只试 keys[1] 的实现会读不到它，从而多花一次钱
+                with open(mc.month_cache_path(oldest_key), "w", encoding="utf-8") as f:
+                    json.dump({"_created": 1.0, "self_emotion": "平静"}, f, ensure_ascii=False)
+
+                calls = []
+
+                def fake_api(*_a, **_kw):
+                    calls.append(1)
+                    return {"self_emotion": "不该被调用"}
+
+                with mock.patch.object(dc, "_call_api", side_effect=fake_api):
+                    out = dc._analyze_periods(
+                        {"2024-01": []},
+                        "SYS",
+                        lambda _p, _m: prompt,
+                        max_tokens=16,
+                        tag="emotion",
+                        chat_hash="hashMigrateMulti",
+                    )
+                self.assertEqual(calls, [], "链里非链头的旧代命中时同样不该再调用 API")
+                self.assertEqual(out["2024-01"]["self_emotion"], "平静")
+                self.assertTrue(os.path.exists(mc.month_cache_path(new_key)), "应搬到当前键")
+                self.assertFalse(os.path.exists(mc.month_cache_path(oldest_key)), "不留第二份敏感内容")
+            finally:
+                mc.configure_month_cache("")
+
     def test_ast_normalization_ignores_comments_and_formatting(self):
         """AST 归一只丢与模型输入无关的差异，逻辑改动照样换键
 

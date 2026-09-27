@@ -95,10 +95,22 @@ def _schedule_flush() -> None:
 
 
 def _timer_flush() -> None:
+    """定时落盘。整段自己兜异常：它跑在 Timer 线程里。
+
+    少了这层包装时，`_flush_locked` 抛出的任何异常都会**杀死这个 Timer 线程**：
+    线程没了、`_TIMER` 已置 None，看起来"下一次会重排"，但每一轮都死在同一行——
+    用量永远落不了盘，而症状只是"页面数字不动"。统计是旁路观测，不许反过来
+    影响主流程，更不许把自己弄死。
+    """
     global _TIMER
-    with _LOCK:
-        _TIMER = None
-        _flush_locked()
+    try:
+        with _LOCK:
+            _TIMER = None
+            _flush_locked()
+    except Exception as e:  # noqa: BLE001
+        with _LOCK:
+            _TIMER = None
+        logger.warning("token 用量定时落盘失败（增量保留在内存，稍后重试）: %s", e)
 
 
 def flush() -> None:
@@ -206,18 +218,56 @@ def get_usage() -> dict:
     return out
 
 
+def _coerce_counter_dict(value) -> dict:
+    """把一个可疑的桶收成 {str: {"calls","prompt","completion"}}；不可用的条目直接丢弃。
+
+    只校验顶层是不够的：`_accumulate` 与 `data["total"].get` 假定这三段都是 dict，
+    而文件被手工编辑过、半个文件写坏过、或上一版格式不同，都会留下 `{"days": []}`
+    或 `{"total": 5}` 这种"能解析、形状不对"的内容。后果原本是一整条静默死循环：
+    `_flush_locked` 抛 AttributeError → record_call 把它吞进 except → `_DIRTY` 永远为真
+    → 每次定时器醒来都在同一行死掉（顺带弄死一个 Timer 线程）、增量永不落盘，
+    而 `get_usage()` 与 `flush()` 都会走同一段 → **/api/usage 从此永久 500**。
+    `_prune_days` 早就对 days 做了 isinstance 守卫，漏的是这里的入口净化：
+    坏数据在门口一次挡掉，比在每个消费点各防一遍可靠得多。
+    """
+    if not isinstance(value, dict):
+        return {}
+    out = {}
+    for key, entry in value.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        out[key] = {
+            "calls": _as_int(entry.get("calls")),
+            "prompt": _as_int(entry.get("prompt")),
+            "completion": _as_int(entry.get("completion")),
+        }
+    return out
+
+
+def _as_int(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _load() -> dict:
     try:
         with open(TOKEN_USAGE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict) and "days" in data:
-            data.setdefault("days", {})
-            data.setdefault("dims", {})
-            data.setdefault("total", {"calls": 0, "prompt": 0, "completion": 0})
-            return data
     except (OSError, json.JSONDecodeError):
-        pass
-    return json.loads(json.dumps(_EMPTY))
+        return json.loads(json.dumps(_EMPTY))
+    if not isinstance(data, dict):
+        return json.loads(json.dumps(_EMPTY))
+    # 三段全部按形状净化后再交出去：下游三处消费点都假定它们是 dict-of-dict
+    days = _coerce_counter_dict(data.get("days"))
+    dims = _coerce_counter_dict(data.get("dims"))
+    total_src = data.get("total")
+    total = {
+        k: _as_int((total_src or {}).get(k)) if isinstance(total_src, dict) else 0
+        for k in ("calls", "prompt", "completion")
+    }
+    return {"days": days, "dims": dims, "total": total}
 
 
 def _dump(data: dict) -> None:

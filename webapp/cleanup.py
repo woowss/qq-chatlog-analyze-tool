@@ -30,11 +30,14 @@
 
 import os
 import time
+from typing import Optional
 
 from flask import request
 
 from config import (
     AI_CACHE_DIR,
+    CACHE_MAX_DAYS,
+    CACHE_SLIDE_DAYS,
     LOG_DIR,
     LOG_RETENTION_DAYS,
     SESSION_FILE_DIR,
@@ -76,6 +79,7 @@ def _purge_dir(directory: str, expired, name_prefix: str = "") -> int:
         entries = os.listdir(directory)
     except OSError:
         return 0
+    failed = 0
     for name in entries:
         if name_prefix and not name.startswith(name_prefix):
             continue
@@ -84,8 +88,19 @@ def _purge_dir(directory: str, expired, name_prefix: str = "") -> int:
             if os.path.isfile(path) and expired(path):
                 os.remove(path)
                 removed += 1
-        except OSError:
-            continue
+        except OSError as e:
+            # 必须出声。_cache_expired 对"读不到时间"是 fail-closed（判成该删），
+            # 也就是这类文件删不掉时会**每小时重试、永远删不掉、永远没人知道**；
+            # 而 ai_cache/ 与 stats_cache/ 里是含聊天内容引用的派生数据，README 对它的
+            # 承诺是"到期自动回收"。本文件 _cache_created_at 的注释也白纸黑字写着
+            # "删不掉会留下告警（见 _purge_dir/_purge_tree 对 OSError 的兜底）"——
+            # 静默 continue 等于让那句承诺与实现互相矛盾。
+            # 按需清理那条路径早就做对了（store._purge_chat_caches 的
+            # "缓存文件删除失败（可能仍残留敏感内容）"），这里补的是同一件事的另一半。
+            failed += 1
+            logger.warning("过期文件删除失败（可能仍残留敏感内容）: %s (%s)", name, e)
+    if failed:
+        logger.warning("目录 %s 有 %d 个过期文件未能删除，下个清理周期会重试", directory, failed)
     return removed
 
 
@@ -97,6 +112,7 @@ def _purge_tree(root: str, expired) -> int:
     都会被跳过、永不回收，与"图片副本随 uploads/ 的 24 小时策略回收"的承诺相悖。
     """
     removed = 0
+    failed = 0
     root_abs = os.path.abspath(root)
     for dirpath, _dirnames, filenames in os.walk(root, topdown=False):
         for name in filenames:
@@ -105,13 +121,18 @@ def _purge_tree(root: str, expired) -> int:
                 if expired(path):
                     os.remove(path)
                     removed += 1
-            except OSError:
-                continue
+            except OSError as e:
+                # 同上，且这一层是 uploads/ 与 flask_session/：原始聊天记录与登录态，
+                # 删不掉的后果比派生缓存更直接，更不能静默。
+                failed += 1
+                logger.warning("过期文件删除失败（可能仍残留敏感内容）: %s (%s)", path, e)
         if os.path.abspath(dirpath) != root_abs:
             try:
                 os.rmdir(dirpath)  # 只删空目录：还有未过期内容时 rmdir 自然失败
             except OSError:
-                pass
+                pass  # 目录非空是常态而非故障，报出来只会淹没真正的告警
+    if failed:
+        logger.warning("目录树 %s 有 %d 个过期文件未能删除，下个清理周期会重试", root, failed)
     return removed
 
 
@@ -130,26 +151,48 @@ def _older_than(now: float, seconds: float):
 
 
 def cleanup_old_files(
-    max_age_seconds: int = 86400, cache_max_age: int = 30 * 86400, cache_hard_max_age: int = 90 * 86400
+    max_age_seconds: int = 86400,
+    cache_max_age: Optional[int] = None,
+    cache_hard_max_age: Optional[int] = None,
 ) -> int:
-    """删除过期的临时文件与缓存；日志按天保留 LOG_RETENTION_DAYS 天"""
+    """删除过期的临时文件与缓存；日志按天保留 LOG_RETENTION_DAYS 天
+
+    缓存双上限默认取 QQCHAT_CACHE_SLIDE_DAYS / QQCHAT_CACHE_MAX_DAYS（30/90 天）。
+    此前这两个数字写死在函数默认参数里、没有任何配置出口——"30 天没浏览就删掉
+    已付费的 AI 结果"对低频使用者是真伤害，而调长/关闭是用户的正当权利
+    （数据始终只在本机）。0 = 对应规则永不过期；两条都关时启动横幅会提示
+    "已偏离 README 的到期回收承诺"。显式传参的调用方（测试）不受配置影响。
+    """
+    if cache_max_age is None:
+        cache_max_age = CACHE_SLIDE_DAYS * 86400
+    if cache_hard_max_age is None:
+        cache_hard_max_age = CACHE_MAX_DAYS * 86400
+    never_expire = cache_max_age <= 0 and cache_hard_max_age <= 0
     now = time.time()
     cleaned = 0
     for directory in (UPLOAD_FOLDER, SESSION_FILE_DIR):
         cleaned += _purge_tree(directory, _older_than(now, max_age_seconds))
 
     def _cache_expired(path: str) -> bool:
-        """缓存的双上限：滑动 30 天（按 mtime，命中即续期）+ 绝对 90 天（按 _created）
+        """缓存的双上限：滑动（按 mtime，命中即续期）+ 绝对（按 _created）
 
         取不到 mtime 时按"该回收"处理（fail-closed）：这两个目录装的是含聊天内容的
         派生数据，判不出来的正确方向是尝试删掉并留一行日志，而不是当作新文件永远
         留下。删不掉由调用方兜住（_purge_dir/_purge_tree 都捕获 OSError 并跳过）。
+        例外：两条规则都被显式关掉时，"判不出时间"不再是删除的理由——用户要的就是
+        "永不过期"，宁可留下也不删。
         """
+        if never_expire:
+            return False
         try:
             mtime = os.path.getmtime(path)
         except OSError:
             return True
-        return now - mtime > cache_max_age or now - _cache_created_at(path) > cache_hard_max_age
+        if cache_max_age > 0 and now - mtime > cache_max_age:
+            return True
+        if cache_hard_max_age > 0:
+            return now - _cache_created_at(path) > cache_hard_max_age
+        return False
 
     for directory in (AI_CACHE_DIR, STATS_CACHE_DIR):
         cleaned += _purge_dir(directory, _cache_expired)

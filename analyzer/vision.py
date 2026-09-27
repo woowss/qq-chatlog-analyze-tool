@@ -44,6 +44,7 @@ from config import (
     VISION_MIN_SIDE,
 )
 from analyzer.logger import get_logger, mask_name
+from analyzer import purge_marks
 
 logger = get_logger("vision")
 
@@ -356,6 +357,15 @@ def digest(msgs: list, chat_hash: str = "", label: str = "") -> str:
     text = dc._call_vision(VISION_SYSTEM, _build_user_text(images, label), images)
     if not text:
         return ""
+    # 与月份缓存、维度缓存同一道守卫：这批摘要背后是一次付费调用，落盘本身天经地义，
+    # 但如果这个聊天在"算摘要"这几秒里被级联清理掉了（用户换了文件），那就不该把
+    # 含聊天图片描述的摘要写回盘上——清理报称"已删除"的数据不能原地复活。
+    if chat_hash and purge_marks.is_marked(chat_hash):
+        logger.info("该聊天的缓存刚被清理，本次图片摘要不落盘")
+        # memo 不能跟着跳过：同一批图片在本轮里被多个维度复用，拒收内存缓存等于
+        # 刚说"不落盘"转头又为同一批图再付一次 vision 调用。
+        _memo_put(key, text)
+        return text
     _write_cache(path, text)
     _memo_put(key, text)
     logger.info("图片摘要完成：%d 张（%s）", len(images), mask_name(label) if label else "本批")

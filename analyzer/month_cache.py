@@ -33,11 +33,14 @@
 import hashlib
 import json
 import os
+import re
+import secrets
 import threading
 import time
 from typing import Iterable, Optional
 
 from config import env_number
+from analyzer import purge_marks
 from analyzer.logger import get_logger
 
 logger = get_logger("deepseek")
@@ -68,6 +71,43 @@ _last_write_warning = [0.0]
 # 无引用的月份缓存先留一段宽限期：上传新文件时的级联清理不能顺手删掉
 # "同一段对话的历史月份"，否则增量分析就失去意义。孤儿文件由定期清理回收。
 MONTH_CACHE_GRACE_SECONDS = env_number("LLM_MONTH_CACHE_GRACE_HOURS", 24, 0, 24 * 30) * 3600
+
+#: 合法的月份 key 形状。`_month_key` 产出的是 sha256 前 20 位十六进制，但测试与历史
+#: 数据里也用过 `m1` / `k1` 这类短名，所以放宽到"安全字符集"而不是死卡 hex——**目的只有
+#: 一个：绝不允许分隔符 / 上跳 / 盘符 / NUL 出现在被拼进文件名的值里**。
+_MONTH_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def is_safe_month_key(key) -> bool:
+    """这个 key 能不能安全地拼进 `month_<key>.json`？
+
+    为什么必须有这道闸（不是洁癖）：`months` 列表**来自磁盘上的 manifest 文件**，而
+    manifest 可以由「导入结果包」写进来——包的内容不受本机控制。key 里只要出现一个
+    分隔符，`os.path.join(dir, f"month_{key}.json")` 就能整段逃出缓存目录：
+    `month_x/../../某文件` 归一后落在缓存目录之外。Windows 上路径是**先做词法归一**
+    再交给文件系统的，所以中间那层目录不存在也照样穿越（Linux 需要中间目录真实存在，
+    但本工具的主力平台是 Windows，不能指望这一点）。
+
+    后果有两条，都实测复现过：级联清理按这个路径 `os.remove`，于是**删掉用户机器上
+    任意一个 `.json`**；导出则 `zf.write` 同一路径，于是把任意 `.json` 的**内容打包
+    进用户会拿去分享的结果包**。这正是 `_bundle_leaf_ok` 那段注释声称已经挡住的
+    "一个不含聊天数据的 zip 不该能碰别人那份聊天"——归属校验只管文件名，没管
+    manifest 里那个被当成路径使用的 key。
+    """
+    return isinstance(key, str) and bool(_MONTH_KEY_RE.fullmatch(key))
+
+
+def _tmp_sibling(path: str) -> str:
+    """原子写入的临时文件名：**必须唯一**，不能用固定的 `f"{path}.tmp"`。
+
+    与 `webapp.store._tmp_sibling` 同一口径（analyzer 不能反向依赖 webapp，所以这里
+    自己留一份）。固定名让两个并发写者踩同一个临时文件：A 刚 open、B 重开覆盖，或任
+    一方在失败分支里删掉对方正在写的那份，`os.replace` 就可能把半截文件发布成正式
+    缓存——月份缓存丢的是**一次已付费结果**，用户要重新付钱。多浏览器/多设备共用一份
+    聊天是本项目明确支持的用法，而 `_restamp_month_cache` 更让这条路径成为常态
+    （每个被读到的历史文件都会补写一次）。
+    """
+    return f"{path}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}.tmp"
 
 
 def configure_month_cache(directory: str) -> None:
@@ -124,6 +164,16 @@ def migrate_month_cache(old_key: str, new_key: str) -> bool:
 
 
 def month_cache_path(key: str) -> str:
+    """月份文件的路径。**不合法的 key 一律返回空串**，而不是拼出一个能逃出目录的路径。
+
+    这是唯一的路径构造点，放在这里等于把所有调用方（读、写、迁移、清理、导出）一次
+    盖住：空串在每一条消费路径上都是"安全的无操作"——`os.path.getmtime("")` /
+    `os.path.exists("")` 抛 OSError / 返回 False，`os.remove("")` 抛 OSError，
+    全部被既有的 `except OSError` 兜住。合法 key 的行为逐字节不变。
+    """
+    if not is_safe_month_key(key):
+        logger.warning("月份缓存键形状非法，已拒绝拼路径（可能来自被篡改的 manifest）")
+        return ""
     return os.path.join(_MONTH_CACHE_DIR, f"month_{key}.json")
 
 
@@ -131,22 +181,86 @@ def _manifest_path(chat_hash: str) -> str:
     return os.path.join(_MONTH_CACHE_DIR, f"manifest_{chat_hash}.json")
 
 
-def _read_month_cache(key: str) -> Optional[dict]:
+def _read_month_cache(
+    key: str, expect_thinking: "Optional[bool]" = None, chat_hash: str = ""
+) -> Optional[dict]:
+    """读月份缓存。expect_thinking 不是 None 时，思考模式对不上的那份算未命中。
+
+    为什么不把思考模式放进键里：那会让所有既有月份缓存一次性不再命中，而用户已经为
+    它们付过钱——这正是维度缓存用 `_think` 后缀、读侧再认旧键的那套迁移机制要避免的事。
+    改成"文件里记一个 `_thinking` 标记"：键完全不变（零成本），从这次升级之后写下的
+    每一份月份缓存都自带口径声明，切换 LLM_THINKING 之后再也不会串到另一种模式的
+    结果上。老文件没有标记（当初是哪种模式已无从判断）→ 按当前模式照常消费一次
+    （绝不 retroactively 收费），并**在命中时补上标记**；从这次起它也参与口径核对，
+    首次切换模式会重算一次——没有补标记这一步的话，无标记文件会被任何模式永久放行，
+    "切换后不再串模式"就只对升级后新写的文件成立。
+    """
     if not _MONTH_CACHE_DIR:
         return None
     path = month_cache_path(key)
+    if not path:  # 非法 key：month_cache_path 拒绝拼路径，这里如实当"没有缓存"
+        return None
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
     if isinstance(data, dict):
-        data.pop("_created", None)  # 元数据不进调用方拿到的结果
+        created = data.pop("_created", None)  # 元数据不进调用方拿到的结果
+        stamped = data.pop("_thinking", None)  # 同上：口径声明只在缓存层内部用
+    else:
+        return None
+    if expect_thinking is not None and stamped is not None and bool(stamped) != bool(expect_thinking):
+        # 口径不一致：当成没有缓存，让调用方重新发一次请求（结果会带标记落盘）
+        logger.info("月份缓存是另一种思考模式算出来的，本轮重新分析: %s", key[:12])
+        return None
     try:
         os.utime(path, None)  # 命中即续期，避免常用缓存被 30 天 TTL 回收
     except OSError:
         pass
-    return data if isinstance(data, dict) else None
+    if expect_thinking is not None and stamped is None:
+        _restamp_month_cache(path, data, bool(expect_thinking), created, chat_hash)
+    return data
+
+
+def _restamp_month_cache(path: str, data: dict, thinking: bool, created, chat_hash: str = "") -> None:
+    """给升级前无口径声明的老文件补记 `_thinking`（只在读侧命中时调用）。
+
+    补当前消费的模式不算撒谎：结果本身无从考证是哪个模式产出的，但从这一刻起
+    它被当作该模式的产出对待——之后的模式切换会重算它（付一次费，口径从此正确）。
+    失败不致命：这份结果已在内存里，不补只是"下轮切换还会串用一次"。
+
+    这是**读路径上的写**，也是这一族里唯一一处"顺手落盘"的地方，所以要两道闸：
+
+    ① `os.path.exists` 复查——读→补写之间文件可能刚被级联清理删掉（用户换了文件）；
+    ② `purge_marks.is_marked(chat_hash)`——只靠 exists 复查挡不住 TOCTOU：检查通过、
+       `os.replace` 之前恰好被清理，补写就把刚删掉的月份文件（含聊天原句引用）重新
+       造回盘上，而且没有 manifest 引用它，只能等 24 小时宽限期后的孤儿回收。
+       症状正是本仓库反复修的那一类："清理报称已删，盘上却又长出含聊天内容的文件"。
+       写**新结果**的两处（deepseek_client / group_client）早就查这个标记，这里补齐。
+       没传 chat_hash（老调用方/测试）时退化为只做 ①，行为与从前一致。
+    """
+    tmp = _tmp_sibling(path)
+    payload = {
+        "_created": created if created is not None else time.time(),
+        "_thinking": bool(thinking),
+        **data,
+    }
+    try:
+        if chat_hash and purge_marks.is_marked(chat_hash):
+            logger.info("该聊天的缓存刚被清理，跳过月份缓存补标记（不复活已删数据）")
+            return
+        if not os.path.exists(path):
+            return
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError as e:
+        _warn_write_failure("月份缓存补标记", path, e)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _warn_write_failure(what: str, path: str, err: OSError) -> None:
@@ -163,11 +277,13 @@ def _warn_write_failure(what: str, path: str, err: OSError) -> None:
     logger.warning("%s写入失败（缓存不生效，可能重复调用 API）: %s (%s)", what, path, err)
 
 
-def _write_month_cache(key: str, result: dict) -> None:
+def _write_month_cache(key: str, result: dict, thinking: "Optional[bool]" = None) -> None:
     if not _MONTH_CACHE_DIR:
         return
     path = month_cache_path(key)
-    tmp = f"{path}.tmp"
+    if not path:  # 非法 key 不落盘（见 month_cache_path）
+        return
+    tmp = _tmp_sibling(path)
     try:
         # _created 是"绝对 90 天"硬上限的依据（cleanup 读它）。缺了它就只能按 mtime 判，
         # 而 mtime 在每次命中时被续期（见 _read_month_cache）——含聊天原句引用的这族
@@ -176,11 +292,13 @@ def _write_month_cache(key: str, result: dict) -> None:
         # （见 webapp.store.read_created_at）。
         payload = dict(result) if isinstance(result, dict) else {"result": result}
         payload.pop("_created", None)
+        payload.pop("_thinking", None)  # 口径声明由本函数负责写，不接受调用方塞进来的值
+        stamp = {"_thinking": bool(thinking)} if thinking is not None else {}
         # 目录可能被用户按 README 的指引删掉来"彻底清除数据"，而服务还开着：
         # 这里不补目录，月份缓存从此再也写不进去，增量分析静默失效（每月重复付费）。
         os.makedirs(_MONTH_CACHE_DIR, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"_created": time.time(), **payload}, f, ensure_ascii=False)
+            json.dump({"_created": time.time(), **stamp, **payload}, f, ensure_ascii=False)
         os.replace(tmp, path)
     except OSError as e:
         _warn_write_failure("月份缓存", path, e)
@@ -199,7 +317,15 @@ def _record_month_usage(chat_hash: str, keys: "Iterable[str]") -> None:
     """
     if not _MONTH_CACHE_DIR or not chat_hash:
         return
-    new_keys = set(keys)
+    # 刚被级联清理过的聊天不再重建 manifest。分析动辄跑几分钟，用户在中间换了文件，
+    # 跑完的那一轮照样会写月份文件、并在收尾时把 manifest 重新造出来 —— 于是清理
+    # 报称"已删"的数据原地复活，而且这份 manifest 还会把那批含聊天原句引用的月份文件
+    # 钉成"仍被引用"，连孤儿回收都收不走。用户重新上传同一份内容时
+    # （webapp.store.start_stats_job 会撤销标记）这条路径立刻恢复。
+    if purge_marks.is_marked(chat_hash):
+        logger.info("该聊天的缓存刚被清理，跳过 manifest 重建（月份文件交由孤儿回收处理）")
+        return
+    new_keys = {str(k) for k in keys if is_safe_month_key(k)}
     if not new_keys:
         return
     path = _manifest_path(chat_hash)
@@ -215,13 +341,16 @@ def _record_month_usage(chat_hash: str, keys: "Iterable[str]") -> None:
             pass
         merged = set(data.get("months") or [])
         merged |= new_keys
+        # 写回时也过一遍闸：磁盘上既有的清单可能是被篡改的（见 is_safe_month_key），
+        # 顺手把它一起洗干净，别让非法 key 通过"读旧 + 并新"继续留在文件里。
+        merged = {k for k in merged if is_safe_month_key(k)}
         data["months"] = sorted(merged)
         data["updated"] = time.time()
         # setdefault 语义：绝对上限看的是"首次创建"，重写 manifest 不该把它续期。
         # 重排到最前面写，让清理任务只扫文件头就能取到（见 webapp.store.read_created_at）。
         data["_created"] = data.get("_created") or time.time()
         payload = {"_created": data.pop("_created"), **data}
-        tmp = f"{path}.tmp"
+        tmp = _tmp_sibling(path)
         try:
             # 同 _write_month_cache：manifest 写不进去 = 这些月份文件会变成"无引用"，
             # 宽限期后被孤儿回收删掉，增量分析白跑。
@@ -234,8 +363,30 @@ def _record_month_usage(chat_hash: str, keys: "Iterable[str]") -> None:
             # 但会让增量分析静默失效（每次都全量付费），所以也要出声
             _warn_write_failure("月份缓存 manifest", path, e)
             _MANIFEST_KEYS.pop(name, None)
+            # 半成品必须删掉（与 _write_month_cache / store._save_stats 的失败分支一致）。
+            # 留着它有两处长期的害处，都不只是"多一个垃圾文件"：
+            # ① 下面的清单扫描按 manifest_ 前缀认领活清单，这个 .tmp 会被当成一份真清单读进
+            #    引用集，于是该聊天的 month_*.json（含聊天原句引用）被永久钉成"仍被引用"，
+            #    purge 与孤儿回收都收不走它；
+            # ② 它的哈希段粘着 .json.tmp，级联清理的整段匹配认不出来，也就删不掉。
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
         else:
-            _MANIFEST_KEYS[name] = (os.path.getmtime(path), set(data["months"]))
+            # getmtime 同样必须兜住：这一行原本裸在外面，而调用方 _record_month_usage
+            # 是 _analyze_periods 的 **finally** 分支（见 deepseek_client 那处）。
+            # 于是"`os.replace` 成功之后、`getmtime` 之前"恰好被并发的级联清理删掉
+            # manifest，会让 FileNotFoundError 从 finally 里抛出去，把**已经付费跑完**的
+            # 整个维度打掉——用户等了几分钟、花了钱，最后只拿到一个错误。
+            # 同函数里其它每个 fs 调用都有 try 包着，只有这一行漏了。
+            # 取不到 mtime 时退化成当前时间：这份清单的校验口径是"mtime 变了就重读"，
+            # 记新一点只会让下次多读一次文件，方向无害；记 0 反而会被当成"已变更"。
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                mtime = time.time()
+            _MANIFEST_KEYS[name] = (mtime, set(data["months"]))
 
 
 def purge_month_cache(chat_hash: str) -> int:
@@ -258,6 +409,8 @@ def purge_month_cache(chat_hash: str) -> int:
         now = time.time()
         for key in mine - others:
             target = month_cache_path(key)
+            if not target:  # 非法 key（被篡改的 manifest）：绝不按它去 os.remove
+                continue
             try:
                 if now - os.path.getmtime(target) < MONTH_CACHE_GRACE_SECONDS:
                     continue  # 宽限期内：留给增量分析复用
@@ -278,6 +431,11 @@ def _manifest_keys_locked(name: str) -> set:
     """（调用方须持有 _MONTH_CACHE_LOCK）单个 manifest 引用的月份 key 集合
 
     带 mtime 缓存：manifest 只由本模块写，写路径会同步刷缓存，所以命中时直接用。
+
+    **读进来就按形状过滤**：`months` 是磁盘内容，而 manifest 可以由「导入结果包」
+    写进本机（见 is_safe_month_key 里那段后果说明）。过滤放在这里，等于让"引用集"
+    这个下游一切判断（回收、导出、钉引用）都只可能看到安全 key；非法项当成不存在，
+    而不是把它带到 `os.path.join` 上去。
     """
     path = os.path.join(_MONTH_CACHE_DIR, name)
     try:
@@ -290,9 +448,10 @@ def _manifest_keys_locked(name: str) -> set:
         return cached[1]
     try:
         with open(path, "r", encoding="utf-8") as f:
-            keys = set(json.load(f).get("months") or [])
-    except (OSError, json.JSONDecodeError):
-        keys = set()
+            raw_keys = json.load(f).get("months") or []
+    except (OSError, json.JSONDecodeError, AttributeError):
+        raw_keys = []
+    keys = {k for k in raw_keys if is_safe_month_key(k)}
     _MANIFEST_KEYS[name] = (mtime, keys)
     return keys
 
@@ -304,7 +463,7 @@ def _referenced_keys_locked(exclude: str = "") -> set:
         names = os.listdir(_MONTH_CACHE_DIR)
     except OSError:
         return keys
-    live = {n for n in names if n.startswith("manifest_")}
+    live = {n for n in names if n.startswith("manifest_") and n.endswith(".json")}
     for name in live:
         if name == exclude:
             continue

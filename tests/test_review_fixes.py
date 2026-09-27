@@ -1385,6 +1385,53 @@ class TestFaceImagesOptional(unittest.TestCase):
             self.assertIsNone(self.fi._download("https://evil.example.com/a.gif"))
             self.assertFalse(real.called)
 
+    def test_classic_wins_over_message_level_market_url(self):
+        """一条消息混发"经典+商城"时，经典表情不许被那张贴纸的地址污染。
+
+        `face_url` 是**消息级**字段（解析层把 face 与 market_face 两类名字塞进同一个
+        face_names，只留一个地址）。原先 key_for/url_for 都先看地址，于是同一条消息里
+        每个名字都拿到那张贴石的键与图："微笑""可怜"明明各自有跨导出稳定的
+        c0/c53，却被并成同一个 m…，表情榜上三个不同表情显示同一张图，
+        而且哪条消息先出现决定结果。这正是本模块改成"按名取图"时要修掉的
+        张冠李戴，只是当时只修了"名字对不上不取图"那一半。
+        """
+        sticker = "https://gxh.vip.qq.com/club/item/parcel/item/3b/abc/raw300.gif"
+        names = ["微笑", "可怜", "叉腰"]  # 前两个是经典黄脸，第三个是商城贴纸
+
+        keys = {n: self.fi.key_for(n, sticker) for n in names}
+        urls = {n: self.fi.url_for(n, sticker) for n in names}
+        self.assertEqual(len(set(keys.values())), 3, f"三个名字塌成同一把键：{keys}")
+        self.assertEqual(keys["微笑"], "c0")
+        self.assertEqual(keys["可怜"], "c53")
+        self.assertEqual(keys["叉腰"], self.fi.market_key(sticker), "真正的贴纸仍按地址走")
+        self.assertEqual(
+            urls["微笑"], "https://qzonestyle.gtimg.cn/qzone/em/e100.gif", "经典表情的图不许被贴纸顶掉"
+        )
+        self.assertEqual(urls["叉腰"], sticker)
+
+        # 键与 URL 必须同源：否则 ensure() 拿 c0 去查缓存、却下载贴纸，
+        # 正确的黄脸缓存会被反复判成未命中而重抓
+        for name in names:
+            with self.subTest(name=name):
+                key = keys[name]
+                got = urls[name]
+                if key.startswith("c"):
+                    self.assertIn("qzonestyle.gtimg.cn", got, "经典键必须配经典的官方地址")
+                else:
+                    self.assertEqual(got, sticker, "商城键必须配那个商城地址")
+
+        # 顺序无关：谁先出现都不该改变结果
+        self.assertEqual(keys, {n: self.fi.key_for(n, sticker) for n in reversed(names)})
+
+    def test_foreign_market_url_cannot_override_classic_identity(self):
+        """非白名单地址既不许被取用，也不许改写表情的身份。"""
+        evil = "https://evil.example.com/a.gif"
+        # 经典表情：走官方地址，外部地址根本参与不进来（顺带把 SSRF 面关死）
+        self.assertEqual(self.fi.url_for("微笑", evil), "https://qzonestyle.gtimg.cn/qzone/em/e100.gif")
+        self.assertEqual(self.fi.key_for("微笑", evil), "c0", "外部地址不许污染经典表的键")
+        # 非经典名：白名单外的地址一律不给 URL（不许把这段代码当成任意下载器）
+        self.assertIsNone(self.fi.url_for("[13]", evil))
+
     def test_offline_failure_degrades_gracefully(self):
         import urllib.error
 

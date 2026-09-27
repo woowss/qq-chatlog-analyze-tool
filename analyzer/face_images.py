@@ -199,15 +199,31 @@ def name_key(name: str) -> str:
     return "n" + hashlib.sha1(clean_name(name).encode("utf-8")).hexdigest()[:16]
 
 
+def classic_id_of(name: str) -> "int | None":
+    """该表情名是否命中经典黄脸表（命中返回编号，否则 None）。"""
+    clean = clean_name(name)
+    return NAME_TO_CLASSIC.get(clean) if clean else None
+
+
 def key_for(name: str, market_url: str = "") -> str:
-    """缓存键：经典表情按名称反查的编号（跨导出稳定），商城表情按其地址"""
+    """缓存键：经典表情按名称反查的编号（跨导出稳定），商城表情按其地址。
+
+    **经典表必须优先于 market_url。** `face_url` 是**消息级**字段，而一条消息里
+    可能同时带经典表情名与商城表情名（解析层把两类都塞进同一个 `face_names`，
+    只留一个地址，见 qq_parser 的 face / market_face 两个分支）。若先看地址，
+    同一条消息里的每个名字都会拿到那张贴纸的键——"微笑""可怜"明明各自有
+    跨导出稳定的 c0/c53，却被并成同一个 m…，表情榜上三个不同表情显示同一张图，
+    而且谁先出现决定结果。名称能唯一确定原图时，就不该去看那个含糊的地址。
+    """
+    fid = classic_id_of(name)
+    if fid is not None:
+        return f"c{fid}"
     if market_url:
         return market_key(market_url)
     clean = clean_name(name)
     if not clean:
         return ""
-    fid = NAME_TO_CLASSIC.get(clean)
-    return f"c{fid}" if fid is not None else name_key(clean)
+    return name_key(clean)
 
 
 def _url_allowed(url: str) -> bool:
@@ -215,12 +231,17 @@ def _url_allowed(url: str) -> bool:
 
 
 def url_for(name: str, market_url: str = ""):
-    """该表情能从哪个地址取原图；没有则 None（超级表情/未收录名称一律不猜）"""
-    if market_url and _url_allowed(market_url):
-        return market_url
-    fid = NAME_TO_CLASSIC.get(clean_name(name))
+    """该表情能从哪个地址取原图；没有则 None（超级表情/未收录名称一律不猜）。
+
+    与 key_for 同口径：**先查经典表**，命中就用官方地址。否则一条"经典+商城"
+    混发的消息会让经典表情拿到贴纸的 URL，而它的键却是 c0 —— 键与图不匹配，
+    缓存里那张正确的黄脸会被反复当成未命中去重抓。
+    """
+    fid = classic_id_of(name)
     if fid is not None:
         return QZONE_PATTERN.format(fid + 100)
+    if market_url and _url_allowed(market_url):
+        return market_url
     return None
 
 
