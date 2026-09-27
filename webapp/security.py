@@ -420,6 +420,12 @@ def logout():
         return guard
 
     ip = request.remote_addr or "127.0.0.1"
+    # 松开本会话对当前聊天内容的引用：会话即将作废，留着那条记录等于让一个
+    # 已经不存在的会话继续"主张"这份缓存还在被使用，从而把级联清理挡住最多 24 小时。
+    # （引用表的 TTL 是兜底，不是不用管的理由：退出登录就是明确的"不再使用"。）
+    from webapp import store  # 延迟导入：store 不依赖本模块，但避免模块级互相缠绕
+
+    store.forget_live_chat(session.get("chat_hash", "") or "", getattr(session, "sid", "") or "")
     session.clear()
     # regenerate() 内部用 `if session:` 判空，而只剩 _permanent 的空会话是 falsy：
     # 不先放一份内容，轮换会被静默跳过（登录路径踩过同一个坑，见 _regenerate_session_id）。
