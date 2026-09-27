@@ -83,6 +83,11 @@ class _TempCacheDirs(unittest.TestCase):
         grace = mock.patch.object(mc, "MONTH_CACHE_GRACE_SECONDS", 0)
         grace.start()
         self.addCleanup(grace.stop)
+        # 造出穿越路径的**中间目录**（键 "/../.." 拼出来的是 `month_/../../x.json`）。
+        # 为什么必须有：POSIX 的路径解析要求中间每一段都真实存在，而 Windows 是先做
+        # 词法归一、不需要。少了这一层，那两条"去掉闸门就该中招"的反向验证在 Linux 上
+        # 会因为"路径压根解析不通"而失败（CI 就是 Linux）——那验的就不是闸门了。
+        os.makedirs(os.path.join(self.ai, "month_"), exist_ok=True)
         purge_marks.clear()
         self.addCleanup(purge_marks.clear)
 
@@ -307,14 +312,19 @@ class TestParserToleratesNonStringTypeFields(unittest.TestCase):
 
         链路：other_name=int → views 里 mask_name(chat.other_name) → logger 的
         `(name or "").strip()` → AttributeError → 上传被当成"解析失败"并删文件。
+
+        消息里**故意不带 sender.name**：只有走 statistics.senders 那条兜底取值时，
+        这个数字才会真的落到 other_name 上。消息自带名字的话，聚合名会先命中，
+        这条用例就变成恒真的了（第一版就是这么写的，校验不了任何东西）。
         """
         payload = {
             "chatInfo": {"name": "对方", "selfUid": "uA", "selfName": "我"},
             "statistics": {"senders": [{"uid": "uB", "name": 12345}]},
-            "messages": [_msg(1, "uB", "uB", BASE, "text", text="在")],
+            "messages": [_msg(1, "uB", "", BASE, "text", text="在")],
         }
         chat = self._load(payload)
         self.assertIsInstance(chat.other_name, str, "other_name 必须是字符串")
+        self.assertEqual(chat.other_name, "12345", "数字名归一成字符串，而不是留在 int 上")
         from analyzer.logger import mask_name
 
         mask_name(chat.other_name)  # 不该抛：这正是上传路径上的那一步
@@ -660,15 +670,28 @@ class TestSecretsAreScrubbedFromOutwardFacingText(unittest.TestCase):
     """Key 走 Authorization 头、不进 URL，官方端点还会打码——但第三方网关常把它原样
     写进错误正文，而这些文本会回到浏览器（用户会截图求助）与 logs/（README 承诺
     日志可以整目录留存/贴给别人看）。
+
+    **不读环境里那个真实的 Key**（CI 上没有 `.env`，key 是空串，于是"应当有 key"这类
+    断言必挂、`assertNotIn("", detail)` 更是恒假——这正是 `_bootstrap.api_configured_patcher`
+    的说明里点名过的那类"本机绿、CI 红"的坑，本文件第一版就踩了）。一律用打桩的
+    合成 key，两个环境跑的是同一条用例。
     """
 
+    #: 合成 key：**不是** _PLACEHOLDER_KEYS 里的占位符，所以会被当作真秘密处理
+    FAKE_KEY = "sk-qqchatlogfakekey0123456789"
+
     def test_configured_key_is_replaced(self):
-        key = dc.DEEPSEEK_API_KEY
-        self.assertTrue(key, "测试环境应当有（占位或真实的）key，否则这条什么都没验")
-        out = dc.scrub_secrets(f"upstream said: invalid key {key} for model x")
-        if key.strip() and key not in dc._PLACEHOLDER_KEYS:
-            self.assertNotIn(key, out)
+        with mock.patch.object(dc, "DEEPSEEK_API_KEY", self.FAKE_KEY):
+            out = dc.scrub_secrets(f"upstream said: invalid key {self.FAKE_KEY} for model x")
+        self.assertNotIn(self.FAKE_KEY, out, "本机配置的那个 Key 必须被抹掉")
+        self.assertIn("<API_KEY>", out)
         self.assertIn("invalid key", out, "除 Key 之外的排障信息必须保留")
+
+    def test_placeholder_key_is_not_a_secret(self):
+        """占位符（.env.example 里那种"你的API_Key"）不是秘密，不必抹也不用报。"""
+        with mock.patch.object(dc, "DEEPSEEK_API_KEY", "你的API_Key"):
+            out = dc.scrub_secrets("bad key 你的API_Key rejected")
+        self.assertIn("你的API_Key", out)
 
     def test_key_shaped_strings_are_redacted(self):
         token = "sk-abcdefghijklmnop1234"
@@ -688,8 +711,10 @@ class TestSecretsAreScrubbedFromOutwardFacingText(unittest.TestCase):
 
     def test_test_connection_does_not_echo_the_key(self):
         """`/api/status/test` 的响应会显示给用户：上游把 Key 回显进正文时不许带出去。"""
-        key = dc.DEEPSEEK_API_KEY
-        leaky = f"Error code: 401 - {{'error': {{'message': 'bad key sk-abcdefghijklmnop1234 / {key}'}}}}"
+        leaky = (
+            "Error code: 401 - {'error': {'message': 'bad key "
+            f"sk-abcdefghijklmnop1234 / {self.FAKE_KEY}'}}}}"
+        )
 
         class _Boom:
             class chat:  # noqa: N801
@@ -699,13 +724,14 @@ class TestSecretsAreScrubbedFromOutwardFacingText(unittest.TestCase):
                         raise RuntimeError(leaky)
 
         with (
+            mock.patch.object(dc, "DEEPSEEK_API_KEY", self.FAKE_KEY),
             mock.patch.object(dc, "is_api_configured", lambda: True),
             mock.patch.object(dc, "_get_client", lambda: _Boom()),
         ):
             ok, detail = dc.test_connection()
         self.assertFalse(ok)
         self.assertNotIn("sk-abcdefghijklmnop1234", detail, "长相像 Key 的字串必须被抹掉")
-        self.assertNotIn(key, detail, "本机配置的 Key 本身必须被抹掉")
+        self.assertNotIn(self.FAKE_KEY, detail, "本机配置的 Key 本身必须被抹掉")
         self.assertIn("401", detail, "错误码这类排障线索要保留")
 
 

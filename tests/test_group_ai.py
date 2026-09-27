@@ -49,7 +49,7 @@ import shutil as _shutil
 # 测试隔离 + 网络护栏：数据目录指向本次进程独占的临时目录，且未配置真实 API Key 时
 # 禁止一切真实 LLM 调用。两者都必须在 import 项目模块（config / analyzer.*）之前完成，
 # 否则 config 会把数据目录读成真实目录。实现与理由见 tests/_bootstrap.py。
-from _bootstrap import bootstrap  # noqa: E402
+from _bootstrap import api_configured_patcher, bootstrap  # noqa: E402
 from _stats import ensure_stats  # noqa: E402
 
 bootstrap()
@@ -589,9 +589,19 @@ class TestApiModeGuard(unittest.TestCase):
         self.assertIsNone(self._guard("recap", "two_party"))
 
     def test_ask_rejects_group_session_at_the_http_layer(self):
-        """真实 HTTP 路径也要挡住（守卫写在函数里、而不是只写在 helper 上）。"""
+        """真实 HTTP 路径也要挡住（守卫写在函数里、而不是只写在 helper 上）。
+
+        "API Key 已配置"必须是本用例的**显式前提**：api_ask 里"Key 未配置"那道检查排在
+        模式守卫之前，所以没有 Key 的环境（= CI，没有 .env）会先回一句"API Key 未配置"
+        ——状态码同为 400、原因却完全不同，于是"错误文案里要有'群聊'"这条断言在 CI 上必挂，
+        而开发机因为配了 Key 永远看不到。这个坑在 _bootstrap.api_configured_patcher 的
+        说明里点名过（"一度有 3 个这样的用例：本机全绿、CI 必挂"），这里按它的用法办。
+        """
         import app as appmod
 
+        guard = api_configured_patcher()
+        guard.start()
+        self.addCleanup(guard.stop)
         client = appmod.app.test_client()
         client.get("/")
         with client.session_transaction() as sess:
