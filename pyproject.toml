@@ -64,6 +64,18 @@ include-package-data = true
 web = ["templates/**/*.html", "static/**/*"]
 
 # ===========================================================================
+# 测试发现：CI 跑的是 `python -m unittest discover -s tests`（见 .github/workflows），
+# 但本地和各种自动化工具的肌肉记忆是裸 `pytest`。缺这一段时 pytest 从仓库根递归收集，
+# 把 temp/reversal/** 下那 26 份"把已修 bug 反向改回去"的整仓副本一起收进来——
+# 它们的模块基名（test_core.py 等）与 tests/ 完全相同，于是 `python -m pytest`
+# 报出 620 个收集错误。症状看着像"测试套件坏了"，真相只是没人告诉它只跑 tests/。
+# 写死 testpaths，让两种跑法得到同一套用例（temp/ 已在 .gitignore 里，ruff 同理）。
+# ===========================================================================
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["temp", "_audit", "dist", "build", "node_modules", ".*", "*.egg-info"]
+
+# ===========================================================================
 # 代码检查配置：CI 与本地都用 `ruff check .`
 # ===========================================================================
 [tool.ruff]
