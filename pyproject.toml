@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qqchatlog"
-version = "1.2.0"
+version = "1.2.1"
 description = "QQ 聊天记录分析工具：本地统计 + OpenAI 兼容接口的对话分析（私聊与群聊导出）"
 readme = "README.md"
 requires-python = ">=3.10"
