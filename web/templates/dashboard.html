@@ -30,6 +30,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     如需按成员分别统计，请改用 <code>QQCHAT_GROUP_CHAT=auto</code>（群聊分析就绪后生效）。
 </div>
 {%- endif %}
+{%- set unknown = overview.get('unknown_element_types') or {} %}
+{%- if unknown %}
+{# 格式漂移提示：这些元素类型没能命中解析器的任何分支——不猜语义、不静默丢，
+   如实告诉用户"有内容没被认出来"，并给出体检工具。（导出器改版后最值钱的一条告警） #}
+<div class="alert alert-warning small mb-3">
+    有 {{ unknown.values() | sum }} 个消息元素没有被识别（类型：
+    {%- for k, v in unknown | dictsort %} {{ k }}×{{ v }}{% if not loop.last %}、{% endif %}{% endfor -%}）。
+    它们没有进入统计与分析；若这不是预期中的空元素，可用
+    <code>python tools/inspect_chat.py &lt;导出文件&gt;</code> 体检确认。
+</div>
+{%- endif %}
 
 <div class="row mb-4">
     <div class="col-md-3 mb-3">
@@ -63,7 +74,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                 <div class="stat-label">图片总数</div>
                 <small class="text-muted">
                     视频 {{ overview.get('total_videos', 0) }} · 文件 {{ overview.get('total_files', 0) }}
-                    · 转发 {{ overview.get('total_forwards', 0) }} · 表情 {{ overview.get('total_faces', 0) }}<br>
+                    · 转发 {{ overview.get('total_forwards', 0) }} · 语音 {{ overview.get('total_voices', 0) }}
+                    · 表情 {{ overview.get('total_faces', 0) }}
+                    · 撤回 {{ overview.get('total_recalls', 0) }}<br>
                     图片 {{ overview.get('image_bytes', 0) | filesizeformat }}
                     · 文件/视频 {{ overview.get('other_media_bytes', 0) | filesizeformat }}
                     {% if overview.get('unique_images') %}
@@ -100,6 +113,63 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         <div id="dailyChart" style="height: 350px;"></div>
     </div>
 </div>
+
+{% if trends.months and trends.months | length > 1 %}
+{# 逐月互发比例与句长趋势：overview 只有一个全程汇总，看不出"这段时间是谁在主动" #}
+<div class="card mb-4">
+    <div class="card-header">月度趋势</div>
+    <div class="card-body">
+        <div id="monthlyTrendChart" style="height: 350px;"></div>
+    </div>
+</div>
+{% endif %}
+
+{% set nh = trends.name_history or {} %}
+{% set other_names = nh.get('other') or [] %}
+{% set self_names = nh.get('self') or [] %}
+{% if trends.first_message or (trends.restarts and trends.restarts.count)
+      or (other_names | length > 1) or (self_names | length > 1) %}
+<div class="card mb-4">
+    <div class="card-header">时间线细节</div>
+    <div class="card-body">
+        <div class="row g-3">
+            {% if trends.first_message %}
+            <div class="col-md-4">
+                <div class="stat-label">第一条消息（{{ trends.first_message.date }} {{ trends.first_message.time }}）</div>
+                <p class="small mb-0">
+                    <strong>{{ '我' if trends.first_message.who == 'self' else trends.first_message.name }}：</strong>
+                    {{ trends.first_message.text }}
+                </p>
+            </div>
+            {% endif %}
+            {% if trends.restarts and trends.restarts.count %}
+            <div class="col-md-4">
+                <div class="stat-label">中断 ≥{{ trends.restarts.threshold_days }} 天后的重启</div>
+                <p class="small mb-0">
+                    共 {{ trends.restarts.count }} 次：我开口 {{ trends.restarts.self }} 次 ·
+                    {{ overview.other_name }}开口 {{ trends.restarts.other }} 次<br>
+                    <small class="text-muted">最近：
+                    {%- for e in trends.restarts.events[-3:] %}
+                    {{ e.date }}（冷场 {{ e.gap_days }} 天后{{ '我' if e.who == 'self' else '对方' }}先开口）{% if not loop.last %}、{% endif %}
+                    {%- endfor %}</small>
+                </p>
+            </div>
+            {% endif %}
+            {% set other_names = trends.name_history.other or [] %}
+            {% if other_names | length > 1 %}
+            <div class="col-md-4">
+                <div class="stat-label">称呼变迁（{{ overview.other_name }}）</div>
+                <p class="small mb-0">
+                    {%- for n in other_names %}
+                    <strong>{{ n.name }}</strong>（{{ n.first_month }}{% if n.last_month != n.first_month %}~{{ n.last_month }}{% endif %}，{{ n.count }} 条）{% if not loop.last %} → {% endif %}
+                    {%- endfor %}
+                </p>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endif %}
 
 <div class="row mb-4">
     <div class="col-md-6 mb-3">
@@ -206,12 +276,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             <button class="btn btn-outline-primary btn-analyze" data-dim="habits" data-orig="个人习惯">个人习惯</button>
             <button class="btn btn-outline-primary btn-analyze" data-dim="topics" data-orig="话题趋势">话题趋势</button>
             <button class="btn btn-outline-primary btn-analyze" data-dim="profile" data-orig="人物锐评">人物锐评</button>
+            <button class="btn btn-outline-primary btn-analyze" data-dim="recap" data-orig="整体总括" title="跨月全量的一次调用：看完整条时间线再下结论，约一次维度的 1/5 成本">整体总括</button>
             <button class="btn btn-primary" id="btn-analyze-all">全量分析</button>
+            <button class="btn btn-outline-secondary" id="btn-api-test" title="发一个真实最小请求（输出 1 token）验证端点、Key 与模型名">测试连通</button>
         </div>
         <div class="form-check mt-3">
             <input class="form-check-input" type="checkbox" id="forceRefresh">
             <label class="form-check-label small text-muted" for="forceRefresh">强制重新分析（忽略缓存，会产生 API 费用）</label>
         </div>
+        <div id="apiTestMsg" class="mt-2"></div>
         <div id="analyzeStatus" class="mt-3"></div>
         <div class="mt-3">
             <a href="/report" class="btn btn-outline-primary btn-sm">查看完整报告</a>
@@ -310,8 +383,57 @@ $('#btn-analyze-all').on('click', function() {
     });
     startAnalyzeAll(opts);
 });
+
+$('#btn-api-test').on('click', function() {
+    var btn = $(this);
+    btn.prop('disabled', true).text('测试中…');
+    $('#apiTestMsg').html('<div class="alert alert-secondary small mb-0">正在向配置的端点发一个最小请求…</div>');
+    $.post('/api/status/test', function(r) {
+        $('#apiTestMsg').html(
+            '<div class="alert ' + (r.ok ? 'alert-success' : 'alert-warning') + ' small mb-0">' + esc(r.detail || '未知结果') + '</div>'
+        );
+    }).fail(function(xhr) {
+        var msg = (xhr.responseJSON && xhr.responseJSON.error) || ('请求失败（HTTP ' + xhr.status + '）');
+        $('#apiTestMsg').html('<div class="alert alert-warning small mb-0">' + esc(msg) + '</div>');
+    }).always(function() {
+        btn.prop('disabled', false).text('测试连通');
+    });
+});
 </script>
 {% endif %}
+
+{# 数据与隐私：此前"想清空当前聊天"只能再传一份别的文件顶掉，或手删目录重启；
+   换机器时已付费结果也没有带得走的口子。两个能力都在这里，且不依赖 API Key。 #}
+<div class="card mb-4">
+    <div class="card-header">数据与隐私</div>
+    <div class="card-body">
+        <div class="d-flex gap-2 flex-wrap align-items-center">
+            <a href="/api/export" class="btn btn-outline-secondary btn-sm">导出统计与已付费结果（.zip）</a>
+            <button class="btn btn-outline-danger btn-sm" id="btn-delete-chat">删除本聊天</button>
+            <small class="text-muted">
+                导出包含统计、各维度结果与<b>月份增量缓存</b>，在另一台机器导入后继续复用、不重复付费；
+                删除会把上传原件与本机全部派生缓存一并回收，不可恢复。
+            </small>
+        </div>
+        <div id="dataZoneMsg" class="mt-2"></div>
+    </div>
+</div>
+<script>
+$('#btn-delete-chat').on('click', function() {
+    if (!confirm('确定删除这份聊天？上传原件、统计与已付费的 AI 结果将从本机清除，且不可恢复。')) return;
+    var btn = $(this).prop('disabled', true).text('删除中…');
+    $.post('/api/chat/delete', function(r) {
+        sessionStorage.setItem('chat_deleted', r.kept_for_other_sessions
+            ? '已退出本会话；这份内容仍被其它浏览器使用，缓存待最后一个使用者离开后回收。'
+            : '本聊天及其全部派生缓存已清除。');
+        window.location.href = '/';
+    }).fail(function(xhr) {
+        btn.prop('disabled', false).text('删除本聊天');
+        $('#dataZoneMsg').html('<div class="alert alert-danger small mb-0">' +
+            esc((xhr.responseJSON && xhr.responseJSON.error) || '删除失败，请刷新重试') + '</div>');
+    });
+});
+</script>
 
 <div class="card mb-4 d-none" id="usageCard">
     <div class="card-header">LLM 用量统计 <small class="text-muted">（本地累计，仅数字不含聊天内容）</small></div>
@@ -324,8 +446,14 @@ $('#btn-analyze-all').on('click', function() {
             </div>
             <div class="col-md-6">
                 <h6 class="small text-muted">按天（最近 14 天）</h6>
-                <table class="table table-sm" id="usageDays"></table>
+                 <table class="table table-sm" id="usageDays"></table>
             </div>
+        </div>
+        <hr class="my-2">
+        <div class="d-none" id="usageJobsWrap">
+            <h6 class="small text-muted">最近任务 <span class="text-muted">（落盘账目，重启仍可查；只含维度与状态，不含聊天内容）</span></h6>
+            <table class="table table-sm mb-0" id="usageJobsHead"></table>
+            <table class="table table-sm mb-0" id="usageJobs"></table>
         </div>
     </div>
 </div>
@@ -333,8 +461,27 @@ $('#btn-analyze-all').on('click', function() {
 <script>
 (function() {
     const DIM_LABEL = {emotion:'情绪',topics:'话题',relationship:'关系',habits:'习惯',profile:'锐评',
-                       vision:'图片理解',unknown:'其他'};
+                       vision:'图片理解',unknown:'其他',all:'一键全量',recap:'整体总括'};
     function fmt(n) { return (n || 0).toLocaleString(); }
+
+    // 任务历史独立于用量：还没产生任何调用时（全被取消/失败），这张表也要能出现
+    $.get('/api/jobs/history', function(h) {
+        var rows = (h.history || []).slice(0, 10).map(function(e) {
+            var st = { done: ['success', '完成'], error: ['danger', '失败'], cancelled: ['secondary', '已取消'] }[e.status]
+                || ['secondary', esc(e.status || '')];
+            var prog = e.total > 0 ? (e.done + '/' + e.total) : '—';
+            return '<tr><td>' + esc(DIM_LABEL[e.dim] || e.dim || '') + '</td>' +
+                '<td><span class="badge bg-' + st[0] + '">' + st[1] + '</span></td>' +
+                '<td class="text-end small text-muted">' + prog + '</td>' +
+                '<td class="text-end small text-muted">' + esc(new Date((e.t || 0) * 1000).toLocaleString()) + '</td></tr>';
+        });
+        if (!rows.length) return;
+        $('#usageJobsHead').html('<tr><th>任务</th><th>结果</th><th class="text-end">进度</th><th class="text-end">时间</th></tr>');
+        $('#usageJobs').html(rows.join(''));
+        $('#usageJobsWrap').removeClass('d-none');
+        $('#usageCard').removeClass('d-none');
+    });
+
     $.get('/api/usage', function(u) {
         if (!u || !u.total || !u.total.calls) return;
         var cost = (u.total.cost || 0);
@@ -382,5 +529,9 @@ renderPieChart('charRatioChart', [
 renderLineChart('dailyChart', {{ daily_counts | tojson }}, '消息数');
 renderBarChart('hourlyChart', {{ hourly_dist | tojson }}, '消息数');
 renderWeeklyChart('weeklyChart', {{ weekly_dist | tojson }}, '消息数');
+{% if trends.months and trends.months | length > 1 %}
+renderMonthlyTrendChart('monthlyTrendChart', {{ trends.months | tojson }},
+    {{ overview.self_name | tojson }}, {{ overview.other_name | tojson }});
+{% endif %}
 </script>
 {% endblock %}

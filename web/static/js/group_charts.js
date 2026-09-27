@@ -79,10 +79,18 @@ function renderMemberBar(domId, activity, maxN) {
     }));
 }
 
-// 互动热力矩阵：X = 谁先说，Y = 谁接话；对角线留空（自己不接自己的话）
-function renderInteractionHeatmap(domId, interaction) {
+// 互动热力矩阵：X（列）= 接话/点名的人，Y（行）= 先说/被@的人；对角线留空（自己不接自己的话）
+// （读法与 tooltip、卡片标题、服务端矩阵定义四方一致；本行注释曾把 X/Y 写反，
+//   而那个 bug 恰恰就是照着这句错注释养成的——留错注释比留 bug 更长寿）
+function renderInteractionHeatmap(domId, interaction, opts) {
     var chart = mountChart(domId);
     if (!chart) return;
+    // 同一张热力图被两种矩阵复用，两处的**读法必须不同**，所以模式要显式传：
+    //   接话/回复矩阵（group_stats.calc_interaction_matrix）：directed[i][j] 的
+    //     i = 先说的人（行）、j = 接话的人（列）；
+    //   @点名矩阵：mention[i][j] 的 i = 被@的人（行）、j = 点名的人（列）。
+    // 数据点压成 [列, 行, 值] 交给 ECharts，于是 x=列、y=行。
+    var mention = !!(opts && opts.mode === 'mention');
     var members = asList(interaction && interaction.members);
     var matrix = asList(interaction && interaction.directed);
     var names = members.map(function (m) { return m.name; });
@@ -100,8 +108,18 @@ function renderInteractionHeatmap(domId, interaction) {
         tooltip: {
             position: 'top',
             formatter: function (p) {
-                if (p.value[2] === null) return esc(names[p.value[1]]) + '（自己不接自己的话）';
-                return esc(names[p.value[0]]) + ' 说完，' + esc(names[p.value[1]]) + ' 接了 ' + p.value[2] + ' 次';
+                // p.value[0] = 列 = 动作的**发出方**，p.value[1] = 行 = 动作的**对象**。
+                // 这里曾经写反（先说/接话两个角色互换），而卡片标题、坐标轴与数据都是
+                // 对的 —— 于是鼠标停在"A 先说、B 接了 4 次"的格子上，气泡却说
+                // "B 说完，A 接了 4 次"：一处与其余三处相反，用户信的是气泡。
+                var row = esc(names[p.value[1]]);  // 行 = 先说的人 / 被@的人
+                var col = esc(names[p.value[0]]);  // 列 = 接话的人 / 点名的人
+                if (p.value[2] === null) {
+                    return row + (mention ? '（自己不@自己）' : '（自己不接自己的话）');
+                }
+                return mention
+                    ? col + ' @了 ' + row + ' ' + p.value[2] + ' 次'
+                    : row + ' 说完，' + col + ' 接了 ' + p.value[2] + ' 次';
             }
         },
         grid: { left: 8, right: 16, top: 16, bottom: 56, containLabel: true },

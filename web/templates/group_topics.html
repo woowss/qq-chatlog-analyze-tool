@@ -28,7 +28,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <div class="row mb-4">
     <div class="col-md-6 mb-3">
         <div class="card h-100">
-            <div class="card-header">@点名矩阵 <small class="text-muted ms-2">谁点名了谁（事实）</small></div>
+            <div class="card-header">@点名矩阵 <small class="text-muted ms-2">谁点名了谁（事实）· 纵向：被@的人；横向：点名的人</small></div>
             <div class="card-body"><div id="mentionHeat" style="height: 380px;"></div></div>
         </div>
     </div>
@@ -64,7 +64,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {% block scripts %}
 <script>
 const MEMBERS = {{ member_activity | tojson }};
-renderInteractionHeatmap('mentionHeat', { members: {{ interaction | tojson }}.members, directed: {{ interaction | tojson }}.mention_directed });
+{# @点名矩阵的行/列语义与接话矩阵相反（行=被@的人、列=点名的人），必须显式声明模式，
+   否则 tooltip 会把"@了谁"说成"谁先说"。 #}
+renderInteractionHeatmap('mentionHeat', { members: {{ interaction | tojson }}.members, directed: {{ interaction | tojson }}.mention_directed }, { mode: 'mention' });
 renderRelationGraph('relationGraph', {{ interaction | tojson }}, MEMBERS);
 loadGroupAnalysis('group_topics', document.getElementById('sec-topics'), renderGroupTopics);
 wireGroupAnalyzeButtons(MEMBERS);

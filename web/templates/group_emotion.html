@@ -62,7 +62,14 @@ const MEMBERS = {{ member_activity | tojson }};
 renderMemberHourlyArea('memberHourly', {{ member_hourly | tojson }});
 loadAnalysis('group_emotion', function (data) {
     if (!data) return;
-    renderGroupEmotion(document.getElementById('sec-emotion'), data);
+    // #sec-emotion 只在 api_ok 为真时渲染（未配 Key 时整张卡片不存在），而
+    // /api/analysis/<维度> 不看 Key：只要盘上/别处的 sessionStorage 里有旧结果就照样发过来。
+    // 于是"以前配过 Key、现在撤掉了"这台机器上，这个回调拿到的是**有数据、容器为 null**，
+    // renderGroupEmotion 在 container.innerHTML 处抛 TypeError —— 而它下面那行
+    // mountChart('emotionTrend') 就再也不会执行：一句判空缺失，把本地统计的走势图
+    // 一起带走了（其余群页面统一走 loadGroupAnalysis，它开头就 `if (!container) return`）。
+    var box = document.getElementById('sec-emotion');
+    if (box) renderGroupEmotion(box, data);
     var months = Object.keys(data).sort();
     var chart = mountChart('emotionTrend');
     if (!chart) return;

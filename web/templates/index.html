@@ -44,6 +44,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                 </div>
                 {% endif %}
 
+                <div id="deletedMsg" class="alert alert-success d-none" role="alert"></div>
+
                 <form action="/upload" method="post" enctype="multipart/form-data" id="uploadForm">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                     <div class="upload-zone mb-3" id="dropZone">
@@ -65,6 +67,18 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                         上传并分析
                     </button>
                 </form>
+
+                <details class="mt-3">
+                    <summary class="small text-muted">从另一台机器导入已付费结果（结果包 .zip）</summary>
+                    <form id="importForm" class="mt-2" enctype="multipart/form-data">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <div class="d-flex gap-2 flex-wrap align-items-center">
+                            <input type="file" name="file" id="importFile" accept=".zip" class="form-control form-control-sm" style="max-width:320px">
+                            <button type="submit" class="btn btn-outline-secondary btn-sm">导入</button>
+                        </div>
+                        <div id="importHint" class="mt-2 small text-muted d-none"></div>
+                    </form>
+                </details>
 
                 <hr class="my-4">
 
@@ -188,7 +202,7 @@ $(function() {
         // 私聊 5 维 + 群聊 4 维都要清：上传页此刻的会话可能是上一条记录（私聊或群聊），
         // 而 loadAnalysis 在服务端缓存未命中时会回退到 sessionStorage——只清一半就会出现
         // "换了文件还显示上一份的群聊分析结果"。两个列表的并集是唯一安全的选择。
-        ['emotion', 'relationship', 'habits', 'topics', 'profile',
+        ['emotion', 'relationship', 'habits', 'topics', 'profile', 'recap',
          'group_dynamics', 'group_topics', 'group_emotion', 'member_profiles'].forEach(function(k) {
             sessionStorage.removeItem('ai_' + k);
         });
@@ -225,6 +239,52 @@ $(function() {
             $('#submitBtn').prop('disabled', false).text('上传并分析');
             var msg = (xhr.responseJSON && xhr.responseJSON.error) || xhr.responseText || '上传失败';
             $('#uploadHint').removeClass('d-none').text(String(msg).slice(0, 120));
+        });
+    });
+
+    // 删除当前聊天后跳回首页：把结果如实说一声（sessionStorage 一次性消费）
+    var delMsg = sessionStorage.getItem('chat_deleted');
+    if (delMsg) {
+        sessionStorage.removeItem('chat_deleted');
+        $('#deletedMsg').removeClass('d-none').text(delMsg);
+    }
+
+    // 导入结果包。409 + need_confirm 是服务端要求"再点一次"：这份包声明的正是当前
+    // 浏览器里打开的那份聊天，导入会覆盖正在看的统计与已付费结果。换机器恢复时这是
+    // 合法操作，所以不禁止、只要求一次明确确认；而"随手导入一个来路不明的 zip 就
+    // 把自己当前的结论换掉"这条路被这一眼拦下（服务端的归属校验是另一道）。
+    var importConfirmed = false;
+    $('#importForm').on('submit', function(e) {
+        e.preventDefault();
+        var file = $('#importFile')[0].files[0];
+        if (!file) {
+            $('#importHint').removeClass('d-none').text('请先选择导出的 .zip 结果包');
+            return;
+        }
+        var fd = new FormData(this);
+        if (importConfirmed) fd.append('confirm', '1');
+        $('#importHint').removeClass('d-none').text('导入中…');
+        $.ajax({
+            url: '/api/import', method: 'POST', data: fd,
+            processData: false, contentType: false,
+            headers: { 'X-CSRF-Token': csrf() }
+        }).done(function(res) {
+            importConfirmed = false;
+            var parts = ['已写入 ' + res.written + ' 个结果文件'];
+            if (res.skipped) parts.push('跳过 ' + res.skipped + ' 个不属于该聊天或形状不对的条目');
+            parts.push('上传同内容的导出文件后，分析会直接命中');
+            $('#importHint').text(parts.join('，'));
+        }).fail(function(xhr) {
+            var body = xhr.responseJSON || {};
+            if (xhr.status === 409 && body.need_confirm) {
+                // 保持文件选择不变，只把下一次点击变成"确认覆盖"
+                importConfirmed = true;
+                $('#importHint').text(String(body.error || '确认导入？') + '（再点一次「导入」即确认覆盖）');
+                return;
+            }
+            importConfirmed = false;
+            var msg = body.error || '导入失败（HTTP ' + xhr.status + '）';
+            $('#importHint').text(String(msg).slice(0, 200));
         });
     });
 });

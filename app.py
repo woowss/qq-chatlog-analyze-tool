@@ -36,6 +36,8 @@ from config import (
     ACCESS_PASSWORD,
     AI_CACHE_DIR,
     ALLOWED_ORIGINS,
+    CACHE_MAX_DAYS,
+    CACHE_SLIDE_DAYS,
     COOKIE_SECURE,
     DEEPSEEK_MODEL,
     FLASK_DEBUG,
@@ -131,7 +133,10 @@ def create_app() -> Flask:
     configure_month_cache(AI_CACHE_DIR if MONTH_CACHE_ENABLED else "")
 
     # 注册顺序即 before_request 执行顺序（与拆分前的 app.py 保持一致）：
-    # log_request → ensure_csrf_token → require_login → periodic_cleanup → 路由分发
+    # log_request → track_active_chat → ensure_csrf_token → require_login
+    # → periodic_cleanup → 路由分发
+    # （track_active_chat 只读会话、不拦截，所以排在登录之前也无妨；它必须每个请求
+    #   都跑一次，见 webapp/views.py 里那段说明）
     views.register(app)
     security.register(app)
     cleanup.register(app)
@@ -202,6 +207,16 @@ def _startup_report() -> bool:
     _print_safe(f"  数据目录: {os.path.dirname(AI_CACHE_DIR)}（可用 QQCHAT_DATA_DIR 迁移，测试更安全）")
     _print_safe(f"  单次上传上限: {MAX_CONTENT_LENGTH // 1048576} MB（QQCHAT_MAX_UPLOAD_MB 可调）")
     _print_safe(f"  增量缓存: {'开（只分析新增月份）' if MONTH_CACHE_ENABLED else '关'}")
+    if CACHE_SLIDE_DAYS <= 0 or CACHE_MAX_DAYS <= 0:
+        _print_safe(
+            "  [WARN] 派生缓存回收已手动关闭（QQCHAT_CACHE_SLIDE_DAYS / QQCHAT_CACHE_MAX_DAYS 为 0）："
+        )
+        _print_safe("         已付费的 AI 结果与统计将【永久留在本机】，不再到期自动回收")
+    else:
+        _print_safe(
+            f"  派生缓存: 滑动 {CACHE_SLIDE_DAYS} 天 + 绝对 {CACHE_MAX_DAYS} 天上限"
+            "（QQCHAT_CACHE_SLIDE_DAYS / QQCHAT_CACHE_MAX_DAYS 可调，0=不过期）"
+        )
     _print_safe(f"  内存任务 TTL: {JOB_TTL_SECONDS}s · 结果本身永远先落盘（重启/超时不丢）")
 
     loopback = _is_loopback(FLASK_HOST)

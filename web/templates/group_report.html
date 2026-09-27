@@ -45,6 +45,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     <div class="stat-item"><div class="num">{{ overview.peak_concurrent.count }}</div><div class="label">同时在线高峰（人）</div></div>
     <div class="stat-item"><div class="num">{{ overview.total_images }}</div><div class="label">图片</div></div>
     <div class="stat-item"><div class="num">{{ overview.total_faces }}</div><div class="label">表情</div></div>
+    <div class="stat-item"><div class="num">{{ overview.get('total_voices', 0) }}</div><div class="label">语音</div></div>
+    <div class="stat-item"><div class="num">{{ overview.get('total_recalls', 0) }}</div><div class="label">撤回</div></div>
     <div class="stat-item"><div class="num">{{ overview.active_days }}</div><div class="label">有聊天天数</div></div>
 </div>
 

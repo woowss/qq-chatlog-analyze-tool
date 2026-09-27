@@ -23,6 +23,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 {% block content %}
 <h2 class="page-title">群聊仪表盘 <span class="sub">{{ overview.group_name }}</span></h2>
+{%- set unknown = overview.get('unknown_element_types') or {} %}
+{%- if unknown %}
+{# 与私聊仪表盘同一口径：未识别元素不静默丢，如实提示并引导体检。 #}
+<div class="alert alert-warning small mb-3">
+    有 {{ unknown.values() | sum }} 个消息元素没有被识别（类型：
+    {%- for k, v in unknown | dictsort %} {{ k }}×{{ v }}{% if not loop.last %}、{% endif %}{% endfor -%}）。
+    它们没有进入统计与分析；若这不是预期中的空元素，可用
+    <code>python tools/inspect_chat.py &lt;导出文件&gt;</code> 体检确认。
+</div>
+{%- endif %}
 
 <div class="row mb-4">
     <div class="col-md-3 mb-3">
@@ -85,6 +95,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                 <small class="text-muted d-block mt-2">
                     图片 {{ overview.total_images }} · 表情 {{ overview.total_faces }}
                     · 文件 {{ overview.get('total_files', 0) }} · 转发 {{ overview.get('total_forwards', 0) }}
+                    · 语音 {{ overview.get('total_voices', 0) }} · 撤回 {{ overview.get('total_recalls', 0) }}
                 </small>
             </div>
         </div>

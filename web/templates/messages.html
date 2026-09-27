@@ -1,0 +1,148 @@
+<!--
+Copyright (C) 2026 woowss
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-->
+{% extends "base.html" %}
+{% block title %}消息记录{% endblock %}
+
+{% block content %}
+<h2 class="page-title">消息记录 <span class="sub">{{ chat_name }}</span></h2>
+<p class="text-muted small">
+    原始记录浏览与搜索（全部在本机计算，不产生 API 费用）。撤回与系统消息如实列出并打标——
+    这里就是"AI 结论可回溯"的那条退路：看到引用，能搜到原句、点开看上下文。
+</p>
+
+<form class="row g-2 align-items-end mb-3" id="filterForm" onsubmit="return false;">
+    <div class="col-12 col-md-4">
+        <label class="form-label small text-muted mb-1" for="q">关键词</label>
+        <input class="form-control form-control-sm" id="q" type="search" placeholder="正文 / 文件名 / 表情名 / 发言人">
+    </div>
+    <div class="col-6 col-md-2">
+        <label class="form-label small text-muted mb-1" for="sender">发言人</label>
+        <select class="form-select form-select-sm" id="sender"><option value="">全部</option></select>
+    </div>
+    <div class="col-6 col-md-2">
+        <label class="form-label small text-muted mb-1" for="month">月份</label>
+        <input class="form-control form-control-sm" id="month" type="month">
+    </div>
+    <div class="col-6 col-md-2">
+        <label class="form-label small text-muted mb-1" for="from">从</label>
+        <input class="form-control form-control-sm" id="from" type="date">
+    </div>
+    <div class="col-6 col-md-2">
+        <label class="form-label small text-muted mb-1" for="to">到</label>
+        <input class="form-control form-control-sm" id="to" type="date">
+    </div>
+    <div class="col-12 d-flex gap-2 mt-2">
+        <button class="btn btn-primary btn-sm" id="btnSearch" type="button">搜索</button>
+        <button class="btn btn-outline-secondary btn-sm" id="btnReset" type="button">清空条件</button>
+        <span class="small text-muted align-self-center" id="resultMeta"></span>
+    </div>
+</form>
+
+<div class="alert alert-warning small d-none" id="msgWarn"></div>
+<div id="msgList" class="msg-list"></div>
+<nav class="mt-3 d-flex justify-content-between align-items-center" id="pagerBox">
+    <button class="btn btn-outline-secondary btn-sm" id="prevPage" disabled>上一页</button>
+    <span class="small text-muted" id="pageInfo"></span>
+    <button class="btn btn-outline-secondary btn-sm" id="nextPage" disabled>下一页</button>
+</nav>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+    function esc(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+    var state = { page: 1, pages: 1, total: 0 };
+    var sendersLoaded = false;
+
+    function params(extra) {
+        var p = {};
+        ['q', 'sender', 'month', 'from', 'to'].forEach(function(k) {
+            p[k] = $('#' + k).val() || '';
+        });
+        p.page = state.page;
+        if (extra) $.extend(p, extra);
+        return p;
+    }
+
+    function rowHtml(m, highlightId) {
+        var cls = 'msg-row' + (m.system ? ' msg-system' : '') + (m.recalled ? ' msg-recalled' : '')
+                + (m.id === highlightId ? ' msg-hit' : '');
+        var tags = [];
+        if (m.recalled) tags.push('<span class="badge bg-secondary">已撤回</span>');
+        if (m.system) tags.push('<span class="badge bg-secondary">系统</span>');
+        if (m.is_reply) tags.push('<span class="badge bg-info">回复</span>');
+        if (m.mentions_all) tags.push('<span class="badge bg-warning text-dark">@全体</span>');
+        return '<div class="' + cls + '" data-id="' + esc(m.id) + '">'
+            + '<span class="msg-time">' + esc(m.time) + '</span> '
+            + '<span class="msg-who' + (m.is_self ? ' text-primary' : '') + '">' + esc(m.name || '未知') + ':</span> '
+            + '<span class="msg-body">' + esc(m.text) + ' ' + tags.join(' ') + '</span></div>';
+    }
+
+    function render(res, highlightId) {
+        state.total = res.total || 0;
+        if (res.pages) state.pages = res.pages;
+        var list = (res.messages || []).map(function(m) { return rowHtml(m, highlightId); });
+        $('#msgList').html(list.join('') || '<div class="text-muted small">没有符合条件的消息</div>');
+        $('#resultMeta').text('共 ' + state.total + ' 条');
+        $('#pageInfo').text(state.pages > 1 ? ('第 ' + (res.page || state.page) + ' / ' + state.pages + ' 页') : '');
+        var p = res.page || state.page;
+        $('#prevPage').prop('disabled', p <= 1);
+        $('#nextPage').prop('disabled', p >= (res.pages || 1));
+        if (res.senders && !sendersLoaded) {
+            var sel = $('#sender'), cur = sel.val();
+            res.senders.forEach(function(s) {
+                sel.append($('<option>').val(s.uid).text((s.is_self ? '我' : s.name) + '（' + s.name + '）'));
+            });
+            sel.val(cur || '');
+            sendersLoaded = true;
+        }
+        if (highlightId) {
+            var hit = $('.msg-hit');
+            if (hit.length) hit[0].scrollIntoView({ block: 'center' });
+        }
+    }
+
+    function load(highlightId) {
+        $.get('/api/messages', params(highlightId ? { around: highlightId } : null), function(res) {
+            if (res.error) { $('#msgWarn').removeClass('d-none').text(res.error); return; }
+            $('#msgWarn').addClass('d-none');
+            render(res, highlightId);
+        }).fail(function(xhr) {
+            $('#msgWarn').removeClass('d-none')
+                .text((xhr.responseJSON && xhr.responseJSON.error) || '查询失败（会话可能已过期，刷新页面重试）');
+        });
+    }
+
+    $('#btnSearch').on('click', function() { state.page = 1; load(); });
+    $('#q').on('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); state.page = 1; load(); } });
+    $('#btnReset').on('click', function() {
+        ['q', 'sender', 'month', 'from', 'to'].forEach(function(k) { $('#' + k).val(''); });
+        state.page = 1; load();
+    });
+    $('#prevPage').on('click', function() { if (state.page > 1) { state.page--; load(); } });
+    $('#nextPage').on('click', function() { if (state.page < state.pages) { state.page++; load(); } });
+    // 点一行 = 以它为锚点看前后文（分页过滤下也能定位回原对话）
+    $('#msgList').on('click', '.msg-row', function() { load(String($(this).data('id'))); });
+
+    load();
+})();
+</script>
+{% endblock %}

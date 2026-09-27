@@ -69,6 +69,23 @@ function applyChartTheme(option) {
     var o = $.extend(true, {}, option);
     if (!o.color) o.color = T.palette;
 
+    // 活页图表统一补"下载为图片"：右上角一个图标，点了存当前渲染的 PNG。
+    // 此前只有导出报告才会把图冻结成图片，页面上想看某一张图只能截图。
+    // 已有 toolbox 的图（少数）不覆盖它的 feature。
+    if (!o.toolbox) {
+        o.toolbox = {
+            feature: {
+                saveAsImage: {
+                    title: '下载图片',
+                    pixelRatio: 2,
+                    name: (document.title || 'chart').replace(/[\\/:*?"<>|]/g, '_')
+                }
+            }
+        };
+    } else if (o.toolbox.feature && !o.toolbox.feature.saveAsImage) {
+        o.toolbox.feature.saveAsImage = { title: '下载图片', pixelRatio: 2 };
+    }
+
     var tip = o.tooltip;
     if (tip) {
         var list = $.isArray(tip) ? tip : [tip];
@@ -277,6 +294,47 @@ function renderBarChart(domId, data, yName) {
                 name: '自己', type: 'bar',
                 data: data.map(function(d) { return d.self; }),
                 itemStyle: { color: T.primary, borderRadius: [3,3,0,0] }
+            }
+        ]
+    });
+}
+
+// 月度趋势：柱=当月双方条数（堆叠看总量、对比看谁主动），线=当月平均句长（右轴）。
+// 数据来自本地统计 trends.months，服务端已按月排好序。
+function renderMonthlyTrendChart(domId, months, selfName, otherName) {
+    const chart = mountChart(domId);
+    if (!chart || !months || !months.length) return;
+    var names = [selfName + '条数', otherName + '条数', selfName + '平均句长', otherName + '平均句长'];
+    chart.setOption({
+        tooltip: { trigger: 'axis', axisPointer: { type: 'cross', crossStyle: { color: T.axis } } },
+        legend: { data: names, bottom: 0, textStyle: { fontSize: 11 } },
+        grid: { left: '3%', right: '4%', bottom: '16%', top: 30, containLabel: true },
+        xAxis: { type: 'category', data: months.map(function (m) { return m.month; }),
+                 axisLabel: { rotate: 45, fontSize: 10 } },
+        yAxis: [
+            { type: 'value', name: '消息条数' },
+            { type: 'value', name: '平均句长(字)', splitLine: { show: false } }
+        ],
+        series: [
+            {
+                name: selfName + '条数', type: 'bar', stack: 'total',
+                data: months.map(function (m) { return m.self; }),
+                itemStyle: { color: T.primary }
+            },
+            {
+                name: otherName + '条数', type: 'bar', stack: 'total',
+                data: months.map(function (m) { return m.other; }),
+                itemStyle: { color: T.accent2 }
+            },
+            {
+                name: selfName + '平均句长', type: 'line', yAxisIndex: 1, smooth: true,
+                data: months.map(function (m) { return m.avg_len_self; }),
+                lineStyle: { color: T.primary, type: 'dashed' }, itemStyle: { color: T.primary }
+            },
+            {
+                name: otherName + '平均句长', type: 'line', yAxisIndex: 1, smooth: true,
+                data: months.map(function (m) { return m.avg_len_other; }),
+                lineStyle: { color: T.accent2, type: 'dashed' }, itemStyle: { color: T.accent2 }
             }
         ]
     });

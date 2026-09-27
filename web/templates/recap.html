@@ -1,0 +1,189 @@
+<!--
+Copyright (C) 2026 woowss
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-->
+{% extends "base.html" %}
+{% block title %}整体总括{% endblock %}
+
+{% block content %}
+<h2 class="page-title">整体总括 <span class="sub">{{ overview.other_name }}</span></h2>
+<p class="text-muted small">
+    五个维度各自只看得到自己那一个月；这一个是<b>跨月全量</b>的一次调用——
+    输入是本地统计的逐月事实加时间均匀抽样的对话，所以"什么时候开始变淡、谁先开口"
+    这类只有看完整条时间线才配回答的问题，在这里才有可靠答案。
+    只调用 1 次 API（成本约为单维度的五分之一），历史月份命中缓存时重开页面不重复计费。
+</p>
+
+<div class="card mb-4">
+    <div class="card-body d-flex gap-2 flex-wrap align-items-center">
+        <button class="btn btn-primary" id="btn-recap" {{ 'disabled' if not api_ok }}>{{ '生成整体总括' if api_ok else '未配置 API Key' }}</button>
+        <div class="form-check">
+            <input class="form-check-input me-2" type="checkbox" id="forceRefresh">
+            <label class="form-check-label small text-muted" for="forceRefresh">强制重新生成（会产生 API 费用）</label>
+        </div>
+        <div id="recapStatus" class="flex-grow-1"></div>
+    </div>
+</div>
+
+{% if api_ok %}
+<div class="card mb-4">
+    <div class="card-header">
+        提问角
+        <small class="text-muted">与总括同一份跨月材料：第一次问 = 1 次 API 调用，重问同一个问题免费</small>
+    </div>
+    <div class="card-body">
+        <div class="d-flex gap-2 flex-wrap">
+            <input class="form-control form-control-sm" id="askQ" maxlength="300"
+                   placeholder="例如：我们聊结婚这个话题是在哪段时间最密？" style="max-width:520px">
+            <button class="btn btn-primary btn-sm" id="askGo" type="button">提问</button>
+        </div>
+        <div id="askStatus" class="mt-2 small"></div>
+        <div id="askAnswer" class="mt-2"></div>
+    </div>
+</div>
+{% endif %}
+
+<div id="recapResult" class="d-none">
+    <div class="card mb-4">
+        <div class="card-header">总述</div>
+        <div class="card-body"><p id="recapOverall" class="mb-0"></p></div>
+    </div>
+    <div class="card mb-4" id="sec-arc" style="display:none">
+        <div class="card-header">时间线分段</div>
+        <div class="card-body" id="recapArc"></div>
+    </div>
+    <div class="card mb-4" id="sec-turn" style="display:none">
+        <div class="card-header">转折点</div>
+        <div class="card-body" id="recapTurning"></div>
+    </div>
+    <div class="card mb-4" id="sec-unread" style="display:none">
+        <div class="card-header">数字里没说破的事</div>
+        <div class="card-body"><ul class="mb-0" id="recapUnread"></ul></div>
+    </div>
+    <div class="card mb-4" id="sec-drive" style="display:none">
+        <div class="card-header">节奏与收尾</div>
+        <div class="card-body">
+            <p id="recapDrive" class="mb-2"></p>
+            <p id="recapClosing" class="fst-italic text-muted mb-0"></p>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+    function esc(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    function render(r) {
+        r = r || {};
+        $('#recapOverall').text(r.overall || '（无总述）');
+        var arc = r.arc || [];
+        if (arc.length) {
+            $('#sec-arc').show();
+            $('#recapArc').html(arc.map(function(a) {
+                return '<div class="mb-2"><span class="badge bg-primary">' + esc(a.period || '') + '</span> '
+                    + '<strong>' + esc(a.phase || '') + '</strong><br>'
+                    + '<span class="small">' + esc(a.text || '') + '</span></div>';
+            }).join(''));
+        }
+        var tp = r.turning_points || [];
+        if (tp.length) {
+            $('#sec-turn').show();
+            $('#recapTurning').html(tp.map(function(t) {
+                return '<div class="mb-2"><span class="badge bg-warning text-dark">' + esc(t.month || '') + '</span> '
+                    + esc(t.what_changed || '')
+                    + '<br><span class="small text-muted">' + esc(t.evidence || '') + '</span></div>';
+            }).join(''));
+        }
+        var un = r.unread_between_lines || [];
+        if (un.length) {
+            $('#sec-unread').show();
+            $('#recapUnread').html(un.map(function(x) { return '<li class="small">' + esc(x) + '</li>'; }).join(''));
+        }
+        if (r.who_drives || r.closing) {
+            $('#sec-drive').show();
+            $('#recapDrive').text(r.who_drives ? '长期节奏：' + r.who_drives : '');
+            $('#recapClosing').text(r.closing || '');
+        }
+        $('#recapResult').removeClass('d-none');
+    }
+
+    // 已有结果先读盘（跨标签页/重启仍有效），没配 Key 也照常展示已生成的结果
+    loadAnalysis('recap', function(cached) { if (cached) render(cached); });
+
+    $('#btn-recap').on('click', function() {
+        var btn = $(this), status = $('#recapStatus');
+        if (btn.prop('disabled')) return;
+        btn.prop('disabled', true).text('生成中…');
+        var opts = {
+            refresh: $('#forceRefresh').is(':checked'),
+            onProgress: function(done, total) {
+                status.html('<div class="spinner-border spinner-border-sm text-primary" role="status"></div> '
+                    + '<span class="small text-muted">' + (total > 1 ? done + '/' + total : '跨月总括生成中（一次调用）…') + '</span>');
+            },
+            onDone: function(result) {
+                sessionStorage.setItem('ai_recap', JSON.stringify(result));
+                status.html('<div class="alert alert-success py-1 mb-0 small">已生成</div>');
+                btn.prop('disabled', false).text('重新生成');
+                render(result);
+            },
+            onError: function(msg) {
+                status.html('<div class="alert alert-danger py-1 mb-0 small">' + esc(msg) + '</div>');
+                btn.prop('disabled', false).text('生成整体总括');
+            }
+        };
+        startAnalyze('recap', opts);
+    });
+
+    // 提问角：同步等待一次调用；同一问题重问直接命中服务端缓存（免费）
+    function askNow() {
+        var q = ($('#askQ').val() || '').trim();
+        if (q.length < 2) { $('#askStatus').text('问题至少 2 个字'); return; }
+        var btn = $('#askGo').prop('disabled', true).text('思考中…');
+        $('#askStatus').html('<span class="spinner-border spinner-border-sm text-primary"></span> '
+            + '<span class="text-muted">一次调用，可能要十几秒到一分钟；期间请勿切换或上传别的聊天（那会中止并丢弃结果）</span>');
+        $.ajax({
+            url: '/api/ask', method: 'POST', contentType: 'application/json',
+            data: JSON.stringify({ question: q })
+        }).done(function (r) {
+            var res = r.result || {};
+            var conf = { high: '把握高', medium: '有一定把握', low: '把握有限' }[res.confidence] || '';
+            var html = '<div class="alert alert-secondary mb-2">' + esc(res.answer || '（无回答）')
+                + (conf ? ' <span class="badge bg-light text-muted">' + conf + '</span>' : '') + '</div>';
+            var ev = res.evidence || [];
+            if (ev.length) {
+                html += '<ul class="small text-muted mb-0">'
+                    + ev.map(function (e) { return '<li>' + esc(e) + '</li>'; }).join('') + '</ul>';
+            }
+            if (r.cached) html += '<div class="small text-muted mt-1">（命中缓存，未产生新费用）</div>';
+            $('#askAnswer').html(html);
+            $('#askStatus').text('');
+        }).fail(function (xhr) {
+            $('#askStatus').html('<span class="text-danger">'
+                + esc((xhr.responseJSON && xhr.responseJSON.error) || '提问失败（HTTP ' + (xhr.status || '网络') + '）') + '</span>');
+        }).always(function () {
+            btn.prop('disabled', false).text('提问');
+        });
+    }
+    $('#askGo').on('click', askNow);
+    $('#askQ').on('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); askNow(); } });
+})();
+</script>
+{% endblock %}

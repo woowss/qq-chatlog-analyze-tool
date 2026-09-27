@@ -19,7 +19,7 @@
 import os
 import uuid
 
-from flask import jsonify, redirect, render_template, request, send_file, session, url_for
+from flask import flash, jsonify, redirect, render_template, request, send_file, session, url_for
 
 import config
 from config import LOG_REDACT_NAMES, MAX_CONTENT_LENGTH, UPLOAD_FOLDER
@@ -47,6 +47,27 @@ def log_response(response):
     if response.status_code >= 400:
         logger.warning("--> %s %s", response.status_code, request.path)
     return response
+
+
+def track_active_chat():
+    """刷新"本会话正在用哪份聊天内容"的引用（见 webapp.store.note_live_chat）。
+
+    为什么挂在每个请求上而不是只在上传时记一次：级联清理的判据是"还有没有别的会话
+    在用这个哈希"，而"在用"这件事只有在请求到来时才看得出来。只在上传时记一次的话，
+    一个只浏览不上传的会话会被判成"没人用"，它的付费结果照样被别的会话换文件删掉——
+    修了一半等于没修。每个请求刷一次时间戳，代价是一次 dict 写入。
+
+    引用的有效期与会话文件本身的 24 小时回收同口径（store.LIVE_CHAT_REF_TTL）：
+    关掉的浏览器不再刷时间戳，一天后自动失效，不会把派生缓存永久钉住。
+    """
+    if request.endpoint in BYPASS_ENDPOINTS:
+        return None  # 存活探针不该建会话，也不该在里面记任何东西
+    chat_hash = session.get("chat_hash")
+    if not chat_hash:
+        return None
+    sid = getattr(session, "sid", "") or ""
+    store.note_live_chat(chat_hash, sid)
+    return None
 
 
 def inject_stats_flag():
@@ -119,14 +140,17 @@ def upload():
         logger.warning("上传文件格式无效: %s", orig_name if not LOG_REDACT_NAMES else "<脱敏>")
         return "请选择有效的 .json 文件", 400
 
-    # 旧文件信息先记下，等新文件解析成功后再处置（解析失败不伤及当前会话）
+    # 旧文件信息先记下，等新文件解析成功后再处置（解析失败不伤及当前会话）。
+    # 哈希**取会话里那份**，不是重新读旧文件算：读盘算哈希的前提是"旧文件还在"，
+    # 而 uploads/ 按 mtime 24 小时回收，会话却因为每个请求都重下 cookie 而一直续期。
+    # 于是"标签页开着放了几天、回来再传另一份聊天"是常态路径：那时旧文件早被收走了，
+    # old_hash 取不到 → 整段级联清理被跳过 → 上一条聊天的维度缓存（含聊天原句引用）、
+    # 月份文件、图片摘要、统计结果一条都没删，而界面已经按"换文件即清理"对外承诺过
+    # （README「重新上传时，旧文件及其派生缓存立即删除」）。会话里那份哈希就是上一轮
+    # 自己算出来写进去的，读盘纯属多余的依赖。
     old_path = session.get("filepath")
-    old_hash = None
-    if old_path and os.path.exists(old_path) and os.path.dirname(old_path) == UPLOAD_FOLDER:
-        try:
-            old_hash = store._chat_hash(old_path)
-        except OSError:
-            old_hash = None
+    old_hash = session.get("chat_hash", "") or ""
+    sid = getattr(session, "sid", "") or ""
 
     filename = f"{uuid.uuid4().hex}.json"
     filepath = os.path.join(UPLOAD_FOLDER, filename)
@@ -172,15 +196,40 @@ def upload():
             pass
         return f"解析失败: {e}", 400
 
-    # 新文件解析成功：处置旧文件。内容未变则保留其缓存（重传同文件应命中缓存省钱），
-    # 内容变了才联动清除旧文件的派生缓存，避免敏感分析结果成为孤儿
-    if old_path and old_path != filepath and os.path.exists(old_path):
-        if old_hash and old_hash != new_hash:
+    # 新文件解析成功：处置上一份聊天。内容未变则保留其缓存（重传同文件应命中缓存省钱），
+    # 内容变了才联动清除旧文件的派生缓存，避免敏感分析结果成为孤儿。
+    # 「删旧文件的上传副本」与「清旧内容的派生缓存」必须各自判定：后者已经不再依赖
+    # 旧文件还在不在（见上面 old_hash 的取法），把它继续嵌在 os.path.exists(old_path)
+    # 里面，等于把刚修好的隐私缺口重新钉回原处。
+    switching = bool(old_hash) and old_hash != new_hash
+    if not switching and old_hash == new_hash:
+        # 重复上传同一份内容：如实说清"没有新文件、不会重复付费"——
+        # 此前这条最常见的误操作（手滑传了两次）静默成功，用户无从知道
+        # 缓存已经命中、更不知道会不会二次计费。
+        flash(
+            "这份内容与当前会话是同一份聊天记录：统计与已付费的 AI 结果都会直接命中缓存，不会重复计费。",
+            "info",
+        )
+    if switching:
+        # 本会话先松开对旧内容的引用，再看还有没有**别的**会话在用同一份内容：
+        # 缓存按内容哈希寻址，两个浏览器/两台设备传同一个文件拿到的是同一个哈希，
+        # 于是原先一方换文件会把另一方的统计与已付费 AI 结果一起删掉（对方的症状是
+        # "仪表盘平白弹回首页"，恢复只能重新分析、重新付费）。没人用了才真删。
+        store.forget_live_chat(old_hash, sid)
+        holders = store.other_live_sessions(old_hash, exclude_sid=sid)
+        if holders:
+            logger.info("旧聊天仍被其它 %d 个会话使用中，本次不清理其派生缓存", len(holders))
+        else:
             store._purge_chat_caches(old_hash)
-        try:
-            os.remove(old_path)
-        except OSError:
-            pass
+            logger.info("同一会话上传了新文件，旧文件（%s…）的派生缓存已清理", old_hash[:8])
+    if old_path and old_path != filepath and os.path.exists(old_path):
+        # 只回收本工具自己写进 uploads/ 的那份副本：会话里的路径万一指向别处
+        # （旧版本遗留、或会话文件被手工编辑过），这里也不该顺手删别人的文件
+        if os.path.dirname(old_path) == UPLOAD_FOLDER:
+            try:
+                os.remove(old_path)
+            except OSError:
+                pass
 
     # 存入 session（只放小体积的会话元数据：统计结果落盘，见 store._save_stats）
     session["chat_name"] = chat.chat_name
@@ -192,8 +241,13 @@ def upload():
     # 本次解析用的口径（private/group/two_party）：页面与统计缓存都靠它判断走哪条轨，
     # 不能在请求里重新判定——那意味着每个请求都重新解析一次大文件。
     session["chat_mode"] = chat.mode
-    if old_hash and old_hash != new_hash:
-        logger.info("同一会话上传了新文件，旧文件（%s…）的派生缓存已清理", old_hash[:8])
+    store.note_live_chat(new_hash, sid)
+    # 这次上传成功 = 这份内容重新有人要了：撤销"刚被清理"标记，否则它会一直生效。
+    # 原先只有 start_stats_job 里那一处撤销，而它在本地上传统计**命中缓存**时不会执行
+    # ——清理时若统计文件没删掉（Windows 上文件被占用是常见情形），标记就会残留，
+    # 之后该聊天的分析任务会被 `_stop_requested` 当成"这份聊天已废弃"而直接取消：
+    # 不报错、不落盘，用户看到的是"一键全量永远停在取消状态"。放在这里与统计命中与否无关。
+    store._unmark_purged(new_hash)
 
     # 本地统计：内容相同的文件直接复用上次结果（统计是确定性的，重算纯属浪费）
     if store._load_stats(new_hash, expect_mode=store.stats_mode_of(chat)) is None:
@@ -333,6 +387,7 @@ def dashboard():
             "length_stats": stats.get("length_stats"),
             "exchange_rounds": stats.get("exchange_rounds"),
             "milestones": stats.get("milestones"),
+            "trends": stats.get("trends") or {},
             "chat_name": session.get("chat_name"),
             # 只在 two_party（旧逃生阀）下渲染一条如实提示；正常私聊时模板不会输出任何东西，
             # 因此私聊页面渲染结果逐字节不变（tests/test_group_foundation.py 有对照用例）。
@@ -348,6 +403,16 @@ def emotion():
         "emotion.html",
         lambda stats: {"overview": stats["overview"]},
     )
+
+
+def recap():
+    """整体总括页（私聊专用：群聊会话访问时回到群仪表盘，与维度守卫同口径）"""
+    stats, redir = _require_stats()
+    if redir:
+        return redir
+    if _is_group():
+        return redirect(url_for("dashboard"))
+    return render_template("recap.html", overview=stats["overview"])
 
 
 def relationship():
@@ -464,15 +529,36 @@ def face_image(key: str):
     return resp
 
 
+def messages_page():
+    """原始消息浏览与搜索页（群聊/私聊共用一个模板：这里没有"对方"，只有发言人列表）。
+
+    页面本身只渲染骨架与当前身份，真正的消息由前端按需拉 /api/messages（分页）。
+    与其它页一致：无统计就回首页。
+    """
+    _, redir = _require_stats()
+    if redir:
+        return redir
+    return render_template(
+        "messages.html",
+        chat_name=session.get("chat_name"),
+        chat_mode=session.get("chat_mode", "private"),
+        self_name=session.get("self_name"),
+        other_name=session.get("other_name"),
+    )
+
+
 def register(app):
     """页面路由注册（端点名与旧 app.py 完全一致，url_for/模板比较不受影响）"""
     app.before_request(log_request)
+    app.before_request(track_active_chat)
     app.after_request(log_response)
     app.context_processor(inject_stats_flag)
     app.register_error_handler(413, upload_too_large)
     app.add_url_rule("/", "index", index)
     app.add_url_rule("/upload", "upload", upload, methods=["POST"])
     app.add_url_rule("/dashboard", "dashboard", dashboard)
+    app.add_url_rule("/messages", "messages_page", messages_page)
+    app.add_url_rule("/recap", "recap", recap)
     app.add_url_rule("/emotion", "emotion", emotion)
     app.add_url_rule("/relationship", "relationship", relationship)
     app.add_url_rule("/habits", "habits", habits)

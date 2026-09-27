@@ -37,6 +37,19 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <div class="alert alert-warning">未配置 API Key，无法运行 AI 分析；本地统计功能不受影响。</div>
 {% endif %}
 
+{% if api_ok %}
+<div class="card mb-4">
+    <div class="card-body d-flex align-items-center gap-3 flex-wrap">
+        <button class="btn btn-primary" id="inPageAnalyze" data-orig="运行习惯分析">运行习惯分析</button>
+        <div class="form-check mb-0">
+            <input class="form-check-input" type="checkbox" id="inPageRefresh">
+            <label class="form-check-label small text-muted" for="inPageRefresh">强制重新分析（忽略缓存，会产生 API 费用）</label>
+        </div>
+        <div id="inPageStatus" class="ms-auto"></div>
+    </div>
+</div>
+{% endif %}
+
 <div class="row mb-4">
     <div class="col-md-6 mb-3">
         <div class="card">
@@ -86,7 +99,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <div class="card mb-4">
     <div class="card-header">AI 风格分析</div>
     <div class="card-body" id="habitsInsight">
-        <p class="text-muted text-center">尚无分析结果。回到仪表盘运行「个人习惯」后，结果会显示在这里。</p>
+        <p class="text-muted text-center">尚无分析结果。{% if api_ok %}点上方「运行习惯分析」，{% else %}配置 API Key 后，{% endif %}结果会显示在这里。</p>
     </div>
 </div>
 
@@ -115,6 +128,7 @@ $(function() {
     loadAnalysis('habits', function(data) {
         if (data) renderHabitsInsight(data);
     });
+    analyzeInPage('habits', renderHabitsInsight);
 
     // 可选的原始表情图抓取：只在用户点击时联网；失败也不报错，继续用 emoji/文字
     $('#fetchFacesBtn').on('click', function() {

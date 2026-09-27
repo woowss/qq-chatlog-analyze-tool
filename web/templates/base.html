@@ -64,6 +64,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                     <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'habits' }}" href="/habits">成员活跃</a></li>
                     <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'topics' }}" href="/topics">群话题</a></li>
                     <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'profile' }}" href="/profile">成员画像</a></li>
+                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'messages_page' }}" href="/messages">消息</a></li>
                     <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'report' }}" href="/report">群报告</a></li>
                     {% else %}
                     <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'dashboard' }}" href="/dashboard">仪表盘</a></li>
@@ -72,6 +73,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                     <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'habits' }}" href="/habits">习惯</a></li>
                     <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'topics' }}" href="/topics">话题</a></li>
                     <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'profile' }}" href="/profile">锐评</a></li>
+                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'recap' }}" href="/recap">总括</a></li>
+                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'messages_page' }}" href="/messages">消息</a></li>
                     <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'report' }}" href="/report">报告</a></li>
                     {% endif %}{% endif %}
                 </ul>
@@ -103,6 +106,18 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </nav>
 
     <div class="container">
+        {# 一次性提示（如"重复上传同一份内容不重复计费"）：Flask flash，读到即清 #}
+        {%- set flashes = get_flashed_messages(with_categories=true) %}
+        {%- if flashes %}
+        <div class="mt-3">
+            {%- for cat, msg in flashes %}
+            <div class="alert alert-{{ 'info' if cat == 'info' else cat }} alert-dismissible fade show py-2 small" role="alert">
+                {{ msg }}
+                <button type="button" class="btn-close btn-sm" data-bs-dismiss="alert" aria-label="关闭"></button>
+            </div>
+            {%- endfor %}
+        </div>
+        {%- endif %}
         {% block content %}{% endblock %}
     </div>
 

@@ -457,6 +457,18 @@ li { margin-bottom: .15rem; }
 .rel-hint { color: var(--text-disabled); }
 .rel-count { margin-left: auto; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
 
+/* 消息记录页（原始浏览/搜索）：紧凑列表 + 主题变量自适应 */
+.msg-list { border: 1px solid var(--border, #e8e8e8); border-radius: 6px; }
+.msg-row { padding: .3rem .6rem; font-size: .85rem; border-bottom: 1px solid var(--border, #e8e8e8); cursor: pointer; word-break: break-all; }
+.msg-row:last-child { border-bottom: none; }
+.msg-row:hover { background: var(--hover, rgba(24, 144, 255, .06)); }
+.msg-time { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.msg-who { font-weight: 600; }
+.msg-body { color: var(--text, inherit); }
+.msg-system, .msg-recalled { opacity: .55; }
+.msg-recalled .msg-body { text-decoration: line-through; text-decoration-thickness: 1px; }
+.msg-hit { background: var(--hit, rgba(250, 140, 22, .16)); }
+
 @media (max-width: 768px) {
     .stat-value { font-size: 1.4rem; }
     .page-title { font-size: 1.15rem; }

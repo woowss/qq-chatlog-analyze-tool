@@ -109,15 +109,60 @@ async function inlineFaceImages(root) {
 // <script>），贪婪与非贪婪差一点就能从 <head> 一路吞到页脚——"导出的报告只剩两百多字节"
 // 那次事故正是这么来的；正则也分不清"HTML 标签"和"脚本字符串里的同名文本"。
 // 节点操作没有"匹配到一半"这类失败模式。
+
+// 把画出来的图表冻结成图片，塞进克隆体的同一位置。
+//
+// 为什么必须冻结：ECharts 画在 <canvas> 上，而 canvas 的**像素不参与 outerHTML 序列化**。
+// 所以导出件里每个图表区域都是一个空 div —— 原先还把画图的脚本一并删掉（见下面的
+// /static/js/ 分支），于是分享版既没有图、也没有画图的代码，四个图表区域全白。
+// 在还拿得到活实例的时候取一次 getDataURL，分享版就是一份真正的静态报告：
+// 不需要收件人能连上 CDN、不需要本机服务、也不会因为缺函数报错。
+function freezeCharts(clone) {
+    var live = Array.prototype.slice.call(document.querySelectorAll('[_echarts_instance_]'));
+    var copies = Array.prototype.slice.call(clone.querySelectorAll('[_echarts_instance_]'));
+    // 底色取 --surface（卡片底），不是 --bs-body-bg（页面底）：所有图表容器都嵌在
+    // .card 里，按页面底填色会在暗色主题下让每张导出图自带一块比卡片更深的矩形。
+    var bg = (getComputedStyle(document.documentElement).getPropertyValue('--surface') || '#fff').trim()
+        || '#fff';
+    for (var i = 0; i < live.length && i < copies.length; i++) {
+        var url = '';
+        try {
+            var inst = window.echarts && window.echarts.getInstanceByDom(live[i]);
+            if (inst) url = inst.getDataURL({ type: 'png', pixelRatio: 2, backgroundColor: bg });
+        } catch (e) {
+            url = '';  // 画不出来就留空容器，绝不为这个把整份导出打断
+        }
+        if (!url || url.indexOf('data:image') !== 0) continue;
+        copies[i].textContent = '';
+        var img = document.createElement('img');
+        img.src = url;
+        img.style.width = '100%';
+        img.alt = '图表（导出快照）';
+        copies[i].appendChild(img);
+    }
+}
+
 async function buildReportSnapshot() {
     var clone = document.documentElement.cloneNode(true);
+    freezeCharts(clone);  // 必须趁活实例还在：一旦下面剥了脚本就再也画不出来了
 
     Array.prototype.slice.call(clone.querySelectorAll('script')).forEach(function (s) {
         var src = s.getAttribute('src') || '';
         if (!src) {
-            // 只删服务端注入的 CSRF 脚本（分享出去没有服务端，token 也不该外流）；
-            // 其余内联脚本（报告渲染、主题初始化）必须留着，否则导出版是空白壳
-            if (/window\.CSRF_TOKEN/.test(s.textContent || '')) s.remove();
+            // 内联脚本在分享版里只有一处该留：首屏的主题初始化（它必须在首次绘制前
+            // 把 data-theme 写上，否则分享出去的报告打开时先闪一下浅色）。
+            // 其余两类都必须摘掉：
+            // ① 服务端注入的 CSRF——含 token 的脚本绝不外流，按内容精确剔除；
+            // ② 页面的"活渲染块"与本文件的导出机制。前者调的是刚被删掉的 /static/js
+            //    里的函数（renderMemberBar、loadAnalysis…）：留着就是一打开就
+            //    ReferenceError；更糟的是万一脚本没删干净，loadAnalysis 在无服务端的
+            //    机器上必然拉不到结果，回调会用"没有数据"覆盖掉快照里**已经渲染好**的
+            //    AI 小节。快照是在渲染完成之后克隆的，文字与图表（已冻结成图片）都在
+            //    DOM 里，删掉这些代码不会让分享版少任何东西。
+            if (/window\.CSRF_TOKEN/.test(s.textContent || '')) { s.remove(); return; }
+            if (!/documentElement\.setAttribute\(\s*['"]data-theme['"]/.test(s.textContent || '')) {
+                s.remove();
+            }
             return;
         }
         if (src.indexOf('/static/js/') >= 0) { s.remove(); return; }   // 自有脚本依赖本机服务
@@ -130,6 +175,11 @@ async function buildReportSnapshot() {
 
     // 打印/下载按钮不该出现在分享版里；no-print 只是本页打印开关，一并摘掉
     Array.prototype.slice.call(clone.querySelectorAll('button')).forEach(function (b) { b.remove(); });
+    // 登出表单的 hidden csrf_token 也绝不能进分享件：README 承诺"导出会剥掉 CSRF token"，
+    // 上一行摘的是 <button>，挡不住同表单里的 <input type=hidden>（值与 window.CSRF_TOKEN
+    // 是同一个 token，脚本那侧已经按内容剔了，表单漏剥就是承诺落空）。
+    Array.prototype.slice.call(clone.querySelectorAll('input[name="csrf_token"], form.nav-logout'))
+        .forEach(function (el) { el.remove(); });
     Array.prototype.slice.call(clone.querySelectorAll('.no-print')).forEach(function (el) {
         el.classList.remove('no-print');
         if (!el.getAttribute('class')) el.removeAttribute('class');

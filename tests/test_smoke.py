@@ -103,17 +103,26 @@ class TestPageSmoke(unittest.TestCase):
             os.remove(cls.filepath)
         storemod._purge_chat_caches(cls.chat_hash)
 
+    #: 逐页冒烟覆盖的页面清单（新增用户可见页面必须同步这里 + 下面那条一致性用例）
+    SMOKE_PAGES = (
+        "/",
+        "/dashboard",
+        "/emotion",
+        "/relationship",
+        "/habits",
+        "/topics",
+        "/profile",
+        "/report",
+        "/recap",
+        "/messages",
+    )
+
     def test_pages_render_clean(self):
-        for path in (
-            "/",
-            "/dashboard",
-            "/emotion",
-            "/relationship",
-            "/habits",
-            "/topics",
-            "/profile",
-            "/report",
-        ):
+        # 这份清单必须与 webapp/views.py 注册的用户可见页面同步。README 对外承诺
+        # "全量单测含逐页冒烟"，漏一页就等于那一页的 500 / 模板异常 / emoji 回潮
+        # 不在守卫范围内——而这三类恰好只有真渲染才暴露得出来。
+        # /recap 与 /messages 上线时就漏在清单外（当时单独手测是 200，所以没人发现）。
+        for path in self.SMOKE_PAGES:
             with self.subTest(page=path):
                 r = self.client.get(path)
                 body = r.get_data(as_text=True)
@@ -121,6 +130,35 @@ class TestPageSmoke(unittest.TestCase):
                 self.assertNotIn("Traceback", body)
                 self.assertEqual(_emoji_count(body), 0, f"{path} 出现了 emoji")
                 self.assertIn("data-theme", body)  # 主题脚本
+
+    def test_smoke_page_list_covers_every_html_route(self):
+        """守卫自己也要防"漏了一页"：清单必须覆盖 views 注册的全部页面路由。
+
+        少了这条，上面那条会一直全绿，同时新页面悄悄落在守卫之外——那比没有守卫更糟，
+        因为它给出"已经覆盖"的错觉。判据取"url_map 里真实存在的 GET 页面"，
+        而不是再抄一份常量清单（抄的这份正是会漏的东西）。
+        """
+        import app as appmod
+
+        covered = set(self.SMOKE_PAGES)
+        # 有意不在此列，各自都有理由：
+        #   /login  —— 设了口令才有意义，未设时重定向，冒烟环境走的是那条分支
+        #   /health —— 探针，故意绕开登录/会话/日志/清理整条中间件链
+        excluded = {"/login", "/health"}
+        html_pages = set()
+        for rule in appmod.app.url_map.iter_rules():
+            if "GET" not in rule.methods or "<" in rule.rule:
+                continue  # 带参数的路由（/face/<key>）不是整页
+            if rule.endpoint == "static" or rule.rule.startswith("/api/"):
+                continue  # 静态资源与 JSON 端点由别的用例覆盖
+            if rule.rule in excluded:
+                continue
+            html_pages.add(rule.rule)
+        self.assertTrue(html_pages, "一个页面路由都没匹配到：这条守卫本身失效了")
+        missing = html_pages - covered
+        self.assertEqual(missing, set(), f"这些用户可见页面没进逐页冒烟清单：{sorted(missing)}")
+        stale = covered - html_pages - {"/"}
+        self.assertEqual(stale, set(), f"冒烟清单里有不再存在的路由：{sorted(stale)}")
 
     def test_api_endpoints(self):
         self.assertEqual(self.client.get("/api/status").status_code, 200)
