@@ -50,6 +50,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import textwrap
 import threading
 import time
@@ -71,6 +72,7 @@ from config import (
 )
 from parser.qq_parser import ChatData, is_statistical, split_by_month
 from analyzer.logger import get_logger, mask_name
+from analyzer import purge_marks
 from analyzer.shutdown import shutdown_requested
 from analyzer.usage import record_call
 from analyzer.local_stats import SESSION_GAP_MS
@@ -178,6 +180,13 @@ _DEFAULT_MAX_TOKENS = {
     "group_topics": 32768,
     "group_emotion": 32768,
     "member_profiles": 49152,
+    # —— 「整体总括」维度（analyzer/recap_client.py）。加进这张表是为了共用
+    #    LLM_MAX_TOKENS_<维度> 的环境变量覆盖；它**不在**私聊指纹的常量元组里
+    #    （那里只 .get() 五维的名字），所以加这一行不会让任何既有缓存失效。
+    "recap": 16384,
+    # 自定义提问：单问单答；预算同样守"≥16384 给思维链留足空间"的全维度不变量
+    # （max_tokens 只是上限，短答案不会因此多付一分钱）
+    "ask": 16384,
 }
 
 
@@ -377,6 +386,35 @@ def _is_tpm_throttle(e: Exception) -> bool:
 # .env 模板中的占位符值，视为"未配置"
 _PLACEHOLDER_KEYS = {"", "你的DeepSeek_API_Key", "你的API_Key"}
 
+#: 长得像 API Key 的字串。刻意**窄**：宽泛的"长字串"规则会把
+#: `session_id=…`、`request-id: …` 这类有用的排障线索一起抹掉。
+#: ① 各家网关通用的 `sk-` 前缀；② 键名后面跟的长值（第 1 组是键名，保留；第 2 组是值，抹掉）。
+_KEY_SHAPED = re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}\b")
+_KEYED_VALUE = re.compile(
+    r"(\b(?:api[_-]?key|apikey|access[_-]?token|authorization)\b\s*[:=]\s*[\"']?)([A-Za-z0-9_\-\.]{12,})",
+    re.IGNORECASE,
+)
+
+
+def scrub_secrets(text) -> str:
+    """把可能夹带 API Key 的文本洗一遍，供**对外可见**的路径使用（回显给浏览器、写日志）。
+
+    为什么需要：本项目把上游错误原文当"产品"如实带回（429/401/404 的文案差异就是排障
+    线索），Key 本身是以 Authorization 头发的、不出现在 URL 里，官方端点还会把它打码
+    ——但"OpenAI 兼容"的第三方网关/反代把**收到的 Key 原样写进错误正文**是常见做法。
+    而这些文本会走到两处对外的地方：`/api/status/test` 的响应（用户会截图贴出来求助）
+    与 `logs/app.log`（README 承诺日志可以整目录留存/贴给别人看）。
+    所以抹两类东西：① 本机配置的那个 Key 本身（无论上游怎么拼装、切片它）；
+    ② 任何"长得像 Key"的字串。是抹掉而不是截断：错误文本其余部分仍要可读。
+    """
+    out = str(text or "")
+    configured = (DEEPSEEK_API_KEY or "").strip()
+    if configured and configured not in _PLACEHOLDER_KEYS:
+        out = out.replace(configured, "<API_KEY>")
+    out = _KEY_SHAPED.sub("<redacted>", out)
+    return _KEYED_VALUE.sub(r"\1<redacted>", out)
+
+
 _CLIENT: Optional[OpenAI] = None
 _CLIENT_LOCK = threading.Lock()
 
@@ -508,29 +546,94 @@ def _prompt_fingerprint(salt: "str | None" = None, normalize: bool = True) -> st
 PROMPT_FINGERPRINT = _prompt_fingerprint()
 #: 旧公式（按 getsource 原文哈希）的取值。只用于"读旧缓存并迁移"：
 #: 用 AST 归一之后，所有既有用户的缓存都是以这个值命名的，直接换键等于让他们重新付费。
-PROMPT_FINGERPRINT_LEGACY = _prompt_fingerprint(normalize=False)
+#:
+#: **这里必须写死成字面量，不可以再改成 _prompt_fingerprint(normalize=False)。**
+#: 旧公式的哈希对象是**当前源码原文**，所以只要动过任何一个进指纹的函数
+#: （哪怕只是重排一行、或有意改一次口径），现算值就跟着漂——而它是
+#: "读取 AST 归一之前写下的缓存并免费迁移"的唯一凭据。漂掉的后果不是测试变红那么简单：
+#: 那批老用户的旧缓存永远读不到，本该免费的迁移退化成一次真实重付费，
+#: 而且症状与"我们改了什么"毫无关联，排查时会完全想不到这条路径断了。
+#: 历史值本身就是**事实**，事实不该由活的源码算出来。它由
+#: tests/test_group_foundation.py 的 PINNED_LEGACY_PRIVATE_FINGERPRINT 钉住，
+#: 并由 tests/test_privacy_guards.py::TestFingerprintMigration 端到端验证仍然读得通。
+PROMPT_FINGERPRINT_LEGACY = "26bf952fe772"
 
 
 def fingerprint_for_dimension(dim: str) -> str:
-    """该维度该用哪个提示词指纹：群聊维度走群聊指纹，其余（私聊/未知）走私聊指纹。
+    """该维度该用哪个提示词指纹：群聊维度走群聊指纹，recap 走 recap 指纹，其余（私聊/未知）走私聊指纹。
 
     维度级缓存的文件名里嵌着这个值，所以群聊提示词一改，群聊维度的旧缓存自动失效，
     而私聊维度的文件名**一个字都不变**（用户不会因为新增群聊功能而重新付费）。
+    recap 独立成族的理由同 group_client：它有自己的 system prompt 与摘要构建逻辑，
+    既不能被私聊指纹的变动无谓刷掉，也不能因为不在 `_PRIVATE_PROMPT_NAMES` 里而
+    改了自身提示词却不失效（那会让旧复盘永远命中）。
     """
     from analyzer import group_client  # 延迟导入：group_client 在模块级 import 本模块
 
     if dim in group_client.GROUP_DIMENSIONS:
         return group_client.GROUP_PROMPT_FINGERPRINT
+    from analyzer import recap_client
+
+    if dim == recap_client.RECAP_DIMENSION:
+        return recap_client.RECAP_PROMPT_FINGERPRINT
     return PROMPT_FINGERPRINT
 
 
-def legacy_fingerprint_for_dimension(dim: str) -> str:
-    """该维度"旧公式"的指纹：只用来读 AST 归一之前写下的缓存（读到即迁移）。"""
-    from analyzer import group_client
+#: 私聊族的历史代链（最新一代在前）。设计见 legacy_fingerprints_for_dimension：
+#: 每次有意换代，把"当时的当前值"压进这里，读侧就会挨代找到旧缓存并搬到新键。
+#:
+#: f4bd6aa06d52 —— 中位数口径换代时的值。_conversation_stats 的 median_gap 从
+#: 就地 `s[n//2]`（上中位）改为复用 local_stats._median（教科书定义，偶数取中间两数
+#: 平均）。这句改动真的改变喂给模型的那行"回复间隔中位数约 N 秒"，所以必须换键；
+#: 换键让既有私聊用户的五维缓存不再命中当前键，**默认就是全员重付费**（已确认接受）。
+#: 把它留在链里，是为了让"重付费一次"不会变成"每次换代都重付一次"：
+#: 下一代键的用户仍能沿链搬回这一代已付费的结果。
+PRIVATE_FINGERPRINT_GENERATIONS = ("f4bd6aa06d52",)
 
-    if dim in group_client.GROUP_DIMENSIONS:
-        return group_client.GROUP_PROMPT_FINGERPRINT_LEGACY
-    return PROMPT_FINGERPRINT_LEGACY
+
+def _legacy_chain_for_fingerprint_value(fp: str) -> tuple:
+    """某个族指纹**值**对应的历史代链（认不出该值 = 这族没有历史包袱，返回空链）。"""
+    if fp == PROMPT_FINGERPRINT:
+        chain = (*PRIVATE_FINGERPRINT_GENERATIONS, PROMPT_FINGERPRINT_LEGACY)
+        # 顺序：先按"上一代的当前键"找（AST 归一时代写的），再按更早的原文公式找；
+        # 与当前键相同的值剔掉，否则会白读一次自己
+        return tuple(dict.fromkeys(x for x in chain if x != fp))
+    from analyzer import group_client, recap_client
+
+    if fp == group_client.GROUP_PROMPT_FINGERPRINT:
+        return (
+            (group_client.GROUP_PROMPT_FINGERPRINT_LEGACY,)
+            if group_client.GROUP_PROMPT_FINGERPRINT_LEGACY != fp
+            else ()
+        )
+    if fp == recap_client.RECAP_PROMPT_FINGERPRINT:
+        return (
+            (recap_client.RECAP_PROMPT_FINGERPRINT_LEGACY,)
+            if recap_client.RECAP_PROMPT_FINGERPRINT_LEGACY != fp
+            else ()
+        )
+    return ()
+
+
+def legacy_fingerprints_for_dimension(dim: str) -> tuple:
+    """该维度"历史代"指纹值的链（读旧缓存时的尝试顺序，最新一代在前）。
+
+    此前每族只认**一代**旧键（AST 归一之前的原文公式），意味着第三次指纹换代时，
+    第二代键写下的缓存再也读不到——用户为同一段对话再付一次钱，而这次改动与内容
+    无关。泛化成链：以后每次换代，把"当时的当前值"压进对应族的链头，读侧逻辑一字不改。
+    现在每族仍只有既有的一代，行为与升级前逐字节一致（纯机制扩展，零现值变化）。
+    """
+    return _legacy_chain_for_fingerprint_value(fingerprint_for_dimension(dim))
+
+
+def legacy_fingerprint_for_dimension(dim: str) -> str:
+    """该维度"旧公式"的指纹：只用来读 AST 归一之前写下的缓存（读到即迁移）。
+
+    保留单值入口（`_cache_path(legacy=True)` 与既有用例依赖它）；链式读取请用
+    legacy_fingerprints_for_dimension。链空时回当前指纹（等价"没有历史包袱"）。
+    """
+    chain = legacy_fingerprints_for_dimension(dim)
+    return chain[0] if chain else fingerprint_for_dimension(dim)
 
 
 # 思考模式的最低输出预算：思维链 token 也计入 max_tokens，低于这个值必然截断
@@ -613,7 +716,9 @@ def _request_with_retry(
                 return None, "tpm"
             if attempt < generic_retries:
                 delay = 2**attempt
-                logger.warning("API 调用失败（第 %s 次，%ss 后重试）: %s", attempt + 1, delay, e)
+                logger.warning(
+                    "API 调用失败（第 %s 次，%ss 后重试）: %s", attempt + 1, delay, scrub_secrets(e)
+                )
                 time.sleep(delay)
                 continue
             raise  # 最后仍失败则抛出，由调用方决定"致命"还是"降级"
@@ -824,24 +929,19 @@ def _analyze_periods(
         return shutdown_requested() or bool(should_cancel and should_cancel())
 
     def _keys_for(prompt: str) -> list:
-        """该月 prompt 对应的缓存键：[(当前指纹的)键] 或 [当前键, 旧指纹的键]。
+        """该月 prompt 对应的缓存键：[当前键, 各历史代键…]（尝试顺序即链序）。
 
-        第二个键是为了读取"AST 归一之前"写下的月份缓存。不这么做的话，指纹公式一改，
-        所有既有用户的月份缓存全部不再命中——他们会为**同一段对话**重新付一次钱，
-        而这次改动本身与提示词、与对话内容都无关。
+        历史代是为了读取"AST 归一之前"（以及未来任何一次换代之前）写下的月份缓存。
+        不这么做的话，指纹公式一改，所有既有用户的月份缓存全部不再命中——他们会为
+        **同一段对话**重新付一次钱，而这次改动本身与提示词、与对话内容都无关。
+        链按**指纹值**映射（调用方传进来的就是这个族的值），换代时只需把上一代
+        当前值压进对应族的链头，这里不再逐族写 if。
         """
         current_fp = fingerprint or PROMPT_FINGERPRINT
         keys = [_month_key(system_prompt, prompt, fingerprint)]
-        legacy_fp = None
-        if fingerprint is None:
-            legacy_fp = PROMPT_FINGERPRINT_LEGACY
-        else:
-            from analyzer import group_client  # 延迟导入：group_client 在模块级 import 本模块
-
-            if fingerprint == group_client.GROUP_PROMPT_FINGERPRINT:
-                legacy_fp = group_client.GROUP_PROMPT_FINGERPRINT_LEGACY
-        if legacy_fp and legacy_fp != current_fp:
-            keys.append(_month_key(system_prompt, prompt, legacy_fp))
+        for legacy_fp in _legacy_chain_for_fingerprint_value(current_fp):
+            if legacy_fp != current_fp:
+                keys.append(_month_key(system_prompt, prompt, legacy_fp))
         return keys
 
     def _work(period: str, msgs: list) -> tuple[str, Optional[dict]]:
@@ -854,22 +954,39 @@ def _analyze_periods(
                 return period, None
             keys = _keys_for(prompt)
             key = keys[0]
-            result = _read_month_cache(key)
-            if result is None and len(keys) > 1:
-                result = _read_month_cache(keys[1])
-                if result is not None:
+            # 思考模式必须参与口径核对：思维链开与关产出的结果差别很大，让一次
+            # "关了思考"的分析吃到"开着思考"算出来的月份，用户看到的就是配置静默失效
+            # （维度缓存那侧早就用 `_think` 后缀把两者分开了，月份缓存这一侧一直漏着）。
+            # 取值与 _call_api 实际用的那一次完全一致（它按 dim=tag 决定发不发 thinking）。
+            want_thinking = thinking_enabled(tag)
+            result = _read_month_cache(key, expect_thinking=want_thinking, chat_hash=chat_hash)
+            if result is None:
+                # 必须**挨代**试，不能只看 keys[1]：链里现在可能有两代以上
+                # （私聊在"原文公式"之外又多了一代 AST 归一期的键，见
+                # PRIVATE_FINGERPRINT_GENERATIONS）。写死下标的版本只会试到链头那一代，
+                # 于是"更早一代"写下的月份缓存永远读不到——用户为同一段对话再付一次钱，
+                # 而这正是 legacy_fingerprints_for_dimension 当初泛化成链要防的事，
+                # 只是读侧漏跟着改。顺序即链序：最近的换代在前。
+                for legacy_key in keys[1:]:
+                    result = _read_month_cache(legacy_key, expect_thinking=want_thinking, chat_hash=chat_hash)
+                    if result is None:
+                        continue
                     # 旧键里的结果照常可用：改名到当前键，并按**当前键**记账（下面 used_keys），
                     # 否则新文件会成为"无引用"，宽限期后被孤儿回收删掉。
-                    if migrate_month_cache(keys[1], key):
+                    if migrate_month_cache(legacy_key, key):
                         logger.info("%s 命中旧指纹的月份缓存，已迁移到当前键", period)
                     else:
                         logger.info("%s 命中旧指纹的月份缓存", period)
+                    break
             if result is not None:
                 logger.info("%s 命中月份缓存，跳过 API 调用", period)
             else:
                 result = _call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag, dim=tag)
-                if result:
-                    _write_month_cache(key, result)
+                # 清理守卫：用户在这几分钟里换了文件，这一轮就不该把含聊天原句引用
+                # 的结果写回盘上（否则级联清理报称"已删除"的数据会原地复活）。
+                # 已经付费拿到的结果本身照常返回给这一轮，只是不缓存。
+                if result and not purge_marks.is_marked(chat_hash):
+                    _write_month_cache(key, result, thinking=want_thinking)
             if result:
                 result["period"] = period
                 result["month"] = period
@@ -919,9 +1036,14 @@ def _analyze_periods(
         _record_month_usage(chat_hash, used_keys)
 
     if fatal:
-        if not results:
-            raise QuotaExhaustedError(fatal["error"])
-        logger.error("部分月份因配额耗尽未完成: %s", fatal["error"])
+        # 配额中止一律上报，哪怕已经拿到几个月的结果。
+        # 原先"有一个月成功就当成正常结果返回"的做法，会让调用方把**缺了后面所有月**的
+        # 残缺结果写进维度缓存并置 done：用户之后每次点这个维度都直接命中这份残缺缓存，
+        # 缺掉的那几个月永远不会再补——界面显示"分析完成"，数据却少了一半，正是最难发现
+        # 的那类错。这里抛出去，jobs 侧会记为失败、不写维度缓存；而已成功的那几个月
+        # **已经落在月份缓存里**，充值或调高上限后重跑只为缺的月份付费。
+        # 与 _stop_requested 对"取消/关闭"立的规矩同一性质（见 webapp/jobs.py 那段注释）。
+        raise QuotaExhaustedError(fatal["error"])
 
     # 按月份自然序返回
     return {period: results[period] for period in months if period in results}
@@ -1096,6 +1218,11 @@ def _analyze_person(
         original_n = len(lines)
         lines = _fit_lines(lines, MAX_DIALOG_CHARS)
         head = f"统计：{display_name} 共发言 {len(valid_all)} 条（样本 {len(valid)} 条{span_note}，图片 "
+        # 已知口径分歧（故意保留，与 analyzer.dialog / group_client._member_facts 同批）：
+        # 这里按"含图消息条数"，仪表盘按张。本函数虽不在指纹集合里，但它生成的文本进
+        # 月份缓存的 user_content 哈希——单改这里会让私聊五个维度内部又分两种口径，
+        # 而三处一起改要等指纹换代的多代迁移链。统一方案见
+        # docs/reviews/2026-09-26-round6-precommit-review.md P1-3。
         head += f"{sum(1 for m in valid if m.has_image)} 张）"
         if len(lines) < original_n:
             head += f"，因篇幅限制展示其中 {len(lines)} 条"
@@ -1120,7 +1247,7 @@ def _analyze_person(
     except QuotaExhaustedError:
         raise  # 配额耗尽需中止整个维度，不能被当作单人失败吞掉
     except Exception as e:
-        logger.error("%s 的 AI 分析失败: %s", mask_name(display_name), e)
+        logger.error("%s 的 AI 分析失败: %s", mask_name(display_name), scrub_secrets(e))
     return None
 
 
@@ -1221,3 +1348,28 @@ if is_insecure_base_url():
     logger.warning(
         "DEEPSEEK_BASE_URL 使用明文 http 且不是本机地址：API Key 与聊天内容会以明文过网，请改用 https 端点"
     )
+
+
+def test_connection() -> tuple:
+    """连通性自检：发一个真实的最小请求（输出 1 token），如实回报延迟或错误。
+
+    is_api_configured 只查"Key 存在"，答不了"端点通不通、模型名对不对、Key 有没有额度"——
+    用户第一次配置时最想要的就是这一声回话，而不是点全量分析才发现 401。
+    错误文本原样带回（截断）：429/401/404 的文案差异本身就是排障线索。
+    不记入 token 用量表：探测不是分析，混进用量报表会污染"每天花了多少"的账。
+    """
+    if not is_api_configured():
+        return False, "API Key 未配置（在 .env 里填 DEEPSEEK_API_KEY）"
+    client = _get_client()
+    if client is None:
+        return False, "客户端创建失败：检查 DEEPSEEK_BASE_URL 与 DEEPSEEK_API_KEY"
+    t0 = time.time()
+    try:
+        client.chat.completions.create(
+            model=DEEPSEEK_MODEL, messages=[{"role": "user", "content": "ping"}], max_tokens=1
+        )
+    except Exception as e:  # noqa: BLE001 —— 错误文本就是产品，这里不吞、原样带回
+        # 原样带回，但先洗一遍：第三方网关常把收到的 Key 原样写进错误正文，
+        # 而这段文本会直接显示给用户、并进日志（见 scrub_secrets）。
+        return False, scrub_secrets(f"{type(e).__name__}: {str(e)[:200]}")
+    return True, f"模型 {DEEPSEEK_MODEL} 应答成功，延迟 {int((time.time() - t0) * 1000)} ms"

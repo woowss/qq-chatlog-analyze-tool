@@ -40,8 +40,11 @@ from analyzer.deepseek_client import (
     analyze_profile,
     begin_run,
     end_run,
+    scrub_secrets,
 )
 from analyzer.group_client import GROUP_DIMENSIONS
+from analyzer.recap_client import RECAP_DIMENSIONS
+from analyzer import purge_marks
 from analyzer.logger import get_logger
 from analyzer.shutdown import shutdown_requested
 from webapp import store
@@ -69,7 +72,12 @@ ANALYZE_FUNCS = {
 # 因为把群聊维度跑在私聊数据上只会产出"我 vs 对方"式的错误结论。
 GROUP_DIM_NAMES = {dim: info[0] for dim, info in GROUP_DIMENSIONS.items()}
 GROUP_ANALYZE_FUNCS = {dim: info[1] for dim, info in GROUP_DIMENSIONS.items()}
-ALL_DIMENSION_NAMES = {**DIMENSION_NAMES, **GROUP_DIM_NAMES}
+# 「整体总括」（analyzer/recap_client.py）：私聊专用、单次调用、独立缓存族。
+# **刻意不进** ANALYZE_FUNCS——dimensions_for_mode 就是"一键全量"的清单，
+# README 对全量成本有实测承诺（约 ¥6），悄悄把新维度塞进去等于改了承诺；
+# recap 走独立按钮，成本（一次调用）在页面上写清。
+RECAP_ANALYZE_FUNCS = {dim: info[1] for dim, info in RECAP_DIMENSIONS.items()}
+ALL_DIMENSION_NAMES = {**DIMENSION_NAMES, **GROUP_DIM_NAMES, **{d: v[0] for d, v in RECAP_DIMENSIONS.items()}}
 
 
 def dimensions_for_mode(is_group: bool) -> list:
@@ -77,22 +85,41 @@ def dimensions_for_mode(is_group: bool) -> list:
 
     群聊把最贵的"成员画像"放在最后：用户先拿到便宜的群级结果，配额万一在中途耗尽，
     也已经有可用产出。
+    私聊的全量清单不含 recap（理由见 RECAP_ANALYZE_FUNCS 上方注释）。
     """
     return list(GROUP_DIMENSIONS) if is_group else list(ANALYZE_FUNCS)
 
 
 def analyze_func_for(dimension: str):
-    """维度 → 执行函数（两套注册表合一，未知维度返回 None）"""
-    return ANALYZE_FUNCS.get(dimension) or GROUP_ANALYZE_FUNCS.get(dimension)
+    """维度 → 执行函数（三套注册表合一，未知维度返回 None）"""
+    return (
+        ANALYZE_FUNCS.get(dimension)
+        or GROUP_ANALYZE_FUNCS.get(dimension)
+        or RECAP_ANALYZE_FUNCS.get(dimension)
+    )
 
 
 def is_group_dimension(dimension: str) -> bool:
     return dimension in GROUP_ANALYZE_FUNCS
 
 
+def is_private_only_dimension(dimension: str) -> bool:
+    """该维度是否"只适用于两人私聊"——群聊会话一律不许跑。
+
+    为什么不能直接用 `not is_group_dimension(dim)` 代替：recap 既不在 ANALYZE_FUNCS
+    也不在 GROUP_DIMENSIONS（它是第三套独立注册表 RECAP_DIMENSIONS），所以
+    `is_group_dimension("recap")` 是 False，`False != True` 就放行了群聊会话。
+    而 recap 与私聊五维吃的是**同一份**摘要，那份摘要是二人关系口径
+    （"参与者：我 与 对方"，每条非本人消息都标成 other_name；群聊文件里
+    other_name 是群名），拿它跑群聊就是"我 vs 全群"被讲成二人关系——与
+    _dimension_guard 存在的目的完全同类，且每跑一次就真花一次钱。
+    """
+    return dimension in RECAP_ANALYZE_FUNCS
+
+
 def dimension_unit(dimension: str) -> str:
-    """进度单位：群聊成员画像是"人"，其余是"月"（前端提示文案用它）"""
-    info = GROUP_DIMENSIONS.get(dimension)
+    """进度单位：群聊成员画像是"人"、recap 是"次"，其余是"月"（前端提示文案用它）"""
+    info = GROUP_DIMENSIONS.get(dimension) or RECAP_DIMENSIONS.get(dimension)
     return info[2] if info else "月"
 
 
@@ -199,15 +226,26 @@ def _job_cancelled(job_id: str) -> bool:
         return bool(JOBS.get(job_id, {}).get("cancel"))
 
 
-def _stop_requested(job_id: str) -> bool:
-    """是否该停止继续派发新任务：用户点了取消，或进程正在关闭（Ctrl+C / SIGTERM）。
+def _job_chat_hash(job_id: str) -> str:
+    with JOBS_LOCK:
+        j = JOBS.get(job_id)
+        return j.get("chat_hash", "") if j else ""
 
-    两者必须分开看的地方在缓存写入：关闭时 _analyze_periods 会带着"已完成的部分
+
+def _stop_requested(job_id: str) -> bool:
+    """是否该停止继续派发新任务：用户点了取消、进程正在关闭，或这个聊天刚被清掉。
+
+    三者必须分开看的地方在缓存写入：关闭时 _analyze_periods 会带着"已完成的部分
     月份"返回，把它当正常结果写进**维度**缓存，用户之后重跑就直接命中这份残缺结果，
     缺掉的月份再也不会补上。而用户主动取消是"我不要这次结果"，同样不该写。
     已经完成调用的月份本身已经落在月份缓存里，重跑不会重复付费。
+
+    "刚被清掉"这一条原先是缺的：分析动辄跑几分钟，用户在中间换了一份聊天，级联清理
+    把派生数据全删了，而这一轮跑完照样把维度结果、月份文件、manifest 依次写回盘上——
+    清理报称"已删除"的敏感数据原地复活，且已无人引用。把它做成停止条件，一处就同时
+    管住三处：不再派发新月份、不写月份缓存、不写维度缓存（状态记为 cancelled）。
     """
-    return _job_cancelled(job_id) or shutdown_requested()
+    return _job_cancelled(job_id) or shutdown_requested() or purge_marks.is_marked(_job_chat_hash(job_id))
 
 
 def _run_job(job_id: str, dimension: str, filepath: str, chat_hash: str) -> None:
@@ -260,11 +298,24 @@ def _run_job(job_id: str, dimension: str, filepath: str, chat_hash: str) -> None
                 )
             else:
                 j.update(status="done", result=result, finished_at=time.time())
+        # 任务历史落盘（只记白名单字段，跨重启可查；错误文本不进这份账）
+        store.append_job_history(
+            {
+                "t": j.get("finished_at"),
+                "dim": dimension,
+                "status": j.get("status"),
+                "done": j.get("done", 0),
+                "total": j.get("total", 0),
+                "chat": (chat_hash or "")[:12],
+            }
+        )
         if result and not cancelled:
             logger.info("%s 完成（任务 %s）", dim_name, job_id[:8])
     except Exception as e:
-        logger.error("%s 失败: %s", dim_name, e)
-        _fail_job(job_id, f"AI 分析失败: {e}")
+        # 洗一遍再落日志：上游/网关的错误正文里可能夹带 API Key（见 scrub_secrets）
+        logger.error("%s 失败: %s", dim_name, scrub_secrets(e))
+        # _fail_job 的文本会经 /api/analyze-job 回给浏览器，同样先洗（用户会截图求助）
+        _fail_job(job_id, f"AI 分析失败: {scrub_secrets(e)}")
     finally:
         # 与 begin_run 配对（即使中途 return/抛异常也要释放）：漏掉的后果是
         # _run_depth 永远 >0，之后每次 begin_run 都不再清零，LLM_MAX_CALLS_PER_RUN
@@ -335,7 +386,7 @@ def _run_analyze_all(
                     _fail_job(job_id, f"{e}（已完成维度：{len(summary)}，其结果已缓存）")
                     return
                 except Exception as e:
-                    logger.error("一键全量分析 %s 失败: %s", dim_name, e)
+                    logger.error("一键全量分析 %s 失败: %s", dim_name, scrub_secrets(e))
                     summary[dim] = "error"
             with JOBS_LOCK:
                 j = JOBS.get(job_id)
@@ -347,15 +398,26 @@ def _run_analyze_all(
                 return
             # 这里已经在 JOBS_LOCK 里，不能再调 _stop_requested()/_job_cancelled()
             # ——JOBS_LOCK 是不可重入的 Lock，同线程二次获取会直接死锁。
-            # j["cancel"] 现成可读，关闭标志则由无锁的 shutdown_requested() 给出。
-            if j.get("cancel") or shutdown_requested():
+            # j["cancel"] 现成可读，关闭标志则由无锁的 shutdown_requested() 给出；
+            # 第三个停止条件（刚被清理）同理从手头直接判 —— 循环就是因此中断的，
+            # 这里漏判会把"清理后整轮作废"如实发生的任务标成 done。
+            if j.get("cancel") or shutdown_requested() or purge_marks.is_marked(j.get("chat_hash", "")):
                 j.update(status="cancelled", finished_at=time.time())
             else:
                 j.update(status="done", result=summary, finished_at=time.time())
+            hist = {
+                "t": j.get("finished_at"),
+                "dim": "all",
+                "status": j.get("status"),
+                "done": j.get("done", 0),
+                "total": j.get("total", 0),
+                "chat": (j.get("chat_hash") or "")[:12],
+            }
+        store.append_job_history(hist)
         logger.info("一键全量分析完成（任务 %s）: %s", job_id[:8], summary)
     except Exception as e:
-        logger.error("一键全量分析失败: %s", e)
-        _fail_job(job_id, f"AI 分析失败: {e}")
+        logger.error("一键全量分析失败: %s", scrub_secrets(e))
+        _fail_job(job_id, f"AI 分析失败: {scrub_secrets(e)}")
     finally:
         # 与 _run_job 同理：全量循环里的 return（配额/花费上限中止）也必须释放运行边界
         end_run()

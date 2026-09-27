@@ -156,6 +156,15 @@ def _interaction_digest(msgs: list, name_of: Callable[[str], str]) -> str:
     )
 
 
+# 注意：_member_facts / build_group_dialog 在 GROUP_PROMPT_FINGERPRINT 的哈希集合里，
+# 而 *_LEGACY 指纹按**原始源码**哈希——函数体内连注释都不许动（提交前复核在这里加过
+# 说明注释，把 GROUP_PROMPT_FINGERPRINT_LEGACY 挤离钉值、被 CI 拦下；已知口径分歧的
+# 说明因此只能挂在这里——函数体外）。
+# 已知口径分歧（故意保留）：_member_facts 的图片数按"含图消息条数"，仪表盘按张。
+# 一条消息连发多张图时两个数字不一致。不在函数内改成 image_count 的原因：动它 = 群聊
+# 指纹换代，而迁移链只认"当前 + 一代旧"两代键，换代即让所有既有群聊月份/维度缓存
+# 不可达（LEGACY 是历史值、无法跟着重算，全体群聊用户重新付费）。想统一必须先扩
+# 多代迁移链，见 docs/reviews/2026-09-26-round6-precommit-review.md P1-3。
 def _member_facts(msgs: list, chat: ChatData) -> tuple[str, list[tuple[str, int]]]:
     """本月群级事实（统计头用）与成员条数排行"""
     from collections import Counter
@@ -202,11 +211,28 @@ def _fit_group_lines(entries: list, max_chars: int) -> list:
     for e in entries:
         by_member.setdefault(e[1], []).append(e)
 
+    def _avg_line_len(items: list) -> float:
+        """该成员平均每条多少字符（含换行）。字符预算换算成行数要用它。"""
+        return (sum(len(e[2]) + 1 for e in items) / len(items)) if items else 1.0
+
     def _quota_plan(min_lines: int) -> dict[str, int]:
+        """把"该成员的字符占比"换算成"该成员保留多少**行**"。
+
+        单位必须换算清楚：max_chars 是**字符**预算，而 plan 的值是**行数**。
+        早先写的是 `share * (max_chars / 1.05)` —— 直接把字符数当行数用，比正确值
+        大了一个平均行长（实测约 40 倍）。后果不是"稍微多留一点"，而是整段逻辑失效：
+        keep = min(plan[uid], len(items)) 恒等于 len(items)（人人都全留）→ _estimate
+        必然超预算 → 降级循环又被下面的 max(min_lines, ...) 掩住（min_lines 只是下限）
+        → 每次落到 :244 的 _fit_lines 均匀截断。也就是说"成员感知抽样"从未生效过，
+        而 build_group_dialog 已经对着模型写了"每位成员都有保底条数，低频成员不会被
+        整段丢掉"——那句话在这个 bug 下是假的，低频成员恰恰被均匀抽样丢掉了。
+        """
         plan: dict[str, int] = {}
         for uid, items in by_member.items():
             share = sum(len(e[2]) + 1 for e in items) / total_chars
-            plan[uid] = max(min_lines, int(round(share * (max_chars / 1.05) / 1.0)) if share else min_lines)
+            # 该成员分到的字符预算 ÷ 他的平均行长 = 他能保留的行数
+            line_budget = int(round(share * max_chars / max(1.0, _avg_line_len(items) * 1.05)))
+            plan[uid] = min(len(items), max(min_lines, line_budget))
         return plan
 
     def _estimate(plan: dict[str, int]) -> int:
@@ -236,6 +262,9 @@ def _fit_group_lines(entries: list, max_chars: int) -> list:
     return out
 
 
+# build_group_dialog 的隐私面：函数体内的注释同样受上方"LEGACY 按原始源码哈希"约束，
+# 因此"重名成员显示名带 #完整uid 会随 prompt 外发名单内成员的号"这笔隐私记账只能写在这里
+# （见 privacy-audit-report.md 与 CHANGELOG「未发布」节），不进去改函数体内那行注释。
 def build_group_dialog(
     chat: ChatData, msgs: list, chat_hash: str = "", vision_label: str = "", max_chars: int = 0
 ) -> str:
@@ -309,7 +338,16 @@ def _group_month_prompt(chat: ChatData, period: str, msgs: list, chat_hash: str 
 
 def _member_context(chat: ChatData, member: Participant) -> str:
     """成员画像的群上下文：本地精确算出的互动数字（事实与推断分开标注）"""
-    matrix = calc_interaction_matrix(chat, top_k=0)  # 不截断：这里要给每位成员准确数字
+    # top_k=0 在这里的含义是**不截断**，而这不是"顺手传个 0"：下面要按 uid 取每位
+    # 成员的互动计数，矩阵默认只保留发言量前 30 名（GROUP_MATRIX_MEMBERS）。
+    # 榜外成员在 totals 里根本没有条目 → totals.get(uid, {}) 拿到空 dict → 下面的
+    # 数字全成 0 → 提示词写成"被精确回复 0 次、主动回复别人 0 次（事实）"，
+    # 而 select_ai_members 恰恰会专门把不在前列的"我"选进来（见那里的注释），
+    # 也就是说最容易踩到的正是"用户本人被编成零互动"。这是最贵的一档维度
+    # （每位成员一次付费调用）拿到的假数据。
+    # 早先同样写的是 top_k=0，但那时 group_stats 用 `top_k or 默认上限` 解释参数，
+    # 0 被当成"没传"→ 照样截断 → 这句注释承诺的事从未发生（见该函数里的说明）。
+    matrix = calc_interaction_matrix(chat, top_k=0)
     totals = {t["uid"]: t for t in matrix["totals"]}
     t = totals.get(member.uid, {})
     activity = {a["uid"]: a for a in calc_member_activity(chat)}
@@ -405,13 +443,18 @@ def _analyze_member(
         import analyzer.deepseek_client as dc
 
         key = _member_cache_key(member, prompt)
-        result = dc._read_month_cache(key)
+        # 思考模式要进口径核对，与私聊月份缓存那条规则一致（见 month_cache._read_month_cache）：
+        # 成员画像是最贵的一个维度，让"关了思考"的重跑吃到"开着思考"算出来的画像，
+        # 用户看到的同样是配置静默失效。
+        want_thinking = dc.thinking_enabled(tag)
+        result = dc._read_month_cache(key, expect_thinking=want_thinking, chat_hash=chat_hash)
         if result is not None:
             logger.info("%s 命中成员缓存，跳过 API 调用", mask_name(member.name))
         else:
             result = _call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag, dim=tag)
-            if result:
-                dc._write_month_cache(key, result)
+            # 与私聊同一道清理守卫：这个聊天刚被级联清掉就不要把成员画像写回盘上
+            if result and not dc.purge_marks.is_marked(chat_hash):
+                dc._write_month_cache(key, result, thinking=want_thinking)
         if result is not None and used_keys is not None:
             used_keys.add(key)
         if result:
@@ -554,9 +597,17 @@ def group_prompt_fingerprint(salt: "str | None" = None, normalize: bool = True) 
     只用于算 GROUP_PROMPT_FINGERPRINT_LEGACY 以读取旧缓存。
 
     源码不可读时（frozen/打包）降级为函数名占位，并提示用 PROMPT_CACHE_SALT 手动换键。
+
+    群聊独立盐 QQCHAT_GROUP_CACHE_SALT：PROMPT_CACHE_SALT 是一颗盐同时换私聊/群聊
+    两族键——想只重刷群聊缓存做不到。新增的这颗盐**只在非空时**并入群聊指纹，
+    默认（空）时群聊指纹与升级前逐字节一致，不影响任何既有缓存；
+    PROMPT_CACHE_SALT 对群聊继续生效（既有测试与用户配置都依赖它）。
     """
     if salt is None:
         salt = (os.getenv("PROMPT_CACHE_SALT", "") or "").strip()
+        group_salt = (os.getenv("QQCHAT_GROUP_CACHE_SALT", "") or "").strip()
+        if group_salt:
+            salt = f"{salt}+{group_salt}" if salt else group_salt
     parts = [getattr(gp, n) for n in sorted(dir(gp)) if n.startswith("GROUP_SYSTEM_PROMPT_")]
     parts.append(gp.MEMBER_CONTEXT_NOTES)
     parts.append(
@@ -590,5 +641,12 @@ def group_prompt_fingerprint(salt: "str | None" = None, normalize: bool = True) 
 
 
 GROUP_PROMPT_FINGERPRINT = group_prompt_fingerprint()
-#: 旧公式（按 getsource 原文哈希）的取值：只为读取 AST 归一之前写下的群聊缓存
-GROUP_PROMPT_FINGERPRINT_LEGACY = group_prompt_fingerprint(normalize=False)
+#: 旧公式（按 getsource 原文哈希）的取值：只为读取 AST 归一之前写下的群聊缓存。
+#: **必须是字面量，不能改回 group_prompt_fingerprint(normalize=False)**：旧公式哈希的是
+#: 当前源码原文，任何一次对进指纹函数（build_group_dialog / _fit_group_lines /
+#: _interaction_digest / _member_facts / _member_context）的改动都会让现算值漂移，
+#: 而它是"读旧群聊缓存并免费迁移"的唯一凭据——漂掉之后那批用户的旧缓存再也读不到，
+#: 本该免费的迁移静默退化成重新付费。理由与私聊那条完全一致，
+#: 详见 deepseek_client.PROMPT_FINGERPRINT_LEGACY 上方的说明。
+#: 取值由 tests/test_group_foundation.py::PINNED_LEGACY_GROUP_FINGERPRINT 钉住。
+GROUP_PROMPT_FINGERPRINT_LEGACY = "5f1f7bb3c0ce"

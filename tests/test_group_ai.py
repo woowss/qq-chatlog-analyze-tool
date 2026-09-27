@@ -38,6 +38,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -124,6 +125,96 @@ class TestMemberAwareSampling(unittest.TestCase):
         self.assertIn("潜水员第0句", dialog, "低频成员被整段丢掉了——这会让模型把他读成缺席")
         self.assertIn("话痨第0句", dialog)
         self.assertIn("因篇幅限制展示其中", dialog)
+
+    def test_quota_engages_instead_of_falling_back_to_uniform_truncation(self):
+        """成员感知抽样必须**真的生效**，不许每次都掉到 _fit_lines 均匀截断。
+
+        原实现的单位错了：`share * (max_chars / 1.05)` 算出来的是**字符**预算，
+        却被直接当作**行数**存进 plan，比正确值大了一个平均行长（约 40 倍）。
+        后果不是"稍微多留几行"，而是整段逻辑失效：keep = min(plan, len(items))
+        恒等于 len(items)（人人全留）→ 估算必然超预算 → 降级循环又被
+        max(min_lines, ...) 掩住（min_lines 只是下限）→ 每次都落到 _fit_lines
+        的均匀截断。也就是说"成员感知"从未运行过，而 build_group_dialog 已经
+        对着模型写了"每位成员都有保底条数，低频成员不会被整段丢掉"——那句话在
+        这个 bug 下是假的。
+
+        上面那条 test_low_frequency_member_survives_sampling 当时是**绿的**：
+        潜水员只有 3 句，正好被均匀抽样的步长捞回来，掩盖了故障。所以这里必须
+        直接钉"降级路径没被走到"和"保底行数按成员成立"，而不是只看结果里有没有
+        那句短语。
+        """
+        entries = []
+        seq = 0
+        # 三个话痨（长行）+ 两个中频成员：话痨把预算吃满，中频成员只有靠配额才留得住
+        for uid, count, text in [
+            ("loud1", 300, "长" * 60),
+            ("loud2", 300, "长" * 60),
+            ("mid1", 40, "中" * 30),
+            ("mid2", 40, "中" * 30),
+        ]:
+            for _ in range(count):
+                entries.append((seq, uid, f"{text}|{seq}"))
+                seq += 1
+        budget = 6000
+
+        spy = []
+        real_fit = gc._fit_lines
+
+        def counting_fit(lines, mx):
+            spy.append(len(lines))
+            return real_fit(lines, mx)
+
+        with mock.patch.object(gc, "_fit_lines", counting_fit):
+            out = gc._fit_group_lines(entries, budget)
+
+        self.assertEqual(spy, [], "成员感知抽样没生效，又掉回均匀截断了（见本用例说明）")
+        self.assertLessEqual(sum(len(line) + 1 for line in out), budget, "绝不允许超预算")
+
+        uid_of = {e[2]: e[1] for e in entries}
+        available = {"loud1": 300, "loud2": 300, "mid1": 40, "mid2": 40}
+        kept: dict[str, int] = {}
+        for line in out:
+            kept[uid_of[line]] = kept.get(uid_of[line], 0) + 1
+        self.assertEqual(set(kept), set(available), "每位成员都必须有代表")
+
+        # 配额的本质：**低频成员的保留比例不低于话痨**（保底让他们在预算挤迫下活下来）。
+        # 均匀截断做不到这点——它按同一步长抽样，40 句的人被抽走的比例和 300 句的人一样，
+        # 绝对条数却少得多，容易被整段抹平。这里按比例断言，不去钉具体行数：
+        # GROUP_MEMBER_MIN_LINES 只是**下限**，预算真的不够时降级循环会把它调低
+        # （本例 6000 字符下地板从 20 降到 10），那是设计行为，不是本用例要钉的东西。
+        for loud, quiet in (("loud1", "mid1"), ("loud2", "mid2")):
+            self.assertGreaterEqual(
+                kept[quiet] / available[quiet],
+                kept[loud] / available[loud],
+                f"{quiet} 的保留比例低于话痨 {loud}，等于低频成员仍在被挤出去",
+            )
+
+    def test_member_floor_is_honoured_when_budget_allows(self):
+        """预算够用时，每位成员的 GROUP_MEMBER_MIN_LINES 保必须兑现。
+
+        与上一条分开钉：上一条管"配额有没有生效"，这一条管"保底有没有真的给到"。
+        预算从 6000 提到 12000，降级循环不再触发，mid1 应拿到完整地板 20 行。
+        """
+        entries = []
+        seq = 0
+        for uid, count, text in [
+            ("loud1", 300, "长" * 60),
+            ("loud2", 300, "长" * 60),
+            ("mid1", 40, "中" * 30),
+        ]:
+            for _ in range(count):
+                entries.append((seq, uid, f"{text}|{seq}"))
+                seq += 1
+        out = gc._fit_group_lines(entries, 12000)
+        uid_of = {e[2]: e[1] for e in entries}
+        kept: dict[str, int] = {}
+        for line in out:
+            kept[uid_of[line]] = kept.get(uid_of[line], 0) + 1
+        self.assertGreaterEqual(
+            kept["mid1"],
+            gc.GROUP_MEMBER_MIN_LINES,
+            "预算充足却没兑现保底：说明行数字符单位又换算错了",
+        )
 
     def test_no_sampling_when_within_budget(self):
         chat = _group(_small_group())
@@ -482,6 +573,112 @@ class TestApiModeGuard(unittest.TestCase):
 
     def test_unknown_dimension_is_rejected(self):
         self.assertEqual(self._guard("not_a_dim", "group"), 400)
+
+    def test_group_session_rejects_recap(self):
+        """recap 是第三套注册表，`is_group_dimension()` 天然盖不到它。
+
+        它的判断是"在不在群聊表里"，而 recap 既不在群聊表也不在私聊 ANALYZE_FUNCS 里
+        （独立注册表 RECAP_DIMENSIONS）→ 被判成"非群聊维度"→ 与群聊会话相等 → 放行。
+        但 recap 与私聊五维吃同一份摘要，那份摘要是二人关系口径：头行写
+        "参与者：我 与 对方"，每条非本人消息都标成 other_name，而群聊文件里
+        other_name 是**群名**（parser 的兜底）。于是全群被讲成一个人格，
+        而且每放行一次就真花一次钱。/recap 页面早就重定向了，API 这条不能漏。
+        """
+        self.assertEqual(self._guard("recap", "group"), 400, "群聊会话跑 recap 必须被拒")
+        self.assertIsNone(self._guard("recap", "private"), "私聊会话照常放行")
+        self.assertIsNone(self._guard("recap", "two_party"))
+
+    def test_ask_rejects_group_session_at_the_http_layer(self):
+        """真实 HTTP 路径也要挡住（守卫写在函数里、而不是只写在 helper 上）。"""
+        import app as appmod
+
+        client = appmod.app.test_client()
+        client.get("/")
+        with client.session_transaction() as sess:
+            token = sess["csrf_token"]
+            sess["chat_hash"] = "a" * 16
+            sess["chat_mode"] = "group"
+            sess["filepath"] = "does-not-matter.json"
+        headers = {"Origin": "http://localhost:5000", "X-CSRF-Token": token}
+        r = client.post("/api/ask", json={"question": "我们群里谁最活跃"}, headers=headers)
+        self.assertEqual(r.status_code, 400, "群聊会话的提问必须被拒，且要在花钱之前")
+        self.assertIn("群聊", (r.get_json() or {}).get("error", ""))
+
+
+class TestAskSameQuestionMutex(unittest.TestCase):
+    """同一个问题并发只许付一次钱。
+
+    提问的答案缓存是在**调用返回之后**才写的，所以两个并发的相同问题都读不到缓存、
+    各发一次真实调用——用户手抖点两下就是双倍计费。这与 api_analyze 那条既有规则
+    同类（"拒绝而不是另起一个任务，否则同一维度会被分析两遍、双倍计费"），
+    只是提问走同步路径进不了任务表，所以要单独一道锁。
+    """
+
+    def test_second_identical_question_is_rejected(self):
+        import app as appmod
+
+        from webapp import api
+
+        with appmod.app.test_request_context("/api/ask"):
+            token, busy = api._ask_acquire("h1", "我们最后一年聊了什么")
+            self.assertIsNotNone(token)
+            self.assertIsNone(busy, "第一次占用应当成功")
+            token2, busy2 = api._ask_acquire("h1", "我们最后一年聊了什么")
+            self.assertIsNone(token2, "同一问题并发时第二个必须拿不到锁")
+            self.assertIsNotNone(busy2)
+            api._ask_release("h1", "我们最后一年聊了什么", token)
+            token3, busy3 = api._ask_acquire("h1", "我们最后一年聊了什么")
+            self.assertIsNotNone(token3, "释放后必须可以再次占用")
+            self.assertIsNone(busy3)
+
+    def test_different_questions_do_not_block_each_other(self):
+        import app as appmod
+
+        from webapp import api
+
+        with appmod.app.test_request_context("/api/ask"):
+            t1, _ = api._ask_acquire("h1", "问题甲")
+            t2, busy = api._ask_acquire("h1", "问题乙")
+            self.assertIsNotNone(t2, "不同问题互不阻塞")
+            self.assertIsNone(busy)
+            t3, busy3 = api._ask_acquire("h2", "问题甲")
+            self.assertIsNotNone(t3, "不同聊天互不阻塞")
+            self.assertIsNone(busy3)
+
+    def test_stale_reservation_expires(self):
+        """持有者被硬杀不许把这个问题永久锁死。"""
+        import app as appmod
+
+        from webapp import api
+
+        with appmod.app.test_request_context("/api/ask"):
+            key = ("h1", api._ask_key_fingerprint("会卡住的问题"))
+            t1, _ = api._ask_acquire("h1", "会卡住的问题")
+            api._ASK_IN_FLIGHT[key] = (t1, time.time() - api._ASK_STALE_SECONDS - 1, "")
+            t2, busy = api._ask_acquire("h1", "会卡住的问题")
+            self.assertIsNotNone(t2, "超时占位必须可被接管")
+            self.assertIsNone(busy)
+
+    def test_release_is_owner_only(self):
+        """迟到的持有者不许解掉别人接手的锁（否则互斥形同虚设）。"""
+        import app as appmod
+
+        from webapp import api
+
+        with appmod.app.test_request_context("/api/ask"):
+            key = ("h1", api._ask_key_fingerprint("归属问题"))
+            old, _ = api._ask_acquire("h1", "归属问题")
+            # 模拟锁被过期接管：现在盘上是别人（sid-b）持有的新 token
+            api._ASK_IN_FLIGHT[key] = ("someone-else", time.time(), "sid-b")
+            api._ask_release("h1", "归属问题", old)
+            self.assertIn(key, api._ASK_IN_FLIGHT, "旧 token 不得释放新持有者的锁")
+            api._ask_release("h1", "归属问题", "someone-else")
+            self.assertNotIn(key, api._ASK_IN_FLIGHT)
+
+    def tearDown(self):
+        from webapp import api
+
+        api._ASK_IN_FLIGHT.clear()
 
 
 class TestRealFileShapedGroup(unittest.TestCase):
