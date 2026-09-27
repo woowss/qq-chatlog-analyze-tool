@@ -151,6 +151,17 @@ def inspect(path: str, show_names: bool) -> int:
     print(f"  记录跨度：{chat.duration_days} 天 | 月份：{'、'.join(chat.months()) or '<空>'}")
     if chat.dropped_messages:
         problems.append(f"{chat.dropped_messages} 条消息因时间戳无效被丢弃（未计入统计）")
+    if chat.unknown_element_types:
+        # 解析器没命中任何分支的元素类型（与上面"元素分布"的全量口径对账：
+        # 分布里有、这里也有 = 导出器出现了解析器还不认识的新类型）。
+        print(
+            f"  ⚠ 未识别元素类型：{_histogram(collections.Counter(chat.unknown_element_types))}"
+            "（未进入统计与分析；若含正文类类型，说明导出器格式漂移）"
+        )
+        problems.append(
+            f"{sum(chat.unknown_element_types.values())} 个元素未被识别"
+            f"（类型：{'、'.join(sorted(chat.unknown_element_types))}）"
+        )
 
     # ---------- 3. 成员与占比 ----------
     print("\n【成员】")

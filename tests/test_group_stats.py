@@ -188,6 +188,47 @@ class TestInteractionMatrix(unittest.TestCase):
         self.assertEqual(len(m["directed"]), 2)
         self.assertEqual(len(m["directed"][0]), 2)
 
+    def test_top_k_zero_means_no_truncation_not_the_default_cap(self):
+        """top_k=0 必须真的是"不截断"。
+
+        原来实现是 `limit = top_k or _matrix_top_k()`：0 是假值，于是调用方显式
+        要求"不截断"反而拿回了默认上限。这不只是语义别扭——成员画像那条路
+        （group_client._member_context）就是按"拿到每位成员的准确互动数字"来写注释
+        并传 top_k=0 的，而它取的 `totals.get(uid, {})` 对榜外成员是空 dict，
+        提示词于是写成"被精确回复 0 次、主动回复别人 0 次（事实）"，并要求模型
+        据此判断这个人在群里的角色。select_ai_members 还会**专门**把不在前列的
+        "我"选进来，所以最容易中招的正是用户本人。
+
+        同时钉住默认值不变：榜单截断是给前端热力图用的，改了会让群聊页放大。
+        """
+        msgs = []
+        seq = 0
+        for i, uid in enumerate(["uA", "uB", "uC", "uD", "uE"]):
+            for _ in range(5 - i):  # 条数严格递减 → 排名确定，uE 一定在榜尾
+                msgs.append(_msg(uid, uid, seq))
+                seq += 1
+        chat = _group(msgs)
+
+        with mock.patch.object(config, "GROUP_MATRIX_MEMBERS", 2):
+            default = gs.calc_interaction_matrix(chat)
+            untruncated = gs.calc_interaction_matrix(chat, top_k=0)
+            capped = gs.calc_interaction_matrix(chat, top_k=4)
+
+        self.assertEqual(len(default["members"]), 2, "默认仍按配置上限截断（前端行为不变）")
+        self.assertEqual(len(untruncated["members"]), 5, "top_k=0 必须给到全部成员")
+        self.assertEqual(untruncated["dropped"], 0)
+        self.assertEqual(len(capped["members"]), 4, "显式 k 生效")
+
+        default_uids = {t["uid"] for t in default["totals"]}
+        self.assertNotIn("uE", default_uids, "榜外成员本就不在默认 totals 里")
+        untr_map = {t["uid"]: t for t in untruncated["totals"]}
+        self.assertIn("uE", untr_map)
+        self.assertGreater(
+            untr_map["uE"]["explicit_replies_to"] + untr_map["uE"]["replies_to"],
+            0,
+            "榜尾成员必须拿到真实计数，而不是被 .get(uid, {}) 静默变成 0",
+        )
+
     def test_matrix_limit_reads_config_at_call_time(self):
         chat = _group([_msg("uA", "我", 0), _msg("uB", "小明", 1), _msg("uC", "小红", 2)])
         self.assertEqual(gs.calc_interaction_matrix(chat)["matrix_limit"], config.GROUP_MATRIX_MEMBERS)

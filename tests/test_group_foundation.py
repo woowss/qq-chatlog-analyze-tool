@@ -382,7 +382,14 @@ class TestChatDataCompatibility(unittest.TestCase):
 #: 为 26bf952fe772；同月哈希对象从"源码原文"改为"源码的 AST 归一"（见 _hashed_source），
 #: 现值如下。**旧值仍然有效**：它是 LEGACY 常量，用来读取旧指纹命名的缓存并迁移，
 #: 所以那次公式变更没有让任何人为同样的分析重新付费（有专门的用例钉住迁移）。
-PINNED_PRIVATE_FINGERPRINT = "f4bd6aa06d52"
+#:
+#: 换代记录：83f7b5eaa608（本轮）—— _conversation_stats 的 median_gap 从就地
+#: `s[n//2]`（上中位）改为复用 local_stats._median（偶数取中间两数平均）。这行改动
+#: 真的改变喂给模型的那句"回复间隔中位数约 N 秒"，所以必须换键。
+#: 代价**已在 CHANGELOG 写明**：既有私聊用户下次跑五个维度会重新付费。
+#: 被换出去的 f4bd6aa06d52 压进了 deepseek_client.PRIVATE_FINGERPRINT_GENERATIONS，
+#: 因此它不是"消失"，而是变成链条里可读可迁的一代——下一次换代时老用户仍能沿链搬回。
+PINNED_PRIVATE_FINGERPRINT = "83f7b5eaa608"
 
 #: 旧公式（按 getsource 原文哈希）的取值。它必须继续可复现——降低它的唯一方式是
 #: 让"旧缓存读不到"，也就是让用户重新付费。改动它同样要写 CHANGELOG。
@@ -407,7 +414,14 @@ _FINGERPRINT_ENV_KEYS = (
 #: 同月哈希对象改为 AST 归一后现值为 a8e00d5ae5ca。**旧值仍然是有效凭据**：它负责
 #: 读取"AST 归一之前"写下的群聊缓存并迁移（见 tests/test_privacy_guards.py 的
 #: TestFingerprintMigration），所以两边都必须继续可复现。
-PINNED_GROUP_FINGERPRINT = "a8e00d5ae5ca"
+#:
+#: 第二次换代（成员感知抽样修复）：_fit_group_lines 的预算单位从"把字符数当行数用"
+#: 改成真的换算成行数，**喂给模型的对话样本因此变了**（修复前那段抽样是死代码，
+#: 每次都落到均匀截断，低频成员被丢掉，而提示词却告诉模型"每位成员都有保底条数"）。
+#: 输入变了就必须换键——继续命中旧键等于让新口径下的结论配不上旧样本。
+#: 代价：既有群聊用户下次分析群聊维度时重付一次（成员画像是每人一次调用）。
+#: 旧凭据 5f1f7bb3c0ce 不受影响：它已改为字面量冻结，不再随源码浮动。
+PINNED_GROUP_FINGERPRINT = "f9b8b7d70e13"
 
 #: 旧公式下的群聊指纹取值，作用同上：改它的后果是所有既有群聊用户的旧缓存读不到。
 PINNED_LEGACY_GROUP_FINGERPRINT = "5f1f7bb3c0ce"
@@ -580,6 +594,48 @@ class TestGroupFingerprintIsolation(unittest.TestCase):
             "所有既有群聊用户的旧缓存都读不到，也就是让他们为同样的分析重新付费。",
         )
 
+    def test_legacy_credentials_are_frozen_not_recomputed(self):
+        """三族的"旧公式凭据"必须是字面量，不许改回"从当前源码现算"。
+
+        这条不是风格偏好，而是一次真实事故的教训：现算的 LEGACY 值会随任何一次
+        对进指纹函数的改动而漂移，可它的职责恰恰是"记住过去那个键"。漂掉的后果
+        不是测试变红这么简单——"读取 AST 归一之前的缓存并免费迁移"这条路会静默断掉，
+        那批老用户本该免费的迁移退化成一次真实重付费，而且症状与"我们改了什么"
+        毫无关联，排查时根本想不到是这条链断了。
+
+        本轮改 _fit_group_lines 时正好踩到：现算的群聊 LEGACY 从 5f1f7bb3c0ce
+        飘到了 70ed3c31e351，是上面那条 pin 用例把它逮住的。修法是冻结，
+        而不是把 pin 跟着改掉——所以这里再钉一道，防止将来有人"顺手"改回现算。
+        """
+        import inspect
+        import re
+
+        import analyzer.deepseek_client as dc
+        from analyzer import group_client as gc
+        from analyzer import recap_client as rc
+
+        targets = (
+            ("analyzer.deepseek_client", dc, "PROMPT_FINGERPRINT_LEGACY"),
+            ("analyzer.group_client", gc, "GROUP_PROMPT_FINGERPRINT_LEGACY"),
+            ("analyzer.recap_client", rc, "RECAP_PROMPT_FINGERPRINT_LEGACY"),
+        )
+        for module_name, module, const in targets:
+            with self.subTest(credential=const):
+                self.assertRegex(
+                    getattr(module, const),
+                    r"^[0-9a-f]{12}$",
+                    "旧公式凭据必须是 12 位十六进制字面量",
+                )
+                src = inspect.getsource(sys.modules[module_name])
+                assignment = re.search(rf"^{const}\s*=\s*(.+)$", src, re.MULTILINE)
+                self.assertIsNotNone(assignment, f"找不到 {const} 的赋值语句")
+                self.assertNotIn(
+                    "fingerprint(",
+                    assignment.group(1),
+                    f"{const} 又被改成从当前源码现算了：这会随任何一次改动漂移，"
+                    "并静默切断'读旧缓存免费迁移'这条路（见本用例说明）",
+                )
+
     def test_group_prompt_change_moves_group_fingerprint_only(self):
         """改群聊提示词：群聊键必须变，私聊键必须一个字节都不动
 
@@ -637,6 +693,9 @@ class TestPrivateStatsShapeFrozen(unittest.TestCase):
 
         chat = _chat(_bulk_chat_messages("uA", "我", 3) + _bulk_chat_messages("uB", "对方", 2))
         stats = compute_stats(chat)
+        # 钉的是"群聊字段不得混进私聊载荷"；本集随有意的形状变更显式更新——
+        # v6 追加 trends（逐月趋势/中断重启/称呼变迁/首条消息，纯本地、私聊专用，
+        # 见 store.STATS_SCHEMA_VERSION 注释与 CHANGELOG）。
         self.assertEqual(
             set(stats),
             {
@@ -650,6 +709,7 @@ class TestPrivateStatsShapeFrozen(unittest.TestCase):
                 "exchange_rounds",
                 "weekly_activity",
                 "milestones",
+                "trends",
             },
             "私聊统计的键集合是对外契约（模板逐字段引用），只能整体新增一个群聊分支，不能改动这里",
         )
@@ -806,7 +866,7 @@ class TestGroupFixture(unittest.TestCase):
         self.assertEqual(
             [p.name for p in chat.participants()],
             ["我", "小明#u_2", "小明#u_3", "阿强", "小美"],
-            "同名成员必须被唯一化（#uid4），否则模型与界面会把两个人当成一个",
+            "同名成员必须被唯一化（#完整uid），否则模型与界面会把两个人当成一个",
         )
         self.assertTrue(chat.participants()[0].is_self)
         self.assertEqual(list(chat.months()), ["2025-01", "2025-02", "2025-03"])

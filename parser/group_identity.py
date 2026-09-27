@@ -32,9 +32,6 @@
 from dataclasses import dataclass, field
 from typing import Optional
 
-#: 显示名去重时追加的 UID 后缀长度（够区分同群重名，又不至于刷屏）
-UID_SUFFIX_LEN = 4
-
 #: 占位 sender 的显示名（导出器给系统类消息安排的假发言人）
 PLACEHOLDER_NAMES = frozenset({"系统消息", "未知用户", "未知成员", "系统提示", "群系统消息"})
 #: 占位 sender 的 UID 前缀（实测导出器写 "未知uid未知" 这类）
@@ -51,9 +48,14 @@ def is_placeholder_sender(uid: str, name: str = "") -> bool:
 
     判据只认导出器的稳定约定（UID 前缀 + 名字），不做启发式猜测：宁可把可疑的算作成员
     （用户能在界面上看到它并反馈），也不要凭空把真人塞进"未知"桶。
+
+    入参先 str() 归一再比较：异版导出器/手工编辑的文件里 sender.uid 是 JSON 数字，
+    这个函数在 load_chat 主路径上被调，非 str 入参会把整份文件的解析崩成
+    'int' object has no attribute 'strip'（解析器那侧本轮已同步加 str()，这里再防一道，
+    两边谁先执行都不取决于另一个的自觉）。
     """
-    u = (uid or "").strip()
-    n = (name or "").strip()
+    u = str(uid or "").strip()
+    n = str(name or "").strip()
     if n in PLACEHOLDER_NAMES:
         return True
     low = u.lower()
@@ -64,7 +66,7 @@ def is_placeholder_sender(uid: str, name: str = "") -> bool:
 class Participant:
     """群聊参与者身份。
 
-    name 是**唯一显示名**：同名成员会被追加 `#uid4`（见 unique_display_names），
+    name 是**唯一显示名**：同名成员会被追加 `#完整uid`（见 unique_display_names），
     因此 prompt、统计表、模板可以放心用 name 当键——否则群里两个"小明"会在模型
     与界面里合并成同一个人。raw_name 保留导出文件里的原样显示名，供界面如实展示。
     """
@@ -144,8 +146,15 @@ def unique_display_names(participants: list[Participant]) -> list[Participant]:
 
     规则（只在群聊轨使用，私聊轨不经过这里，因此私聊的"我方/对方"文案不受影响）：
     - 空名 → 用 uid 前 8 位兜底（导出文件偶有 sender 缺 name 的条目）；
-    - 重名 → 双方都追加 `#uid4`，而不是只改后来者：只改一个会让读者分不清
+    - 重名 → 双方都追加 `#完整uid`，而不是只改后来者：只改一个会让读者分不清
       "带后缀的那个"和"没带后缀的那个"谁是谁。
+
+    后缀必须是**完整 uid**，不能只取前缀。这里对外承诺的是"唯一显示名"，而模板、
+    统计与 prompt 都拿 name 当键；截断的前缀不保证唯一 —— 真实 QQ 号是位数相同的
+    纯数字，1000000001 与 1000000042 的前 4 位都是 "1000"，两个都叫"小明"的成员
+    会被写成同一个"小明#1000"：在模型眼里他们合并成一个人，在互动矩阵里也黏在
+    一起，恰好是这条消歧规则想避免的事。用 full uid 之后，同名成员的显示名里
+    带的是他自己的号，谁是谁一眼可查。
     """
     seen: dict[str, int] = {}
     for p in participants:
@@ -153,7 +162,7 @@ def unique_display_names(participants: list[Participant]) -> list[Participant]:
         seen[key] = seen.get(key, 0) + 1
     for p in participants:
         base = p.name or p.uid[:8]
-        p.name = f"{base}#{p.uid[:UID_SUFFIX_LEN]}" if seen.get(base, 0) > 1 else base
+        p.name = f"{base}#{p.uid}" if seen.get(base, 0) > 1 else base
     return participants
 
 

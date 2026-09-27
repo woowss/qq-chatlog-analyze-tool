@@ -34,7 +34,7 @@ from typing import Optional
 
 from config import env_number
 from parser.qq_parser import CST, MEDIA_KINDS, is_statistical
-from analyzer.local_stats import is_session_start
+from analyzer.local_stats import _median, is_session_start
 from analyzer.logger import get_logger
 
 logger = get_logger("deepseek")
@@ -120,7 +120,15 @@ def _conversation_stats(messages: list, self_uid: str = "") -> dict:
         last = m
     return {
         "peak_hour": hours.most_common(1)[0][0] if hours else None,
-        "median_gap": sorted(gaps)[len(gaps) // 2] if gaps else None,
+        # 中位数必须走 local_stats._median：就地 `sorted(gaps)[len(gaps)//2]` 取的是
+        # **上中位**，偶数样本上它不是中位数（[10,20,30,40] 报成 30，真值 25；
+        # [1,9] 报成 9，真值 5）。那正是本轮 local_stats 为句长/媒体长度专门
+        # 顶了一次 STATS_SCHEMA_VERSION 修掉的同一个毛病——同一个词"中位数"在
+        # 界面卡上算了 25、在给模型这句"回复间隔中位数约 N 秒"里算了 30，
+        # 用户只会以为其中一处错了。口径唯一是本地统计的立身之本。
+        # _median 与 is_session_start 同源于 local_stats（模块级已 import，不成环），
+        # 复用而不是就地再写一遍：两处各算一遍就是下一次漂移的种子。
+        "median_gap": _median(sorted(gaps)) if gaps else None,
         "sessions": sessions,
         "self_opened": self_opened,
     }

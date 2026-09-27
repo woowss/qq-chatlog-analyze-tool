@@ -259,6 +259,37 @@ class TestReplyTargets(BaseCase):
         self.assertEqual(mi["reply_total"], mi["reply_located"] + mi["reply_no_target"])
         self.assertEqual(mi["reply_located"], mi["reply_resolved"] + mi["reply_unresolved"])
 
+    def test_numeric_message_id_still_resolves_the_reply_target(self):
+        """数字型 id 不许让"谁回复了谁"整体归零。
+
+        回填靠 `uid_by_id = {m.id: ...}` 再按 reply_to_id 查，而 referencedMessageId
+        是 str() 归一过的：只要 m.id 保留原生的 int，两边就永远对不上，
+        每条回复都解析不到人。症状完全是静默的——文件解析成功、页面正常、
+        只是精确互动矩阵全空、全部计入 reply_unresolved、成员画像拿到"0 次"。
+        本仓库已承认数字 uid/id 在真实导出里存在，所以这不是理论输入。
+        """
+        msgs = [
+            _msg("uA", "我", 0, "第一条", id=9001),
+            _msg(
+                "uB",
+                "小明",
+                1,
+                "回复第一条",
+                id=9002,
+                elements=[
+                    {"type": "reply", "data": {"referencedMessageId": 9001}},
+                    _text_el("回复第一条"),
+                ],
+            ),
+        ]
+        chat = self.load(_wrap(msgs, {"uA": "我", "uB": "小明"}))
+        by_id = {m.id: m for m in chat.messages}
+        self.assertIn("9001", by_id, "id 必须与 reply_to_id 同一类型口径（str）")
+        self.assertEqual(by_id["9002"].reply_to_uid, "uA", "数字 id 的回复也必须回查到发言人")
+        mi = gs.calc_interaction_matrix(chat)
+        self.assertEqual(mi["reply_resolved"], 1, "精确回复信号不能因为 id 类型而丢失")
+        self.assertEqual(mi["reply_unresolved"], 0)
+
     def test_explicit_matrix_uses_same_convention_as_inferred(self):
         """约定：X[i][j] = 「j 对 i 的动作」；列和=我对别人动作，行和=别人对我动作"""
         chat = self._chat()
@@ -344,6 +375,69 @@ class TestReplyTargets(BaseCase):
         mi = gs.calc_interaction_matrix(chat)
         self.assertEqual(mi["reply_unknown"], 1)
         self.assertEqual(sum(sum(r) for r in mi["explicit_directed"]), 0)
+
+
+class TestTimestampMagnitude(BaseCase):
+    """时间戳量级：秒/微秒/纳秒导出不许崩溃，也不许凭空造出一个付费月份"""
+
+    def _one_msg(self, ts, time_str="2023-11-15 08:00:00"):
+        msgs = [
+            {
+                "id": "x1",
+                "timestamp": ts,
+                "time": time_str,
+                "sender": {"uid": "uA", "name": "我"},
+                "type": "text",
+                "content": {"text": "在吗", "elements": [_text_el("在吗")]},
+            }
+        ]
+        return self.load(_wrap(msgs, {"uA": "我"}))
+
+    def test_seconds_and_microseconds_normalise_to_the_same_moment(self):
+        """同一个时刻的四种写法，归一后必须落在同一个月份。
+
+        量级错了的后果两边都不可接受：微秒 → /1000 后是荒谬的年 →
+        datetime.fromtimestamp 抛 `OSError: [Errno 22]` 让**整份文件传不上去**
+        （用户看到的症状与"时间戳格式"毫不相干）；秒 → 解释成 1970-01，
+        凭空多出一个"月份"，而 _analyze_periods 会把它当真实月份发一次付费调用。
+        """
+        wanted = self._one_msg(1700000000000).messages[0].time_str[:7]
+        self.assertEqual(wanted, "2023-11")
+        for ts in (1700000000, 1700000000000, 1700000000000000, 1700000000000000000):
+            with self.subTest(ts=ts):
+                chat = self._one_msg(ts)
+                self.assertEqual(len(chat.messages), 1, "不许把救得回来的量级整条丢弃")
+                self.assertEqual(chat.messages[0].time_str[:7], wanted, f"量级 {ts} 归一错了")
+                self.assertNotIn("1970-01", chat.messages[0].time_str, "不许造出 1970 的幽灵月份")
+
+    def test_unrescuable_positive_value_falls_back_to_the_time_string(self):
+        """数值救不回来时回退 time 字符串，而不是把荒谬值喂给下游。"""
+        chat = self._one_msg(5, time_str="2023-11-15 08:00:00")
+        self.assertEqual(len(chat.messages), 1)
+        self.assertTrue(chat.messages[0].time_str.startswith("2023-11-15"))
+
+    def test_stats_survive_a_mis_scaled_export(self):
+        """回归钉子：微秒导出过去会在 calc_overview 里直接把整份文件打崩。"""
+        from analyzer.local_stats import calc_overview
+
+        chat = self._one_msg(1700000000000000)
+        ov = calc_overview(chat)  # 修复前这里 OSError: [Errno 22] Invalid argument
+        self.assertEqual(ov["total_messages"], 1)
+
+    def test_missing_timestamp_is_dropped_not_invented(self):
+        """非正数且无可用 time 字符串：丢弃并计数，绝不落到 1970-01。"""
+        msgs = [
+            {
+                "id": "y1",
+                "timestamp": 0,
+                "sender": {"uid": "uA", "name": "我"},
+                "type": "text",
+                "content": {"text": "坏时间戳", "elements": [_text_el("坏时间戳")]},
+            }
+        ]
+        chat = self.load(_wrap(msgs, {"uA": "我"}))
+        self.assertEqual(chat.messages, [], "ts<=0 且无 time 字符串必须丢弃")
+        self.assertEqual(chat.dropped_messages, 1)
 
 
 class TestAtMentions(BaseCase):
@@ -441,6 +535,10 @@ class TestMatrixSchemaStability(BaseCase):
                 "explicit_directed",
                 "explicit_undirected",
                 "explicit_edges",
+                # 自回复总数：关系图的边只取 i<j（力导向画不出自环），而自回复在矩阵
+                # 对角上又看得到，所以必须有个字段能对账，不能让它无声消失。
+                # 第六轮审查加的字段（见 analyzer/group_stats.py 的 _symmetrize）。
+                "self_replies",
                 "mention_directed",
                 "mentions_all_count",
                 "totals",

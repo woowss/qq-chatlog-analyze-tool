@@ -32,6 +32,7 @@
 
 from collections import Counter, deque
 from datetime import datetime
+from typing import Optional
 
 import config
 from parser.qq_parser import CST, ChatData
@@ -138,7 +139,7 @@ def calc_member_activity(chat: ChatData) -> list[dict]:
     return out
 
 
-def calc_interaction_matrix(chat: ChatData, top_k: int = 0) -> dict:
+def calc_interaction_matrix(chat: ChatData, top_k: Optional[int] = None) -> dict:
     """互动矩阵：谁回应了谁。**推断的"接话"与精确的"回复/@点名"分开统计**。
 
     三条信号的可信度完全不同，混在一起会得出似是而非的结论，所以各占一个矩阵：
@@ -155,7 +156,7 @@ def calc_interaction_matrix(chat: ChatData, top_k: int = 0) -> dict:
     i 动作的次数——热力图的行列读法、totals 的字段都由这条约定决定，不能各写各的。
 
     返回结构（前端热力图与力导向图直接可用）：
-    - members: [{uid, name, is_self}]，矩阵的轴（已按发言量截断到 top_k）
+    - members: [{uid, name, is_self}]，矩阵的轴（按发言量截断到 top_k；top_k=0 不截断）
     - directed / undirected / edges：接话（推断）
     - explicit_directed / explicit_undirected / explicit_edges：回复（精确）
     - mention_directed / mentions_all_count：@点名（精确）
@@ -169,7 +170,29 @@ def calc_interaction_matrix(chat: ChatData, top_k: int = 0) -> dict:
       同理。任何一条没被计入的互动都是"悄悄消失的数据"，宁可单列也不让它凭空不见。
     """
     msgs, _fields = _statistical(chat)
-    limit = top_k or _matrix_top_k()
+    # top_k 的三档语义（None=用配置的默认上限；0=不截断；k>0=截断到 k）：
+    # 这里绝不能写成 `top_k or _matrix_top_k()`。`or` 把 0 当成"没传"，于是
+    # 调用方显式要求"不截断"（写 top_k=0）反而拿回了默认上限——而矩阵是按发言量
+    # 截断的，落在 31 名以后的成员根本不在 totals 里。成员画像那条路
+    # （group_client._member_context）恰恰**专门**把不在前列的"我"选进去
+    # （见 select_ai_members），于是 `totals.get(uid, {})` 取到空 dict，
+    # 提示词里就写成"被精确回复 0 次、主动回复别人 0 次（事实）"——
+    # 一个标注为事实、模型被要求据此判断此人在群里的角色的数字，是编出来的。
+    # 这是本项目最贵的一个维度（每位成员一次付费调用）拿到假数据。
+    limit = _matrix_top_k() if top_k is None else top_k
+    # 同一份聊天 + 同一个生效上限的结果是确定性的，而调用方会**重复**要同一份：
+    # group_client._member_context 是"每位成员一次"，每次都传 top_k=0（=不截断）。
+    # 不缓存的话，大群每分析一位成员就把 n×n 矩阵重算一遍（实测 n=3000 单次 4.4s /
+    # 376MB，成员画像最多 10 位 = 44 秒与上 GB 的反复分配）。缓存挂在 chat 对象上，
+    # 随它一起被回收（解析结果本就在 _CHAT_CACHE 里复用）。
+    # 键是**已解析的生效上限**：_matrix_top_k() 按调用时读配置，拿 top_k 当键会让
+    # "改了配置仍返回旧上限的矩阵"（有用例专门钉"读配置发生在调用时"）。
+    cache = chat._matrix_cache
+    if cache is None:
+        cache = chat._matrix_cache = {}
+    cached = cache.get(limit)
+    if cached is not None:
+        return cached
     members = _members(chat)
     kept = members[:limit] if limit > 0 else members
     index = {p.uid: i for i, p in enumerate(kept)}
@@ -247,8 +270,24 @@ def calc_interaction_matrix(chat: ChatData, top_k: int = 0) -> dict:
                 # 点名对象在矩阵之外（被 top_k 截断）：不硬塞，但要记账
                 mention_outside += 1
 
-    undirected = [[directed[i][j] + directed[j][i] for j in range(n)] for i in range(n)]
-    explicit_undirected = [[explicit[i][j] + explicit[j][i] for j in range(n)] for i in range(n)]
+    def _symmetrize(matrix: list) -> list:
+        """把有向矩阵对称化。非对角项两边相加；**对角项保持原样**。
+
+        对角不能一起相加：explicit 的对角是可以非零的 —— 引用自己发的消息在 QQ 里
+        很常见（reply_to_uid 解析出来就是本人，见上面的 2) 分支），逐项相加会得到
+        2×自环：3 次自回复在 explicit_undirected 里报成 6 次。无向矩阵的对角按定义
+        就是"自己对自己"的次数本身，翻倍等于凭空多算一遍。
+        （directed 的对角恒为 0 —— 同一人连发在 1) 分支就被跳过 —— 所以这一改动
+        只影响精确回复矩阵，不影响既有的接话数字。）
+        """
+        return [[matrix[i][j] + matrix[j][i] if i != j else matrix[i][i] for j in range(n)] for i in range(n)]
+
+    undirected = _symmetrize(directed)
+    explicit_undirected = _symmetrize(explicit)
+    # 自回复的总量单独报出来：关系图的边只取 i<j（力导向画不出自环），
+    # 所以这几个次数不会出现在任何一条边上。不记一笔就是"悄悄消失的数据"，
+    # 而矩阵对角上又看得到它 —— 两边必须能对上账。
+    self_replies = sum(explicit[i][i] for i in range(n))
 
     def _edges(matrix: list) -> list:
         return [
@@ -273,7 +312,7 @@ def calc_interaction_matrix(chat: ChatData, top_k: int = 0) -> dict:
         }
         for i in range(n)
     ]
-    return {
+    result = {
         "members": [{"uid": p.uid, "name": p.name, "is_self": p.is_self} for p in kept],
         "directed": directed,
         "undirected": undirected,
@@ -281,6 +320,9 @@ def calc_interaction_matrix(chat: ChatData, top_k: int = 0) -> dict:
         "explicit_directed": explicit,
         "explicit_undirected": explicit_undirected,
         "explicit_edges": _edges(explicit_undirected),
+        # 自回复（引用自己的消息）：矩阵对角上看得到，但关系图的边只取 i<j，
+        # 所以单独给一个总数，别让这几次数在图上凭空消失
+        "self_replies": self_replies,
         "mention_directed": mention,
         "mentions_all_count": mentions_all_count,
         "totals": totals,
@@ -305,6 +347,11 @@ def calc_interaction_matrix(chat: ChatData, top_k: int = 0) -> dict:
         "mention_unknown": mention_unknown,
         "mention_outside": mention_outside,
     }
+    # 结果只读：所有调用点（成员画像、群聊统计、前端热力图）都只读它。
+    # 共享同一个 dict 是缓存的意义所在（复制一份 n×n 等于把省下的开销又花回去），
+    # 所以约定写在这里：**调用方不得就地修改返回值**。
+    cache[limit] = result
+    return result
 
 
 def calc_member_hourly(chat: ChatData) -> dict:
