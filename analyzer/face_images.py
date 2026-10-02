@@ -48,6 +48,7 @@ from config import (
     FACE_IMAGES_ENABLED,
 )
 from analyzer.logger import get_logger
+from analyzer.atomic_write import write_bytes_atomic
 
 logger = get_logger("faces")
 
@@ -311,10 +312,7 @@ def _store(key: str, data: bytes) -> str:
     elif data.startswith(b"RIFF"):
         ext = ".webp"
     path = os.path.join(cache_dir(), key + ext)
-    tmp = path + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, path)
+    write_bytes_atomic(path, data)
     return path
 
 

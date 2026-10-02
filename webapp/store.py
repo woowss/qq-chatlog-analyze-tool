@@ -26,7 +26,6 @@ import io
 import json
 import os
 import re
-import secrets
 import threading
 import time
 import zipfile
@@ -52,6 +51,7 @@ from analyzer.local_stats import (
 )
 from analyzer.group_stats import compute_group_stats
 from analyzer import month_cache, purge_marks
+from analyzer.atomic_write import tmp_sibling, write_bytes_atomic, write_json_atomic, write_text_atomic
 from analyzer.deepseek_client import (
     fingerprint_for_dimension,
     legacy_fingerprint_for_dimension,
@@ -450,15 +450,12 @@ def _stats_path(chat_hash: str) -> str:
 def _tmp_sibling(path: str) -> str:
     """原子写入的临时文件名。
 
-    **必须是唯一名**，不能继续用 `f"{path}.tmp"`。多浏览器并发打开同一份聊天是本
-    项目明确支持的用法（见 _LIVE_CHAT_REFS 那一整段的实测记录），固定名等于让两个
-    写者踩同一个临时文件：A 刚 open 完、B 把同一个文件重开覆盖，或任一方在失败分支
-    里 `os.remove(tmp)` 删掉对方正在写的那份，最后 `os.replace` 就可能把半截文件
-    发布成正式缓存——维度缓存丢的是**一次已付费结果**，统计缓存丢的是页面渲染时的
-    数据结构。pid + 线程 id + 随机后缀保证每个写者各用各的；仍在同一目录内，
-    所以 os.replace 的原子性不变，清理侧也照旧按 `.tmp` 后缀识别（见 _cache_belongs_to）。
+    口径只有 `analyzer.atomic_write.tmp_sibling` 一份（唯一名的理由写在那个模块的文件
+    说明里：固定名会让两个并发写者互相删半成品，并把半截文件发布成正式缓存）。
+    这里保留同名函数，是因为清理侧与用例都把它当契约（见 _cache_belongs_to 与
+    tests/test_feature_round7.py 的临时名唯一性用例）。
     """
-    return f"{path}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}.tmp"
+    return tmp_sibling(path)
 
 
 def _load_stats(chat_hash: str, expect_mode: str = STATS_MODE_PRIVATE):
@@ -502,7 +499,6 @@ def _save_stats(chat_hash: str, stats: dict, mode: str = STATS_MODE_PRIVATE) -> 
     if not chat_hash:
         return
     path = _stats_path(chat_hash)
-    tmp = _tmp_sibling(path)
     payload = dict(stats)
     payload.pop("_created", None)  # 不让调用方塞进来的值生效：首次创建时间只认盘上那份
     payload["mode"] = mode
@@ -512,21 +508,15 @@ def _save_stats(chat_hash: str, stats: dict, mode: str = STATS_MODE_PRIVATE) -> 
     # 否则"每次查看词频就把 90 天硬上限往后推一格"，与 README 的保留承诺相反。
     created = read_created_at(path) or time.time()
     try:
-        # 目录补建必须在 try 里、与 _write_cache 同一层：README 教用户"删掉 stats_cache/
-        # 即可彻底清除数据"，而服务可能还开着（重建的目录随后被删、或那个位置被一个
-        # 同名文件占住）。放在 try 外面时 FileExistsError 会一路穿到请求层，
-        # 变成"统计页 500"这种与真实原因毫不相干的症状。
-        os.makedirs(STATS_CACHE_DIR, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as f:
-            # _created 放最前面，让清理任务只扫文件头就能拿到它（见 read_created_at）
-            json.dump({"_created": created, **payload}, f, ensure_ascii=False)
-        os.replace(tmp, path)
+        # 目录补建必须发生在写入之前、与 _write_cache 同一层：README 教用户"删掉
+        # stats_cache/ 即可彻底清除数据"，而服务可能还开着（重建的目录随后被删、或那个
+        # 位置被一个同名文件占住）。目录问题抛出来的是 OSError，落到这里的 except 就只是
+        # 一行告警；放在 try 外面它会一路穿到请求层，变成"统计页 500"这种与真实原因
+        # 毫不相干的症状。_created 放最前面，让清理任务只扫文件头就能拿到它
+        # （见 read_created_at）。
+        write_json_atomic(path, {"_created": created, **payload}, mkdir=STATS_CACHE_DIR)
     except OSError as e:
         logger.warning("统计缓存写入失败: %s", e)
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
 
 
 def _delete_stats(chat_hash: str) -> None:
@@ -896,23 +886,15 @@ def _write_cache(dimension: str, chat_hash: str, result) -> None:
         logger.info("该聊天的缓存刚被清理，维度结果不落盘（避免复活）")
         return
     path = _cache_path(dimension, chat_hash)
-    tmp = _tmp_sibling(path)
     payload = {"_created": time.time(), "result": result}
     try:
         # 目录必须在这里补建，不能只在 create_app() 里建一次就假定它永远在：
         # README 教用户"删掉 ai_cache/ 即可彻底清除数据"，而服务可能还开着——
         # 那种情况下这里不补目录，此后**每一次**写入都会静默失败，
         # 用户以为在命中缓存，实际每个月、每个维度都在重复付费（只有日志知道）。
-        os.makedirs(AI_CACHE_DIR, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp, path)
+        write_json_atomic(path, payload, mkdir=AI_CACHE_DIR)
     except OSError as e:
         logger.warning("AI 缓存写入失败: %s", e)
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1105,7 +1087,6 @@ def read_chat_bundle(stream, confirm_overwrite: bool = False, live_hash: str = "
                 return {"error": "导出包解压体积超限，已中止（导入不完整）"}
             target_dir = AI_CACHE_DIR if head == "ai_cache" else STATS_CACHE_DIR
             path = os.path.join(target_dir, leaf)
-            tmp = _tmp_sibling(path)
             try:
                 with zf.open(info) as src:
                     raw = src.read()
@@ -1118,17 +1099,10 @@ def read_chat_bundle(stream, confirm_overwrite: bool = False, live_hash: str = "
                 skipped += 1
                 continue
             try:
-                os.makedirs(target_dir, exist_ok=True)
-                with open(tmp, "wb") as dst:
-                    dst.write(raw)
-                os.replace(tmp, path)
+                write_bytes_atomic(path, raw, mkdir=target_dir)
                 written += 1
             except OSError:
                 skipped += 1
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
     if written:
         # 已解析的 ChatData 与 manifest 引用缓存都可能盖着旧状态：清掉，
         # 让导入的文件从下一次读起就是权威（与级联清理同一口径）。
@@ -1167,19 +1141,11 @@ def ask_cache_write(chat_hash: str, question: str, result) -> None:
     if not chat_hash or not result or _is_recently_purged(chat_hash):
         return
     path = _ask_path(chat_hash, question)
-    tmp = _tmp_sibling(path)
     payload = {"_created": time.time(), "result": result}
     try:
-        os.makedirs(AI_CACHE_DIR, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp, path)
+        write_json_atomic(path, payload, mkdir=AI_CACHE_DIR)
     except OSError as e:
         logger.warning("提问缓存写入失败: %s", e)
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1261,16 +1227,9 @@ def purge_job_history(chat_hash: str) -> int:
         if removed <= 0:
             return 0
         try:
-            tmp = _tmp_sibling(path)
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write("".join(line + "\n" for line in kept))
-            os.replace(tmp, path)
+            write_text_atomic(path, "".join(line + "\n" for line in kept))
         except OSError as e:
             logger.warning("任务历史按聊天清理失败（可能仍残留哈希前缀）: %s", e)
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
             return 0
     return removed
 
@@ -1301,10 +1260,7 @@ def append_job_history(entry: dict, max_age_days: Optional[int] = None) -> None:
                 kept = kept[-(JOB_HISTORY_MAX_LINES // 2) :]
             if len(kept) == original:
                 return  # 什么都没掉就不重写文件（绝大多数时候走这条）
-            tmp = _tmp_sibling(path)
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write("".join(x + "\n" for x in kept))
-            os.replace(tmp, path)
+            write_text_atomic(path, "".join(x + "\n" for x in kept))
         except OSError as e:
             logger.warning("任务历史写入失败（不影响分析本身）: %s", e)
 

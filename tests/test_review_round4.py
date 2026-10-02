@@ -46,7 +46,8 @@ _TMP_ROOT = os.path.join(os.environ["QQCHAT_DATA_DIR"], "tmp")
 os.makedirs(_TMP_ROOT, exist_ok=True)
 tempfile.tempdir = _TMP_ROOT
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
 from parser.qq_parser import CST, ChatData, Message, split_by_month  # noqa: E402
 from analyzer import deepseek_client as dc  # noqa: E402
@@ -464,9 +465,7 @@ class TestAssetCacheBusting(unittest.TestCase):
         index = self.client.get("/").get_data(as_text=True)
         self.assertRegex(index, r"css/style\.css\?v=\d+")
 
-        base = (Path(__file__).resolve().parent.parent / "web" / "templates" / "base.html").read_text(
-            encoding="utf-8"
-        )
+        base = (ROOT / "web" / "templates" / "base.html").read_text(encoding="utf-8")
         self.assertRegex(base, r"js/charts\.js'\) \}\}\?v=\{\{ asset_v \}\}")
         self.assertRegex(base, r"js/analyze\.js'\) \}\}\?v=\{\{ asset_v \}\}")
 
@@ -504,7 +503,7 @@ class TestApiOkInjectedGlobally(unittest.TestCase):
         self.assertIn("未配置 API Key", body, "页面要如实显示未配置状态")
 
     def test_views_no_longer_pass_it_manually(self):
-        src = Path("webapp/views.py").read_text(encoding="utf-8")
+        src = (ROOT / "webapp" / "views.py").read_text(encoding="utf-8")
         self.assertEqual(
             src.count("api_ok=is_api_configured()"),
             0,
@@ -516,14 +515,14 @@ class TestNetworkInterruptionRecovery(unittest.TestCase):
     """服务重启/断网时前端要回读缓存，而不是报"分析失败"诱导用户重跑"""
 
     def test_analyze_js_handles_status_zero(self):
-        src = Path("web/static/js/analyze.js").read_text(encoding="utf-8")
+        src = (ROOT / "web" / "static" / "js" / "analyze.js").read_text(encoding="utf-8")
         self.assertIn("xhr.status === 0", src, "网络层失败要有单独分支")
         branch = src.split("xhr.status === 0")[1].split("opts.onError((xhr.responseJSON")[0]
         self.assertIn("loadAnalysis", branch, "网络中断时要尝试回读磁盘缓存")
         self.assertIn("不会重复付费", branch, "提示要说清「结果已保存」")
 
     def test_analyze_js_still_handles_404(self):
-        src = Path("web/static/js/analyze.js").read_text(encoding="utf-8")
+        src = (ROOT / "web" / "static" / "js" / "analyze.js").read_text(encoding="utf-8")
         self.assertIn("xhr.status === 404", src)
 
 

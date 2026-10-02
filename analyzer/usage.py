@@ -30,6 +30,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 from config import LOG_RETENTION_DAYS, TOKEN_USAGE_FILE
+from analyzer.atomic_write import write_json_atomic
 from analyzer.logger import get_logger
 
 logger = get_logger("usage")
@@ -271,11 +272,7 @@ def _load() -> dict:
 
 
 def _dump(data: dict) -> None:
-    os.makedirs(os.path.dirname(TOKEN_USAGE_FILE), exist_ok=True)
-    tmp = TOKEN_USAGE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, TOKEN_USAGE_FILE)
+    write_json_atomic(TOKEN_USAGE_FILE, data, indent=1, mkdir=os.path.dirname(TOKEN_USAGE_FILE))
 
 
 atexit.register(flush)
