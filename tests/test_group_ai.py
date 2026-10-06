@@ -302,7 +302,7 @@ class TestMemberProfiles(unittest.TestCase):
             result = gc.analyze_member_profiles(chat, should_cancel=lambda: True)
         self.assertEqual(result, {}, "取消后不应继续调用 API")
 
-    def test_quota_exhausted_keeps_partial_results(self):
+    def test_quota_exhausted_does_not_return_partial_results_as_complete(self):
         chat = _group(_small_group(per_member=6))
         calls = {"n": 0}
 
@@ -316,8 +316,8 @@ class TestMemberProfiles(unittest.TestCase):
             mock.patch.object(gc, "_call_api", side_effect=fake_call),
             mock.patch.object(gc, "GROUP_AI_MAX_MEMBERS", 3),
         ):
-            result = gc.analyze_member_profiles(chat)
-        self.assertEqual(len(result), 1, "配额耗尽时要保留已完成的成员结果")
+            with self.assertRaises(dc.QuotaExhaustedError):
+                gc.analyze_member_profiles(chat)
 
     def test_member_without_messages_is_skipped(self):
         chat = _group(_small_group(per_member=3))

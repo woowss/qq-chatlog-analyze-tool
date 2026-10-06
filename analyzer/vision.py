@@ -45,6 +45,7 @@ from config import (
 )
 from analyzer.logger import get_logger, mask_name
 from analyzer import purge_marks
+from analyzer.atomic_write import write_json_atomic
 
 logger = get_logger("vision")
 
@@ -305,17 +306,10 @@ def _write_cache(path: str, digest: str) -> None:
     创建时间是"绝对 90 天上限"的依据（清理任务读 _created）：只写 mtime 的话，
     天天看的报告会把 mtime 一直续期，这类含聊天图片描述的缓存就永远不会被回收。
     """
-    tmp = f"{path}.tmp"
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"_created": time.time(), "digest": digest}, f, ensure_ascii=False)
-        os.replace(tmp, path)
+        write_json_atomic(path, {"_created": time.time(), "digest": digest})
     except OSError as e:
         logger.warning("图片摘要缓存写入失败: %s", e)
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
 
 
 def digest(msgs: list, chat_hash: str = "", label: str = "") -> str:

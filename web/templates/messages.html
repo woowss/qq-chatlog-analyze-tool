@@ -17,6 +17,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {% extends "base.html" %}
 {% block title %}消息记录{% endblock %}
 
+{% block chart_scripts %}{% endblock %}
+{% block analyze_scripts %}{% endblock %}
+
 {% block content %}
 <h2 class="page-title">消息记录 <span class="sub">{{ chat_name }}</span></h2>
 <p class="text-muted small">
@@ -25,39 +28,46 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 </p>
 
 <form class="row g-2 align-items-end mb-3" id="filterForm" onsubmit="return false;">
-    <div class="col-12 col-md-4">
+    <div class="col-12 col-md-6">
         <label class="form-label small text-muted mb-1" for="q">关键词</label>
         <input class="form-control form-control-sm" id="q" type="search" placeholder="正文 / 文件名 / 表情名 / 发言人">
     </div>
-    <div class="col-6 col-md-2">
+    <div class="col-12 col-md-3">
         <label class="form-label small text-muted mb-1" for="sender">发言人</label>
         <select class="form-select form-select-sm" id="sender"><option value="">全部</option></select>
     </div>
-    <div class="col-6 col-md-2">
-        <label class="form-label small text-muted mb-1" for="month">月份</label>
-        <input class="form-control form-control-sm" id="month" type="month">
+    <div class="col-12 col-md-3 d-flex gap-2 align-items-end">
+        <button class="btn btn-primary btn-sm" id="btnSearch" type="button" aria-controls="msgList">搜索</button>
+        <button class="btn btn-outline-secondary btn-sm" id="btnReset" type="button">清空</button>
     </div>
-    <div class="col-6 col-md-2">
-        <label class="form-label small text-muted mb-1" for="from">从</label>
-        <input class="form-control form-control-sm" id="from" type="date">
-    </div>
-    <div class="col-6 col-md-2">
-        <label class="form-label small text-muted mb-1" for="to">到</label>
-        <input class="form-control form-control-sm" id="to" type="date">
-    </div>
-    <div class="col-12 d-flex gap-2 mt-2">
-        <button class="btn btn-primary btn-sm" id="btnSearch" type="button">搜索</button>
-        <button class="btn btn-outline-secondary btn-sm" id="btnReset" type="button">清空条件</button>
-        <span class="small text-muted align-self-center" id="resultMeta"></span>
+    <details class="filter-advanced col-12" id="advancedFilters">
+        <summary>日期筛选 <span class="ms-1" id="advancedFilterState">未设置</span></summary>
+        <div class="row g-2">
+            <div class="col-12 col-sm-4">
+                <label class="form-label small text-muted mb-1" for="month">指定月份</label>
+                <input class="form-control form-control-sm" id="month" type="month">
+            </div>
+            <div class="col-6 col-sm-4">
+                <label class="form-label small text-muted mb-1" for="from">开始日期</label>
+                <input class="form-control form-control-sm" id="from" type="date">
+            </div>
+            <div class="col-6 col-sm-4">
+                <label class="form-label small text-muted mb-1" for="to">结束日期</label>
+                <input class="form-control form-control-sm" id="to" type="date">
+            </div>
+        </div>
+    </details>
+    <div class="col-12 mt-1">
+        <span class="small text-muted" id="resultMeta" aria-live="polite"></span>
     </div>
 </form>
 
-<div class="alert alert-warning small d-none" id="msgWarn"></div>
-<div id="msgList" class="msg-list"></div>
-<nav class="mt-3 d-flex justify-content-between align-items-center" id="pagerBox">
-    <button class="btn btn-outline-secondary btn-sm" id="prevPage" disabled>上一页</button>
+<div class="alert alert-warning small d-none" id="msgWarn" role="alert"></div>
+<div id="msgList" class="msg-list" role="feed" aria-label="聊天消息搜索结果" aria-live="polite"></div>
+<nav class="mt-3 d-flex justify-content-between align-items-center" id="pagerBox" aria-label="消息分页">
+    <button class="btn btn-outline-secondary btn-sm" id="prevPage" type="button" disabled>上一页</button>
     <span class="small text-muted" id="pageInfo"></span>
-    <button class="btn btn-outline-secondary btn-sm" id="nextPage" disabled>下一页</button>
+    <button class="btn btn-outline-secondary btn-sm" id="nextPage" type="button" disabled>下一页</button>
 </nav>
 {% endblock %}
 
@@ -82,6 +92,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         return p;
     }
 
+    function updateFilterSummary() {
+        var count = ['month', 'from', 'to'].filter(function(k) { return !!$('#' + k).val(); }).length;
+        $('#advancedFilterState').text(count ? ('已设 ' + count + ' 项') : '未设置');
+    }
+
     function rowHtml(m, highlightId) {
         var cls = 'msg-row' + (m.system ? ' msg-system' : '') + (m.recalled ? ' msg-recalled' : '')
                 + (m.id === highlightId ? ' msg-hit' : '');
@@ -90,10 +105,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         if (m.system) tags.push('<span class="badge bg-secondary">系统</span>');
         if (m.is_reply) tags.push('<span class="badge bg-info">回复</span>');
         if (m.mentions_all) tags.push('<span class="badge bg-warning text-dark">@全体</span>');
-        return '<div class="' + cls + '" data-id="' + esc(m.id) + '">'
+        return '<div class="' + cls + '" data-id="' + esc(m.id) + '" tabindex="0" role="button">'
             + '<span class="msg-time">' + esc(m.time) + '</span> '
             + '<span class="msg-who' + (m.is_self ? ' text-primary' : '') + '">' + esc(m.name || '未知') + ':</span> '
-            + '<span class="msg-body">' + esc(m.text) + ' ' + tags.join(' ') + '</span></div>';
+            + '<span class="msg-body">' + esc(m.text) + ' ' + tags.join(' ') + '</span>'
+            + '<span class="visually-hidden">按 Enter 或空格键查看前后文</span></div>';
     }
 
     function render(res, highlightId) {
@@ -135,13 +151,22 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     $('#q').on('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); state.page = 1; load(); } });
     $('#btnReset').on('click', function() {
         ['q', 'sender', 'month', 'from', 'to'].forEach(function(k) { $('#' + k).val(''); });
+        updateFilterSummary();
         state.page = 1; load();
     });
+    $('#month, #from, #to').on('change', updateFilterSummary);
     $('#prevPage').on('click', function() { if (state.page > 1) { state.page--; load(); } });
     $('#nextPage').on('click', function() { if (state.page < state.pages) { state.page++; load(); } });
     // 点一行 = 以它为锚点看前后文（分页过滤下也能定位回原对话）
     $('#msgList').on('click', '.msg-row', function() { load(String($(this).data('id'))); });
+    $('#msgList').on('keydown', '.msg-row', function(e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            load(String($(this).data('id')));
+        }
+    });
 
+    updateFilterSummary();
     load();
 })();
 </script>

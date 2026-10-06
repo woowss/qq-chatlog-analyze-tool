@@ -34,13 +34,13 @@ import hashlib
 import json
 import os
 import re
-import secrets
 import threading
 import time
 from typing import Iterable, Optional
 
 from config import env_number
 from analyzer import purge_marks
+from analyzer.atomic_write import tmp_sibling, write_json_atomic
 from analyzer.logger import get_logger
 
 logger = get_logger("deepseek")
@@ -100,14 +100,10 @@ def is_safe_month_key(key) -> bool:
 def _tmp_sibling(path: str) -> str:
     """原子写入的临时文件名：**必须唯一**，不能用固定的 `f"{path}.tmp"`。
 
-    与 `webapp.store._tmp_sibling` 同一口径（analyzer 不能反向依赖 webapp，所以这里
-    自己留一份）。固定名让两个并发写者踩同一个临时文件：A 刚 open、B 重开覆盖，或任
-    一方在失败分支里删掉对方正在写的那份，`os.replace` 就可能把半截文件发布成正式
-    缓存——月份缓存丢的是**一次已付费结果**，用户要重新付钱。多浏览器/多设备共用一份
-    聊天是本项目明确支持的用法，而 `_restamp_month_cache` 更让这条路径成为常态
-    （每个被读到的历史文件都会补写一次）。
+    口径只有 `analyzer.atomic_write.tmp_sibling` 一份（那里写着为什么）；保留这个函数名
+    是因为用例把它当契约（tests/test_review_round7.py 钉"临时名唯一且仍被清理侧认出"）。
     """
-    return f"{path}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}.tmp"
+    return tmp_sibling(path)
 
 
 def configure_month_cache(directory: str) -> None:
@@ -240,7 +236,6 @@ def _restamp_month_cache(path: str, data: dict, thinking: bool, created, chat_ha
        写**新结果**的两处（deepseek_client / group_client）早就查这个标记，这里补齐。
        没传 chat_hash（老调用方/测试）时退化为只做 ①，行为与从前一致。
     """
-    tmp = _tmp_sibling(path)
     payload = {
         "_created": created if created is not None else time.time(),
         "_thinking": bool(thinking),
@@ -252,15 +247,9 @@ def _restamp_month_cache(path: str, data: dict, thinking: bool, created, chat_ha
             return
         if not os.path.exists(path):
             return
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp, path)
+        write_json_atomic(path, payload)
     except OSError as e:
         _warn_write_failure("月份缓存补标记", path, e)
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
 
 
 def _warn_write_failure(what: str, path: str, err: OSError) -> None:
@@ -283,29 +272,21 @@ def _write_month_cache(key: str, result: dict, thinking: "Optional[bool]" = None
     path = month_cache_path(key)
     if not path:  # 非法 key 不落盘（见 month_cache_path）
         return
-    tmp = _tmp_sibling(path)
+    # _created 是"绝对 90 天"硬上限的依据（cleanup 读它）。缺了它就只能按 mtime 判，
+    # 而 mtime 在每次命中时被续期（见 _read_month_cache）——含聊天原句引用的这族
+    # 缓存会因此无限期留存。读侧会把它 pop 掉，调用方拿到的结果不变。
+    # 放在**最前面**写：清理任务只扫文件头就能取到，不必整份解析这些最敏感的月份文件
+    # （见 webapp.store.read_created_at）。
+    payload = dict(result) if isinstance(result, dict) else {"result": result}
+    payload.pop("_created", None)
+    payload.pop("_thinking", None)  # 口径声明由本函数负责写，不接受调用方塞进来的值
+    stamp = {"_thinking": bool(thinking)} if thinking is not None else {}
     try:
-        # _created 是"绝对 90 天"硬上限的依据（cleanup 读它）。缺了它就只能按 mtime 判，
-        # 而 mtime 在每次命中时被续期（见 _read_month_cache）——含聊天原句引用的这族
-        # 缓存会因此无限期留存。读侧会把它 pop 掉，调用方拿到的结果不变。
-        # 放在**最前面**写：清理任务只扫文件头就能取到，不必整份解析这些最敏感的月份文件
-        # （见 webapp.store.read_created_at）。
-        payload = dict(result) if isinstance(result, dict) else {"result": result}
-        payload.pop("_created", None)
-        payload.pop("_thinking", None)  # 口径声明由本函数负责写，不接受调用方塞进来的值
-        stamp = {"_thinking": bool(thinking)} if thinking is not None else {}
         # 目录可能被用户按 README 的指引删掉来"彻底清除数据"，而服务还开着：
         # 这里不补目录，月份缓存从此再也写不进去，增量分析静默失效（每月重复付费）。
-        os.makedirs(_MONTH_CACHE_DIR, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"_created": time.time(), **stamp, **payload}, f, ensure_ascii=False)
-        os.replace(tmp, path)
+        write_json_atomic(path, {"_created": time.time(), **stamp, **payload}, mkdir=_MONTH_CACHE_DIR)
     except OSError as e:
         _warn_write_failure("月份缓存", path, e)
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
 
 
 def _record_month_usage(chat_hash: str, keys: "Iterable[str]") -> None:
@@ -350,29 +331,21 @@ def _record_month_usage(chat_hash: str, keys: "Iterable[str]") -> None:
         # 重排到最前面写，让清理任务只扫文件头就能取到（见 webapp.store.read_created_at）。
         data["_created"] = data.get("_created") or time.time()
         payload = {"_created": data.pop("_created"), **data}
-        tmp = _tmp_sibling(path)
         try:
             # 同 _write_month_cache：manifest 写不进去 = 这些月份文件会变成"无引用"，
             # 宽限期后被孤儿回收删掉，增量分析白跑。
-            os.makedirs(_MONTH_CACHE_DIR, exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False)
-            os.replace(tmp, path)
+            write_json_atomic(path, payload, mkdir=_MONTH_CACHE_DIR)
         except OSError as e:
             # manifest 写不进去同样只影响"重新导出时能否复用历史月份"，
             # 但会让增量分析静默失效（每次都全量付费），所以也要出声
             _warn_write_failure("月份缓存 manifest", path, e)
             _MANIFEST_KEYS.pop(name, None)
-            # 半成品必须删掉（与 _write_month_cache / store._save_stats 的失败分支一致）。
-            # 留着它有两处长期的害处，都不只是"多一个垃圾文件"：
+            # 半成品由 write_json_atomic 负责删掉，不会留在这里。留着它有两处长期的害处，
+            # 都不只是"多一个垃圾文件"（这条口径的来历）：
             # ① 下面的清单扫描按 manifest_ 前缀认领活清单，这个 .tmp 会被当成一份真清单读进
             #    引用集，于是该聊天的 month_*.json（含聊天原句引用）被永久钉成"仍被引用"，
             #    purge 与孤儿回收都收不走它；
             # ② 它的哈希段粘着 .json.tmp，级联清理的整段匹配认不出来，也就删不掉。
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
         else:
             # getmtime 同样必须兜住：这一行原本裸在外面，而调用方 _record_month_usage
             # 是 _analyze_periods 的 **finally** 分支（见 deepseek_client 那处）。

@@ -36,13 +36,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     {# 自有 JS/CSS 带版本参数破缓存：vendor/ 的文件名自带版本，自有文件没有 #}
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v={{ asset_v }}">
     <script src="{{ url_for('static', filename='vendor/jquery.min.js') }}"></script>
-    {# 图表脚本只有真正画图的页面才需要：上传页一个图都没有，加载 ECharts（MB 级）
-       纯属浪费解析时间。默认全给，只有 index.html 把它覆盖成空块。
-       jQuery 不放进这个块：上传页的表单提交要用它。 #}
+    {# 可视化库仅供画图页面加载；分析任务脚本独立成块，纯文本页可跳过图表库。
+       jQuery 不放进这些块：上传与消息页面的交互仍会用到它。 #}
     {% block chart_scripts %}
     <script src="{{ url_for('static', filename='vendor/echarts.min.js') }}"></script>
     <script src="{{ url_for('static', filename='vendor/echarts-wordcloud.min.js') }}"></script>
     <script src="{{ url_for('static', filename='js/charts.js') }}?v={{ asset_v }}"></script>
+    {% endblock %}
+    {% block analyze_scripts %}
     <script src="{{ url_for('static', filename='js/analyze.js') }}?v={{ asset_v }}"></script>
     {% endblock %}
     {% block head %}{% endblock %}
@@ -51,32 +52,56 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     <nav class="navbar navbar-expand-lg mb-4">
         <div class="container">
             <a class="navbar-brand" href="/">QQ 聊天分析</a>
-            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav"
+                    aria-controls="navbarNav" aria-expanded="false" aria-label="打开导航菜单">
                 <span class="navbar-toggler-icon"></span>
             </button>
             <div class="collapse navbar-collapse" id="navbarNav">
                 <ul class="navbar-nav me-auto">
-                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'index' }}" href="/">首页</a></li>
-                    {% if has_stats %}{% if is_group_chat %}
-                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'dashboard' }}" href="/dashboard">群仪表盘</a></li>
-                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'emotion' }}" href="/emotion">群情绪</a></li>
-                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'relationship' }}" href="/relationship">群关系</a></li>
-                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'habits' }}" href="/habits">成员活跃</a></li>
-                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'topics' }}" href="/topics">群话题</a></li>
-                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'profile' }}" href="/profile">成员画像</a></li>
-                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'messages_page' }}" href="/messages">消息</a></li>
-                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'report' }}" href="/report">群报告</a></li>
-                    {% else %}
-                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'dashboard' }}" href="/dashboard">仪表盘</a></li>
-                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'emotion' }}" href="/emotion">情绪</a></li>
-                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'relationship' }}" href="/relationship">关系</a></li>
-                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'habits' }}" href="/habits">习惯</a></li>
-                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'topics' }}" href="/topics">话题</a></li>
-                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'profile' }}" href="/profile">锐评</a></li>
-                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'recap' }}" href="/recap">总括</a></li>
-                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'messages_page' }}" href="/messages">消息</a></li>
-                    <li class="nav-item"><a class="nav-link {{ 'active' if request.endpoint == 'report' }}" href="/report">报告</a></li>
-                    {% endif %}{% endif %}
+                    <li class="nav-item">
+                        <a class="nav-link {{ 'active' if request.endpoint == 'index' }}"
+                           href="/" {% if request.endpoint == 'index' %}aria-current="page"{% endif %}>上传</a>
+                    </li>
+                    {% if has_stats %}
+                    <li class="nav-item">
+                        <a class="nav-link {{ 'active' if request.endpoint == 'dashboard' }}"
+                           href="/dashboard" {% if request.endpoint == 'dashboard' %}aria-current="page"{% endif %}>
+                            {{ '群仪表盘' if is_group_chat else '总览' }}
+                        </a>
+                    </li>
+                    {% set analysis_active = request.endpoint in ['emotion', 'relationship', 'habits', 'topics', 'profile', 'recap'] %}
+                    <li class="nav-item dropdown">
+                        <a class="nav-link dropdown-toggle {{ 'active' if analysis_active }}" href="#" id="analysisNav"
+                           role="button" data-bs-toggle="dropdown" aria-expanded="false">分析</a>
+                        <ul class="dropdown-menu" aria-labelledby="analysisNav">
+                            <li><a class="dropdown-item {{ 'active' if request.endpoint == 'emotion' }}" href="/emotion"
+                                   {% if request.endpoint == 'emotion' %}aria-current="page"{% endif %}>{{ '群情绪' if is_group_chat else '情绪分析' }}</a></li>
+                            <li><a class="dropdown-item {{ 'active' if request.endpoint == 'topics' }}" href="/topics"
+                                   {% if request.endpoint == 'topics' %}aria-current="page"{% endif %}>{{ '群话题' if is_group_chat else '话题趋势' }}</a></li>
+                            <li><a class="dropdown-item {{ 'active' if request.endpoint == 'relationship' }}" href="/relationship"
+                                   {% if request.endpoint == 'relationship' %}aria-current="page"{% endif %}>{{ '群关系' if is_group_chat else '人际关系' }}</a></li>
+                            <li><a class="dropdown-item {{ 'active' if request.endpoint == 'habits' }}" href="/habits"
+                                   {% if request.endpoint == 'habits' %}aria-current="page"{% endif %}>{{ '成员活跃' if is_group_chat else '个人习惯' }}</a></li>
+                            <li><a class="dropdown-item {{ 'active' if request.endpoint == 'profile' }}" href="/profile"
+                                   {% if request.endpoint == 'profile' %}aria-current="page"{% endif %}>{{ '成员画像' if is_group_chat else '人物锐评' }}</a></li>
+                            {% if not is_group_chat %}
+                            <li><hr class="dropdown-divider"></li>
+                            <li><a class="dropdown-item {{ 'active' if request.endpoint == 'recap' }}" href="/recap"
+                                   {% if request.endpoint == 'recap' %}aria-current="page"{% endif %}>整体总括</a></li>
+                            {% endif %}
+                        </ul>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link {{ 'active' if request.endpoint == 'messages_page' }}"
+                           href="/messages" {% if request.endpoint == 'messages_page' %}aria-current="page"{% endif %}>消息</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link {{ 'active' if request.endpoint == 'report' }}"
+                           href="/report" {% if request.endpoint == 'report' %}aria-current="page"{% endif %}>
+                            {{ '群报告' if is_group_chat else '报告' }}
+                        </a>
+                    </li>
+                    {% endif %}
                 </ul>
                 <div class="nav-actions">
                     <span class="nav-status d-none d-sm-flex">

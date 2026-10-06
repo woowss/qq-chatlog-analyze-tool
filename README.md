@@ -153,7 +153,7 @@ DEEPSEEK_MODEL=qwen3.8-flash
 DEEPSEEK_BASE_URL=https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
 ```
 
-完整可配项见[配置项](#配置项)，带注释的模板见 `.env.example`，默认值即可直接使用。
+全部可配项与默认值见 [.env.example](.env.example)（权威清单），最常动几项的取舍见[配置项](#配置项)。默认值即可直接使用。
 
 ### 4. 启动与停止
 
@@ -212,80 +212,37 @@ QQ 的超级表情（吃糖、大怨种、菜汪之类）没有公开地址，�
 
 ## 配置项
 
-以下是全部可配项，都写在 `.env` 里（也可以直接用环境变量），默认值可直接使用。配置来源与优先级见
-[配置 API Key](#3-配置-api-key可选)。
+全部可配项连同默认值与"为什么要设它"，逐条写在 **[.env.example](.env.example)** 里——那份清单与代码同源，各维度
+输出预算还有测试对着代码默认值核验（见 `tests/test_review_round5.py`），因此以它为准；本文件不复述清单，
+也刻意不写"共几项"这样的数字（数字会漂，写一次就要同步一次，与下面「开发与测试」里不写用例数同一立场）。
 
-### 模型接口
+配置来源与优先级见 [配置 API Key](#3-配置-api-key可选)。
 
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `DEEPSEEK_API_KEY` | 空 | API Key，留空则只用本地统计 |
-| `DEEPSEEK_MODEL` | `deepseek-flash` | 模型名 |
-| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | 接口地址 |
-| `LLM_CONCURRENCY` | 官方 6 / 其它 2 | 并发月份数 |
-| `LLM_CALL_MIN_INTERVAL` | 官方 0.5 / 其它 3 | 两次调用最小间隔（秒） |
-| `LLM_MAX_DIALOG_CHARS` | 600000 | 单月对话文本上限（字符） |
-| `LLM_MAX_TOKENS_<维度>` | 32k / 锐评 49k / 总括 16k | 按维度覆盖输出预算，如 `LLM_MAX_TOKENS_PROFILE=65536`；截断报错时调这里 |
-| `QQCHAT_STOPWORD_FILE` | 空 | 词云追加停用词文件（一行一词，`#` 注释）；内置词表永远生效，改文件只重算本地词云、不动付费缓存 |
-| `LLM_MAX_CALLS_PER_RUN` | 0（不限） | 一次运行（单维度或"一键全量"）允许发出的请求数上限，超限即中止剩余任务并保留已完成部分；按真正发出的请求计（含重试），命中缓存的月份不计入 |
-| `LLM_THINKING` | 官方端点开启 | `disabled` 关闭思考模式 |
-| `LLM_THINKING_DIMS` | 空 | 只对指定维度开启，逗号分隔 |
-| `LLM_PRICE_IN` / `LLM_PRICE_OUT` | 按模型内置 | 费用估算单价（元/百万 tokens） |
-| `PROMPT_CACHE_SALT` | 空 | 手动强制失效缓存的盐值（同时换私聊与群聊两族键） |
-| `QQCHAT_GROUP_CACHE_SALT` | 空 | 群聊独立盐值：只换群聊族键，私聊不受牵连；默认空时群聊指纹与从前逐字节一致 |
-| `QQCHAT_MONTH_CACHE` | 开 | 设 `0` 关闭月份级增量缓存 |
-| `LLM_MONTH_CACHE_GRACE_HOURS` | 24 | 无引用的月份缓存宽限期 |
-| `QQCHAT_CACHE_SLIDE_DAYS` | 30 | 派生缓存（ai_cache/stats_cache）滑动保留天数，读到即续期；`0`=不过期 |
-| `QQCHAT_CACHE_MAX_DAYS` | 90 | 派生缓存绝对上限天数（再常用到点也回收）；`0`=不过期 |
+### 常用配置
 
-### 图片理解与表情图
+只列最常需要动的几项，默认值与完整说明都在 [.env.example](.env.example)。
 
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `QQCHAT_MEDIA_DIR` | 空 | 导出目录；留空则不用服务端直接读图 |
-| `LLM_VISION` | `true` | 图片理解总开关，`false` 则完全不上传图片 |
-| `LLM_VISION_MAX_PER_MONTH` | 20 | 每月最多送几张图 |
-| `LLM_VISION_DETAIL` | `high` | 送图清晰度，`low` 会压到 512×512 |
-| `LLM_VISION_MIN_SIDE` | 200 | 小于该像素的图按表情包跳过 |
-| `LLM_VISION_MAX_BYTES` | 12582912 | 单张图片体积上限（字节） |
-| `LLM_VISION_MAX_TOTAL_BYTES` | 33554432 | 单次摘要请求的图片总体积上限（字节），装不下的留到下次 |
-| `QQCHAT_FACE_IMAGES` | `false` | 是否允许抓取 QQ 表情原图 |
-| `QQCHAT_FACE_DIR` | 空 | 本地表情包目录，优先级高于联网抓取 |
-| `QQCHAT_FACE_FETCH_LIMIT` | 300 | 一次抓取的表情图数量上限 |
-| `QQCHAT_FACE_FETCH_TIMEOUT` | 6 | 单张表情图下载超时（秒） |
+| 变量 | 什么时候需要动 |
+|---|---|
+| `DEEPSEEK_API_KEY` | 要用 AI 分析就填（留空则只用本地统计） |
+| `DEEPSEEK_MODEL` / `DEEPSEEK_BASE_URL` | 换 OpenAI 兼容网关（如百炼 Qwen）时成对改 |
+| `ACCESS_PASSWORD` | 绑定非回环地址（局域网/公网）**必填**，否则拒绝启动 |
+| `ALLOWED_ORIGINS` | 用局域网 IP 或域名打开页面时必填，否则上传与分析请求被 403 拒绝 |
+| `QQCHAT_COOKIE_SECURE` | 明文 http 访问局域网地址时设 `false`（口令与会话会明文过网，风险自负） |
+| `FLASK_HOST` / `FLASK_PORT` | Windows 上 5000 常被 AirPlay/Hyper-V 占用，可改 5001 |
+| `QQCHAT_DATA_DIR` | 想把聊天记录与 AI 结果搬到别的盘（见[安装](#2-安装)） |
+| `LLM_MAX_CALLS_PER_RUN` | 想给一次运行算一个封顶的花费时设，例如 200（默认 0 = 不限） |
+| `QQCHAT_MONTH_CACHE` | 设 `0` 关闭月份级增量缓存：每次整份重算，会重新付费 |
+| `QQCHAT_CACHE_SLIDE_DAYS` / `QQCHAT_CACHE_MAX_DAYS` | 派生缓存回收（默认滑动 30 天 / 绝对 90 天）；想长期保留已付费结果就调大，`0` = 不过期 |
+| `QQCHAT_MEDIA_DIR` | Firefox 等不支持选目录时，用它让服务端直接读图 |
+| `LLM_VISION` | 设 `false` 完全不上传图片 |
+| `QQCHAT_FACE_IMAGES` | 想显示 QQ 表情原图时打开，详见[可选能力](#可选能力) |
+| `QQCHAT_GROUP_CHAT` | 多人记录的处置：`off` 直接拒收、`two_party` 按「我 vs 其他人」归并 |
 
-### 运行与安全
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `FLASK_HOST` | `127.0.0.1` | 绑定地址；非回环地址必须同时设置访问口令 |
-| `FLASK_PORT` | 5000 | 端口 |
-| `FLASK_DEBUG` | `false` | 调试模式与自动重载 |
-| `ACCESS_PASSWORD` | 空 | 访问口令，设置后所有页面需登录 |
-| `QQCHAT_LOGIN_MAX_ATTEMPTS` | 5 | 同一客户端地址允许的登录失败次数，超过即暂时拒绝（429 + `Retry-After`） |
-| `QQCHAT_LOGIN_WINDOW_SECONDS` | 300 | 上面那个次数对应的滑动窗口（秒）；反代/NAT 共享出口地址时把两者一起调大 |
-| `ALLOWED_ORIGINS` | 空 | 额外允许的浏览器来源主机，用局域网 IP 或域名访问时必填 |
-| `QQCHAT_COOKIE_SECURE` | `auto` | 会话 cookie 的 `Secure` 标志；`auto` = 非回环绑定时自动开启（此时需 https 才能保持登录态），明文 http 局域网访问需设为 `false` |
-| `SECRET_KEY` | 自动生成 | Session 签名密钥，留空则生成并持久化到数据目录下的 `.secret_key` |
-| `QQCHAT_MAX_UPLOAD_MB` | 50 | 单次上传体积上限；超长聊天的 JSON 逼近该值时可调大 |
-| `QQCHAT_JOB_TTL_SECONDS` | 900 | 内存任务记录的存活时间 |
-| `QQCHAT_SHUTDOWN_GRACE_SECONDS` | 5 | `Ctrl+C` 后留给进行中月份的收尾秒数；期间再按一次 `Ctrl+C` 立即退出；设 `0` 恢复"按下就退出" |
-| `QQCHAT_GROUP_CHAT` | `auto` | 多人记录的处置：`auto` 按群聊分析（默认）、`off` 回到"直接拒收"、`two_party` 按「我 vs 其他人」两分类归并 |
-| `QQCHAT_ALLOW_MULTI_PARTY` | `false` | 旧开关，等价于 `QQCHAT_GROUP_CHAT=two_party`（优先级低于新变量） |
-| `QQCHAT_GROUP_AI_MAX_MEMBERS` | 10 | 成员画像最多分析几位（按发言量取前 N，自己必定入选） |
-| `QQCHAT_GROUP_MATRIX_MEMBERS` | 30 | 互动矩阵保留的成员上限（超出只影响矩阵，不影响成员活跃度与总览） |
-| `QQCHAT_GROUP_PEAK_WINDOW_MINUTES` | 10 | "同时在线高峰"的判定窗口（分钟） |
-| `LLM_GROUP_MAX_DIALOG_CHARS` | 600000 | 单个群聊月的对话文本上限（抽样对低频成员有保底） |
-
-### 数据与日志
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `QQCHAT_DATA_DIR` | 见[安装](#2-安装) | 数据总目录，可整体迁到别处 |
-| `UPLOAD_DIR` / `SESSION_DIR` / `AI_CACHE_DIR` / `STATS_CACHE_DIR` / `LOG_DIR` / `FACE_CACHE_DIR` | 数据目录下各子目录 | 单独覆盖某一类数据的位置 |
-| `TOKEN_USAGE_FILE` | `logs/token_usage.json` | token 用量统计文件位置 |
-| `LOG_RETENTION_DAYS` | 7 | 日志按天轮转保留天数 |
-| `LOG_REDACT_NAMES` | `true` | 日志里的昵称与原始文件名脱敏 |
+其余全部可调项——思考模式与各维度输出预算（`LLM_THINKING`、`LLM_MAX_TOKENS_<维度>`）、并发与调用间隔、
+单月与群聊对话字符预算、图片体积与张数上限、表情抓取参数与本地表情目录、缓存盐值与月份宽限期、
+登录限流、任务 TTL、停机宽限、上传体积上限、停用词文件、费用单价、数据与日志目录的单独覆盖、
+日志脱敏与保留天数——都按同一顺序写在 [.env.example](.env.example) 里，每一项都带默认值与理由。
 
 ## 分析质量与费用
 

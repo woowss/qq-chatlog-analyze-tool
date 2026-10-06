@@ -19,6 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {# 上传页没有图表：不加载 ECharts 与两个自有脚本（MB 级 vendor，纯粹是解析开销）。
    jQuery 由 base.html 无条件加载，本页的表单提交要用它。 #}
 {% block chart_scripts %}{% endblock %}
+{% block analyze_scripts %}{% endblock %}
 {% block content %}
 <div class="row justify-content-center">
     <div class="col-lg-7">
