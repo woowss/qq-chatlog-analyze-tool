@@ -504,7 +504,7 @@ def api_messages():
 
     参数：q 关键词 | sender（self/other 或群成员 uid）| month=YYYY-MM |
     from/to=YYYY-MM-DD | page（1 起）| per_page（≤200）| around=消息 id（定位上下文，
-    忽略分页，返回其前后各 ~10 条）。
+    忽略分页，返回其前后各 ~10 条）| context=1（从原始时间线展开上下文）。
     这是"AI 结论可回溯"的入口：锐评引用了某句话，用户从此能搜到原文看上下文。
     """
     chat_hash = session.get("chat_hash")
@@ -537,11 +537,15 @@ def api_messages():
 
     around = (args.get("around") or "").strip()
     if around:
-        idx = next((i for i, m in enumerate(matched) if m.id == around), None)
+        # 搜索结果点开的上下文要回到原始时间线，否则前后 10 条都会是相同关键词命中，
+        # 看不到真正相邻的对话。旧调用仍沿用过滤后定位；新 UI 显式请求 context=1。
+        context_mode = args.get("context") == "1"
+        source = chat.messages if context_mode else matched
+        idx = next((i for i, m in enumerate(source) if m.id == around), None)
         if idx is None:
-            return jsonify({"error": "在当前位置的过滤条件下找不到该消息"}), 404
+            return jsonify({"error": "找不到该消息的上下文"}), 404
         lo = max(0, idx - 10)
-        window = matched[lo : idx + 11]
+        window = source[lo : idx + 11]
         return jsonify(
             {
                 "total": total,

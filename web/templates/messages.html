@@ -69,6 +69,18 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     <span class="small text-muted" id="pageInfo"></span>
     <button class="btn btn-outline-secondary btn-sm" id="nextPage" type="button" disabled>下一页</button>
 </nav>
+<dialog class="context-dialog" id="contextDialog" aria-labelledby="contextTitle">
+    <div class="context-dialog-header">
+        <div>
+            <h3 id="contextTitle">消息前后文</h3>
+            <div class="small text-muted mt-1">显示原始时间线前后各 10 条；筛选列表会保留</div>
+        </div>
+        <button class="btn btn-outline-secondary btn-sm" id="contextClose" type="button">关闭</button>
+    </div>
+    <div class="context-dialog-body" id="contextList" aria-live="polite" aria-busy="false">
+        <div class="text-muted small">正在读取消息上下文…</div>
+    </div>
+</dialog>
 {% endblock %}
 
 {% block scripts %}
@@ -115,8 +127,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     function render(res, highlightId) {
         state.total = res.total || 0;
         if (res.pages) state.pages = res.pages;
-        var list = (res.messages || []).map(function(m) { return rowHtml(m, highlightId); });
-        $('#msgList').html(list.join('') || '<div class="text-muted small">没有符合条件的消息</div>');
+        $('#msgList').html(formatMessages(res.messages || [], highlightId)
+            || '<div class="text-muted small p-2">没有符合条件的消息</div>');
         $('#resultMeta').text('共 ' + state.total + ' 条');
         $('#pageInfo').text(state.pages > 1 ? ('第 ' + (res.page || state.page) + ' / ' + state.pages + ' 页') : '');
         var p = res.page || state.page;
@@ -130,10 +142,19 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             sel.val(cur || '');
             sendersLoaded = true;
         }
-        if (highlightId) {
-            var hit = $('.msg-hit');
-            if (hit.length) hit[0].scrollIntoView({ block: 'center' });
-        }
+    }
+
+    function formatMessages(messages, highlightId) {
+        var lastDay = '';
+        return messages.map(function(m) {
+            var day = String(m.time || '').slice(0, 10);
+            var divider = '';
+            if (day && day !== lastDay) {
+                divider = '<div class="day-divider" role="heading" aria-level="3">' + esc(day) + '</div>';
+                lastDay = day;
+            }
+            return divider + rowHtml(m, highlightId);
+        }).join('');
     }
 
     function load(highlightId) {
@@ -147,6 +168,31 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         });
     }
 
+    function showContext(id) {
+        var dialog = document.getElementById('contextDialog');
+        var list = $('#contextList');
+        list.attr('aria-busy', 'true').html('<div class="text-muted small p-2">正在读取消息上下文…</div>');
+        if (!dialog.open) dialog.showModal();
+        $.get('/api/messages', params({ around: id, context: 1, page: 1 }), function(res) {
+            list.attr('aria-busy', 'false');
+            if (res.error) {
+                list.empty().append($('<div>').addClass('alert alert-warning small mb-0').text(res.error));
+                return;
+            }
+            var rows = formatMessages(res.messages || [], id);
+            if (!rows) {
+                list.empty().append($('<div>').addClass('text-muted small p-2').text('没有找到这条消息的上下文。'));
+                return;
+            }
+            list.html('<div class="msg-list" role="feed" aria-label="消息前后文">' + rows + '</div>');
+            var hit = list.find('.msg-hit')[0];
+            if (hit) hit.scrollIntoView({ block: 'center' });
+        }).fail(function(xhr) {
+            list.attr('aria-busy', 'false').empty().append($('<div>').addClass('alert alert-danger small mb-0')
+                .text((xhr.responseJSON && xhr.responseJSON.error) || '读取上下文失败，请关闭弹窗后重试。'));
+        });
+    }
+
     $('#btnSearch').on('click', function() { state.page = 1; load(); });
     $('#q').on('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); state.page = 1; load(); } });
     $('#btnReset').on('click', function() {
@@ -157,13 +203,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     $('#month, #from, #to').on('change', updateFilterSummary);
     $('#prevPage').on('click', function() { if (state.page > 1) { state.page--; load(); } });
     $('#nextPage').on('click', function() { if (state.page < state.pages) { state.page++; load(); } });
-    // 点一行 = 以它为锚点看前后文（分页过滤下也能定位回原对话）
-    $('#msgList').on('click', '.msg-row', function() { load(String($(this).data('id'))); });
+    // 上下文放在独立弹窗中打开，当前筛选结果和分页不会被替换。
+    $('#msgList').on('click', '.msg-row', function() { showContext(String($(this).data('id'))); });
     $('#msgList').on('keydown', '.msg-row', function(e) {
         if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault();
-            load(String($(this).data('id')));
+            showContext(String($(this).data('id')));
         }
+    });
+    $('#contextClose').on('click', function() { document.getElementById('contextDialog').close(); });
+    $('#contextDialog').on('click', function(e) {
+        if (e.target === this) this.close();
     });
 
     updateFilterSummary();

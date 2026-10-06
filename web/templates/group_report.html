@@ -51,12 +51,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 </div>
 
 <h5 class="section-title">成员活跃度</h5>
+<div class="report-table-scroll">
 <table class="ai-detail">
-    <thead><tr><th>成员</th><th>发言</th><th>占比</th><th>平均每条</th><th>活跃天数</th><th>被回复</th><th>回复别人</th><th>被@</th><th>@别人</th></tr></thead>
+    <thead><tr><th class="sticky-first">成员</th><th>发言</th><th>占比</th><th>平均每条</th><th>活跃天数</th><th>被回复</th><th>回复别人</th><th>被@</th><th>@别人</th></tr></thead>
     <tbody>
     {% for m in member_activity %}
         <tr>
-            <td>{{ m.name }}{% if m.is_self %}（我）{% endif %}</td>
+            <td class="sticky-first">{{ m.name }}{% if m.is_self %}（我）{% endif %}</td>
             <td>{{ m.msg_count }}</td>
             <td>{{ (m.share * 100) | round(1) }}%</td>
             <td>{{ m.avg_chars }}</td>
@@ -70,6 +71,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     {% endfor %}
     </tbody>
 </table>
+</div>
 <p class="text-muted small">
     「被回复/回复别人/被@/@别人」是导出器记录的精确信号；推断的「接话」不计入本表
     （相邻消息换人且间隔在 30 分钟内，可信度低于精确回复）。
@@ -77,18 +79,18 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 </p>
 
 <h5 class="section-title">成员发言量</h5>
-<div id="memberBar" style="height: 360px;"></div>
+<div id="memberBar" class="group-activity-chart" style="height: 360px;"></div>
 
 <h5 class="section-title">互动关系图</h5>
 <p class="text-muted small">实线=精确回复/@（事实）；虚线=相邻接话（推断）。节点越大发言越多。</p>
-<div id="relationGraph" style="height: 460px;"></div>
+<div id="relationGraph" class="group-relation-chart" style="height: 460px;"></div>
 
 <h5 class="section-title">互动热力矩阵</h5>
 <p class="text-muted small">纵向：谁先说；横向：谁接话。</p>
-<div id="interactionHeat" style="height: 460px;"></div>
+<div id="interactionHeat" class="group-overview-chart" style="height: 460px;"></div>
 
 <h5 class="section-title">成员活跃时段</h5>
-<div id="memberHourly" style="height: 380px;"></div>
+<div id="memberHourly" class="group-activity-chart" style="height: 380px;"></div>
 
 <h5 class="section-title">群里程碑</h5>
 <table class="ai-detail">

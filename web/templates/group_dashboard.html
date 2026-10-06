@@ -26,7 +26,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <nav class="page-jump-nav mb-3" aria-label="群聊仪表盘快捷导航">
     <a href="#groupSummary">群聊概览</a>
     <a href="#groupCharts">互动图表</a>
-    {% if api_ok %}<a href="#analysisPanel">AI 分析</a>{% endif %}
+    <a href="#analysisPanel">AI 分析</a>
     <a href="#analysisResults">分析结果</a>
 </nav>
 {%- set unknown = overview.get('unknown_element_types') or {} %}
@@ -41,7 +41,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {%- endif %}
 
 <div class="row mb-4" id="groupSummary">
-    <div class="col-md-3 mb-3">
+    <div class="col-6 col-md-3 mb-3">
         <div class="card stat-card text-center h-100">
             <div class="card-body">
                 <div class="stat-value">{{ overview.total_messages }}</div>
@@ -49,7 +49,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             </div>
         </div>
     </div>
-    <div class="col-md-3 mb-3">
+    <div class="col-6 col-md-3 mb-3">
         <div class="card stat-card text-center h-100">
             <div class="card-body">
                 <div class="stat-value">{{ overview.member_count }}</div>
@@ -57,7 +57,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             </div>
         </div>
     </div>
-    <div class="col-md-3 mb-3">
+    <div class="col-6 col-md-3 mb-3">
         <div class="card stat-card text-center h-100">
             <div class="card-body">
                 <div class="stat-value">{{ overview.total_days }}</div>
@@ -65,7 +65,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             </div>
         </div>
     </div>
-    <div class="col-md-3 mb-3">
+    <div class="col-6 col-md-3 mb-3">
         <div class="card stat-card text-center h-100">
             <div class="card-body">
                 <div class="stat-value">{{ overview.avg_daily }}</div>
@@ -112,13 +112,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     <div class="col-md-6 mb-3">
         <div class="card h-100">
             <div class="card-header">成员发言量（前 15 位）</div>
-            <div class="card-body"><div id="memberBar" style="height: 360px;"></div></div>
+            <div class="card-body"><div id="memberBar" class="group-overview-chart" style="height: 360px;"></div></div>
         </div>
     </div>
     <div class="col-md-6 mb-3">
         <div class="card h-100">
             <div class="card-header">互动热力矩阵<small class="text-muted ms-2">纵向：谁先说；横向：谁接话</small></div>
-            <div class="card-body"><div id="interactionHeat" style="height: 360px;"></div></div>
+            <div class="card-body"><div id="interactionHeat" class="group-overview-chart" style="height: 360px;"></div></div>
         </div>
     </div>
 </div>
@@ -127,7 +127,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     <div class="col-md-6 mb-3">
         <div class="card h-100">
             <div class="card-header">成员活跃时段（前 8 位堆叠）</div>
-            <div class="card-body"><div id="memberHourly" style="height: 340px;"></div></div>
+            <div class="card-body"><div id="memberHourly" class="group-overview-chart" style="height: 340px;"></div></div>
         </div>
     </div>
     <div class="col-md-6 mb-3">
@@ -136,7 +136,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                 互动关系图
                 <small class="text-muted ms-2">实线=精确回复/@（事实）· 虚线=相邻接话（推断）</small>
             </div>
-            <div class="card-body"><div id="relationGraph" style="height: 340px;"></div></div>
+            <div class="card-body"><div id="relationGraph" class="group-relation-chart" style="height: 340px;"></div></div>
         </div>
     </div>
 </div>
@@ -188,40 +188,54 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             （{{ ai_plan.months }} 个月 × 3 个群级维度 + {{ ai_plan.members }} 位成员画像）。
             已分析过的维度命中本地缓存，不重复计费。
         </p>
-        <div class="d-flex gap-2 flex-wrap">
-            <button class="btn btn-outline-primary btn-analyze" data-dim="group_dynamics" data-orig="群聊动态">群聊动态</button>
-            <button class="btn btn-outline-primary btn-analyze" data-dim="group_topics" data-orig="群聊话题">群聊话题</button>
-            <button class="btn btn-outline-primary btn-analyze" data-dim="group_emotion" data-orig="群聊情绪">群聊情绪</button>
-            <button class="btn btn-outline-primary btn-analyze" data-dim="member_profiles" data-orig="成员画像">成员画像</button>
+        <div class="d-flex gap-2 flex-wrap align-items-center">
             <button class="btn btn-primary" id="btn-analyze-all">全量分析</button>
-        </div>
-        <div class="form-check mt-3">
-            <input class="form-check-input" type="checkbox" id="forceRefresh">
-            <label class="form-check-label small text-muted" for="forceRefresh">强制重新分析（忽略缓存，会产生 API 费用）</label>
+            <span class="small text-muted">按月分析群聊，按成员生成画像；已有结果会命中缓存。</span>
+            <details class="analysis-options ms-auto">
+                <summary>单项分析与费用</summary>
+                <div class="d-flex gap-2 flex-wrap mt-2">
+                    <button class="btn btn-outline-primary btn-sm btn-analyze" data-dim="group_dynamics" data-orig="群聊动态">群聊动态</button>
+                    <button class="btn btn-outline-primary btn-sm btn-analyze" data-dim="group_topics" data-orig="群聊话题">群聊话题</button>
+                    <button class="btn btn-outline-primary btn-sm btn-analyze" data-dim="group_emotion" data-orig="群聊情绪">群聊情绪</button>
+                    <button class="btn btn-outline-primary btn-sm btn-analyze" data-dim="member_profiles" data-orig="成员画像">成员画像</button>
+                </div>
+                <label class="form-check mb-0 mt-2">
+                    <input class="form-check-input me-2" type="checkbox" id="forceRefresh">
+                    <span class="form-check-label small">忽略缓存，重新调用 API（会产生费用）</span>
+                </label>
+            </details>
         </div>
         <div id="analyzeStatus" class="mt-3" role="status" aria-live="polite"></div>
         <div class="mt-3"><a href="/report" class="btn btn-outline-primary btn-sm">查看完整报告</a></div>
     </div>
 </div>
 {% else %}
-<div class="alert alert-warning small">未配置 API Key：本地统计照常可用，AI 维度需要先在 .env 里配置 Key。</div>
+<div class="alert alert-info small" id="analysisPanel">本地群聊统计无需 API Key。配置 Key 后，可运行群聊动态、话题、情绪和成员画像分析。</div>
 {% endif %}
 
 <div class="card mb-4" id="analysisResults">
     <div class="card-header">群聊动态</div>
-    <div class="card-body" id="sec-dynamics"><div class="text-muted small">尚未分析（或命中缓存后自动显示）</div></div>
+    <div class="card-body" id="sec-dynamics">
+        {% set analysis_empty_dim = 'group_dynamics' %}{% set analysis_empty_description = '群聊节奏和互动变化会显示在这里。' %}{% set analysis_empty_unconfigured_description = analysis_empty_description %}{% include "_analysis_empty.html" %}
+    </div>
 </div>
 <div class="card mb-4">
     <div class="card-header">群聊话题</div>
-    <div class="card-body" id="sec-topics"><div class="text-muted small">尚未分析</div></div>
+    <div class="card-body" id="sec-topics">
+        {% set analysis_empty_dim = 'group_topics' %}{% set analysis_empty_description = '群聊主题与话题变化会显示在这里。' %}{% set analysis_empty_unconfigured_description = analysis_empty_description %}{% include "_analysis_empty.html" %}
+    </div>
 </div>
 <div class="card mb-4">
     <div class="card-header">群聊情绪</div>
-    <div class="card-body" id="sec-emotion"><div class="text-muted small">尚未分析</div></div>
+    <div class="card-body" id="sec-emotion">
+        {% set analysis_empty_dim = 'group_emotion' %}{% set analysis_empty_description = '群聊情绪强度和逐月判断会显示在这里。' %}{% set analysis_empty_unconfigured_description = analysis_empty_description %}{% include "_analysis_empty.html" %}
+    </div>
 </div>
 <div class="card mb-4">
     <div class="card-header">成员画像</div>
-    <div class="card-body" id="sec-profiles"><div class="text-muted small">尚未分析</div></div>
+    <div class="card-body" id="sec-profiles">
+        {% set analysis_empty_dim = 'member_profiles' %}{% set analysis_empty_description = '成员画像完成后会显示在这里。' %}{% set analysis_empty_unconfigured_description = analysis_empty_description %}{% include "_analysis_empty.html" %}
+    </div>
 </div>
 {% endblock %}
 

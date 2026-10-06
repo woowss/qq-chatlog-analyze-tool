@@ -17,7 +17,7 @@
 
 /* ==========================================================================
    视觉基调对齐 AList（Hope UI / antd 体系）：
-   - 主色 #1890ff（AList 默认主色，官方文档 config/style）
+   - 主色基于 #1890ff（AList 默认蓝）；浅色主题加深文字色，深色主题切换为浅蓝
    - 页面底色 / 卡片色 / 圆角 8px：与 AList 深色主题实测值一致
      （body #151718、surface #202425）
    - 卡片走"纸面 + 轻投影"，导航为带阴影的表面条，右上角提供日/夜切换
@@ -34,11 +34,11 @@
     color-scheme: light;
 
     /* 品牌色 */
-    --primary: #1890ff;
-    --primary-hover: #40a9ff;
-    --primary-active: #096dd9;
-    --primary-weak: #e6f7ff;
-    --primary-border: #91d5ff;
+    --primary: #096dd9;
+    --primary-hover: #0050b3;
+    --primary-active: #003a8c;
+    --primary-weak: #e6f4ff;
+    --primary-border: #91caff;
 
     /* 中性色 */
     --bg: #f5f5f5;
@@ -47,8 +47,8 @@
     --border: #e8e8e8;
     --divider: #f0f0f0;
     --text: rgba(0, 0, 0, .85);
-    --text-secondary: rgba(0, 0, 0, .45);
-    --text-disabled: rgba(0, 0, 0, .25);
+    --text-secondary: #666666;
+    --text-disabled: #767676;
     --hover-bg: rgba(0, 0, 0, .03);
 
     /* 语义色 */
@@ -71,15 +71,15 @@
 
     /* 图表（canvas 不认 CSS 变量，charts.js 读取后再用） */
     --chart-1: #1890ff;
-    --chart-2: #fa8c16;
-    --chart-axis: rgba(0, 0, 0, .45);
+    --chart-2: #ad4e00;
+    --chart-axis: #666666;
     --chart-split: #f0f0f0;
     --chart-tooltip-bg: rgba(255, 255, 255, .96);
     --chart-tooltip-border: #e8e8e8;
     --chart-tooltip-text: rgba(0, 0, 0, .85);
     --chart-heat-low: #f0f5ff;
     --chart-heat-mid: #91d5ff;
-    --chart-heat-high: #1890ff;
+    --chart-heat-high: #096dd9;
 
     /* Bootstrap 变量桥接：让内置组件跟随主题 */
     --bs-body-bg: var(--bg);
@@ -92,8 +92,11 @@
 [data-theme="dark"] {
     color-scheme: dark;
 
-    --primary-weak: rgba(24, 144, 255, .16);
-    --primary-border: rgba(24, 144, 255, .35);
+    --primary: #69b1ff;
+    --primary-hover: #91caff;
+    --primary-active: #40a9ff;
+    --primary-weak: rgba(9, 109, 217, .18);
+    --primary-border: rgba(145, 202, 255, .42);
 
     --bg: #151718;
     --surface: #202425;
@@ -101,8 +104,8 @@
     --border: #2a2e2f;
     --divider: #262a2b;
     --text: rgba(255, 255, 255, .88);
-    --text-secondary: rgba(255, 255, 255, .48);
-    --text-disabled: rgba(255, 255, 255, .3);
+    --text-secondary: #b8c0c8;
+    --text-disabled: #a2adb8;
     --hover-bg: rgba(255, 255, 255, .05);
 
     --success-weak: rgba(82, 196, 26, .14);
@@ -116,14 +119,21 @@
     --shadow-1: 0 1px 2px rgba(0, 0, 0, .3);
     --shadow-2: 0 2px 10px rgba(0, 0, 0, .45);
 
-    --chart-axis: rgba(255, 255, 255, .55);
+    --chart-axis: #b8c0c8;
     --chart-split: #2a2e2f;
     --chart-tooltip-bg: rgba(32, 36, 37, .96);
     --chart-tooltip-border: #2a2e2f;
     --chart-tooltip-text: rgba(255, 255, 255, .88);
     --chart-heat-low: #1c2733;
     --chart-heat-mid: #1d4e7a;
-    --chart-heat-high: #1890ff;
+    --chart-heat-high: #096dd9;
+}
+
+[data-theme="dark"] .btn-primary {
+    --bs-btn-color: #052f4a;
+    --bs-btn-hover-color: #052f4a;
+    --bs-btn-active-color: #052f4a;
+    --bs-btn-disabled-color: #052f4a;
 }
 
 /* ------------------------------------------------------------------ 基础 */
@@ -132,7 +142,7 @@ body {
     color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
                  "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
-    font-size: 14px;
+    font-size: 15px;
     line-height: 1.6;
     transition: background-color .2s ease, color .2s ease;
 }
@@ -144,6 +154,17 @@ h5 { font-size: .95rem; }
 
 a { color: var(--primary); text-decoration: none; }
 a:hover { color: var(--primary-hover); text-decoration: none; }
+
+:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        scroll-behavior: auto !important;
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: .01ms !important;
+    }
+}
 
 code {
     background: var(--hover-bg);
@@ -257,6 +278,10 @@ hr { border-color: var(--divider); opacity: 1; }
 .status-dot.ok { background: var(--success); }
 .status-dot.warn { background: var(--warning); }
 
+.analysis-subnav { display: flex; align-items: center; gap: .4rem; overflow-x: auto; padding: 0 0 .35rem; scrollbar-width: thin; }
+.analysis-subnav a { display: inline-flex; align-items: center; min-height: 36px; padding: .38rem .8rem; border-radius: 999px; color: var(--text-secondary); background: var(--surface); border: 1px solid var(--border); white-space: nowrap; font-size: .88rem; }
+.analysis-subnav a:hover, .analysis-subnav a.active { color: var(--primary); background: var(--primary-weak); border-color: var(--primary-border); }
+
 .icon-btn {
     width: 32px;
     height: 32px;
@@ -369,10 +394,11 @@ hr { border-color: var(--divider); opacity: 1; }
     --bs-btn-hover-border-color: var(--danger);
 }
 .btn-success {
-    --bs-btn-bg: var(--success);
+    --bs-btn-color: #102a05;
+    --bs-btn-bg: #a5d96a;
     --bs-btn-border-color: var(--success);
-    --bs-btn-hover-bg: #73d13d;
-    --bs-btn-hover-border-color: #73d13d;
+    --bs-btn-hover-bg: #8ac64b;
+    --bs-btn-hover-border-color: #8ac64b;
 }
 
 /* ------------------------------------------------------------------ 表单 */
@@ -386,7 +412,7 @@ hr { border-color: var(--divider); opacity: 1; }
     background: var(--surface);
     color: var(--text);
     border-color: var(--primary);
-    box-shadow: 0 0 0 2px rgba(24, 144, 255, .15);
+    box-shadow: 0 0 0 2px rgba(9, 109, 217, .18);
 }
 .form-control::placeholder { color: var(--text-disabled); }
 .form-check-input { background-color: var(--surface); border-color: var(--border); }
@@ -432,6 +458,9 @@ hr { border-color: var(--divider); opacity: 1; }
 }
 .upload-zone:hover, .upload-zone.drag-over { border-color: var(--primary); background: var(--primary-weak); }
 .upload-hint { color: var(--text-secondary); font-size: .875rem; margin-bottom: .8rem; }
+
+.upload-shell { max-width: 680px; }
+.upload-api-note { border-left: 3px solid var(--primary-border); }
 
 /* ------------------------------------------------------------ 进度反馈 */
 .progress { height: 6px; background: var(--hover-bg); border-radius: 3px; }
@@ -506,13 +535,13 @@ li { margin-bottom: .15rem; }
 .msg-list { border: 1px solid var(--border, #e8e8e8); border-radius: 6px; }
 .msg-row { padding: .3rem .6rem; font-size: .85rem; border-bottom: 1px solid var(--border, #e8e8e8); cursor: pointer; word-break: break-all; }
 .msg-row:last-child { border-bottom: none; }
-.msg-row:hover { background: var(--hover, rgba(24, 144, 255, .06)); }
+.msg-row:hover { background: var(--hover-bg); }
 .msg-time { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
 .msg-who { font-weight: 600; }
 .msg-body { color: var(--text, inherit); }
 .msg-system, .msg-recalled { opacity: .55; }
 .msg-recalled .msg-body { text-decoration: line-through; text-decoration-thickness: 1px; }
-.msg-hit { background: var(--hit, rgba(250, 140, 22, .16)); }
+.msg-hit { background: var(--primary-weak); }
 .media-breakdown, .media-storage {
     display: flex;
     flex-wrap: wrap;
@@ -544,6 +573,51 @@ li { margin-bottom: .15rem; }
     outline-offset: -2px;
 }
 .msg-row[role="button"]:active { background: var(--primary-weak); }
+
+.day-divider { display: flex; align-items: center; gap: .65rem; padding: .75rem .65rem .4rem; color: var(--text-secondary); font-size: .8rem; }
+.day-divider::after { content: ""; height: 1px; flex: 1; background: var(--divider); }
+.context-dialog { width: min(720px, calc(100vw - 28px)); max-width: none; max-height: min(82dvh, 760px); border: 1px solid var(--border); border-radius: var(--radius); padding: 0; color: var(--text); background: var(--surface); box-shadow: var(--shadow-2); }
+.context-dialog::backdrop { background: rgba(12, 18, 28, .55); }
+.context-dialog-header { position: sticky; top: 0; z-index: 1; display: flex; justify-content: space-between; align-items: center; gap: 1rem; padding: 1rem; background: var(--surface); border-bottom: 1px solid var(--divider); }
+.context-dialog-header h3 { margin: 0; font-size: 1rem; }
+.context-dialog-body { padding: .5rem .75rem; }
+.context-dialog .msg-list { max-height: 62dvh; overflow: auto; }
+.table-scroll { overflow-x: auto; overscroll-behavior-inline: contain; -webkit-overflow-scrolling: touch; }
+.table-scroll > table { min-width: 560px; }
+.group-interaction-scroll > table { min-width: 680px; }
+.table-scroll .sticky-first { position: sticky; left: 0; z-index: 1; min-width: 92px; background: var(--surface); }
+.table-scroll thead .sticky-first { z-index: 2; background: var(--surface-2); }
+.analysis-empty { display: flex; align-items: flex-start; gap: .8rem; padding: 1rem; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); }
+.analysis-empty-mark { flex: 0 0 .55rem; width: .55rem; height: .55rem; margin-top: .46rem; border-radius: 50%; background: var(--primary); }
+.analysis-empty[data-state="error"] .analysis-empty-mark { background: var(--danger); }
+.analysis-empty[data-state="running"] .analysis-empty-mark,
+.analysis-empty[data-state="checking"] .analysis-empty-mark { background: var(--warning); }
+.analysis-empty-title { font-weight: 600; }
+.analysis-empty-description { margin: .2rem 0 0; font-size: .9rem; color: var(--text-secondary); }
+.analysis-empty-action { display: inline-block; margin-top: .45rem; font-size: .88rem; }
+.analysis-options summary { color: var(--text-secondary); font-size: .84rem; cursor: pointer; }
+.analysis-options[open] summary { color: var(--primary); }
+.media-details { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: .5rem .65rem; background: var(--surface-2); text-align: left; }
+.media-details summary { color: var(--text-secondary); font-size: .8rem; cursor: pointer; }
+.media-details[open] summary { margin-bottom: .45rem; color: var(--primary); }
+.media-details .media-breakdown,
+.media-details .media-storage { justify-content: center; font-size: .77rem; line-height: 1.7; }
+
+@media (max-width: 575.98px) {
+    .analysis-subnav { margin-left: -.15rem; margin-right: -.15rem; }
+    .analysis-subnav a { min-height: 38px; }
+    .upload-shell > .card > .card-body { padding: 1.2rem; }
+    .upload-zone { padding: 26px 14px; }
+    .upload-zone .btn { width: 100%; margin: .25rem 0 !important; }
+    #summaryMetrics .col-6 { padding-left: .4rem; padding-right: .4rem; }
+    .stat-card .card-body { min-height: 88px; }
+    .group-relation-chart { height: 300px !important; }
+    .group-overview-chart,
+    .group-activity-chart,
+    .group-topic-chart,
+    .group-emotion-chart { height: 280px !important; }
+    .context-dialog-body { padding: .4rem; }
+}
 
 @media (max-width: 768px) {
     .stat-value { font-size: 1.4rem; }

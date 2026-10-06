@@ -1,0 +1,17 @@
+{% if api_ok %}
+<div class="card mb-4 analysis-controls" id="analysisControls">
+    <div class="card-body">
+        <div class="d-flex align-items-center gap-3 flex-wrap">
+            <button class="btn btn-primary" id="inPageAnalyze" data-orig="{{ analysis_button_label }}">{{ analysis_button_label }}</button>
+            <div id="inPageStatus" class="small text-muted" role="status" aria-live="polite"></div>
+            <details class="analysis-options ms-auto">
+                <summary>重新分析与费用</summary>
+                <label class="form-check mb-0 mt-2">
+                    <input class="form-check-input" type="checkbox" id="inPageRefresh">
+                    <span class="form-check-label small">忽略缓存，重新调用 API（会产生费用）</span>
+                </label>
+            </details>
+        </div>
+    </div>
+</div>
+{% endif %}

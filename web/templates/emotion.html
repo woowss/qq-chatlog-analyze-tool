@@ -19,24 +19,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {% block content %}
 <h2 class="page-title">情绪分析</h2>
 
-{% if not api_ok %}
-<div class="alert alert-warning">未配置 API Key，无法运行 AI 分析；本地统计功能不受影响。</div>
-{% endif %}
+{% set analysis_button_label = '运行情绪分析' %}
+{% include "_analysis_controls.html" %}
 
-{% if api_ok %}
-{# 页内运行本维度分析：不必"回仪表盘→点按钮→再跳回来"（群聊页早就是这个模式） #}
-<div class="card mb-4">
-    <div class="card-body d-flex align-items-center gap-3 flex-wrap">
-        <button class="btn btn-primary" id="inPageAnalyze" data-orig="运行情绪分析">运行情绪分析</button>
-        <div class="form-check mb-0">
-            <input class="form-check-input" type="checkbox" id="inPageRefresh">
-            <label class="form-check-label small text-muted" for="inPageRefresh">强制重新分析（忽略缓存，会产生 API 费用）</label>
-        </div>
-        <div id="inPageStatus" class="ms-auto" role="status" aria-live="polite"></div>
-    </div>
-</div>
-{% endif %}
-
+<div id="emotionVisuals" class="d-none">
 <div class="row mb-4">
     <div class="col-12">
         <div class="card">
@@ -66,20 +52,28 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         </div>
     </div>
 </div>
+</div>
 
 <div class="card mb-4">
     <div class="card-header">逐月情绪详情</div>
     <div class="card-body" id="emotionDetails">
-        <p class="text-muted text-center">尚无分析结果。{% if api_ok %}点上方「运行情绪分析」，{% else %}配置 API Key 后，{% endif %}结果会显示在这里。</p>
+        {% set analysis_empty_dim = 'emotion' %}
+        {% set analysis_empty_description = '逐月强度曲线和情绪摘要会随分析结果显示在这里。' %}
+        {% include "_analysis_empty.html" %}
     </div>
 </div>
 
 <script>
 $(function() {
+    function render(data) {
+        if (!data) return;
+        $('#emotionVisuals').removeClass('d-none');
+        renderEmotionCharts(data);
+    }
     loadAnalysis('emotion', function(data) {
-        if (data) renderEmotionCharts(data);
+        render(data);
     });
-    analyzeInPage('emotion', renderEmotionCharts);
+    analyzeInPage('emotion', render);
 });
 </script>
 {% endblock %}

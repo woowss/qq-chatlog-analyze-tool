@@ -19,6 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 {% block content %}
 <h2 class="page-title">总览仪表盘 <span class="sub">{{ chat_name }}</span></h2>
+<p class="dashboard-meta text-muted small mb-3">{{ milestones.first_day }} 至 {{ milestones.last_day }} · 记录跨度 {{ overview.total_days }} 天 · 实际活跃 {{ overview.active_days }} 天</p>
 <nav class="page-jump-nav mb-3" aria-label="仪表盘快捷导航">
     <a href="#summaryMetrics">统计概览</a>
     <a href="#overviewCharts">图表分析</a>
@@ -49,7 +50,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {%- endif %}
 
 <div class="row mb-4" id="summaryMetrics">
-    <div class="col-md-3 mb-3">
+    <div class="col-6 col-md-3 mb-3">
         <div class="card stat-card text-center h-100">
             <div class="card-body">
                 <div class="stat-value">{{ overview.total_messages }}</div>
@@ -57,15 +58,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             </div>
         </div>
     </div>
-    <div class="col-md-3 mb-3">
+    <div class="col-6 col-md-3 mb-3">
         <div class="card stat-card text-center h-100">
             <div class="card-body">
-                <div class="stat-value">{{ overview.total_days }}</div>
-                <div class="stat-label">聊天天数<br><small class="text-muted">其中 {{ overview.active_days }} 天有聊天</small></div>
+                <div class="stat-value">{{ overview.active_days }}</div>
+                <div class="stat-label">实际活跃天数</div>
             </div>
         </div>
     </div>
-    <div class="col-md-3 mb-3">
+    <div class="col-6 col-md-3 mb-3">
         <div class="card stat-card text-center h-100">
             <div class="card-body">
                 <div class="stat-value">{{ overview.avg_daily }}</div>
@@ -73,54 +74,38 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             </div>
         </div>
     </div>
-    <div class="col-md-3 mb-3">
+    <div class="col-6 col-md-3 mb-3">
         <div class="card stat-card text-center h-100">
             <div class="card-body">
-                <div class="stat-value">{{ overview.total_images }}</div>
-                <div class="stat-label">图片总数</div>
-                <small class="media-breakdown text-muted">
-                    <span>视频 {{ overview.get('total_videos', 0) }}</span>
-                    <span>文件 {{ overview.get('total_files', 0) }}</span>
-                    <span>转发 {{ overview.get('total_forwards', 0) }}</span>
-                    <span>语音 {{ overview.get('total_voices', 0) }}</span>
-                    <span>表情 {{ overview.get('total_faces', 0) }}</span>
-                    <span>撤回 {{ overview.get('total_recalls', 0) }}</span>
-                </small>
-                <small class="media-storage">
-                    <span>图片 {{ overview.get('image_bytes', 0) | filesizeformat }}</span>
-                    <span>其他媒体 {{ overview.get('other_media_bytes', 0) | filesizeformat }}</span>
-                    {% if overview.get('unique_images') %}
-                    <span>去重后 {{ overview.get('unique_images') }} 张</span>
-                    {% endif %}
-                </small>
+                <div class="stat-value">{{ exchange_rounds if exchange_rounds is not none else '—' }}</div>
+                <div class="stat-label">对话轮次</div>
             </div>
         </div>
     </div>
 </div>
+
+<details class="media-details mb-4">
+    <summary>媒体与图片 · 图片 {{ overview.total_images }} · 文件 {{ overview.get('total_files', 0) }} · 视频 {{ overview.get('total_videos', 0) }}</summary>
+    <small class="media-breakdown text-muted">
+        <span>图片 {{ overview.total_images }}</span>
+        <span>视频 {{ overview.get('total_videos', 0) }}</span>
+        <span>文件 {{ overview.get('total_files', 0) }}</span>
+        <span>转发 {{ overview.get('total_forwards', 0) }}</span>
+        <span>语音 {{ overview.get('total_voices', 0) }}</span>
+        <span>表情 {{ overview.get('total_faces', 0) }}</span>
+        <span>撤回 {{ overview.get('total_recalls', 0) }}</span>
+        <span>图片体积 {{ overview.get('image_bytes', 0) | filesizeformat }}</span>
+        <span>其他媒体体积 {{ overview.get('other_media_bytes', 0) | filesizeformat }}</span>
+        {% if overview.get('unique_images') %}<span>去重后 {{ overview.get('unique_images') }} 张</span>{% endif %}
+    </small>
+</details>
 
 <div class="row mb-4" id="overviewCharts">
-    <div class="col-md-6 mb-3">
+    <div class="col-12 mb-4">
         <div class="card">
-            <div class="card-header">双方消息对比</div>
-            <div class="card-body">
-                <div id="messageRatioChart" style="height: 300px;"></div>
-            </div>
+            <div class="card-header" id="dailyChartTitle">消息量趋势</div>
+            <div class="card-body"><div id="dailyChart" style="height: 320px;"></div></div>
         </div>
-    </div>
-    <div class="col-md-6 mb-3">
-        <div class="card">
-            <div class="card-header">发言字数对比</div>
-            <div class="card-body">
-                <div id="charRatioChart" style="height: 300px;"></div>
-            </div>
-        </div>
-    </div>
-</div>
-
-<div class="card mb-4">
-    <div class="card-header" id="dailyChartTitle">消息量</div>
-    <div class="card-body">
-        <div id="dailyChart" style="height: 350px;"></div>
     </div>
 </div>
 
@@ -133,6 +118,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </div>
 </div>
 {% endif %}
+
+<div class="card mb-4">
+    <div class="card-header">双方消息与字数对比</div>
+    <div class="card-body"><div id="comparisonChart" style="height: 220px;"></div></div>
+</div>
 
 {% set nh = trends.name_history or {} %}
 {% set other_names = nh.get('other') or [] %}
@@ -280,19 +270,25 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         <p class="text-muted small mb-3">
             按维度调用 LLM 分析聊天记录。已分析过的维度会命中本地缓存，不重复计费。
         </p>
-        <div class="d-flex gap-2 flex-wrap">
-            <button class="btn btn-outline-primary btn-analyze" data-dim="emotion" data-orig="情绪分析">情绪分析</button>
-            <button class="btn btn-outline-primary btn-analyze" data-dim="relationship" data-orig="人际关系">人际关系</button>
-            <button class="btn btn-outline-primary btn-analyze" data-dim="habits" data-orig="个人习惯">个人习惯</button>
-            <button class="btn btn-outline-primary btn-analyze" data-dim="topics" data-orig="话题趋势">话题趋势</button>
-            <button class="btn btn-outline-primary btn-analyze" data-dim="profile" data-orig="人物锐评">人物锐评</button>
-            <button class="btn btn-outline-primary btn-analyze" data-dim="recap" data-orig="整体总括" title="跨月全量的一次调用：看完整条时间线再下结论，约一次维度的 1/5 成本">整体总括</button>
+        <div class="d-flex gap-2 flex-wrap align-items-center">
             <button class="btn btn-primary" id="btn-analyze-all">全量分析</button>
-            <button class="btn btn-outline-secondary" id="btn-api-test" title="发一个真实最小请求（输出 1 token）验证端点、Key 与模型名">测试连通</button>
-        </div>
-        <div class="form-check mt-3">
-            <input class="form-check-input" type="checkbox" id="forceRefresh">
-            <label class="form-check-label small text-muted" for="forceRefresh">强制重新分析（忽略缓存，会产生 API 费用）</label>
+            <span class="small text-muted">按顺序完成所有维度，已有结果会命中缓存。</span>
+            <details class="analysis-options ms-auto">
+                <summary>单项分析与费用</summary>
+                <div class="d-flex gap-2 flex-wrap mt-2">
+                    <button class="btn btn-outline-primary btn-sm btn-analyze" data-dim="emotion" data-orig="情绪分析">情绪分析</button>
+                    <button class="btn btn-outline-primary btn-sm btn-analyze" data-dim="relationship" data-orig="人际关系">人际关系</button>
+                    <button class="btn btn-outline-primary btn-sm btn-analyze" data-dim="habits" data-orig="个人习惯">个人习惯</button>
+                    <button class="btn btn-outline-primary btn-sm btn-analyze" data-dim="topics" data-orig="话题趋势">话题趋势</button>
+                    <button class="btn btn-outline-primary btn-sm btn-analyze" data-dim="profile" data-orig="人物锐评">人物锐评</button>
+                    <button class="btn btn-outline-primary btn-sm btn-analyze" data-dim="recap" data-orig="整体总括" title="跨月全量的一次调用：看完整条时间线再下结论，约一次维度的 1/5 成本">整体总括</button>
+                    <button class="btn btn-outline-secondary btn-sm" id="btn-api-test" title="发一个真实最小请求（输出 1 token）验证端点、Key 与模型名">测试连通</button>
+                </div>
+                <label class="form-check mb-0 mt-2">
+                    <input class="form-check-input me-2" type="checkbox" id="forceRefresh">
+                    <span class="form-check-label small">忽略缓存，重新调用 API（会产生费用）</span>
+                </label>
+            </details>
         </div>
         <div id="apiTestMsg" class="mt-2"></div>
         <div id="analyzeStatus" class="mt-3" role="status" aria-live="polite"></div>
@@ -526,16 +522,7 @@ $('#btn-delete-chat').on('click', function() {
 </script>
 
 <script>
-renderPieChart('messageRatioChart', [
-    {name: {{ overview.self_name | tojson }}, value: {{ overview.self_count }}},
-    {name: {{ overview.other_name | tojson }}, value: {{ overview.other_count }}}
-], '消息数');
-
-renderPieChart('charRatioChart', [
-    {name: {{ overview.self_name | tojson }}, value: {{ overview.self_chars }}},
-    {name: {{ overview.other_name | tojson }}, value: {{ overview.other_chars }}}
-], '字数');
-
+renderComparisonChart('comparisonChart', {{ overview | tojson }});
 renderLineChart('dailyChart', {{ daily_counts | tojson }}, '消息数');
 renderBarChart('hourlyChart', {{ hourly_dist | tojson }}, '消息数');
 renderWeeklyChart('weeklyChart', {{ weekly_dist | tojson }}, '消息数');

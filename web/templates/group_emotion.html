@@ -27,32 +27,36 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 <div class="card mb-4">
     <div class="card-header">群情绪强度走势 <small class="text-muted ms-2">来自各月 AI 判断（1-10，5 为中性）</small></div>
-    <div class="card-body"><div id="emotionTrend" style="height: 320px;"></div></div>
+    <div class="card-body">
+        <div id="emotionTrendEmpty" class="small text-muted" role="status">生成情绪分析后，这里会显示逐月情绪强度走势。</div>
+        <div id="emotionTrend" class="group-emotion-chart d-none" style="height: 320px;"></div>
+    </div>
 </div>
 
 <div class="card mb-4">
     <div class="card-header">成员活跃时段对比 <small class="text-muted ms-2">"什么时候说话"是情绪的一种侧写</small></div>
-    <div class="card-body"><div id="memberHourly" style="height: 320px;"></div></div>
+    <div class="card-body"><div id="memberHourly" class="group-emotion-chart" style="height: 320px;"></div></div>
 </div>
 
-{% if api_ok %}
-<div class="card mb-4">
+<div class="card mb-4" id="analysisPanel">
     <div class="card-header">群聊情绪</div>
     <div class="card-body">
-        <div class="d-flex gap-2 flex-wrap mb-3">
+        {% if api_ok %}<div class="d-flex gap-2 flex-wrap mb-3">
             <button class="btn btn-outline-primary btn-analyze" data-dim="group_emotion" data-orig="分析群聊情绪" data-target="sec-emotion">分析群聊情绪</button>
-            <div class="form-check ms-2 d-flex align-items-center">
-                <input class="form-check-input me-2" type="checkbox" id="forceRefresh">
-                <label class="form-check-label small text-muted" for="forceRefresh">强制重分析（会产生 API 费用）</label>
-            </div>
-        </div>
+            <details class="analysis-options">
+                <summary>重新分析与费用</summary>
+                <label class="form-check mb-0 mt-2">
+                    <input class="form-check-input me-2" type="checkbox" id="forceRefresh">
+                    <span class="form-check-label small">忽略缓存，重新调用 API（会产生费用）</span>
+                </label>
+            </details>
+        </div>{% endif %}
         <div id="analyzeStatus"></div>
-        <div id="sec-emotion" class="mt-3"><div class="text-muted small">尚未分析（命中缓存则自动显示）</div></div>
+        <div id="sec-emotion" class="mt-3">
+            {% set analysis_empty_dim = 'group_emotion' %}{% set analysis_empty_description = '群聊情绪强度和逐月判断会显示在这里。' %}{% include "_analysis_empty.html" %}
+        </div>
     </div>
 </div>
-{% else %}
-<div class="alert alert-warning small">未配置 API Key：本地统计照常可用。</div>
-{% endif %}
 
 {% endblock %}
 
@@ -62,29 +66,11 @@ const MEMBERS = {{ member_activity | tojson }};
 renderMemberHourlyArea('memberHourly', {{ member_hourly | tojson }});
 loadAnalysis('group_emotion', function (data) {
     if (!data) return;
-    // #sec-emotion 只在 api_ok 为真时渲染（未配 Key 时整张卡片不存在），而
-    // /api/analysis/<维度> 不看 Key：只要盘上/别处的 sessionStorage 里有旧结果就照样发过来。
-    // 于是"以前配过 Key、现在撤掉了"这台机器上，这个回调拿到的是**有数据、容器为 null**，
-    // renderGroupEmotion 在 container.innerHTML 处抛 TypeError —— 而它下面那行
-    // mountChart('emotionTrend') 就再也不会执行：一句判空缺失，把本地统计的走势图
-    // 一起带走了（其余群页面统一走 loadGroupAnalysis，它开头就 `if (!container) return`）。
     var box = document.getElementById('sec-emotion');
     if (box) renderGroupEmotion(box, data);
-    var months = Object.keys(data).sort();
     var chart = mountChart('emotionTrend');
     if (!chart) return;
-    chart.setOption(applyChartTheme({
-        tooltip: { trigger: 'axis' },
-        grid: { left: 8, right: 16, top: 24, bottom: 24, containLabel: true },
-        xAxis: { type: 'category', data: months },
-        yAxis: { type: 'value', min: 0, max: 10, name: '强度' },
-        series: [{
-            type: 'line', smooth: true, symbolSize: 8, areaStyle: { opacity: 0.18 },
-            label: { show: true, color: T.text, fontSize: 11,
-                     formatter: function (p) { return (data[months[p.dataIndex]] || {}).group_emotion || ''; } },
-            data: months.map(function (m) { return (data[m] || {}).group_intensity || 0; })
-        }]
-    }));
+    renderGroupEmotionTrend(data, chart);
 });
 wireGroupAnalyzeButtons(MEMBERS);
 </script>
