@@ -28,7 +28,7 @@ function esc(s) {
 }
 
 // ---------------------------------------------------------------- 主题
-// AList 同款设计语言：主色 #1890ff，深浅两套由 CSS 变量提供。
+// AList 同款设计语言：主色与深浅变化由 CSS 主题变量提供。
 // canvas 不认 var()，所以统一在这里读取一次并注入每个图表的 option。
 function themeTokens() {
     var cs = getComputedStyle(document.documentElement);
@@ -201,6 +201,40 @@ function renderPieChart(domId, data, name) {
             emphasis: { itemStyle: { shadowBlur: 10, shadowColor: 'rgba(0,0,0,0.2)' } }
         }]
     });
+}
+
+function renderComparisonChart(domId, overview) {
+    var chart = mountChart(domId);
+    if (!chart) return;
+    var people = [overview.self_name || '我', overview.other_name || '对方'];
+    var counts = [Number(overview.self_count) || 0, Number(overview.other_count) || 0];
+    var chars = [Number(overview.self_chars) || 0, Number(overview.other_chars) || 0];
+    function shares(values) {
+        var total = values[0] + values[1];
+        return total ? values.map(function (v) { return Math.round(v / total * 1000) / 10; }) : [0, 0];
+    }
+    var countShares = shares(counts), charShares = shares(chars);
+    chart.setOption(applyChartTheme({
+        color: [T.primary, T.accent2],
+        tooltip: {
+            trigger: 'axis', axisPointer: { type: 'shadow' },
+            formatter: function (items) {
+                var i = items[0].dataIndex;
+                var values = i === 0 ? counts : chars;
+                return esc(items[0].axisValue) + '<br>' +
+                    esc(people[0]) + '：' + Number(values[0]).toLocaleString() + '（' + items[0].value + '%）<br>' +
+                    esc(people[1]) + '：' + Number(values[1]).toLocaleString() + '（' + items[1].value + '%）';
+            }
+        },
+        legend: { bottom: 0, data: people },
+        grid: { left: 8, right: 22, top: 12, bottom: 35, containLabel: true },
+        xAxis: { type: 'value', max: 100, axisLabel: { formatter: '{value}%' }, splitLine: { show: false } },
+        yAxis: { type: 'category', data: ['消息数量', '发言字数'] },
+        series: [
+            { name: people[0], type: 'bar', stack: 'people', barMaxWidth: 28, label: { show: true, formatter: '{c}%', color: '#fff' }, data: [countShares[0], charShares[0]] },
+            { name: people[1], type: 'bar', stack: 'people', barMaxWidth: 28, label: { show: true, formatter: '{c}%', color: '#fff' }, data: [countShares[1], charShares[1]] }
+        ]
+    }));
 }
 
 // 日线聚合：消息只出现在少数日子时，类目轴会把空档压平（首末相隔 100 天可能只画 3 个点）。

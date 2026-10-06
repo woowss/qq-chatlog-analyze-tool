@@ -1,0 +1,32 @@
+{% set empty_title = analysis_empty_unconfigured_title|default('尚未生成 AI 分析') %}
+{% set empty_description = analysis_empty_description|default('分析完成后，结果会显示在这里。') %}
+{% set unconfigured_description = analysis_empty_unconfigured_description|default(empty_description ~ ' 配置 API Key 后即可运行 AI 分析。') %}
+<div class="analysis-empty" data-analysis-empty="{{ analysis_empty_dim }}"
+     data-state="{{ 'checking' if api_ok else 'unconfigured' }}"
+     data-api-configured="{{ 'true' if api_ok else 'false' }}"
+     data-unconfigured-title="{{ empty_title }}"
+     data-empty-title="尚未生成 AI 分析"
+     data-checking-title="正在读取已保存的分析结果…"
+     data-running-title="正在分析…"
+     data-ready-title="分析已完成"
+     data-error-title="未能读取分析结果"
+     data-empty-description="{{ empty_description }}"
+     data-checking-description="正在从本机读取已保存结果。"
+     data-running-description="结果生成后会自动显示在这里。"
+     data-ready-description="分析结果已加载。"
+     data-error-description="读取结果遇到问题。刷新页面再试；已有缓存不会丢失。"
+     data-unconfigured-description="{{ unconfigured_description }}"
+     role="status" aria-live="polite">
+    <span class="analysis-empty-mark" aria-hidden="true"></span>
+    <div>
+        <div class="analysis-empty-title">
+            {{ '正在读取已保存的分析结果…' if api_ok else empty_title }}
+        </div>
+        <p class="analysis-empty-description">
+            {{ empty_description if api_ok else unconfigured_description }}
+        </p>
+        {% if api_ok %}
+        <a class="analysis-empty-action" href="{{ '#analysisPanel' if is_group_chat else '#analysisControls' }}">运行分析</a>
+        {% endif %}
+    </div>
+</div>

@@ -19,25 +19,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {% block content %}
 <h2 class="page-title">人际关系</h2>
 
-{% if not api_ok %}
-<div class="alert alert-warning">未配置 API Key，无法运行 AI 分析；本地统计功能不受影响。</div>
-{% endif %}
-
-{% if api_ok %}
-<div class="card mb-4">
-    <div class="card-body d-flex align-items-center gap-3 flex-wrap">
-        <button class="btn btn-primary" id="inPageAnalyze" data-orig="运行人际关系分析">运行人际关系分析</button>
-        <div class="form-check mb-0">
-            <input class="form-check-input" type="checkbox" id="inPageRefresh">
-            <label class="form-check-label small text-muted" for="inPageRefresh">强制重新分析（忽略缓存，会产生 API 费用）</label>
-        </div>
-        <div id="inPageStatus" class="ms-auto" role="status" aria-live="polite"></div>
-    </div>
-</div>
-{% endif %}
+{% set analysis_button_label = '运行人际关系分析' %}
+{% include "_analysis_controls.html" %}
 
 <div class="row mb-4">
-    <div class="col-md-4 mb-3">
+    <div class="col-6 col-md-4 mb-3">
         <div class="card stat-card text-center h-100">
             <div class="card-body">
                 <div class="stat-value">{{ exchange_rounds if exchange_rounds is not none else '—' }}</div>
@@ -45,7 +31,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             </div>
         </div>
     </div>
-    <div class="col-md-4 mb-3">
+    <div class="col-6 col-md-4 mb-3">
         <div class="card stat-card text-center h-100">
             <div class="card-body">
                 <div class="stat-value text-primary">{{ response_time.self.p50 ~ 's' if response_time else '—' }}</div>
@@ -54,7 +40,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             </div>
         </div>
     </div>
-    <div class="col-md-4 mb-3">
+    <div class="col-6 col-md-4 mb-3">
         <div class="card stat-card text-center h-100">
             <div class="card-body">
                 <div class="stat-value text-success">{{ response_time.other.p50 ~ 's' if response_time else '—' }}</div>
@@ -87,7 +73,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <div class="card mb-4">
     <div class="card-header">AI 关系洞察</div>
     <div class="card-body" id="relationshipInsight">
-        <p class="text-muted text-center">尚无分析结果。{% if api_ok %}点上方「运行人际关系分析」，{% else %}配置 API Key 后，{% endif %}结果会显示在这里。</p>
+        {% set analysis_empty_dim = 'relationship' %}
+        {% set analysis_empty_description = '分析结果会总结对话中的互动方式和关系变化。' %}
+        {% include "_analysis_empty.html" %}
     </div>
 </div>
 

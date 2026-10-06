@@ -27,22 +27,29 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     只调用 1 次 API（成本约为单维度的五分之一），历史月份命中缓存时重开页面不重复计费。
 </p>
 
-<div class="card mb-4">
+<div class="card mb-4" id="analysisControls">
     <div class="card-body d-flex gap-2 flex-wrap align-items-center">
         <button class="btn btn-primary" id="btn-recap" {{ 'disabled' if not api_ok }}>{{ '生成整体总括' if api_ok else '未配置 API Key' }}</button>
-        <div class="form-check">
-            <input class="form-check-input me-2" type="checkbox" id="forceRefresh">
-            <label class="form-check-label small text-muted" for="forceRefresh">强制重新生成（会产生 API 费用）</label>
-        </div>
+        {% if api_ok %}
+        <details class="analysis-options ms-auto">
+            <summary>重新生成与费用</summary>
+            <label class="form-check mb-0 mt-2">
+                <input class="form-check-input me-2" type="checkbox" id="forceRefresh">
+                <span class="form-check-label small">忽略缓存，重新调用 API（会产生费用）</span>
+            </label>
+        </details>
+        {% endif %}
         <div id="recapStatus" class="flex-grow-1" role="status" aria-live="polite"></div>
     </div>
 </div>
+
+{% if not api_ok %}<div class="alert alert-info small" role="status">本地统计已可用；配置 API Key 后，可以生成跨月总括和提问角回答。</div>{% endif %}
 
 {% if api_ok %}
 <div class="card mb-4">
     <div class="card-header">
         提问角
-        <small class="text-muted">与总括同一份跨月材料：第一次问 = 1 次 API 调用，重问同一个问题免费</small>
+        <small class="text-muted">首次提问会调用 API；相同问题命中缓存后不重复计费</small>
     </div>
     <div class="card-body">
         <div class="d-flex gap-2 flex-wrap">
@@ -55,6 +62,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </div>
 </div>
 {% endif %}
+
+{% set analysis_empty_dim = 'recap' %}
+{% set analysis_empty_description = '生成跨月时间线、转折点和关键证据。' %}
+{% set analysis_empty_unconfigured_description = analysis_empty_description %}
+{% include "_analysis_empty.html" %}
 
 <div id="recapResult" class="d-none">
     <div class="card mb-4">
@@ -133,6 +145,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         var btn = $(this), status = $('#recapStatus');
         if (btn.prop('disabled')) return;
         btn.prop('disabled', true).text('生成中…');
+        setAnalysisEmptyState('recap', 'running');
         var opts = {
             refresh: $('#forceRefresh').is(':checked'),
             onProgress: function(done, total) {
@@ -141,12 +154,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             },
             onDone: function(result) {
                 sessionStorage.setItem('ai_recap', JSON.stringify(result));
+                setAnalysisEmptyState('recap', 'ready');
                 status.html('<div class="alert alert-success py-1 mb-0 small">已生成</div>');
                 btn.prop('disabled', false).text('重新生成');
                 render(result);
             },
             onError: function(msg) {
-                status.html('<div class="alert alert-danger py-1 mb-0 small">' + esc(msg) + '</div>');
+                var cancelled = msg === '分析已取消';
+                setAnalysisEmptyState('recap', cancelled ? 'empty' : 'error', cancelled ? null : msg);
+                status.html('<div class="alert alert-' + (cancelled ? 'secondary' : 'danger')
+                    + ' py-1 mb-0 small">' + esc(msg) + '</div>');
                 btn.prop('disabled', false).text('生成整体总括');
             }
         };

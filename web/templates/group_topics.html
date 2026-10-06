@@ -29,35 +29,36 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     <div class="col-md-6 mb-3">
         <div class="card h-100">
             <div class="card-header">@点名矩阵 <small class="text-muted ms-2">谁点名了谁（事实）· 纵向：被@的人；横向：点名的人</small></div>
-            <div class="card-body"><div id="mentionHeat" style="height: 380px;"></div></div>
+            <div class="card-body"><div id="mentionHeat" class="group-topic-chart" style="height: 380px;"></div></div>
         </div>
     </div>
     <div class="col-md-6 mb-3">
         <div class="card h-100">
             <div class="card-header">互动关系图 <small class="text-muted ms-2">实线=精确，虚线=推断</small></div>
-            <div class="card-body"><div id="relationGraph" style="height: 380px;"></div></div>
+            <div class="card-body"><div id="relationGraph" class="group-relation-chart" style="height: 380px;"></div></div>
         </div>
     </div>
 </div>
 
-{% if api_ok %}
-<div class="card mb-4">
+<div class="card mb-4" id="analysisPanel">
     <div class="card-header">群聊话题</div>
     <div class="card-body">
-        <div class="d-flex gap-2 flex-wrap mb-3">
+        {% if api_ok %}<div class="d-flex gap-2 flex-wrap mb-3">
             <button class="btn btn-outline-primary btn-analyze" data-dim="group_topics" data-orig="分析群聊话题" data-target="sec-topics">分析群聊话题</button>
-            <div class="form-check ms-2 d-flex align-items-center">
-                <input class="form-check-input me-2" type="checkbox" id="forceRefresh">
-                <label class="form-check-label small text-muted" for="forceRefresh">强制重分析（会产生 API 费用）</label>
-            </div>
-        </div>
+            <details class="analysis-options">
+                <summary>重新分析与费用</summary>
+                <label class="form-check mb-0 mt-2">
+                    <input class="form-check-input me-2" type="checkbox" id="forceRefresh">
+                    <span class="form-check-label small">忽略缓存，重新调用 API（会产生费用）</span>
+                </label>
+            </details>
+        </div>{% endif %}
         <div id="analyzeStatus"></div>
-        <div id="sec-topics" class="mt-3"><div class="text-muted small">尚未分析（命中缓存则自动显示）</div></div>
+        <div id="sec-topics" class="mt-3">
+            {% set analysis_empty_dim = 'group_topics' %}{% set analysis_empty_description = '群聊主题与话题变化会显示在这里。' %}{% include "_analysis_empty.html" %}
+        </div>
     </div>
 </div>
-{% else %}
-<div class="alert alert-warning small">未配置 API Key：本地统计照常可用。</div>
-{% endif %}
 
 {% endblock %}
 

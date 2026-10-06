@@ -19,73 +19,22 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {% block content %}
 <h2 class="page-title">人物锐评</h2>
 
-{% if not api_ok %}
-<div class="alert alert-warning">未配置 API Key，无法运行 AI 分析；本地统计功能不受影响。</div>
-{% endif %}
-
-{% if api_ok %}
-<div class="card mb-4">
-    <div class="card-body d-flex align-items-center gap-3 flex-wrap">
-        <button class="btn btn-primary" id="inPageAnalyze" data-orig="运行人物锐评">运行人物锐评</button>
-        <div class="form-check mb-0">
-            <input class="form-check-input" type="checkbox" id="inPageRefresh">
-            <label class="form-check-label small text-muted" for="inPageRefresh">强制重新分析（忽略缓存，会产生 API 费用）</label>
-        </div>
-        <div id="inPageStatus" class="ms-auto" role="status" aria-live="polite"></div>
-    </div>
-</div>
-{% endif %}
-
-<div id="profileLoading" class="text-center py-5 d-none">
-    <div class="spinner-border text-primary" role="status"></div>
-    <p class="mt-2 text-muted">正在分析，请稍候…</p>
-</div>
+{% set analysis_button_label = '运行人物锐评' %}
+{% include "_analysis_controls.html" %}
 
 <div id="profileContent">
     <div class="row" id="selfProfile"></div>
     <div class="row" id="otherProfile"></div>
 </div>
 
-<div class="text-center py-5" id="profilePlaceholder">
-    <div style="font-size: 4rem;"></div>
-    <p class="mt-3 text-muted">对双方各生成一份性格画像；该维度启用思考模式，约需 30 秒。</p>
-    <button class="btn btn-lg btn-primary" onclick="runProfile(false)">开始锐评</button>
-</div>
-
-<div class="text-center mb-3 d-none" id="profileRerun">
-    <button class="btn btn-sm btn-outline-secondary" onclick="runProfile(true)">重新锐评（忽略缓存，会产生 API 费用）</button>
-</div>
+{% set analysis_empty_dim = 'profile' %}
+{% set analysis_empty_description = '为双方生成带关键证据的交流风格与人物画像。' %}
+{% include "_analysis_empty.html" %}
 
 <script>
-function runProfile(refresh) {
-    $('#profilePlaceholder').hide();
-    $('#profileLoading').removeClass('d-none');
-    $('#profileContent').empty();
-    $('#profileRerun').addClass('d-none');
-
-    var opts = {
-        refresh: !!refresh,
-        onProgress: function(done, total) {
-            if (done < 0) { $('#profileLoading p').text('正在取消…'); return; }
-            if (total > 0) $('#profileLoading p').text('分析中：已完成 ' + done + '/' + total + '人');
-        },
-        onDone: function(result) {
-            $('#profileLoading').addClass('d-none');
-            sessionStorage.setItem('ai_profile', JSON.stringify(result));
-            renderProfile(result);
-            $('#profileRerun').removeClass('d-none');
-        },
-        onError: function(msg) {
-            $('#profileLoading').html('<div class="alert alert-danger">' + esc(msg) + '</div>');
-        }
-    };
-    startAnalyze('profile', opts);
-}
-
 function showProfile(data) {
-    $('#profilePlaceholder').hide();
+    setAnalysisEmptyState('profile', 'ready');
     renderProfile(data);
-    $('#profileRerun').removeClass('d-none');
 }
 
 function renderProfile(data) {

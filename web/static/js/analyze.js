@@ -198,8 +198,10 @@ function loadAnalysis(dim, cb) {
     $.get('/api/analysis/' + dim, function(data) {
         if (data && data.result) {
             try { sessionStorage.setItem('ai_' + dim, JSON.stringify(data.result)); } catch (e) { /* 配额满忽略 */ }
+            setAnalysisEmptyState(dim, 'ready');
             cb(data.result);
         } else {
+            setAnalysisEmptyState(dim, 'empty');
             cb(null);
         }
     }).fail(function(xhr) {
@@ -208,16 +210,39 @@ function loadAnalysis(dim, cb) {
         try { raw = sessionStorage.getItem('ai_' + dim); } catch (e) { raw = null; }
         var parsed = null;
         try { parsed = raw ? JSON.parse(raw) : null; } catch (e) { parsed = null; }
-        if (parsed) { cb(parsed); return; }
+        if (parsed) { setAnalysisEmptyState(dim, 'ready'); cb(parsed); return; }
         // 服务端给了人话就直接用它（例如会话过期时的"请刷新页面重新登录"），
         // 比报一个裸 HTTP 状态码更可执行。
         var serverMsg = xhr && xhr.responseJSON && xhr.responseJSON.error;
         if (status && status !== 404) {
             showLoadWarning(serverMsg || ('读取分析结果失败（HTTP ' + status + '），请刷新页面重试；'
                 + '已生成的结果不会丢失，重跑也会命中缓存。'));
+            setAnalysisEmptyState(dim, 'error');
+        } else {
+            setAnalysisEmptyState(dim, 'empty');
         }
         cb(null);
     });
+}
+
+function setAnalysisEmptyState(dim, state, message) {
+    var box = document.querySelector('[data-analysis-empty="' + dim + '"]');
+    if (!box) return;
+    box.dataset.state = state;
+    if (state === 'ready') { box.classList.add('d-none'); return; }
+    box.classList.remove('d-none');
+    var title = box.querySelector('.analysis-empty-title');
+    var description = box.querySelector('.analysis-empty-description');
+    var configured = box.dataset.apiConfigured === 'true';
+    var unconfigured = state === 'unconfigured' || (!configured && state === 'empty');
+    if (title) {
+        title.textContent = (unconfigured ? box.dataset.unconfiguredTitle : box.dataset[state + 'Title']) || '尚未分析';
+    }
+    if (description) {
+        description.textContent = message || (unconfigured
+            ? box.dataset.unconfiguredDescription
+            : box.dataset[state + 'Description']);
+    }
 }
 
 // 顶部提示条：只在第一次出现时插入，避免刷屏
@@ -245,6 +270,7 @@ function analyzeInPage(dim, renderFn) {
         var status = $('#inPageStatus');
         var orig = btn.data('orig') || '运行本维度分析';
         btn.prop('disabled', true).text('分析中…');
+        setAnalysisEmptyState(dim, 'running');
         var opts = {
             refresh: $('#inPageRefresh').length ? $('#inPageRefresh').is(':checked') : false,
             onProgress: function (done, total) {
@@ -257,12 +283,16 @@ function analyzeInPage(dim, renderFn) {
             },
             onDone: function (result) {
                 try { sessionStorage.setItem('ai_' + dim, JSON.stringify(result)); } catch (e) { /* 配额满忽略 */ }
+                setAnalysisEmptyState(dim, 'ready');
                 status.html('<div class="alert alert-success py-1 mb-0 small">分析完成</div>');
                 btn.prop('disabled', false).text(orig);
                 if (renderFn) renderFn(result);
             },
             onError: function (msg) {
-                status.html('<div class="alert alert-danger py-1 mb-0 small">' + esc(msg) + '</div>');
+                var cancelled = msg === '分析已取消';
+                setAnalysisEmptyState(dim, cancelled ? 'empty' : 'error', cancelled ? null : msg);
+                status.html('<div class="alert alert-' + (cancelled ? 'secondary' : 'danger')
+                    + ' py-1 mb-0 small">' + esc(msg) + '</div>');
                 btn.prop('disabled', false).text(orig);
             }
         };

@@ -131,6 +131,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </nav>
 
     <div class="container">
+        {% if has_stats and request.endpoint in ['emotion', 'relationship', 'habits', 'topics', 'profile', 'recap'] %}
+        <nav class="analysis-subnav mb-3" aria-label="分析页面">
+            <a href="/emotion" class="{{ 'active' if request.endpoint == 'emotion' }}" {% if request.endpoint == 'emotion' %}aria-current="page"{% endif %}>{{ '群情绪' if is_group_chat else '情绪' }}</a>
+            <a href="/relationship" class="{{ 'active' if request.endpoint == 'relationship' }}" {% if request.endpoint == 'relationship' %}aria-current="page"{% endif %}>{{ '群关系' if is_group_chat else '关系' }}</a>
+            <a href="/habits" class="{{ 'active' if request.endpoint == 'habits' }}" {% if request.endpoint == 'habits' %}aria-current="page"{% endif %}>{{ '成员活跃' if is_group_chat else '习惯' }}</a>
+            <a href="/topics" class="{{ 'active' if request.endpoint == 'topics' }}" {% if request.endpoint == 'topics' %}aria-current="page"{% endif %}>{{ '群话题' if is_group_chat else '话题' }}</a>
+            <a href="/profile" class="{{ 'active' if request.endpoint == 'profile' }}" {% if request.endpoint == 'profile' %}aria-current="page"{% endif %}>{{ '成员画像' if is_group_chat else '画像' }}</a>
+            {% if not is_group_chat %}<a href="/recap" class="{{ 'active' if request.endpoint == 'recap' }}" {% if request.endpoint == 'recap' %}aria-current="page"{% endif %}>整体总括</a>{% endif %}
+        </nav>
+        {% endif %}
         {# 一次性提示（如"重复上传同一份内容不重复计费"）：Flask flash，读到即清 #}
         {%- set flashes = get_flashed_messages(with_categories=true) %}
         {%- if flashes %}

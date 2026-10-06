@@ -780,6 +780,7 @@ function renderGroupTopics(container, data) {
 function renderGroupEmotion(container, data) {
     var months = monthsOf(data);
     if (!months.length) return false;
+    renderGroupEmotionTrend(data);
     var html = '';
     months.forEach(function (m) {
         var d = data[m] || {};
@@ -807,6 +808,31 @@ function renderGroupEmotion(container, data) {
     });
     container.innerHTML = html;
     return true;
+}
+
+// 群聊情绪走势只出现在情绪页；仪表盘复用同一渲染函数时没有该容器，直接跳过。
+function renderGroupEmotionTrend(data) {
+    var el = document.getElementById('emotionTrend');
+    if (!el) return;
+    var months = monthsOf(data);
+    if (!months.length) return;
+    var chart = mountChart('emotionTrend');
+    if (!chart) return;
+    el.classList.remove('d-none');
+    var empty = document.getElementById('emotionTrendEmpty');
+    if (empty) empty.classList.add('d-none');
+    chart.setOption(applyChartTheme({
+        tooltip: { trigger: 'axis' },
+        grid: { left: 8, right: 16, top: 24, bottom: 24, containLabel: true },
+        xAxis: { type: 'category', data: months },
+        yAxis: { type: 'value', min: 0, max: 10, name: '强度' },
+        series: [{
+            type: 'line', smooth: true, symbolSize: 8, areaStyle: { opacity: 0.18 },
+            label: { show: true, color: T.text, fontSize: 11,
+                     formatter: function (p) { return (data[months[p.dataIndex]] || {}).group_emotion || ''; } },
+            data: months.map(function (m) { return (data[m] || {}).group_intensity || 0; })
+        }]
+    }));
 }
 
 // 成员画像卡片网格
@@ -853,7 +879,10 @@ function renderMemberProfiles(container, data, people) {
 function loadGroupAnalysis(dim, container, renderer) {
     if (!container) return;
     loadAnalysis(dim, function (data) {
-        if (!data) return;
+        if (!data) {
+            setAnalysisEmptyState(dim, 'empty');
+            return;
+        }
         var ok = false;
         try {
             ok = renderer(container, data);
@@ -888,6 +917,7 @@ function analyzeGroupDimension(dim, btn, containerId, renderer, onFinish) {
         },
         onDone: function (result) {
             try { sessionStorage.setItem('ai_' + dim, JSON.stringify(result)); } catch (e) { /* 配额满忽略 */ }
+            setAnalysisEmptyState(dim, 'ready');
             if (containerId) {
                 var el = document.getElementById(containerId);
                 if (el && renderer) {
@@ -901,7 +931,10 @@ function analyzeGroupDimension(dim, btn, containerId, renderer, onFinish) {
             if (onFinish) onFinish();
         },
         onError: function (msg) {
-            status.html('<div class="alert alert-danger mb-0">' + esc(msg) + '</div>');
+            var cancelled = msg === '分析已取消';
+            setAnalysisEmptyState(dim, cancelled ? 'empty' : 'error', cancelled ? null : msg);
+            status.html('<div class="alert alert-' + (cancelled ? 'secondary' : 'danger')
+                + ' mb-0">' + esc(msg) + '</div>');
             btn.prop('disabled', false).text(orig);
             if (onFinish) onFinish();
         }
