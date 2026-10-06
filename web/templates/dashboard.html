@@ -19,6 +19,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 {% block content %}
 <h2 class="page-title">总览仪表盘 <span class="sub">{{ chat_name }}</span></h2>
+<nav class="page-jump-nav mb-3" aria-label="仪表盘快捷导航">
+    <a href="#summaryMetrics">统计概览</a>
+    <a href="#overviewCharts">图表分析</a>
+    {% if api_ok %}<a href="#analysisPanel">AI 分析</a>{% endif %}
+    <a href="#dataPrivacy">数据与隐私</a>
+</nav>
 {%- if chat_mode == 'two_party' %}
 {# 如实告知：只有在显式启用旧逃生阀（QQCHAT_GROUP_CHAT=two_party /
    QQCHAT_ALLOW_MULTI_PARTY=1）时才渲染。条件为假时整段不输出任何字符——连空行都不留，
@@ -42,7 +48,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 </div>
 {%- endif %}
 
-<div class="row mb-4">
+<div class="row mb-4" id="summaryMetrics">
     <div class="col-md-3 mb-3">
         <div class="card stat-card text-center h-100">
             <div class="card-body">
@@ -72,15 +78,19 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             <div class="card-body">
                 <div class="stat-value">{{ overview.total_images }}</div>
                 <div class="stat-label">图片总数</div>
-                <small class="text-muted">
-                    视频 {{ overview.get('total_videos', 0) }} · 文件 {{ overview.get('total_files', 0) }}
-                    · 转发 {{ overview.get('total_forwards', 0) }} · 语音 {{ overview.get('total_voices', 0) }}
-                    · 表情 {{ overview.get('total_faces', 0) }}
-                    · 撤回 {{ overview.get('total_recalls', 0) }}<br>
-                    图片 {{ overview.get('image_bytes', 0) | filesizeformat }}
-                    · 文件/视频 {{ overview.get('other_media_bytes', 0) | filesizeformat }}
+                <small class="media-breakdown text-muted">
+                    <span>视频 {{ overview.get('total_videos', 0) }}</span>
+                    <span>文件 {{ overview.get('total_files', 0) }}</span>
+                    <span>转发 {{ overview.get('total_forwards', 0) }}</span>
+                    <span>语音 {{ overview.get('total_voices', 0) }}</span>
+                    <span>表情 {{ overview.get('total_faces', 0) }}</span>
+                    <span>撤回 {{ overview.get('total_recalls', 0) }}</span>
+                </small>
+                <small class="media-storage">
+                    <span>图片 {{ overview.get('image_bytes', 0) | filesizeformat }}</span>
+                    <span>其他媒体 {{ overview.get('other_media_bytes', 0) | filesizeformat }}</span>
                     {% if overview.get('unique_images') %}
-                    · 去重后 {{ overview.get('unique_images') }} 张
+                    <span>去重后 {{ overview.get('unique_images') }} 张</span>
                     {% endif %}
                 </small>
             </div>
@@ -88,7 +98,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </div>
 </div>
 
-<div class="row mb-4">
+<div class="row mb-4" id="overviewCharts">
     <div class="col-md-6 mb-3">
         <div class="card">
             <div class="card-header">双方消息对比</div>
@@ -264,7 +274,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {% endif %}
 
 {% if api_ok %}
-<div class="card mb-4">
+<div class="card mb-4" id="analysisPanel">
     <div class="card-header">AI 分析</div>
     <div class="card-body">
         <p class="text-muted small mb-3">
@@ -285,7 +295,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             <label class="form-check-label small text-muted" for="forceRefresh">强制重新分析（忽略缓存，会产生 API 费用）</label>
         </div>
         <div id="apiTestMsg" class="mt-2"></div>
-        <div id="analyzeStatus" class="mt-3"></div>
+        <div id="analyzeStatus" class="mt-3" role="status" aria-live="polite"></div>
         <div class="mt-3">
             <a href="/report" class="btn btn-outline-primary btn-sm">查看完整报告</a>
         </div>
@@ -404,7 +414,7 @@ $('#btn-api-test').on('click', function() {
 
 {# 数据与隐私：此前"想清空当前聊天"只能再传一份别的文件顶掉，或手删目录重启；
    换机器时已付费结果也没有带得走的口子。两个能力都在这里，且不依赖 API Key。 #}
-<div class="card mb-4">
+<div class="card mb-4" id="dataPrivacy">
     <div class="card-header">数据与隐私</div>
     <div class="card-body">
         <div class="d-flex gap-2 flex-wrap align-items-center">

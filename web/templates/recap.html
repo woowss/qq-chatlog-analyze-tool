@@ -16,6 +16,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 -->
 {% extends "base.html" %}
 {% block title %}整体总括{% endblock %}
+{% block chart_scripts %}{% endblock %}
 
 {% block content %}
 <h2 class="page-title">整体总括 <span class="sub">{{ overview.other_name }}</span></h2>
@@ -33,7 +34,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             <input class="form-check-input me-2" type="checkbox" id="forceRefresh">
             <label class="form-check-label small text-muted" for="forceRefresh">强制重新生成（会产生 API 费用）</label>
         </div>
-        <div id="recapStatus" class="flex-grow-1"></div>
+        <div id="recapStatus" class="flex-grow-1" role="status" aria-live="polite"></div>
     </div>
 </div>
 
@@ -49,7 +50,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                    placeholder="例如：我们聊结婚这个话题是在哪段时间最密？" style="max-width:520px">
             <button class="btn btn-primary btn-sm" id="askGo" type="button">提问</button>
         </div>
-        <div id="askStatus" class="mt-2 small"></div>
+        <div id="askStatus" class="mt-2 small" role="status" aria-live="polite"></div>
         <div id="askAnswer" class="mt-2"></div>
     </div>
 </div>

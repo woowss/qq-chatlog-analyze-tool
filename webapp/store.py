@@ -14,21 +14,20 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 #
-"""持久层：聊天哈希、进程内 ChatData 复用、统计缓存、AI 维度缓存
+"""持久层入口：聊天哈希、进程内 ChatData 复用、统计缓存、AI 维度缓存
 
-从 app.py 拆出。函数读取本模块全局（AI_CACHE_DIR / STATS_CACHE_DIR /
-thinking_enabled / _save_stats ...）——测试打桩请打在 webapp.store 上。
-所有落盘都走"临时文件 + os.replace"，进程中断不会留下半截 JSON。
+从 app.py 拆出。运行时设置与兼容入口保留在本模块（AI_CACHE_DIR / STATS_CACHE_DIR /
+thinking_enabled / _save_stats ...）；打包与任务历史委托给小模块，由这里注入当前配置、
+锁和回调——测试打桩仍打在 webapp.store 上。所有落盘都走"临时文件 + os.replace"，
+进程中断不会留下半截 JSON。
 """
 
 import hashlib
-import io
 import json
 import os
 import re
 import threading
 import time
-import zipfile
 from typing import Optional
 
 from flask import session
@@ -60,6 +59,8 @@ from analyzer.deepseek_client import (
     thinking_enabled,
 )
 from analyzer.logger import get_logger
+from webapp import cache_bundle
+from webapp import job_history
 
 logger = get_logger("app")
 
@@ -900,215 +901,69 @@ def _write_cache(dimension: str, chat_hash: str, result) -> None:
 # ---------------------------------------------------------------------------
 # 结果打包（导出/导入当前聊天）：换机器时"已付费的 AI 结果带得走"
 # ---------------------------------------------------------------------------
-#: 导入文件名的白名单：安全字符集 + 只收 .json、不含任何路径成分（路径校验在
-#: 解包侧按目录前缀做，这里钉死叶子名）。月份/manifest/图片摘要/维度缓存
-#: （{dim}_{hash}_{model}_{指纹}[_think]）与统计文件都落在这个字符集里；
-#: 模型名允许点与横线，".." 单独不可能通过"以字母数字开头且 .json 结尾"。
-BUNDLE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{2,120}\.json$")
-#: meta.json 里声明的 chat_hash 的合法形状（与 _chat_hash() 同一口径：sha256 前 16 位）。
-#: 归属校验的基准值必须先确认"是个哈希"，否则一个空串或 "../x" 会退化成
-#: 在 _bundle_leaf_ok 里做子串匹配的依据。
-_CHAT_HASH_RE = re.compile(r"^[0-9a-f]{16}$")
-BUNDLE_MAX_ENTRIES = 5000
-BUNDLE_MAX_TOTAL_BYTES = 512 * 1024 * 1024
-BUNDLE_META_NAME = "meta.json"
+# Bundle operations live in cache_bundle; store keeps the compatible facade.
+# ---------------------------------------------------------------------------
+
+BUNDLE_NAME_RE = cache_bundle.BUNDLE_NAME_RE
+_CHAT_HASH_RE = cache_bundle.CHAT_HASH_RE
+BUNDLE_MAX_ENTRIES = cache_bundle.BUNDLE_MAX_ENTRIES
+BUNDLE_MAX_TOTAL_BYTES = cache_bundle.BUNDLE_MAX_TOTAL_BYTES
+BUNDLE_META_NAME = cache_bundle.BUNDLE_META_NAME
 
 
 def chat_bundle_files(chat_hash: str) -> dict:
-    """属于该聊天的缓存文件清单：{"ai_cache": [名字…], "stats_cache": [名字…]}（不含路径）。
-
-    月份文件（month_{key}.json）按**内容哈希**寻址、名字里没有 chat_hash，
-    必须顺着 manifest 的引用收进来——否则迁到新机器后增量机制退化成整月重付费，
-    恰好废掉这个项目最核心的省钱设计。
-    """
-    if not chat_hash:
-        return {"ai_cache": [], "stats_cache": []}
-    ai: list[str] = []
-    month_keys: list[str] = []
-    try:
-        entries = os.listdir(AI_CACHE_DIR)
-    except OSError:
-        entries = []
-    for name in entries:
-        if not _cache_belongs_to(name, chat_hash):
-            continue
-        ai.append(name)
-        if name.startswith("manifest_"):
-            try:
-                with open(os.path.join(AI_CACHE_DIR, name), encoding="utf-8") as f:
-                    month_keys += [str(k) for k in (json.load(f).get("months") or [])]
-            except (OSError, json.JSONDecodeError, AttributeError):
-                pass
-    for key in month_keys:
-        # key 来自磁盘上的 manifest（可能由导入的结果包写进来），而它马上要被当成
-        # 路径成分用：不合法的一律丢掉。少了这一步，`month_x/../../某文件` 会归一成
-        # 缓存目录之外的路径，并被 zf.write **把那个文件的内容打进用户会分享的包里**
-        # ——实测复现过（见 analyzer.month_cache.is_safe_month_key）。
-        if not month_cache.is_safe_month_key(key):
-            logger.warning("manifest 里有形状非法的月份键，导出时已跳过")
-            continue
-        mname = f"month_{key}.json"
-        if mname not in ai and os.path.exists(os.path.join(AI_CACHE_DIR, mname)):
-            ai.append(mname)
-    stats: list[str] = []
-    sname = f"stats_{chat_hash}.json"
-    if os.path.exists(os.path.join(STATS_CACHE_DIR, sname)):
-        stats.append(sname)
-    return {"ai_cache": sorted(ai), "stats_cache": stats}
+    return cache_bundle.chat_bundle_files(
+        chat_hash,
+        ai_cache_dir=AI_CACHE_DIR,
+        stats_cache_dir=STATS_CACHE_DIR,
+        cache_belongs_to=_cache_belongs_to,
+        is_safe_month_key=month_cache.is_safe_month_key,
+        logger=logger,
+    )
 
 
-def write_chat_bundle(chat_hash: str, stream: io.BytesIO) -> int:
-    """把该聊天的统计与已付费结果打包成 zip（条目形如 ai_cache/xxx.json），返回文件数"""
-    files = chat_bundle_files(chat_hash)
-    count = 0
-    with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(
-            BUNDLE_META_NAME,
-            json.dumps({"bundle": 1, "chat_hash": chat_hash, "created": time.time()}, ensure_ascii=False),
-        )
-        for logical, names in (("ai_cache", files["ai_cache"]), ("stats_cache", files["stats_cache"])):
-            base = AI_CACHE_DIR if logical == "ai_cache" else STATS_CACHE_DIR
-            for name in names:
-                try:
-                    zf.write(os.path.join(base, name), f"{logical}/{name}")
-                    count += 1
-                except OSError:
-                    pass
-    return count
+def write_chat_bundle(chat_hash: str, stream) -> int:
+    return cache_bundle.write_chat_bundle(
+        chat_hash,
+        stream,
+        files_for_chat=chat_bundle_files,
+        ai_cache_dir=AI_CACHE_DIR,
+        stats_cache_dir=STATS_CACHE_DIR,
+        meta_name=BUNDLE_META_NAME,
+    )
 
 
 def _bundle_leaf_ok(leaf: str, head: str, declared_hash: str) -> bool:
-    """条目文件名是否可以落盘。
-
-    路径成分在这一层之外已经挡掉（目录前缀白名单 + BUNDLE_NAME_RE）；这里管的是
-    **"这个包凭什么写这个键"**。导出包的内容会被当作"已付费的分析结果"直接渲染，
-    所以一个不含任何聊天数据的 zip 必须只能写它自己那份聊天的文件——否则任何人都能
-    把 `stats_<别人当前聊天哈希>.json` 塞进包里，导入后被冒充成用户的真实统计与
-    AI 结论（本项目"AI 结论必须可回溯到本地事实"的立论基础就被打穿了）。
-    """
-    if head == "stats_cache":
-        # stats_{hash}.json —— 必须就是包里声明的那份聊天
-        return leaf == f"stats_{declared_hash}.json"
-    if leaf.startswith("month_"):
-        # 月份缓存按**内容**寻址（month_{key}.json），名字里没有 chat_hash，
-        # 靠 manifest 的引用收进包里（见 chat_bundle_files）。这一族只校验形状，
-        # 不校验归属：它本就是跨聊天复用的"同样的一个月"，强行绑哈希会把
-        # 正常的增量迁移整条打断。
-        return True
-    if leaf.startswith("manifest_"):
-        return leaf == f"manifest_{declared_hash}.json"
-    # 维度缓存 / 图片摘要 / 提问缓存：{dim}_{hash}_{...}.json，chat_hash 是完整段
-    return _cache_belongs_to(leaf, declared_hash)
+    return cache_bundle.bundle_leaf_ok(leaf, head, declared_hash, cache_belongs_to=_cache_belongs_to)
 
 
 def _bundle_payload_ok(head: str, leaf: str, raw: bytes) -> bool:
-    """落盘前的**安全性**校验，不是 schema 校验。
+    return cache_bundle.bundle_payload_ok(raw)
 
-    要挡的是"根本不是 JSON / 结构上不可能被任何读取路径使用"的东西——这类文件一旦
-    进入 ai_cache/，读取侧会把它当作既有结果直接渲染，形状完全陌生的对象会一路走到
-    模板里才炸。所以这里只要求"可解析 + 是个非空 dict"。
 
-    **刻意不做逐族形状判定**：盘上真实缓存的形状本来就五花八门，逐一列名单一定会把
-    合法导出误拒（那比原漏洞更糟——用户带不走已付费结果，症状还是偶发的）：
-    月份缓存是裸的 {期间: 结果} 映射（_read_month_cache 也接受带 result 的外层），
-    图片摘要是 {"_created", "digest"}，维度缓存新旧两制分别是 {"_created","result"}
-    与裸结果 dict，统计缓存顶层是 {mode,_v,overview,...}。名单每漏一族，
-    那一族的迁移就静默失败。读侧对坏文件本来就是容错的（返回 None → 重新分析，
-    只多花一次钱），所以从严没有收益、从宽没有风险。
-    """
-    if len(raw) > 32 * 1024 * 1024:
-        return False
-    try:
-        data = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return False
-    return isinstance(data, dict) and bool(data)
+def _clear_parsed_chat_cache() -> None:
+    with _CHAT_CACHE_LOCK:
+        _CHAT_CACHE.clear()
 
 
 def read_chat_bundle(stream, confirm_overwrite: bool = False, live_hash: str = "") -> dict:
-    """导入结果包：条目必须属于包里声明的那份聊天，且落点只有两个缓存目录。
-
-    zip 里的路径成分一律不信，落点只由"目录前缀 + 过白名单的叶子名"决定。
-    返回 {"written": n, "skipped": m}，或 {"error": 人话}（超限/坏 zip/需要确认时
-    早停，不把半包状态留给用户猜）。
-
-    confirm_overwrite / live_hash：当前会话正打开着同一份聊天时，导入会覆盖**正在看**
-    的统计与已付费结果。这是合法用法（换机器恢复），但也正是"用一个 zip 冒充当前
-    聊天结果"最省事的攻击路径，所以要求显式二次确认才放行（见 api_import_chat）。
-    """
-    try:
-        zf = zipfile.ZipFile(stream)
-    except (zipfile.BadZipFile, OSError):
-        return {"error": "不是有效的导出包（zip 打不开）；请使用本工具的「导出」生成的文件"}
-    with zf:
-        infos = zf.infolist()
-        if len(infos) > BUNDLE_MAX_ENTRIES:
-            return {"error": f"导出包条目过多（{len(infos)}），拒绝"}
-
-        # ① 先读 meta 并取回它声明的 chat_hash —— 这是后面所有归属校验的基准
-        declared = ""
-        try:
-            meta_raw = zf.read(BUNDLE_META_NAME)
-        except KeyError:
-            return {"error": "结果包缺少 meta.json，无法确认它属于哪份聊天，已拒绝"}
-        except Exception as e:  # 坏 CRC / 加密条目 / 不支持的压缩法
-            return {"error": f"结果包的 meta.json 读不出来（{type(e).__name__}），已拒绝"}
-        try:
-            declared = str(json.loads(meta_raw.decode("utf-8")).get("chat_hash") or "").strip()
-        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
-            declared = ""
-        if not _CHAT_HASH_RE.fullmatch(declared):
-            return {"error": "结果包的 meta.json 缺少合法的 chat_hash，已拒绝"}
-
-        # ② 覆盖当前正在看的聊天需要用户明确点头：这是合法用法（换机器恢复），
-        # 但也是"用一个 zip 冒充当前聊天结果"最省事的攻击路径，所以要一次显式确认。
-        if live_hash and live_hash == declared and not confirm_overwrite:
-            return {
-                "need_confirm": True,
-                "error": "这份结果包属于你当前正在打开的聊天，导入会覆盖现有的统计与已付费结果。"
-                "确认要继续请再点一次「导入」。",
-            }
-
-        written = skipped = total = 0
-        for info in infos:
-            name = info.filename.replace("\\", "/")
-            if name == BUNDLE_META_NAME:
-                continue
-            head, sep, leaf = name.rpartition("/")
-            if not sep or head not in ("ai_cache", "stats_cache") or not BUNDLE_NAME_RE.match(leaf):
-                skipped += 1
-                continue
-            # 归属校验：不许写别人那份聊天的键
-            if not _bundle_leaf_ok(leaf, head, declared):
-                skipped += 1
-                continue
-            total += max(0, info.file_size)
-            if total > BUNDLE_MAX_TOTAL_BYTES:
-                return {"error": "导出包解压体积超限，已中止（导入不完整）"}
-            target_dir = AI_CACHE_DIR if head == "ai_cache" else STATS_CACHE_DIR
-            path = os.path.join(target_dir, leaf)
-            try:
-                with zf.open(info) as src:
-                    raw = src.read()
-            except Exception as e:  # 单条目坏掉不许把整个请求打成 500
-                logger.warning("结果包条目 %s 读不出来（%s），已跳过", leaf, type(e).__name__)
-                skipped += 1
-                continue
-            if not _bundle_payload_ok(head, leaf, raw):
-                logger.warning("结果包条目 %s 形状不对，已跳过", leaf)
-                skipped += 1
-                continue
-            try:
-                write_bytes_atomic(path, raw, mkdir=target_dir)
-                written += 1
-            except OSError:
-                skipped += 1
-    if written:
-        # 已解析的 ChatData 与 manifest 引用缓存都可能盖着旧状态：清掉，
-        # 让导入的文件从下一次读起就是权威（与级联清理同一口径）。
-        with _CHAT_CACHE_LOCK:
-            _CHAT_CACHE.clear()
-    return {"written": written, "skipped": skipped, "chat_hash": declared[:12]}
+    return cache_bundle.read_chat_bundle(
+        stream,
+        confirm_overwrite,
+        live_hash,
+        ai_cache_dir=AI_CACHE_DIR,
+        stats_cache_dir=STATS_CACHE_DIR,
+        name_re=BUNDLE_NAME_RE,
+        hash_re=_CHAT_HASH_RE,
+        max_entries=BUNDLE_MAX_ENTRIES,
+        max_total_bytes=BUNDLE_MAX_TOTAL_BYTES,
+        meta_name=BUNDLE_META_NAME,
+        leaf_ok=_bundle_leaf_ok,
+        payload_ok=_bundle_payload_ok,
+        write_bytes_atomic=write_bytes_atomic,
+        clear_chat_cache=_clear_parsed_chat_cache,
+        logger=logger,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1154,14 +1009,11 @@ def ask_cache_write(chat_hash: str, question: str, result) -> None:
 # 错误文本可能带上传路径等环境信息，不进这份账（要细看错误去 logs/，那边有脱敏与轮转）。
 # 也不做"重启自动续跑"：那等于服务一重启就静默发起付费调用，用户没点头的事不替用户做主。
 # ---------------------------------------------------------------------------
+# Job history storage is delegated; retain the store-level patch points.
+# ---------------------------------------------------------------------------
 
-#: 这份账目最多保留多少行（超了对折）与多少天（按条目自带时间戳判过期）。
-#: 天数上限必须与 LOG_RETENTION_DAYS 同口径：README 承诺"日志按天轮转保留 N 天"，
-#: 而这份账目就住在 LOG_DIR 里。清理任务的日志回收只认 `app.log.` 前缀
-#: （见 webapp/cleanup.py），它**永远不会**碰到这个文件名——所以年龄回收只能自己实现，
-#: 否则用户删掉聊天之后，"某人在某日用某维度分析过哈希 X 次"还会在这里留几个月。
-JOB_HISTORY_MAX_LINES = 1000
-JOB_HISTORY_FIELDS = ("t", "dim", "status", "done", "total", "chat")
+JOB_HISTORY_MAX_LINES = job_history.MAX_LINES
+JOB_HISTORY_FIELDS = job_history.FIELDS
 _JOB_HISTORY_LOCK = threading.Lock()
 
 
@@ -1170,116 +1022,36 @@ def _job_history_path() -> str:
 
 
 def _prune_job_history_lines(lines: list, max_age_days: int, drop_prefixes: tuple = ()) -> list:
-    """按年龄与"按聊天删除"两种口径过滤账目行。
-
-    **看不懂的行原样保留**（坏 JSON、非 dict、缺字段一律不动）。理由不是宽容，
-    而是这里做的是**重写整个文件**：读侧（read_job_history）对坏行是"跳过"，
-    顶多不显示；而写侧若顺手把读不懂的行删掉，就等于让一次无关的年龄回收
-    或"删A聊天"顺手销毁了B的行——账目本身是辅助信息，销毁它换不到任何收益。
-    同理，缺 `t` 或 `t` 不是数字的行**不**按年龄删：判不出来就不删。
-    """
-    cutoff = (time.time() - max_age_days * 86400) if max_age_days and max_age_days > 0 else None
-    out = []
-    for line in lines:
-        if not line.strip():
-            continue  # 空行不是数据，收掉不算销毁
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            out.append(line)
-            continue
-        if not isinstance(entry, dict):
-            out.append(line)
-            continue
-        stamp = entry.get("t")
-        if cutoff is not None and isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
-            if stamp < cutoff:
-                continue
-        chat = str(entry.get("chat") or "")
-        # chat 存的是哈希前缀（见 jobs.append 处的 [:12]），所以按前缀比对：
-        # 既能匹配截断后的值，也不会因为只存了 12 位就漏删。
-        if drop_prefixes and chat and chat.startswith(drop_prefixes):
-            continue
-        out.append(json.dumps(entry, ensure_ascii=False))
-    return out
+    return job_history.prune_lines(lines, max_age_days, drop_prefixes=drop_prefixes, now=time.time())
 
 
 def purge_job_history(chat_hash: str) -> int:
-    """删掉属于该聊天的全部账目行（级联清理与"删除本聊天"必须带上这里）。
-
-    为什么算隐私路径：这一行的字段是 (时间, 维度, 状态, 进度, chat_hash[:12])。
-    不含聊天内容，但它是一份**按内容哈希稳定标识"这台机器分析过这份聊天"**的留存记录。
-    用户点「删除本聊天」时接口承诺"上传原件 + 全部派生缓存"，而按内容哈希寻址本来就是
-    本项目的身份口径（两份同名不同内容的文件是两个聊天，反之同内容就是同一份）——
-    所以"这份内容被分析过"这条元信息也归该聊天所有，不该在删除后留下。
-    """
-    if not chat_hash:
-        return 0
-    path = _job_history_path()
-    with _JOB_HISTORY_LOCK:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                lines = f.read().splitlines()
-        except OSError:
-            return 0
-        kept = _prune_job_history_lines(lines, 0, drop_prefixes=(chat_hash[:12],))
-        removed = len([x for x in lines if x.strip()]) - len(kept)
-        if removed <= 0:
-            return 0
-        try:
-            write_text_atomic(path, "".join(line + "\n" for line in kept))
-        except OSError as e:
-            logger.warning("任务历史按聊天清理失败（可能仍残留哈希前缀）: %s", e)
-            return 0
-    return removed
+    return job_history.purge_job_history(
+        chat_hash,
+        path=_job_history_path(),
+        lock=_JOB_HISTORY_LOCK,
+        prune=_prune_job_history_lines,
+        write_text_atomic=write_text_atomic,
+        logger=logger,
+    )
 
 
 def append_job_history(entry: dict, max_age_days: Optional[int] = None) -> None:
-    # 默认跟着 LOG_RETENTION_DAYS 走（而不是让每个调用点各传一遍）：这份账目住在
-    # LOG_DIR 里，README 对它承诺的就是"日志保留 N 天"。写在函数里还有一条好处——
-    # 新增调用点不会忘记传参而悄悄拿到"永不过期"。
     if max_age_days is None:
         max_age_days = LOG_RETENTION_DAYS
-    line = {k: entry.get(k) for k in JOB_HISTORY_FIELDS if entry.get(k) is not None}
-    if not line:
-        return
-    path = _job_history_path()
-    # 整段在锁内：两个分析同时收尾时，"追加 → 读回 → 对折重写"必须互斥，
-    # 否则可能各自读到同一份全量、双双重写，把对方的那一行挤掉。
-    with _JOB_HISTORY_LOCK:
-        try:
-            os.makedirs(LOG_DIR, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(line, ensure_ascii=False) + "\n")
-            with open(path, "r", encoding="utf-8") as f:
-                lines = f.read().splitlines()
-            original = len([x for x in lines if x.strip()])
-            # 有界保留：① 超行数对折到最近一半；② 超过 LOG_RETENTION_DAYS 的条目删除
-            kept = _prune_job_history_lines(lines, max_age_days)
-            if len(kept) > JOB_HISTORY_MAX_LINES:
-                kept = kept[-(JOB_HISTORY_MAX_LINES // 2) :]
-            if len(kept) == original:
-                return  # 什么都没掉就不重写文件（绝大多数时候走这条）
-            write_text_atomic(path, "".join(x + "\n" for x in kept))
-        except OSError as e:
-            logger.warning("任务历史写入失败（不影响分析本身）: %s", e)
+    job_history.append_job_history(
+        entry,
+        log_dir=LOG_DIR,
+        max_age_days=max_age_days,
+        path=_job_history_path(),
+        lock=_JOB_HISTORY_LOCK,
+        prune=_prune_job_history_lines,
+        max_lines=JOB_HISTORY_MAX_LINES,
+        fields=JOB_HISTORY_FIELDS,
+        write_text_atomic=write_text_atomic,
+        logger=logger,
+    )
 
 
 def read_job_history(limit: int = 30) -> list:
-    """最近的历史，新→旧。文件缺失/坏行如实跳过，不抛。"""
-    try:
-        with open(_job_history_path(), "r", encoding="utf-8") as f:
-            raw = f.read()
-    except OSError:
-        return []
-    lines = raw.splitlines()[-max(1, min(int(limit), 500)) :]
-    out = []
-    for line in lines:
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(entry, dict):
-            out.append(entry)
-    out.reverse()
-    return out
+    return job_history.read_job_history(_job_history_path(), limit=limit)

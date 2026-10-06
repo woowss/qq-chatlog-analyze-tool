@@ -45,6 +45,7 @@ from parser.qq_parser import ChatData, is_statistical
 from parser.group_identity import Participant
 from analyzer import group_prompts as gp
 from analyzer.deepseek_client import (
+    AnalysisIncompleteError,
     MAX_TOKENS_BY_DIM,
     QuotaExhaustedError,
     _analyze_periods,
@@ -463,11 +464,14 @@ def _analyze_member(
             result["is_self"] = member.is_self
             result["total_messages"] = len(msgs)
             return result
+        raise AnalysisIncompleteError(f"{mask_name(member.name)} 的成员画像未得到有效结果")
     except QuotaExhaustedError:
         raise  # 配额耗尽要中止整个维度，不能被当作单人失败吞掉
+    except AnalysisIncompleteError:
+        raise
     except Exception as e:
         logger.error("%s 的群内画像失败: %s", mask_name(member.name), e)
-    return None
+        raise AnalysisIncompleteError(f"{mask_name(member.name)} 的成员画像分析失败") from e
 
 
 def analyze_member_profiles(
@@ -501,9 +505,11 @@ def analyze_member_profiles(
                 used_keys=used_keys,
             )
         except QuotaExhaustedError:
-            if results:  # 已有部分结果：保留已完成者，向上报告配额问题
-                logger.error("配额耗尽，剩余成员未分析（已完成 %d/%d）", len(results), total)
-                break
+            # 前面已完成的成员画像各自有内容缓存；重试时命中它们，只补尚未完成的成员。
+            _record_member_usage(chat_hash, used_keys)
+            raise
+        except AnalysisIncompleteError:
+            _record_member_usage(chat_hash, used_keys)
             raise
         if result:
             results[member.uid] = result

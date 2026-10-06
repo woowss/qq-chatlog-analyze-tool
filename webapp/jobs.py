@@ -33,51 +33,48 @@ from flask import session
 from config import JOB_TTL_SECONDS
 from analyzer.deepseek_client import (
     QuotaExhaustedError,
-    analyze_emotion,
-    analyze_topics,
-    analyze_relationship,
-    analyze_habits,
-    analyze_profile,
     begin_run,
     end_run,
     scrub_secrets,
 )
-from analyzer.group_client import GROUP_DIMENSIONS
-from analyzer.recap_client import RECAP_DIMENSIONS
+from analyzer.group_client import GROUP_DIMENSIONS as GROUP_DIMENSIONS
+from analyzer.recap_client import RECAP_DIMENSIONS as RECAP_DIMENSIONS
 from analyzer import purge_marks
 from analyzer.logger import get_logger
 from analyzer.shutdown import shutdown_requested
 from webapp import store
+from webapp import analysis_catalog
 
 logger = get_logger("app")
 
 DIMENSION_NAMES = {
-    "emotion": "情绪分析",
-    "topics": "话题趋势",
-    "relationship": "人际关系",
-    "habits": "个人习惯",
-    "profile": "人物锐评",
+    key: item.label
+    for key, item in analysis_catalog.ANALYSIS_CATALOG.items()
+    if item.mode == "private" and item.include_in_all
 }
-
 ANALYZE_FUNCS = {
-    "emotion": analyze_emotion,
-    "topics": analyze_topics,
-    "relationship": analyze_relationship,
-    "habits": analyze_habits,
-    "profile": analyze_profile,
+    key: item.runner
+    for key, item in analysis_catalog.ANALYSIS_CATALOG.items()
+    if item.mode == "private" and item.include_in_all
 }
 
 # 群聊维度来自 analyzer/group_client.py（dim → (中文名, 执行函数, 进度单位)）。
 # 两套维度**按会话模式二选一**：私聊文件请求群聊维度（或反之）会被 api 层拒绝，
 # 因为把群聊维度跑在私聊数据上只会产出"我 vs 对方"式的错误结论。
-GROUP_DIM_NAMES = {dim: info[0] for dim, info in GROUP_DIMENSIONS.items()}
-GROUP_ANALYZE_FUNCS = {dim: info[1] for dim, info in GROUP_DIMENSIONS.items()}
+GROUP_DIM_NAMES = {
+    key: item.label for key, item in analysis_catalog.ANALYSIS_CATALOG.items() if item.mode == "group"
+}
+GROUP_ANALYZE_FUNCS = {
+    key: item.runner for key, item in analysis_catalog.ANALYSIS_CATALOG.items() if item.mode == "group"
+}
 # 「整体总括」（analyzer/recap_client.py）：私聊专用、单次调用、独立缓存族。
 # **刻意不进** ANALYZE_FUNCS——dimensions_for_mode 就是"一键全量"的清单，
 # README 对全量成本有实测承诺（约 ¥6），悄悄把新维度塞进去等于改了承诺；
 # recap 走独立按钮，成本（一次调用）在页面上写清。
-RECAP_ANALYZE_FUNCS = {dim: info[1] for dim, info in RECAP_DIMENSIONS.items()}
-ALL_DIMENSION_NAMES = {**DIMENSION_NAMES, **GROUP_DIM_NAMES, **{d: v[0] for d, v in RECAP_DIMENSIONS.items()}}
+RECAP_ANALYZE_FUNCS = {
+    key: item.runner for key, item in analysis_catalog.ANALYSIS_CATALOG.items() if item.private_only
+}
+ALL_DIMENSION_NAMES = {key: item.label for key, item in analysis_catalog.ANALYSIS_CATALOG.items()}
 
 
 def dimensions_for_mode(is_group: bool) -> list:
@@ -87,7 +84,14 @@ def dimensions_for_mode(is_group: bool) -> list:
     也已经有可用产出。
     私聊的全量清单不含 recap（理由见 RECAP_ANALYZE_FUNCS 上方注释）。
     """
-    return list(GROUP_DIMENSIONS) if is_group else list(ANALYZE_FUNCS)
+    mode = "group" if is_group else "private"
+    return [
+        key
+        for key, item in analysis_catalog.ANALYSIS_CATALOG.items()
+        if item.mode == mode
+        and item.include_in_all
+        and (key in (GROUP_ANALYZE_FUNCS if is_group else ANALYZE_FUNCS))
+    ]
 
 
 def analyze_func_for(dimension: str):
@@ -100,7 +104,7 @@ def analyze_func_for(dimension: str):
 
 
 def is_group_dimension(dimension: str) -> bool:
-    return dimension in GROUP_ANALYZE_FUNCS
+    return analysis_catalog.mode_for(dimension) == "group"
 
 
 def is_private_only_dimension(dimension: str) -> bool:
@@ -114,13 +118,12 @@ def is_private_only_dimension(dimension: str) -> bool:
     other_name 是群名），拿它跑群聊就是"我 vs 全群"被讲成二人关系——与
     _dimension_guard 存在的目的完全同类，且每跑一次就真花一次钱。
     """
-    return dimension in RECAP_ANALYZE_FUNCS
+    return analysis_catalog.is_private_only(dimension)
 
 
 def dimension_unit(dimension: str) -> str:
     """进度单位：群聊成员画像是"人"、recap 是"次"，其余是"月"（前端提示文案用它）"""
-    info = GROUP_DIMENSIONS.get(dimension) or RECAP_DIMENSIONS.get(dimension)
-    return info[2] if info else "月"
+    return analysis_catalog.unit_for(dimension)
 
 
 # 内存任务表：job_id -> 状态字典

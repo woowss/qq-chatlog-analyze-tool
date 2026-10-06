@@ -167,6 +167,31 @@ hr { border-color: var(--divider); opacity: 1; }
     flex-wrap: wrap;
 }
 .page-title .sub { font-size: .85rem; font-weight: 400; color: var(--text-secondary); }
+.page-jump-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .4rem;
+}
+.page-jump-nav a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 32px;
+    padding: .3rem .65rem;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text-secondary);
+    background: var(--surface);
+    font-size: .8rem;
+    text-decoration: none;
+}
+.page-jump-nav a:hover,
+.page-jump-nav a:focus-visible {
+    color: var(--primary);
+    border-color: var(--primary-border);
+    background: var(--primary-weak);
+}
+#summaryMetrics, #overviewCharts, #groupSummary, #groupCharts,
+#analysisPanel, #analysisResults, #dataPrivacy { scroll-margin-top: 1rem; }
 
 /* ------------------------------------------------------------------ 导航 */
 .navbar {
@@ -201,6 +226,26 @@ hr { border-color: var(--divider); opacity: 1; }
 }
 .navbar .nav-link:hover { background: var(--hover-bg); color: var(--primary) !important; }
 .navbar .nav-link.active { color: var(--primary) !important; background: var(--primary-weak); font-weight: 500; }
+.navbar .dropdown-menu {
+    background: var(--surface);
+    border-color: var(--border);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-2);
+    padding: .35rem;
+}
+.navbar .dropdown-item {
+    color: var(--text);
+    border-radius: calc(var(--radius-sm) - 2px);
+    font-size: .88rem;
+    padding: .42rem .65rem;
+}
+.navbar .dropdown-item:hover,
+.navbar .dropdown-item:focus,
+.navbar .dropdown-item.active {
+    color: var(--primary);
+    background: var(--primary-weak);
+}
+.navbar .dropdown-divider { border-color: var(--divider); }
 .navbar-toggler { border-color: var(--border); }
 
 .nav-actions { display: flex; align-items: center; gap: .5rem; }
@@ -468,6 +513,37 @@ li { margin-bottom: .15rem; }
 .msg-system, .msg-recalled { opacity: .55; }
 .msg-recalled .msg-body { text-decoration: line-through; text-decoration-thickness: 1px; }
 .msg-hit { background: var(--hit, rgba(250, 140, 22, .16)); }
+.media-breakdown, .media-storage {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .2rem .55rem;
+}
+.media-breakdown { margin-top: .35rem; }
+.media-breakdown span, .media-storage span { white-space: nowrap; }
+.media-storage { margin-top: .2rem; color: var(--text-secondary); }
+
+.filter-advanced {
+    border-top: 1px solid var(--divider);
+    padding-top: .65rem;
+}
+.filter-advanced summary {
+    width: fit-content;
+    color: var(--text-secondary);
+    font-size: .82rem;
+    cursor: pointer;
+    user-select: none;
+}
+.filter-advanced[open] summary { margin-bottom: .55rem; color: var(--primary); }
+.filter-advanced summary:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 3px;
+    border-radius: 2px;
+}
+.msg-row:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+}
+.msg-row[role="button"]:active { background: var(--primary-weak); }
 
 @media (max-width: 768px) {
     .stat-value { font-size: 1.4rem; }

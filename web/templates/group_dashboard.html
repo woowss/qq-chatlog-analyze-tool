@@ -23,6 +23,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 {% block content %}
 <h2 class="page-title">群聊仪表盘 <span class="sub">{{ overview.group_name }}</span></h2>
+<nav class="page-jump-nav mb-3" aria-label="群聊仪表盘快捷导航">
+    <a href="#groupSummary">群聊概览</a>
+    <a href="#groupCharts">互动图表</a>
+    {% if api_ok %}<a href="#analysisPanel">AI 分析</a>{% endif %}
+    <a href="#analysisResults">分析结果</a>
+</nav>
 {%- set unknown = overview.get('unknown_element_types') or {} %}
 {%- if unknown %}
 {# 与私聊仪表盘同一口径：未识别元素不静默丢，如实提示并引导体检。 #}
@@ -34,7 +40,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 </div>
 {%- endif %}
 
-<div class="row mb-4">
+<div class="row mb-4" id="groupSummary">
     <div class="col-md-3 mb-3">
         <div class="card stat-card text-center h-100">
             <div class="card-body">
@@ -102,7 +108,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </div>
 </div>
 
-<div class="row mb-4">
+<div class="row mb-4" id="groupCharts">
     <div class="col-md-6 mb-3">
         <div class="card h-100">
             <div class="card-header">成员发言量（前 15 位）</div>
@@ -173,7 +179,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 </div>
 
 {% if api_ok %}
-<div class="card mb-4">
+<div class="card mb-4" id="analysisPanel">
     <div class="card-header">AI 分析</div>
     <div class="card-body">
         <p class="text-muted small mb-2">
@@ -193,7 +199,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             <input class="form-check-input" type="checkbox" id="forceRefresh">
             <label class="form-check-label small text-muted" for="forceRefresh">强制重新分析（忽略缓存，会产生 API 费用）</label>
         </div>
-        <div id="analyzeStatus" class="mt-3"></div>
+        <div id="analyzeStatus" class="mt-3" role="status" aria-live="polite"></div>
         <div class="mt-3"><a href="/report" class="btn btn-outline-primary btn-sm">查看完整报告</a></div>
     </div>
 </div>
@@ -201,7 +207,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <div class="alert alert-warning small">未配置 API Key：本地统计照常可用，AI 维度需要先在 .env 里配置 Key。</div>
 {% endif %}
 
-<div class="card mb-4">
+<div class="card mb-4" id="analysisResults">
     <div class="card-header">群聊动态</div>
     <div class="card-body" id="sec-dynamics"><div class="text-muted small">尚未分析（或命中缓存后自动显示）</div></div>
 </div>
@@ -248,24 +254,52 @@ wireGroupAnalyzeButtons(MEMBERS);
 $('#btn-analyze-all').on('click', function () {
     var btn = $(this);
     var status = $('#analyzeStatus');
-    var queue = Object.keys(SECTIONS);
+    var refresh = $('#forceRefresh').is(':checked');
     $('.btn-analyze, #btn-analyze-all').prop('disabled', true);
     btn.text('全量分析中…');
-    status.html('<div class="alert alert-secondary mb-0">正在按顺序分析 ' + queue.length + ' 个维度…</div>');
-    // 群聊的"全量"在前端按顺序驱动：每个维度的进度/取消逻辑与单维度完全一致，
-    // 不额外引入一套后端编排（后端 /api/analyze-all 同样支持群聊维度）。
-    (function next(i) {
-        if (i >= queue.length) {
-            $('.btn-analyze').prop('disabled', false).each(function () { $(this).text($(this).data('orig')); });
-            btn.prop('disabled', false).text('全量分析');
-            status.html('<div class="alert alert-success mb-0">全量分析完成。</div>');
-            return;
+    status.html('<div class="alert alert-secondary mb-0">正在启动全量分析…</div>');
+
+    function finishButtons() {
+        $('.btn-analyze').prop('disabled', false).each(function () { $(this).text($(this).data('orig')); });
+        btn.prop('disabled', false).text('全量分析');
+    }
+
+    var cancelButton = $('<button type="button" id="batchCancel">')
+        .addClass('btn btn-sm btn-outline-secondary mb-2').text('取消分析')
+        .on('click', function () {
+            $(this).prop('disabled', true).text('正在取消…');
+            cancelAnalyze(opts);
+        });
+    var opts = {
+        refresh: refresh,
+        onProgress: function (done, total, detail) {
+            var text = detail || ('已完成 ' + done + '/' + total + ' 个维度');
+            status.empty().append($('<div>').addClass('alert alert-secondary mb-2').text(text)).append(cancelButton);
+        },
+        onDone: function (summary) {
+            Object.keys(SECTIONS).forEach(function (dim) {
+                loadGroupAnalysis(dim, document.getElementById(SECTIONS[dim][0]), SECTIONS[dim][1]);
+            });
+            finishButtons();
+            var failed = Object.keys(summary || {}).filter(function (dim) {
+                return ['error', 'aborted', 'empty', 'cancelled'].indexOf(summary[dim]) >= 0;
+            });
+            var message = failed.length
+                ? ('全量分析结束，' + failed.length + ' 个维度未能完成。已完成的结果已保存，可稍后重试。')
+                : '全量分析完成。';
+            status.empty().append($('<div>').addClass('alert ' + (failed.length ? 'alert-warning' : 'alert-success') + ' mb-0')
+                .text(message));
+        },
+        onError: function (message) {
+            finishButtons();
+            var cancelled = message === '分析已取消';
+            status.empty().append($('<div>').addClass('alert ' + (cancelled ? 'alert-warning' : 'alert-danger') + ' mb-0')
+                .text(cancelled ? '全量分析已取消。已完成的结果已保存。' : message));
         }
-        var dim = queue[i];
-        var sub = $('.btn-analyze[data-dim="' + dim + '"]');
-        var target = SECTIONS[dim];
-        analyzeGroupDimension(dim, sub, target[0], target[1], function () { next(i + 1); });
-    })(0);
+    };
+
+    status.empty().append(cancelButton);
+    startAnalyzeAll(opts);
 });
 </script>
 {% endblock %}

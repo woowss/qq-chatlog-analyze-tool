@@ -19,12 +19,14 @@
 本模块负责**API 层**：客户端复用、调用闸门与限流冷却、错误分类与重试、思考模式、
 各维度的执行体（逐月并发/取消/配额中止），以及进缓存的提示词指纹。
 
-拆出去的两块（2026-09 从本文件切分；纯搬迁，指纹逐字节未变）：
+职责拆分到独立模块（调用入口仍在本模块兼容保留）：
 - analyzer/dialog.py       对话构建（把消息压成喂模型的文本）与它自己那套格式化常量；
 - analyzer/month_cache.py  月份级增量缓存（内容寻址键 + manifest 引用计数 + 孤儿回收）。
+- analyzer/llm_transport.py 共享的调用计数、限流、用量记账与重试；
+- analyzer/fingerprint_utils.py 稳定的 AST 源码归一化。
 
-为什么拆：本文件曾一次扛八件事、1500 多行，改一处调用节奏要翻遍全文才能确定没有碰到
-缓存键。为什么**不能**顺手改名：dialog 里那 5 个函数的源码进 PROMPT_FINGERPRINT，
+为什么拆：把跨维度共用的纯请求与指纹机械逻辑放在独立模块，方便单独核对与复用。
+为什么**不能**顺手改名：dialog 里那 5 个函数的源码进 PROMPT_FINGERPRINT，
 改名/改注释/被 ruff format 重排都会让所有既有用户的私聊缓存失效、重新付费——
 tests/test_group_foundation.py 的 PINNED_PRIVATE_FINGERPRINT 会让这种改动在 CI 上变红。
 
@@ -44,14 +46,12 @@ tests/test_group_foundation.py 的 PINNED_PRIVATE_FINGERPRINT 会让这种改动
    也让"哪些名字是对外契约"一眼可见。
 """
 
-import ast
 import concurrent.futures
 import hashlib
 import inspect
 import json
 import os
 import re
-import textwrap
 import threading
 import time
 from functools import partial
@@ -73,6 +73,8 @@ from config import (
 from parser.qq_parser import ChatData, is_statistical, split_by_month
 from analyzer.logger import get_logger, mask_name
 from analyzer import purge_marks
+from analyzer import llm_transport
+from analyzer import fingerprint_utils
 from analyzer.shutdown import shutdown_requested
 from analyzer.usage import record_call
 from analyzer.local_stats import SESSION_GAP_MS
@@ -266,6 +268,10 @@ class QuotaExhaustedError(RuntimeError):
     重试已无意义，上层应中止剩余任务并保留部分结果。"""
 
 
+class AnalysisIncompleteError(RuntimeError):
+    """至少一个有可分析内容的单元未能生成有效结果，汇总结果不可作为完成态缓存。"""
+
+
 # ---------------------------------------------------------------------------
 # 本次运行的调用次数硬上限（默认 0 = 不限）
 # ---------------------------------------------------------------------------
@@ -441,68 +447,14 @@ def _get_client() -> Optional[OpenAI]:
 
 
 def _hashed_source(func) -> str:
-    """取函数源码用于哈希：归一到 AST 形态（丢注释/空白/引号风格，保留逻辑）。
-
-    为什么不再直接哈希原始源码：那样连"注释里改一个错别字"或"被 ruff format 重排"
-    都会换掉指纹，而指纹一变，用户就要为**同样的对话**重新付费分析一遍。AST 恰好把
-    "与喂给模型的东西无关的差异"去掉，同时保留原有保证——真正影响模型输入的改动
-    必然改变 AST。
-
-    dedent 是必需的：getsource 返回的是带原始缩进的片段，嵌套函数的源码直接喂给
-    ast.parse 会 IndentationError（踩过：解析失败会静默退回原文，于是"注释不该影响
-    哈希"这条保证在某些函数上悄悄失效）。解析仍失败时退回原文**并出声**，
-    不让降级无声无息。
-
-    注意 docstring 仍在 AST 里（它是函数体的一部分），改文档字符串依然会换键；
-    函数**名**同样在 AST 里，所以改名也会换键——这正是缓存契约要的效果
-    （也意味着那 5 个函数不能顺手改名）。这个方向的保守是可接受的：
-    宁可多失效一次，也不要"改了格式却继续命中旧缓存"。
-    读不到源码时交给调用方统一降级（编译/打包环境）。
-
-    **为什么不用 `ast.dump()`**：它的输出**随 Python 版本变**。CPython 3.13 起
-    `ast.dump` 多了 `show_empty` 参数且默认 `False`——空字段（`returns=None`、
-    `type_params=[]` 之类）不再被打印，而 3.12 及更早会把它们全打出来。于是同一份
-    源码在 3.10/3.12 与 3.13/3.14 上得到**两个不同的指纹**，后果有两条：
-    ① CI 里 3.10 与 3.12 的"指纹绝对值"用例必红（本轮就撞上了，四个版本只过两个）；
-    ② 用户换一个 Python 版本，维度缓存与月份缓存的键全变，**同一份聊天要重新付费**。
-    指纹的全部意义就是"同样的输入得到同样的键"，版本相关性直接把它打穿。
-    所以这里自己把 AST 折叠成规范串：只取节点类型名与**非空**语义字段，字段名排序。
-    新版本新增的可选空字段会被跳过（正是 3.13 起 `ast.dump` 的行为），语义改动照旧换键，
-    而"改注释/重排/换引号不换键"这条原有保证完全保留。
-    """
-    src = inspect.getsource(func)
-    try:
-        return _canonical_ast(ast.parse(textwrap.dedent(src)))
-    except (SyntaxError, ValueError) as e:
-        logger.warning(
-            "提示词指纹：%s 的源码无法解析成 AST（%s），该类回退为原文哈希——"
-            "这意味着它的注释/格式改动也会换键",
-            getattr(func, "__name__", func),
-            e,
-        )
-        return src
+    # Stable compatibility hook; the frozen dialog functions are sourced and normalized
+    # by fingerprint_utils without changing their names or implementations.
+    return fingerprint_utils.hashed_source(func, canonical_ast=_canonical_ast, logger=logger)
 
 
 def _canonical_ast(node) -> str:
-    """把 AST 折叠成**跨 Python 版本稳定**的规范字符串（见 _hashed_source 的说明）。
-
-    规则只有三条，都是为了"同一份源码在任何受支持的 Python 上得到同一个串"：
-    - 节点类型名 + 字段名（**排序**，不依赖 `_fields` 的顺序）；
-    - `None` / 空列表 / 空串一律**省略**——新版本新增的可选空字段因此不影响结果；
-    - 子节点递归折叠，常量与非 AST 值走 repr。
-    不引入任何版本相关的排序或格式（例如不依赖 ast.dump 的括号与缩进风格）。
-    """
-    if isinstance(node, ast.AST):
-        parts = [type(node).__name__]
-        for field in sorted(getattr(node, "_fields", ())):
-            value = getattr(node, field, None)
-            if value is None or value == [] or value == "":
-                continue
-            parts.append(f"{field}={_canonical_ast(value)}")
-        return "(" + " ".join(parts) + ")"
-    if isinstance(node, (list, tuple)):
-        return "[" + " ".join(_canonical_ast(item) for item in node) + "]"
-    return repr(node)
+    # Keep the historical patch point used by tests and tools.
+    return fingerprint_utils.canonical_ast(node)
 
 
 def _prompt_fingerprint(salt: "str | None" = None, normalize: bool = True) -> str:
@@ -692,70 +644,28 @@ def _request_with_retry(
     tpm_wait: float,
     fatal_message: str,
 ) -> tuple[Any, Optional[str]]:
-    """调用 API 的公共骨架：调用闸门 → 请求 → 用量记账 → 错误分类与退避。
-
-    _call_api 与 _call_vision 原先各抄了一份近 100 行的同样逻辑（_pace、限流重试、
-    额度耗尽判定、指数退避、用量统计），改一处必须记得改两处——这里收成一份，
-    两个调用方只管各自的参数构建与结果解析。
-
-    错误分类（两份调用必须一致，否则"文本分析会退避、看图不会"这种差异会
-    在最需要稳定的时候暴露出来）：
-    - 429（TPM/RPM 每分钟限流，含误导性的 "Allocated quota exceeded/insufficient_quota"
-      文案）：全局冷却后重试，最多 TPM_MAX_ATTEMPTS 次；
-    - 401/403 配额、402 余额、欠费等真正的额度耗尽：立即抛 QuotaExhaustedError
-      （重试无意义，且要让上层中止剩余任务而不是烧钱）；
-    - 其他错误：指数退避，最多 generic_retries 次，仍失败则原样抛出。
-
-    返回值：(resp, None) 表示成功；(None, "tpm") 表示限流重试已用尽，由调用方
-    决定是抛 QuotaExhaustedError（文本分析）还是降级返回空串（看图，不致命）。
-    """
-    tpm_hits = 0
-    for attempt in range(max_attempts):
-        # 计费闸门放在 try **之外**：上限错误不能被下面的"错误分类与退避"当成网络抖动
-        # 去重试（那会白白多等几秒，还会把上限再撞几次）。重试循环里的每一次尝试
-        # 都算一次请求——限流重试同样占用服务商配额。
-        _count_call()
-        try:
-            _pace()
-            resp = client.chat.completions.create(**build_params())
-            choice = resp.choices[0]
-            if resp.usage:
-                logger.info(
-                    "token 用量[%s]: prompt=%s completion=%s finish=%s",
-                    tag,
-                    resp.usage.prompt_tokens,
-                    resp.usage.completion_tokens,
-                    choice.finish_reason,
-                )
-                record_call(
-                    DEEPSEEK_MODEL, tag, resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0
-                )
-            return resp, None
-        except Exception as e:
-            if _is_plan_exhausted(e):
-                raise QuotaExhaustedError(fatal_message) from e
-            if _is_tpm_throttle(e):
-                tpm_hits += 1
-                if tpm_hits < TPM_MAX_ATTEMPTS:
-                    logger.warning(
-                        "触发每分钟限流（TPM/RPM），全局冷却 %.0fs 后重试（%d/%d）",
-                        tpm_wait,
-                        tpm_hits,
-                        TPM_MAX_ATTEMPTS,
-                    )
-                    _set_cooldown(tpm_wait)  # 让所有并发线程一起退避，而非各自撞
-                    time.sleep(tpm_wait)
-                    continue
-                return None, "tpm"
-            if attempt < generic_retries:
-                delay = 2**attempt
-                logger.warning(
-                    "API 调用失败（第 %s 次，%ss 后重试）: %s", attempt + 1, delay, scrub_secrets(e)
-                )
-                time.sleep(delay)
-                continue
-            raise  # 最后仍失败则抛出，由调用方决定"致命"还是"降级"
-    return None, "error"
+    # Stable facade: tests and callers patch this module-level name.
+    return llm_transport.request_with_retry(
+        client,
+        build_params,
+        tag=tag,
+        max_attempts=max_attempts,
+        generic_retries=generic_retries,
+        tpm_wait=tpm_wait,
+        fatal_message=fatal_message,
+        count_call=_count_call,
+        pace=_pace,
+        is_plan_exhausted=_is_plan_exhausted,
+        is_tpm_throttle=_is_tpm_throttle,
+        set_cooldown=_set_cooldown,
+        tpm_max_attempts=TPM_MAX_ATTEMPTS,
+        logger=logger,
+        record_call=record_call,
+        model=DEEPSEEK_MODEL,
+        scrub_secrets=scrub_secrets,
+        quota_exhausted_error=QuotaExhaustedError,
+        sleep=time.sleep,
+    )
 
 
 def _json_request_params(system_prompt: str, user_content: str, max_tokens: int, think: bool) -> dict:
@@ -955,6 +865,7 @@ def _analyze_periods(
     total = len(months)
     done = 0
     fatal: dict[str, str] = {}  # 配额耗尽等致命错误：中止剩余月份
+    failed_periods: set[str] = set()  # 普通请求失败或模型输出无效的月份
     used_keys: set[str] = set()  # 本维度命中的月份缓存键，收尾时一次性写 manifest
 
     def _cancel_requested() -> bool:
@@ -1015,6 +926,8 @@ def _analyze_periods(
                 logger.info("%s 命中月份缓存，跳过 API 调用", period)
             else:
                 result = _call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag, dim=tag)
+                if not result:
+                    failed_periods.add(period)
                 # 清理守卫：用户在这几分钟里换了文件，这一轮就不该把含聊天原句引用
                 # 的结果写回盘上（否则级联清理报称"已删除"的数据会原地复活）。
                 # 已经付费拿到的结果本身照常返回给这一轮，只是不缓存。
@@ -1029,6 +942,7 @@ def _analyze_periods(
             fatal.setdefault("error", str(e))
             logger.error("%s 月 AI 分析中止（配额耗尽）", period)
         except Exception as e:
+            failed_periods.add(period)
             logger.error("%s 月 AI 分析失败: %s", period, e)
         return period, None
 
@@ -1077,6 +991,13 @@ def _analyze_periods(
         # **已经落在月份缓存里**，充值或调高上限后重跑只为缺的月份付费。
         # 与 _stop_requested 对"取消/关闭"立的规矩同一性质（见 webapp/jobs.py 那段注释）。
         raise QuotaExhaustedError(fatal["error"])
+
+    if failed_periods and not _cancel_requested():
+        # 成功月份已独立写入内容缓存。不要把缺月的汇总结果交给 jobs.py 写成完整维度缓存，
+        # 否则之后的普通请求会永久命中这份残缺汇总，错过月份也不会再被补算。
+        raise AnalysisIncompleteError(
+            f"{len(failed_periods)} 个月没有得到有效结果；已完成月份已缓存，可重试补齐"
+        )
 
     # 按月份自然序返回
     return {period: results[period] for period in months if period in results}
@@ -1266,13 +1187,27 @@ def _analyze_person(
             dialog += f"\n\n图片内容摘要（由视觉模型识别，供参考）：\n{digest}"
         if not dialog.strip():
             return None
-        result = _call_api(
-            system_prompt,
-            prompt_template.format(display_name=display_name, dialog=dialog),
-            max_tokens=max_tokens,
-            tag=tag,
-            dim=tag,
-        )
+        user_content = prompt_template.format(display_name=display_name, dialog=dialog)
+        # 双方分析各自独立计费。按人物内容缓存成功的一方，额度或临时错误后重试时
+        # 只补失败的一方；命名空间与逐月缓存分开，提示词指纹变动仍会自动换键。
+        cache_prompt = f"{system_prompt}\n[private-person:{tag}:{display_name}]"
+        cache_key = _month_key(cache_prompt, user_content, fingerprint_for_dimension(tag))
+        want_thinking = thinking_enabled(tag)
+        result = _read_month_cache(cache_key, expect_thinking=want_thinking, chat_hash=chat_hash)
+        if result is not None:
+            logger.info("%s 命中个人分析缓存，跳过 API 调用", mask_name(display_name))
+        else:
+            result = _call_api(
+                system_prompt,
+                user_content,
+                max_tokens=max_tokens,
+                tag=tag,
+                dim=tag,
+            )
+            if result and not purge_marks.is_marked(chat_hash):
+                _write_month_cache(cache_key, result, thinking=want_thinking)
+        if result and chat_hash:
+            _record_month_usage(chat_hash, {cache_key})
         if result:
             result["name"] = display_name
             result["total_messages"] = len(valid_all)
@@ -1292,6 +1227,7 @@ def analyze_habits(
     other_msgs = [m for m in chat.messages if m.sender_uid != chat.self_uid]
 
     results: dict[str, Any] = {}
+    incomplete = False
     template = "分析以下 {display_name} 的发言，总结其说话风格：\n\n{dialog}"
     total, done = 2, 0
     for person_key, msgs in [("self", self_msgs), ("other", other_msgs)]:
@@ -1310,15 +1246,16 @@ def analyze_habits(
                 chat_hash=chat_hash,
             )
         except QuotaExhaustedError:
-            if results:  # 已有部分结果：保留已完成者，向上报告配额问题
-                logger.error("配额耗尽，剩余对象未分析（已完成 %d/2）", len(results))
-                break
             raise
         if result:
             results[person_key] = result
+        elif any(_has_content(m) and is_statistical(m) for m in msgs):
+            incomplete = True
         done += 1
         if on_progress:
             on_progress(done, total)
+    if incomplete and results and not (should_cancel and should_cancel()):
+        raise AnalysisIncompleteError("habits 分析未能取得双方的完整结果；已完成的一方可从缓存复用")
     return results
 
 
@@ -1330,6 +1267,7 @@ def analyze_profile(
     other_msgs = [m for m in chat.messages if m.sender_uid != chat.self_uid]
 
     results: dict[str, Any] = {}
+    incomplete = False
     template = "以下是 {display_name} 在私聊中的发言记录，请对其进行深度性格分析：\n\n{dialog}"
     total, done = 2, 0
     for person_key, msgs in [("self", self_msgs), ("other", other_msgs)]:
@@ -1349,15 +1287,16 @@ def analyze_profile(
                 chat_hash=chat_hash,
             )
         except QuotaExhaustedError:
-            if results:
-                logger.error("配额耗尽，剩余对象未分析（已完成 %d/2）", len(results))
-                break
             raise
         if result:
             results[person_key] = result
+        elif any(_has_content(m) and is_statistical(m) for m in msgs):
+            incomplete = True
         done += 1
         if on_progress:
             on_progress(done, total)
+    if incomplete and results and not (should_cancel and should_cancel()):
+        raise AnalysisIncompleteError("profile 分析未能取得双方的完整结果；已完成的一方可从缓存复用")
     return results
 
 
