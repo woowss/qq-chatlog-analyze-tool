@@ -30,6 +30,13 @@ load_dotenv()
 BASE_DIR = Path(__file__).parent
 
 
+def _warn(message: str) -> None:
+    """配置导入阶段的警告：窗口化冻结程序没有可写的 stderr。"""
+    stream = getattr(sys, "stderr", None)
+    if stream is not None:
+        print(message, file=stream)
+
+
 def _is_source_checkout() -> bool:
     """当前是"源码检出"还是"pip 安装后的 site-packages"
 
@@ -117,10 +124,10 @@ def env_int(name: str, default: int, low: int, high: int) -> int:
     try:
         value = int(raw)
     except ValueError:
-        print(f"[WARN] {name}={raw!r} 不是整数，已回退为 {default}", file=sys.stderr)
+        _warn(f"[WARN] {name}={raw!r} 不是整数，已回退为 {default}")
         return default
     if not low <= value <= high:
-        print(f"[WARN] {name}={value} 超出范围 [{low}, {high}]，已回退为 {default}", file=sys.stderr)
+        _warn(f"[WARN] {name}={value} 超出范围 [{low}, {high}]，已回退为 {default}")
         return default
     return value
 
@@ -138,10 +145,10 @@ def env_number(name: str, default: float, low: float, high: float) -> float:
     try:
         value = float(raw)
     except ValueError:
-        print(f"[WARN] {name}={raw!r} 不是数字，已回退为 {default}", file=sys.stderr)
+        _warn(f"[WARN] {name}={raw!r} 不是数字，已回退为 {default}")
         return default
     if not low <= value <= high:
-        print(f"[WARN] {name}={value} 超出范围 [{low}, {high}]，已回退为 {default}", file=sys.stderr)
+        _warn(f"[WARN] {name}={value} 超出范围 [{low}, {high}]，已回退为 {default}")
         return default
     return value
 
@@ -152,7 +159,7 @@ def env_choice(name: str, default: str, allowed: tuple) -> str:
     if not raw:
         return default
     if raw not in allowed:
-        print(f"[WARN] {name}={raw!r} 不是 {'/'.join(allowed)} 之一，已回退为 {default}", file=sys.stderr)
+        _warn(f"[WARN] {name}={raw!r} 不是 {'/'.join(allowed)} 之一，已回退为 {default}")
         return default
     return raw
 

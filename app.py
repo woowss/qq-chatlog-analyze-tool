@@ -159,7 +159,10 @@ cleanup.startup_cleanup()
 
 def _print_safe(msg: str) -> None:
     """打印启动信息：控制台编码表示不了时降级替换，别让一行生僻字把启动打崩"""
-    enc = sys.stdout.encoding or "utf-8"
+    stream = getattr(sys, "stdout", None)
+    if stream is None:
+        return
+    enc = getattr(stream, "encoding", None) or "utf-8"
     try:
         print(msg)
     except UnicodeEncodeError:

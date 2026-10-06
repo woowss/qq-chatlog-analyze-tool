@@ -21,6 +21,7 @@
 
 - [功能](#功能)
 - [快速开始](#快速开始)
+- [Windows 直装版](#windows-直装版)
 - [可选能力](#可选能力)
 - [配置项](#配置项)
 - [分析质量与费用](#分析质量与费用)
@@ -102,7 +103,7 @@ AI 分析，而消息正文保持干净（文件名和占位符不会进入词�
 
 ```bash
 # 方式 A（推荐）：直接装 Release 里的 wheel，装完即得 qqchatlog 命令
-pip install https://github.com/woowss/qq-chatlog-analyze-tool/releases/download/v1.2.1/qqchatlog-1.2.1-py3-none-any.whl
+pip install https://github.com/woowss/qq-chatlog-analyze-tool/releases/download/v1.2.2/qqchatlog-1.2.2-py3-none-any.whl
 qqchatlog --version
 
 # 方式 B：从源码装成命令（想改代码就用可编辑安装）
@@ -184,6 +185,32 @@ python app.py      # 方式 C，等价入口
 1. 上传导出的 `.json` 文件，进入仪表盘查看本地统计。
 2. 配置了 API Key 时，按维度运行 AI 分析，或点「全量分析」跑完五个维度。
 3. 已分析的结果缓存在 `ai_cache/`，重开页面不会重复调用接口；需要重跑时勾选「强制重新分析」。
+
+## Windows 直装版
+
+Release 同时提供 Windows 10/11 x64 安装包与免安装压缩包：
+
+```text
+QQChatLog-<版本>-windows-x64-Setup.exe
+QQChatLog-<版本>-windows-x64-portable.zip
+```
+
+安装包内置 Python 和运行依赖，普通用户无需另装 Python。安装完成后从开始菜单或桌面快捷方式启动，
+启动器会等待本机服务就绪并自动打开默认浏览器。启动管理窗口可以重新打开页面、打开配置文件、打开
+数据目录和日志目录，也可以停止服务并退出。重复点击快捷方式会打开已经运行的实例。
+
+Windows 直装版默认只监听 `127.0.0.1`，端口从 `.env` 中的 `FLASK_PORT` 开始寻找可用端口。
+用户数据与程序目录分开保存，默认仍是 `%LOCALAPPDATA%\qqchatlog`；升级不会覆盖 `.env`、聊天记录、
+分析缓存或日志，卸载程序也不会删除这些数据。AI 分析仍需在配置文件中填写自己的 OpenAI 兼容接口 Key。
+
+开发者可以在 Windows 上安装 Inno Setup 6，然后运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging/windows/build.ps1
+```
+
+构建产物会写入 `dist/windows/`，其中包含安装包、免安装 ZIP 和 `SHA256SUMS.txt`。构建过程不会把真实
+聊天记录、`.env`、`.secret_key`、缓存或日志放入发布物。
 
 ## 可选能力
 

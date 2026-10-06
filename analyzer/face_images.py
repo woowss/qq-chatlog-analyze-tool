@@ -345,7 +345,10 @@ def ensure(faces: dict, allow_network: bool = True, max_seconds: float = 0.0) ->
         deadline = (time.monotonic() + max_seconds) if max_seconds > 0 else None
         queue = pending[:FACE_FETCH_LIMIT]
         for idx, (name, info, key) in enumerate(queue):
-            if deadline is not None and time.monotonic() > deadline:
+            # 在 Windows 上 monotonic 的时钟粒度可能比测试给出的极小预算更粗；
+            # 剩余不到 1ms 时启动同步网络请求没有实际意义，也会让请求越过预算。
+            # 提前这一点收口只影响已经没有足够时间发起请求的尾部窗口。
+            if deadline is not None and deadline - time.monotonic() <= 0.001:
                 logger.info(
                     "表情图抓取已达单次时长上限（%.0fs），剩余 %d 个留到下次", max_seconds, len(queue) - idx
                 )

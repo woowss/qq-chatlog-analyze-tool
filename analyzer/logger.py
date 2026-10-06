@@ -59,14 +59,16 @@ def mask_name(name: str) -> str:
 class _ConsoleHandler(logging.StreamHandler):
     """兼容 Windows GBK 终端的控制台处理器，自动替换不可打印字符"""
 
-    def __init__(self):
-        super().__init__(sys.stdout)
-        self._enc = sys.stdout.encoding or "utf-8"
+    def __init__(self, stream):
+        super().__init__(stream)
+        self._enc = getattr(stream, "encoding", None) or "utf-8"
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = self.format(record)
             stream = self.stream
+            if stream is None:
+                return
             stream.write(msg + self.terminator)
             self.flush()
         except UnicodeEncodeError:
@@ -109,10 +111,15 @@ def _configure(base: logging.Logger) -> None:
         "[%(asctime)s] %(levelname)-7s | %(message)s",
         datefmt="%H:%M:%S",
     )
-    console_handler = _ConsoleHandler()
-    console_handler.setLevel(LOG_LEVEL)
-    console_handler.setFormatter(console_fmt)
-    base.addHandler(console_handler)
+    # PyInstaller 的 --windowed 模式没有 stdout/stderr。日志仍然完整写入文件，
+    # 但不能把一个不可用的 StreamHandler 加进去，否则首次记录日志就会在
+    # ``None.encoding`` 或 ``None.write`` 处失败，启动器只能显示一个空窗口。
+    console_stream = getattr(sys, "stdout", None)
+    if console_stream is not None:
+        console_handler = _ConsoleHandler(console_stream)
+        console_handler.setLevel(LOG_LEVEL)
+        console_handler.setFormatter(console_fmt)
+        base.addHandler(console_handler)
 
 
 def get_logger(name: str = PACKAGE_LOGGER) -> logging.Logger:

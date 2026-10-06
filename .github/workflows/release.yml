@@ -36,7 +36,69 @@ permissions:
   contents: write        # 建 Release 与上传附件所需
 
 jobs:
+  windows-package:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: 校验 Windows 构建版本
+        shell: pwsh
+        run: |
+          $tag = $env:TAG.TrimStart('v')
+          $project = Get-Content -Raw pyproject.toml
+          $match = [regex]::Match($project, '(?m)^version\s*=\s*"([^"]+)"')
+          if (-not $match.Success -or $match.Groups[1].Value -ne $tag) {
+            throw "tag $env:TAG 与 pyproject.toml 版本不一致"
+          }
+
+      - name: 构建 Windows 安装包
+        shell: pwsh
+        run: |
+          & .\packaging\windows\build.ps1 `
+            -Python python `
+            -InnoCompiler 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows 安装包构建失败"
+          }
+
+      - name: 校验冻结目录
+        shell: pwsh
+        run: python tools/verify_windows_package.py dist/windows/QQChatLog
+
+      - name: Windows 启动器回归与冻结入口检查
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -p test_windows_launcher.py -v
+          if ($LASTEXITCODE -ne 0) { throw "Windows 启动器测试失败" }
+          $env:QQCHAT_DATA_DIR = Join-Path $env:RUNNER_TEMP 'qqchatlog-version-smoke'
+          $exe = (Resolve-Path 'dist/windows/QQChatLog/QQChatLog.exe').Path
+          $process = Start-Process -FilePath $exe -ArgumentList '--version' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "冻结程序版本入口失败" }
+
+      - name: 保存 Windows 发布物
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-package
+          path: |
+            dist/windows/*.exe
+            dist/windows/*.zip
+          if-no-files-found: error
+
   release:
+    needs: windows-package
     runs-on: ubuntu-latest
     env:
       # tag 推送时用被推的 tag；手动触发时用输入值
@@ -89,10 +151,19 @@ jobs:
           python tools/verify_wheel.py .tmp_dist/*.whl
           ls -l .tmp_dist
 
+      - name: 下载 Windows 发布物
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-package
+          path: .tmp_windows_dist
+
+      - name: 合并 Windows 发布物
+        run: cp .tmp_windows_dist/* .tmp_dist/
+
       - name: 生成校验和
         run: |
           cd .tmp_dist
-          sha256sum *.whl *.tar.gz > SHA256SUMS.txt
+          sha256sum *.whl *.tar.gz *.exe *.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: 建 Release 并挂附件
@@ -114,6 +185,9 @@ jobs:
             echo '```bash'
             echo "pip install https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/qqchatlog-${TAG#v}-py3-none-any.whl"
             echo '```'
+            echo
+            echo 'Windows 用户可下载 `QQChatLog-<版本>-windows-x64-Setup.exe`，安装后双击桌面快捷方式即可运行；'
+            echo '同时提供 `QQChatLog-<版本>-windows-x64-portable.zip` 免安装版本。'
             echo
             echo '### 隐私说明'
             echo
@@ -151,7 +225,8 @@ jobs:
               ;;
           esac
           gh release upload "$TAG" \
-            .tmp_dist/*.whl .tmp_dist/*.tar.gz .tmp_dist/SHA256SUMS.txt --clobber
+            .tmp_dist/*.whl .tmp_dist/*.tar.gz .tmp_dist/*.exe .tmp_dist/*.zip \
+            .tmp_dist/SHA256SUMS.txt --clobber
           # 兜底：上一版遗留的草稿（或本次误建）在这里发布出去。附件已经挂好，
           # 这一步失败就说明发布页对使用者仍不可用，宁可让 job 红。
           gh release edit "$TAG" --draft=false
