@@ -780,7 +780,6 @@ function renderGroupTopics(container, data) {
 function renderGroupEmotion(container, data) {
     var months = monthsOf(data);
     if (!months.length) return false;
-    renderGroupEmotionTrend(data);
     var html = '';
     months.forEach(function (m) {
         var d = data[m] || {};
@@ -811,12 +810,12 @@ function renderGroupEmotion(container, data) {
 }
 
 // 群聊情绪走势只出现在情绪页；仪表盘复用同一渲染函数时没有该容器，直接跳过。
-function renderGroupEmotionTrend(data) {
+function renderGroupEmotionTrend(data, chart) {
     var el = document.getElementById('emotionTrend');
     if (!el) return;
     var months = monthsOf(data);
     if (!months.length) return;
-    var chart = mountChart('emotionTrend');
+    chart = chart || mountChart('emotionTrend');
     if (!chart) return;
     el.classList.remove('d-none');
     var empty = document.getElementById('emotionTrendEmpty');
@@ -959,7 +958,11 @@ function analyzeGroupDimension(dim, btn, containerId, renderer, onFinish) {
 var GROUP_RENDERERS = {
     group_dynamics: renderGroupDynamics,
     group_topics: renderGroupTopics,
-    group_emotion: renderGroupEmotion,
+    group_emotion: function (container, data) {
+        var rendered = renderGroupEmotion(container, data);
+        if (rendered) renderGroupEmotionTrend(data);
+        return rendered;
+    },
     member_profiles: renderMemberProfiles
 };
 

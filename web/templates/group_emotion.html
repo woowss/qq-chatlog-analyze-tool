@@ -68,6 +68,9 @@ loadAnalysis('group_emotion', function (data) {
     if (!data) return;
     var box = document.getElementById('sec-emotion');
     if (box) renderGroupEmotion(box, data);
+    var chart = mountChart('emotionTrend');
+    if (!chart) return;
+    renderGroupEmotionTrend(data, chart);
 });
 wireGroupAnalyzeButtons(MEMBERS);
 </script>
