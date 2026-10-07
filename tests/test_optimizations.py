@@ -208,6 +208,110 @@ class TestDialogCompaction(unittest.TestCase):
         self.assertIn("先开口", head)  # 谁更常开启话题（本地算）
         self.assertIn("回复间隔中位数", head)
 
+    def test_sampling_rebuilds_speaker_context(self):
+        """抽样后的每次换人都必须重新打印昵称，不能沿用被抽走的前置行。"""
+        base = int(datetime(2024, 1, 1, 8, 0, tzinfo=CST).timestamp() * 1000)
+        speakers = ["u1", "u1", "u2", "u2", "u2", "u1", "u1", "u1"]
+        messages = [
+            _msg(uid, base + i * 1000, text=f"sample-{i}-" + "x" * 70) for i, uid in enumerate(speakers)
+        ]
+        selected, lines, sampled = dc._fit_message_context(messages, "u1", "A", "B", 300)
+        self.assertTrue(sampled)
+        self.assertEqual([m.sender_uid for m in selected], ["u1", "u2", "u1"])
+        self.assertTrue(lines[0].startswith("["))
+        self.assertTrue(lines[1].startswith("B:"), lines[1])
+        self.assertTrue(lines[2].startswith("A:"), lines[2])
+        dialog = dc._build_dialog(messages, "u1", "A", "B", max_chars=300)
+        self.assertIn("B: sample-3-", dialog)
+        self.assertIn("A: sample-6-", dialog)
+
+    def test_sampling_uses_a_separate_dimension_cache_fingerprint(self):
+        """只有触发新抽样格式的聊天才切到新维度缓存代次。"""
+        base = int(datetime(2024, 1, 1, 8, 0, tzinfo=CST).timestamp() * 1000)
+        messages = [_msg("u1" if i % 2 else "u2", base + i * 1000, text="x" * 100) for i in range(20)]
+        chat = _chat(messages)
+        current = dc.analysis_cache_fingerprint("emotion", chat)
+        with mock.patch.object(dc, "MAX_DIALOG_CHARS", 300):
+            sampled = dc.analysis_cache_fingerprint("emotion", chat)
+            self.assertNotEqual(sampled, current)
+            self.assertEqual(sampled, dc.sampled_prompt_fingerprint())
+
+    def test_single_long_message_stays_within_budget(self):
+        """只有一条超长消息时，截断后的换行也必须计入预算。"""
+        base = int(datetime(2024, 1, 1, 8, 0, tzinfo=CST).timestamp() * 1000)
+        selected, lines, sampled = dc._fit_message_context(
+            [_msg("u1", base, text="x" * 1000)], "u1", "A", "B", 100
+        )
+        self.assertTrue(sampled)
+        self.assertEqual(len(selected), 1)
+        self.assertLessEqual(sum(len(line) + 1 for line in lines), 100)
+
+    def test_sampling_does_not_collapse_around_one_long_message(self):
+        """超长孤立消息不能把整个月的样本退化成末尾一小段。"""
+        base = int(datetime(2024, 1, 1, 8, 0, tzinfo=CST).timestamp() * 1000)
+        messages = [_msg("u1", base, text="x" * 1000)]
+        messages.extend(
+            _msg("u1" if i % 2 else "u2", base + (i + 1) * 1000, text=f"普通-{i}") for i in range(99)
+        )
+        selected, lines, sampled = dc._fit_message_context(messages, "u1", "A", "B", 200)
+        self.assertTrue(sampled)
+        self.assertLessEqual(sum(len(line) + 1 for line in lines), 200)
+        self.assertGreaterEqual(len(selected), 3)
+        indexes = [messages.index(message) for message in selected]
+        self.assertLess(indexes[0], 20)
+        self.assertGreater(indexes[-1], 80)
+
+    def test_mixed_long_messages_do_not_erase_all_ordinary_messages(self):
+        """步长不能被多条超长消息推到总条数以上，只留下超长首条。"""
+        base = int(datetime(2024, 1, 1, 8, 0, tzinfo=CST).timestamp() * 1000)
+        sizes = [
+            2000,
+            20,
+            60,
+            10,
+            10,
+            60,
+            10,
+            60,
+            20,
+            3000,
+            3000,
+            20,
+            3000,
+            2000,
+            10,
+            2000,
+            60,
+            3000,
+            2000,
+            10,
+            60,
+            20,
+        ]
+        messages = [
+            _msg(
+                "u1" if i % 2 else "u2",
+                base + i * 60_000,
+                text="x" * size if size >= 100 else f"ordinary-{i}",
+            )
+            for i, size in enumerate(sizes)
+        ]
+        ordinary = [message for message in messages if message.text.startswith("ordinary-")]
+        selected, lines, sampled = dc._fit_message_context(messages, "u1", "A", "B", 1000)
+        self.assertTrue(sampled)
+        self.assertEqual(selected, ordinary)
+        self.assertEqual(lines, dc._render_message_lines(ordinary, "u1", "A", "B"))
+        self.assertLessEqual(sum(len(line) + 1 for line in lines), 1000)
+
+    def test_sampling_terminates_when_every_message_is_too_long(self):
+        """所有候选都超过预算时也必须收敛到一条截断消息。"""
+        base = int(datetime(2024, 1, 1, 8, 0, tzinfo=CST).timestamp() * 1000)
+        messages = [_msg("u1" if i % 2 else "u2", base + i * 1000, text="x" * 1000) for i in range(40)]
+        selected, lines, sampled = dc._fit_message_context(messages, "u1", "A", "B", 100)
+        self.assertTrue(sampled)
+        self.assertEqual(len(selected), 1)
+        self.assertLessEqual(sum(len(line) + 1 for line in lines), 100)
+
 
 class TestMonthIncrementalCache(unittest.TestCase):
     """增量分析：重新导出多了一个月时，历史月份不该再付费"""
@@ -466,6 +570,43 @@ class TestPromptFingerprint(unittest.TestCase):
             self.assertNotEqual(base, dc._prompt_fingerprint(), "改了对话字符预算必须换指纹")
         with mock.patch.object(dc, "TIME_MARK_MINUTES", 5):
             self.assertNotEqual(base, dc._prompt_fingerprint(), "改了时间标记口径必须换指纹")
+
+    def test_unsampled_custom_budget_keeps_historical_cache_key(self):
+        """同配置升级应保留历史键；不同预算不能混用维度缓存。"""
+        base = int(datetime(2024, 1, 1, 8, 0, tzinfo=CST).timestamp() * 1000)
+        chat = _chat([_msg("u1", base, text="短消息"), _msg("u2", base + 1000, text="回复")])
+        current = dc.analysis_cache_fingerprint("emotion", chat)
+        with mock.patch.object(dc, "MAX_DIALOG_CHARS", 10_000):
+            historical = "d305632c87ea"
+            self.assertNotEqual(historical, current)
+            self.assertEqual(dc.analysis_cache_fingerprint("emotion", chat), historical)
+            self.assertEqual(dc._unsampled_prompt_fingerprint(), historical)
+            prompt = dc._month_prompt(chat, "2024-01", chat.messages)
+            self.assertEqual(getattr(prompt, "cache_fingerprint", None), historical)
+
+    def test_compat_fingerprint_detects_formatter_change(self):
+        """固定历史指纹必须先确认格式源码仍是已审核版本。"""
+        import inspect
+
+        base = dc._prompt_fingerprint()
+        original = inspect.getsource
+
+        def changed_source(func):
+            source = original(func)
+            if func is dc._build_dialog_with_meta:
+                return source.replace("统计：", "统计(修订)：")
+            return source
+
+        with mock.patch("inspect.getsource", side_effect=changed_source):
+            self.assertNotEqual(base, dc._prompt_fingerprint())
+
+    def test_sampled_fingerprint_falls_back_when_source_is_unavailable(self):
+        """打包环境读不到源码时，新抽样键仍须稳定地产生。"""
+        with mock.patch("inspect.getsource", side_effect=OSError("no source here")):
+            first = dc.sampled_prompt_fingerprint()
+            second = dc.sampled_prompt_fingerprint()
+        self.assertEqual(len(first), 12)
+        self.assertEqual(first, second)
 
     def test_cache_key_uses_fingerprint_not_manual_version(self):
         path = storemod._cache_path("emotion", "deadbeefdeadbeef")

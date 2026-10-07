@@ -196,7 +196,112 @@ def _message_line(m, name: str, prev_uid: Optional[str] = None, prev_ts: Optiona
     return f"{prefix} {text}".strip() if prefix and text else (prefix or text)
 
 
-def _build_dialog(
+def _render_message_lines(messages: list, self_uid: str, self_name: str, other_name: str) -> list[str]:
+    """按给定消息子集重新生成对话行，让首条/换人标记只依赖保留消息。"""
+    lines: list[str] = []
+    prev_uid: Optional[str] = None
+    prev_ts: Optional[int] = None
+    for m in messages:
+        lines.append(
+            _message_line(m, self_name if m.sender_uid == self_uid else other_name, prev_uid, prev_ts)
+        )
+        prev_uid, prev_ts = m.sender_uid, m.timestamp
+    return lines
+
+
+def _truncate_dialog_line(line: str, max_chars: int) -> str:
+    """截断单条超长消息时保留身份前缀。"""
+    if len(line) <= max_chars:
+        return line
+    if max_chars <= 0:
+        return ""
+    colon = line.find(":")
+    if colon < 0 or colon + 1 >= max_chars:
+        return line[:max_chars]
+    prefix = line[: colon + 1]
+    return prefix + line[len(prefix) : max_chars]
+
+
+def _fit_message_context(
+    messages: list, self_uid: str, self_name: str, other_name: str, max_chars: int
+) -> tuple[list, list[str], bool]:
+    """抽样消息对象，再按抽样后的相邻关系重建对话行。
+
+    旧的 `_fit_lines` 只能看到已经压缩过的字符串：它抽走换人标记后，保留下来的正文
+    就无法判断属于谁。这里的步长仍按字符预算计算，但每次候选抽样都重新调用
+    `_message_line`，所以任何保留消息的身份都由当前片段中的首条/换人标记确定。
+    """
+    if max_chars <= 0:
+        return [], [], bool(messages)
+    full_lines = _render_message_lines(messages, self_uid, self_name, other_name)
+    if not messages or sum(len(line) + 1 for line in full_lines) <= max_chars:
+        return messages, full_lines, False
+
+    # Filter the pool before choosing a stride. Filtering only the sampled rows
+    # can miss every ordinary row when several oversized messages inflate the
+    # stride. Compare independent rows so omitted prefixes cannot hide the cost.
+    fitting = [
+        message
+        for message in messages
+        if len(_message_line(message, self_name if message.sender_uid == self_uid else other_name)) + 1
+        <= max_chars
+    ]
+    if fitting:
+        messages = fitting
+        full_lines = _render_message_lines(messages, self_uid, self_name, other_name)
+    # If every row is oversized, still converge to one truncated message.
+    total = sum(min(len(line) + 1, max_chars) for line in full_lines)
+    step = max(1, (total + max_chars - 1) // max_chars)
+
+    def _render_candidates(candidates: list) -> tuple[list, list[str]]:
+        rendered = _render_message_lines(candidates, self_uid, self_name, other_name)
+        if len(candidates) > 1:
+            # Do not let an uncontainable line crowd out every ordinary message.
+            fitting = [
+                message
+                for message, line in zip(candidates, rendered, strict=True)
+                if len(line) + 1 <= max_chars
+            ]
+            if fitting:
+                candidates = fitting
+                rendered = _render_message_lines(candidates, self_uid, self_name, other_name)
+        rendered = [
+            _truncate_dialog_line(line, max(0, max_chars - 1)) if len(line) + 1 > max_chars else line
+            for line in rendered
+        ]
+        return candidates, rendered
+
+    while True:
+        sampled = messages[::step]
+        if len(sampled) < 3 and len(messages) > 3 and step < len(messages):
+            sampled = messages[-30:]
+        sampled, lines = _render_candidates(sampled)
+        rendered_chars = sum(len(line) + 1 for line in lines)
+        if rendered_chars <= max_chars:
+            return sampled, lines, True
+        if len(sampled) <= 1:
+            line = _truncate_dialog_line(lines[0], max(0, max_chars - 1)) if lines else ""
+            return sampled, [line] if lines else [], True
+
+        # The reintroduced names can make a candidate larger than the original
+        # compressed-line estimate. Increase the stride and render again.
+        ratio = max(2, (rendered_chars + max_chars - 1) // max_chars)
+        next_step = max(step + 1, step * ratio)
+        step = next_step
+
+
+def _dialog_needs_sampling(
+    messages: list, self_uid: str, self_name: str, other_name: str, max_chars: int
+) -> bool:
+    """判断一个月份是否会走上下文抽样路径，不改动消息或生成摘要。"""
+    valid = [m for m in messages if _has_content(m) and is_statistical(m)]
+    if not valid or not max_chars:
+        return False
+    lines = _render_message_lines(valid, self_uid, self_name, other_name)
+    return sum(len(line) + 1 for line in lines) > max_chars
+
+
+def _build_dialog_with_meta(
     messages: list,
     self_uid: str,
     self_name: str,
@@ -204,7 +309,7 @@ def _build_dialog(
     max_chars: Optional[int] = MAX_DIALOG_CHARS,
     chat_hash: str = "",
     vision_label: str = "",
-) -> str:
+) -> tuple[str, bool]:
     """构建喂给模型的对话内容：统计头（含本地事实）+ 压缩后的对话行 + 图片摘要。
 
     统计头给模型全貌（即使抽样截断也能知道真实消息量），并附上本地精确算出的
@@ -216,23 +321,17 @@ def _build_dialog(
     """
     valid = [m for m in messages if _has_content(m) and is_statistical(m)]
     if not valid:
-        return ""
+        return "", False
     total = len(valid)
     self_n = sum(1 for m in valid if m.sender_uid == self_uid)
     other_n = total - self_n
     images = sum(1 for m in valid if m.has_image)
 
-    lines: list[str] = []
-    prev_uid: Optional[str] = None
-    prev_ts: Optional[int] = None
-    for m in valid:
-        lines.append(
-            _message_line(m, self_name if m.sender_uid == self_uid else other_name, prev_uid, prev_ts)
-        )
-        prev_uid, prev_ts = m.sender_uid, m.timestamp
-    original_n = len(lines)
+    sampled = False
     if max_chars:
-        lines = _fit_lines(lines, max_chars)
+        _selected, lines, sampled = _fit_message_context(valid, self_uid, self_name, other_name, max_chars)
+    else:
+        lines = _render_message_lines(valid, self_uid, self_name, other_name)
 
     parts = [f"共 {total} 条消息（我方 {self_n} 条 / 对方 {other_n} 条，图片 {images} 张）"]
     stats = _conversation_stats(valid, self_uid)
@@ -246,13 +345,35 @@ def _build_dialog(
             ratio = round(stats["self_opened"] / stats["sessions"] * 100)
             parts.append(f"其中我方先开口 {ratio}%、对方 {100 - ratio}%")
     head = "统计：" + "，".join(parts)
-    if len(lines) < original_n:
+    if sampled:
         head += f"，因篇幅限制展示其中 {len(lines)} 条（等间隔抽样，覆盖整月分布）"
     dialog = f"{head}。\n\n" + "\n".join(lines)
 
     digest = _vision_digest(valid, chat_hash, vision_label)
     if digest:
         dialog += f"\n\n图片内容摘要（由视觉模型识别，供参考）：\n{digest}"
+    return dialog, sampled
+
+
+def _build_dialog(
+    messages: list,
+    self_uid: str,
+    self_name: str,
+    other_name: str,
+    max_chars: Optional[int] = MAX_DIALOG_CHARS,
+    chat_hash: str = "",
+    vision_label: str = "",
+) -> str:
+    """构建喂给模型的对话内容，并兼容旧调用方只取文本的接口。"""
+    dialog, _sampled = _build_dialog_with_meta(
+        messages,
+        self_uid,
+        self_name,
+        other_name,
+        max_chars=max_chars,
+        chat_hash=chat_hash,
+        vision_label=vision_label,
+    )
     return dialog
 
 
