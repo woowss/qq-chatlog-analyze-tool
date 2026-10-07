@@ -26,7 +26,7 @@
 1. 数据目录：`QQCHAT_DATA_DIR` 指向本次进程独占的临时目录，绝不碰真实
    uploads/ai_cache/flask_session/logs。系统临时目录不可写时退到仓库内。
 
-2. 网络护栏：**没有配置真实 API Key 时**，把 `analyzer.deepseek_client._get_client`
+2. 网络护栏：默认无条件把 `analyzer.deepseek_client._get_client`
    换成一个"一调用就响亮失败"的哨兵。
 
    为什么不能只靠 tests/conftest.py：那里是 pytest 的 autouse fixture，而 CI 与
@@ -34,11 +34,8 @@
    于是 pytest 下有护栏、CI 下没有：一旦本机 .env 配了真 Key，跑 unittest 就可能真的出网
    花钱（项目为这类事故付过两次学费）。本模块对两种跑法一视同仁。
 
-   为什么"没配 Key 才装"就够了：`_get_client()` 在 Key 是占位符时本来返回 None
-   （见 deepseek_client._PLACEHOLDER_KEYS），调用方随即失败并报"未配置 API Key"。
-   哨兵只是把那句含糊的失败换成明确指路的失败。反过来，本机配了真 Key 时**不装护栏**，
-   所以"用真 Key 跑真实网络路径"的排查方式仍然可用——只是必须显式设置
-   `QQCHAT_TESTS_ALLOW_REAL_LLM=1` 表示自己知道在做什么。
+   `QQCHAT_TESTS_ALLOW_REAL_LLM=1` 是唯一关闭护栏的方式。这样开发机即使从 `.env`
+   读到了真 Key，普通测试也不会意外建立客户端；联网测试必须明确留下这个开关。
 """
 
 import atexit
@@ -70,8 +67,8 @@ def _forbidden_client(*_args, **_kwargs):
 
 
 def install_llm_network_guard() -> bool:
-    """没有真实 API Key 时切断客户端入口；返回护栏是否装上"""
-    if os.getenv("QQCHAT_TESTS_ALLOW_REAL_LLM", "").strip() not in ("", "0", "false"):
+    """默认切断客户端入口；只有显式值 ``1`` 才返回未安装。"""
+    if os.getenv("QQCHAT_TESTS_ALLOW_REAL_LLM", "").strip() == "1":
         print(
             "[tests] QQCHAT_TESTS_ALLOW_REAL_LLM 已设置：真实 LLM 调用护栏已关闭，测试可能产生费用",
             file=sys.stderr,
@@ -79,11 +76,6 @@ def install_llm_network_guard() -> bool:
         return False
 
     from analyzer import deepseek_client
-
-    # 真实 Key 已配置（本机 .env 常见）：出网是"应用真实行为"，不装作测试能覆盖它，
-    # 留给用例自己 mock——但不再由本模块兜底。
-    if deepseek_client.is_api_configured():
-        return False
 
     deepseek_client._get_client = _forbidden_client
     return True

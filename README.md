@@ -418,6 +418,10 @@ python -m ruff format .                      # 统一风格；CI 用 --check 卡
 python -m unittest discover -s tests -v      # 全量单测（含逐页冒烟、打包自检、会话后端自检）
 ```
 
+测试默认无条件阻止真实 LLM 客户端，即使开发机的 `.env` 配置了 API Key；pytest 与 unittest
+使用同一条护栏。只有明确执行联网测试时才设置 `QQCHAT_TESTS_ALLOW_REAL_LLM=1`，此时可能产生
+模型费用。其它取值（包括 `0`、`false`）仍保持护栏开启。
+
 用例数**刻意不写在这份文档里**：写死了就得每加一条用例同步改一次，而漏改的表现仅仅是
 "README 说了个过时的数字"——此前已经漂移过两次，且没有守卫能发现。数量以这条命令输出里的
 `Ran N tests` 为准。
