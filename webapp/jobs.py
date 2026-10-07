@@ -288,7 +288,8 @@ def _run_job(job_id: str, dimension: str, filepath: str, chat_hash: str) -> None
         # /api/analysis/<dim> 时可能读不到缓存，反而重新发起一次付费分析
         if result and not cancelled:
             validate_dimension_result(dimension, result)
-            store._write_cache(dimension, chat_hash, result)
+            cache_fp = store.analysis_cache_fingerprint(dimension, chat)
+            store._write_cache(dimension, chat_hash, result, fingerprint=cache_fp)
         with JOBS_LOCK:
             j = JOBS.get(job_id)
             if not j:
@@ -364,7 +365,8 @@ def _run_analyze_all(
                 j = JOBS.get(job_id)
                 if j:
                     j["detail"] = f"{idx}/{total} {dim_name}"
-            if not refresh and store._read_cache(dim, chat_hash) is not None:
+            cache_fp = store.analysis_cache_fingerprint(dim, chat)
+            if not refresh and store._read_cache(dim, chat_hash, fingerprint=cache_fp) is not None:
                 summary[dim] = "cached"
             else:
                 unit = dimension_unit(dim)
@@ -385,7 +387,7 @@ def _run_analyze_all(
                         summary[dim] = "cancelled"
                     elif result:
                         validate_dimension_result(dim, result)
-                        store._write_cache(dim, chat_hash, result)
+                        store._write_cache(dim, chat_hash, result, fingerprint=cache_fp)
                         summary[dim] = "done"
                     else:
                         summary[dim] = "empty"

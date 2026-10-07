@@ -38,6 +38,9 @@
 import hashlib
 import inspect
 import os
+from bisect import bisect_left
+from collections import deque
+from dataclasses import replace
 from typing import Callable, Optional
 
 from config import GROUP_AI_MAX_MEMBERS, env_number
@@ -47,16 +50,20 @@ from analyzer import group_prompts as gp
 from analyzer.deepseek_client import (
     AnalysisIncompleteError,
     MAX_TOKENS_BY_DIM,
+    _PromptText,
     QuotaExhaustedError,
     ResultValidationError,
     _analyze_periods,
     _call_api,
     _fit_lines,
+    _gap_mark,
     _has_content,
     _hashed_source,
     _message_line,
     month_cache_enabled,
     validate_result,
+    _short_time,
+    _truncate_dialog_line,
     _vision_digest,
     logger,
 )
@@ -72,6 +79,11 @@ GROUP_MEMBER_MIN_LINES = int(env_number("LLM_GROUP_MEMBER_MIN_LINES", 20, 1, 500
 MEMBER_PROFILE_SAMPLES = 800
 #: 单条 prompt 里展示的互动"Top 对"数量（三张矩阵各取前 N 对，太长反而淹没重点）
 INTERACTION_DIGEST_PAIRS = 8
+
+_GROUP_COMPAT_FINGERPRINT = "30c7d6356e3a"
+# Keep the historical formula behind a literal source check.  Recomputing
+# this digest at import time would make a formatter change look compatible again.
+_GROUP_COMPAT_FORMAT_DIGEST = "91ebeee1c18355a095ebf21eef21b9ab0083fa441dac87c1e4bcde9e1ee2fd3e"
 
 
 def select_ai_members(chat: ChatData, limit: int = 0) -> list[Participant]:
@@ -198,72 +210,324 @@ def _member_facts(msgs: list, chat: ChatData) -> tuple[str, list[tuple[str, int]
     )
 
 
-def _fit_group_lines(entries: list, max_chars: int) -> list:
-    """成员感知抽样：entries 是 [(原始序号, uid, 文本行)]，返回保序的文本行列表。
+def _entry_line(entry) -> str:
+    """取成员配额计算用的基准行（兼容旧的三元组测试夹具）。"""
+    if len(entry) > 3 and isinstance(entry[3], str):
+        return entry[3]
+    return entry[2] if isinstance(entry[2], str) else ""
 
-    先给每位成员 GROUP_MEMBER_MIN_LINES 条保底，再按"该成员字符占比"分配预算，
-    每个成员内部用等间隔步长取（保证覆盖整段时间）；仍然超预算时按兜底截断收敛。
-    """
+
+def _trim_group_entries(entries: list, render, max_chars: int) -> tuple[list, list[str]]:
+    """最后一道预算闸门：删消息或截一条消息，但始终用完整上下文重绘。"""
+    if max_chars <= 0:
+        return [], []
+    current = list(entries)
+    while current:
+        lines = render(current)
+        if sum(len(line) + 1 for line in lines) <= max_chars:
+            return current, lines
+        if len(current) == 1:
+            return current, [_truncate_dialog_line(lines[0], max(0, max_chars - 1))]
+        kept: list = []
+        used = 0
+        for entry, line in reversed(list(zip(current, lines, strict=True))):
+            if used + len(line) + 1 <= max_chars:
+                kept.append(entry)
+                used += len(line) + 1
+            elif not kept:
+                kept.append(entry)
+                break
+        current = list(reversed(kept))
+    return [], []
+
+
+def _fit_group_entries(entries: list, max_chars: int, render) -> tuple[list, list[str], bool]:
+    """按成员配额选择消息，再根据最终保留消息重建发言人上下文。"""
     if not entries:
-        return []
-    lines = [e[2] for e in entries]
-    total_chars = sum(len(line) + 1 for line in lines)
+        return [], [], False
+    if max_chars <= 0:
+        return [], [], True
+    full_lines = render(entries)
+    total_chars = sum(len(line) + 1 for line in full_lines)
     if total_chars <= max_chars:
-        return lines
+        return entries, full_lines, False
 
     by_member: dict[str, list] = {}
-    for e in entries:
-        by_member.setdefault(e[1], []).append(e)
+    for entry in entries:
+        by_member.setdefault(entry[1], []).append(entry)
+    # A stride always selects a member's first row. If that row alone exceeds
+    # the budget, shrinking quotas cannot make it fit and eventually loses the
+    # entire member. Prefer its ordinary rows; retain oversized rows only when
+    # the member has no alternative so the final gate can truncate one.
+    for uid, items in by_member.items():
+        fitting = [entry for entry in items if len(_entry_line(entry)) + 1 <= max_chars]
+        if fitting:
+            by_member[uid] = fitting
+    base_chars = sum(len(_entry_line(entry)) + 1 for items in by_member.values() for entry in items)
 
     def _avg_line_len(items: list) -> float:
-        """该成员平均每条多少字符（含换行）。字符预算换算成行数要用它。"""
-        return (sum(len(e[2]) + 1 for e in items) / len(items)) if items else 1.0
+        return sum(len(_entry_line(entry)) + 1 for entry in items) / len(items)
 
     def _quota_plan(min_lines: int) -> dict[str, int]:
-        """把"该成员的字符占比"换算成"该成员保留多少**行**"。
-
-        单位必须换算清楚：max_chars 是**字符**预算，而 plan 的值是**行数**。
-        早先写的是 `share * (max_chars / 1.05)` —— 直接把字符数当行数用，比正确值
-        大了一个平均行长（实测约 40 倍）。后果不是"稍微多留一点"，而是整段逻辑失效：
-        keep = min(plan[uid], len(items)) 恒等于 len(items)（人人都全留）→ _estimate
-        必然超预算 → 降级循环又被下面的 max(min_lines, ...) 掩住（min_lines 只是下限）
-        → 每次落到 :244 的 _fit_lines 均匀截断。也就是说"成员感知抽样"从未生效过，
-        而 build_group_dialog 已经对着模型写了"每位成员都有保底条数，低频成员不会被
-        整段丢掉"——那句话在这个 bug 下是假的，低频成员恰恰被均匀抽样丢掉了。
-        """
         plan: dict[str, int] = {}
         for uid, items in by_member.items():
-            share = sum(len(e[2]) + 1 for e in items) / total_chars
-            # 该成员分到的字符预算 ÷ 他的平均行长 = 他能保留的行数
+            share = sum(len(_entry_line(entry)) + 1 for entry in items) / max(1, base_chars)
             line_budget = int(round(share * max_chars / max(1.0, _avg_line_len(items) * 1.05)))
             plan[uid] = min(len(items), max(min_lines, line_budget))
         return plan
 
-    def _estimate(plan: dict[str, int]) -> int:
-        total = 0
+    def _representative_cost(entry) -> int:
+        if isinstance(entry[2], str):
+            return len(_entry_line(entry))
+        # Original rows can omit a speaker/time prefix. Compare independently
+        # rendered rows instead; the resolved name adds the same cost to every
+        # candidate for a given member and is unnecessary for this comparison.
+        return len(_message_line(entry[2], ""))
+
+    def _pick(plan: dict[str, int]) -> list:
+        picked: list = []
         for uid, items in by_member.items():
-            keep = min(plan[uid], len(items))
+            keep = max(1, min(plan[uid], len(items)))
+            if keep == 1:
+                # A member's expensive first row can prevent everyone fitting
+                # even when a shorter row from that member would fit easily.
+                picked.append(min(items, key=_representative_cost))
+                continue
             stride = max(1, (len(items) + keep - 1) // keep)
-            total += sum(len(e[2]) + 1 for e in items[::stride])
-        return total
+            picked.extend(items[::stride])
+        return sorted(picked, key=lambda entry: entry[0])
+
+    def _fit_representatives() -> tuple[list, list[str]]:
+        cheapest = _pick(dict.fromkeys(by_member, 1))
+        lines = render(cheapest)
+        cost = sum(len(line) + 1 for line in lines)
+        if cost <= max_chars:
+            return cheapest, lines
+        # Choosing shorter bodies can spread messages farther apart and add
+        # full time markers. Try the earliest rows too before dropping members.
+        earliest = sorted((items[0] for items in by_member.values()), key=lambda entry: entry[0])
+        early_lines = render(earliest)
+        early_cost = sum(len(line) + 1 for line in early_lines)
+        if early_cost <= max_chars:
+            return earliest, early_lines
+        best, best_cost = (earliest, early_cost) if early_cost < cost else (cheapest, cost)
+        # Keep cheap candidates in a moving window instead of overwriting them
+        # with each member's latest row. Once the window covers every member,
+        # advance its start too: cheap but distant old rows must not prevent a
+        # compact middle cohort from fitting. Per-member monotone queues retain
+        # the cheapest row until it expires, including rows followed by noise.
+        candidates = sorted((entry for items in by_member.values() for entry in items), key=lambda e: e[0])
+        indexed = {entry[0]: entry for entry in candidates}
+        queues: dict[str, deque] = {uid: deque() for uid in by_member}
+        chosen: dict[str, int] = {}
+        ordered: list[int] = []
+        costs: dict[int, int] = {}
+        running_cost = 0
+
+        def row_cost(index: int, previous: int | None) -> int:
+            pair = [indexed[previous], indexed[index]] if previous is not None else [indexed[index]]
+            return len(render(pair)[-1]) + 1
+
+        def choose(uid: str, index: int | None) -> None:
+            nonlocal running_cost
+            if chosen.get(uid) == index:
+                return
+            # Only the replaced row and its immediate successors change cost.
+            # Recompute their prefixes, including when a successor becomes the
+            # first row. Always validate a fitting set with the full renderer.
+            if uid in chosen:
+                old = chosen.pop(uid)
+                position = bisect_left(ordered, old)
+                running_cost -= costs.pop(old)
+                ordered.pop(position)
+                if position < len(ordered):
+                    successor = ordered[position]
+                    running_cost -= costs[successor]
+                    costs[successor] = row_cost(successor, ordered[position - 1] if position else None)
+                    running_cost += costs[successor]
+            if index is None:
+                return
+            position = bisect_left(ordered, index)
+            costs[index] = row_cost(index, ordered[position - 1] if position else None)
+            running_cost += costs[index]
+            ordered.insert(position, index)
+            chosen[uid] = index
+            if position + 1 < len(ordered):
+                successor = ordered[position + 1]
+                running_cost -= costs[successor]
+                costs[successor] = row_cost(successor, index)
+                running_cost += costs[successor]
+
+        left = 0
+        for entry in candidates:
+            index, uid = entry[:2]
+            queue = queues[uid]
+            price = _representative_cost(entry)
+            while queue and queue[-1][1] > price:
+                queue.pop()
+            queue.append((index, price))
+            choose(uid, queue[0][0])
+            while len(chosen) == len(by_member):
+                if running_cost < best_cost:
+                    selected = [indexed[i] for i in ordered]
+                    selected_lines = render(selected)
+                    selected_cost = sum(len(line) + 1 for line in selected_lines)
+                    if selected_cost <= max_chars:
+                        return selected, selected_lines
+                    if selected_cost < best_cost:
+                        best, best_cost = selected, selected_cost
+                expired = candidates[left]
+                left += 1
+                queue = queues[expired[1]]
+                if queue[0][0] == expired[0]:
+                    queue.popleft()
+                    choose(expired[1], queue[0][0] if queue else None)
+        # Preserve every speaker if their identity/time markers fit. Searching
+        # representatives is a heuristic; failure to find complete bodies does
+        # not justify discarding a member. Truncate only the body, and never a
+        # speaker marker. The string-only compatibility fixtures have no message
+        # metadata with which to render these markers.
+        if not isinstance(best[0][2], str):
+            prefix_options = []
+            for selected in (best, cheapest, earliest):
+                bare = [
+                    (
+                        entry[0],
+                        entry[1],
+                        replace(
+                            entry[2],
+                            text="",
+                            has_image=False,
+                            is_reply=False,
+                            media_kind="",
+                            media_label="",
+                            face_names=[],
+                        ),
+                        "",
+                    )
+                    for entry in selected
+                ]
+                prefixes = render(bare)
+                prefix_cost = sum(len(line) + 1 for line in prefixes)
+                prefix_options.append((prefix_cost, selected, prefixes))
+            prefix_cost, selected, prefixes = min(prefix_options, key=lambda option: option[0])
+            if prefix_cost <= max_chars:
+                selected_lines = render(selected)
+                if all(
+                    line.startswith(prefix) for line, prefix in zip(selected_lines, prefixes, strict=True)
+                ):
+                    needs = [
+                        len(line) - len(prefix) for line, prefix in zip(selected_lines, prefixes, strict=True)
+                    ]
+                    allowance = [0] * len(needs)
+                    remaining = max_chars - prefix_cost
+                    count = len(needs)
+                    for i in sorted(range(count), key=needs.__getitem__):
+                        allowance[i] = min(needs[i], remaining // count)
+                        remaining -= allowance[i]
+                        count -= 1
+                    clipped = []
+                    for line, prefix, need, take in zip(
+                        selected_lines, prefixes, needs, allowance, strict=True
+                    ):
+                        if take >= need:
+                            clipped.append(line)
+                        elif take:
+                            clipped.append(line[: len(prefix) + take - 1] + "…")
+                        else:
+                            clipped.append(prefix)
+                    return selected, clipped
+        return _trim_group_entries(best, render, max_chars)
 
     plan = _quota_plan(GROUP_MEMBER_MIN_LINES)
-    if _estimate(plan) > max_chars:
-        # 保底太高（人特别多）：逐步降到 1 条，仍超预算就交给兜底截断
-        for min_lines in (10, 5, 3, 1):
-            plan = _quota_plan(min_lines)
-            if _estimate(plan) <= max_chars:
-                break
-    kept: list = []
-    for uid, items in by_member.items():
-        keep = max(1, min(plan[uid], len(items)))
-        stride = max(1, (len(items) + keep - 1) // keep)
-        kept.extend(items[::stride])
-    kept.sort(key=lambda e: e[0])
-    out = [e[2] for e in kept]
-    if sum(len(line) + 1 for line in out) > max_chars:
-        out = _fit_lines(out, max_chars)  # 兜底：与私聊同一套截断，保证绝不超预算
-    return out
+    # Keep a member's floor intact while another member still has excess rows.
+    # Scaling every allocation together can erase a low-frequency member even
+    # when its complete set of messages would still fit after reducing a noisy
+    # member. Only when all allocations are at their floors may the floors be
+    # lowered to make an unusually large group fit.
+    floor_plan = {uid: min(GROUP_MEMBER_MIN_LINES, len(items)) for uid, items in by_member.items()}
+    for _ in range(16):
+        picked = _pick(plan)
+        rendered = render(picked)
+        rendered_chars = sum(len(line) + 1 for line in rendered)
+        if rendered_chars <= max_chars:
+            return picked, rendered, True
+        reducible = [uid for uid, count in plan.items() if count > floor_plan[uid]]
+        if not reducible:
+            reducible = [uid for uid, count in plan.items() if count > 1]
+            if reducible:
+                # Members with fewer messages than the configured floor keep
+                # all their rows until the high-frequency members have reached
+                # one row each, even when their rows exceed the fair share.
+                frequent = [uid for uid in reducible if len(by_member[uid]) > GROUP_MEMBER_MIN_LINES]
+                reducible = frequent or reducible
+                # Reduce all members above a fair character share together.
+                # Reducing just one member per round exhausts the iteration
+                # limit in large groups, after which tail trimming loses entire
+                # members. Cheap, low-frequency members keep their full floor.
+                costs = dict.fromkeys(by_member, 0)
+                for entry, line in zip(picked, rendered, strict=True):
+                    costs[entry[1]] += len(line) + 1
+                fair_share = max_chars / len(by_member)
+                costly = [uid for uid in reducible if costs[uid] > fair_share]
+                reducible = costly or reducible
+        if not reducible:
+            picked, rendered = _fit_representatives()
+            return picked, rendered, True
+        changed = False
+        for uid in reducible:
+            current = plan[uid]
+            # Leave a little headroom for prefixes introduced by re-rendering.
+            minimum = floor_plan[uid] if current > floor_plan[uid] else 1
+            target = max(minimum, (current * max_chars * 9) // (rendered_chars * 10))
+            if target >= current:
+                target = current - 1
+            if target < current:
+                plan[uid] = target
+                changed = True
+        if not changed:
+            break
+
+    # Even pathological prefix changes must not send a partially reduced plan
+    # to tail trimming: first try one representative from every member. Only
+    # when that complete set exceeds the budget may the final gate drop members.
+    picked, rendered = _fit_representatives()
+    return picked, rendered, True
+
+
+def _fit_group_lines(entries: list, max_chars: int) -> list:
+    """成员感知抽样的兼容接口，返回保序文本行。"""
+    _kept, lines, _sampled = _fit_group_entries(
+        entries, max_chars, lambda selected: [_entry_line(entry) for entry in selected]
+    )
+    return lines
+
+
+def _render_group_entries(entries: list, resolve) -> list[str]:
+    """只用最终保留的消息计算首条、换人和相对时间标记。"""
+    lines: list[str] = []
+    prev_uid = prev_ts = None
+    for entry in entries:
+        message = entry[2]
+        line = _message_line(message, resolve(message.sender_uid), prev_uid, prev_ts)
+        lines.append(line)
+        prev_uid, prev_ts = message.sender_uid, message.timestamp
+    return lines
+
+
+def _group_dialog_needs_sampling(chat: ChatData, msgs: list, max_chars: int = 0) -> bool:
+    """判断群聊月份是否会触发成员感知抽样。"""
+    valid = _month_messages(chat, msgs)
+    if not valid:
+        return False
+    name_map = {participant.uid: participant.name for participant in chat.participants()}
+
+    def resolve(uid: str) -> str:
+        return name_map.get(uid, "未知发送者")
+
+    entries = [(index, m.sender_uid or "__unknown__", m, "") for index, m in enumerate(valid)]
+    lines = _render_group_entries(entries, resolve)
+    return sum(len(line) + 1 for line in lines) > (max_chars or GROUP_MAX_DIALOG_CHARS)
 
 
 # build_group_dialog 的隐私面：函数体内的注释同样受上方"LEGACY 按原始源码哈希"约束，
@@ -287,11 +551,14 @@ def build_group_dialog(
     prev_uid = prev_ts = None
     for idx, m in enumerate(valid):
         line = _message_line(m, resolve(m.sender_uid), prev_uid, prev_ts)
-        entries.append((idx, m.sender_uid or "__unknown__", line))
+        entries.append((idx, m.sender_uid or "__unknown__", m, line))
         prev_uid, prev_ts = m.sender_uid, m.timestamp
 
-    original_n = len(entries)
-    kept_lines = _fit_group_lines(entries, max_chars or GROUP_MAX_DIALOG_CHARS)
+    _, kept_lines, sampled = _fit_group_entries(
+        entries,
+        max_chars or GROUP_MAX_DIALOG_CHARS,
+        lambda selected: _render_group_entries(selected, resolve),
+    )
 
     top = "、".join(f"{resolve(uid)} {n} 条" for uid, n in ranked[:5]) or "无"
     from datetime import datetime
@@ -320,24 +587,29 @@ def build_group_dialog(
         parts.append(f"「我」= 导出者本人，在群里的显示名是 {me.name}")
     head = "，".join(parts)
     head += "\n本月互动摘要：\n" + _interaction_digest(valid, resolve)
-    if len(kept_lines) < original_n:
+    if sampled:
         head += (
             f"\n（因篇幅限制展示其中 {len(kept_lines)} 条：按成员配额抽样，"
-            "每位成员都有保底条数，低频成员不会被整段丢掉）"
+            "优先覆盖所有成员，预算不足时截断正文或减少展示成员）"
         )
 
     dialog = f"{head}。\n\n" + "\n".join(kept_lines)
     digest = _vision_digest(valid, chat_hash, vision_label)
     if digest:
         dialog += f"\n\n图片内容摘要（由视觉模型识别，供参考）：\n{digest}"
-    return dialog
+    if sampled:
+        return _PromptText(dialog, group_sampled_prompt_fingerprint())
+    return _PromptText(dialog, _unsampled_group_prompt_fingerprint())
 
 
 def _group_month_prompt(chat: ChatData, period: str, msgs: list, chat_hash: str = "") -> str:
     dialog = build_group_dialog(chat, msgs, chat_hash=chat_hash, vision_label=f"{period} 月")
     if not dialog.strip():
         return ""
-    return f"以下是 {period} 月「{chat.chat_name}」的群聊数据：\n\n{dialog}"
+    return _PromptText(
+        f"以下是 {period} 月「{chat.chat_name}」的群聊数据：\n\n{dialog}",
+        getattr(dialog, "cache_fingerprint", _unsampled_group_prompt_fingerprint()),
+    )
 
 
 def _member_context(chat: ChatData, member: Participant) -> str:
@@ -602,6 +874,100 @@ GROUP_DIMENSIONS: dict = {
 }
 
 
+_GROUP_FORMAT_FUNCS = (
+    build_group_dialog,
+    _fit_group_entries,
+    _render_group_entries,
+    _fit_group_lines,
+    _fit_lines,
+    _interaction_digest,
+    _member_facts,
+    _member_context,
+    _message_line,
+    _gap_mark,
+    _short_time,
+    _truncate_dialog_line,
+)
+_GROUP_COMPAT_FORMAT_FUNCS = (
+    build_group_dialog,
+    _render_group_entries,
+    _fit_lines,
+    _interaction_digest,
+    _member_facts,
+    _member_context,
+    _message_line,
+    _gap_mark,
+    _short_time,
+)
+
+
+def _group_fingerprint_inputs():
+    prompt_values = tuple(
+        getattr(gp, name) for name in sorted(dir(gp)) if name.startswith("GROUP_SYSTEM_PROMPT_")
+    )
+    return (
+        prompt_values,
+        gp.MEMBER_CONTEXT_NOTES,
+        (
+            GROUP_MAX_DIALOG_CHARS,
+            GROUP_MEMBER_MIN_LINES,
+            MEMBER_PROFILE_SAMPLES,
+            INTERACTION_DIGEST_PAIRS,
+            GROUP_AI_MAX_MEMBERS,
+            MAX_TOKENS_BY_DIM.get("group_dynamics"),
+            MAX_TOKENS_BY_DIM.get("group_topics"),
+            MAX_TOKENS_BY_DIM.get("group_emotion"),
+            MAX_TOKENS_BY_DIM.get("member_profiles"),
+        ),
+    )
+
+
+def _group_compat_format_matches() -> bool:
+    try:
+        payload = "\n".join(_hashed_source(func) for func in _GROUP_COMPAT_FORMAT_FUNCS)
+    except (OSError, TypeError):
+        return False
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest() == _GROUP_COMPAT_FORMAT_DIGEST
+
+
+def _group_source_parts(funcs: tuple, normalize: bool = True) -> list[str]:
+    try:
+        return [_hashed_source(func) if normalize else inspect.getsource(func) for func in funcs]
+    except (OSError, TypeError):
+        logger.warning(
+            "无法读取群聊格式化函数源码（编译/打包环境），群聊指纹降级为函数名级——"
+            "改动群聊对话格式不会自动失效旧缓存；改过格式后请设 PROMPT_CACHE_SALT 手动换键"
+        )
+        return [f"<source-unavailable:{func.__name__}>" for func in funcs]
+
+
+def _group_fingerprint_from_inputs(current, salt: str, compatible: bool = False) -> str:
+    prompt_values, context_notes, const_values = current
+    parts = list(prompt_values)
+    parts.append(context_notes)
+    parts.append("consts:%s" % repr(const_values))
+    if compatible:
+        from analyzer.dialog_cache_compat import historical_source
+
+        parts += [historical_source("build_group_dialog"), historical_source("_fit_group_lines")]
+        parts += _group_source_parts((_interaction_digest, _member_facts, _member_context))
+    else:
+        parts += _group_source_parts(_GROUP_FORMAT_FUNCS)
+    if salt:
+        parts.append(f"salt:{salt}")
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
+def _group_cache_salt(salt: "str | None") -> str:
+    if salt is not None:
+        return salt
+    value = (os.getenv("PROMPT_CACHE_SALT", "") or "").strip()
+    group_salt = (os.getenv("QQCHAT_GROUP_CACHE_SALT", "") or "").strip()
+    if group_salt:
+        value = f"{value}+{group_salt}" if value else group_salt
+    return value
+
+
 def group_prompt_fingerprint(salt: "str | None" = None, normalize: bool = True) -> str:
     """群聊提示词与格式的指纹，参与群聊的月份缓存键与维度缓存文件名。
 
@@ -620,44 +986,51 @@ def group_prompt_fingerprint(salt: "str | None" = None, normalize: bool = True) 
     默认（空）时群聊指纹与升级前逐字节一致，不影响任何既有缓存；
     PROMPT_CACHE_SALT 对群聊继续生效（既有测试与用户配置都依赖它）。
     """
-    if salt is None:
-        salt = (os.getenv("PROMPT_CACHE_SALT", "") or "").strip()
-        group_salt = (os.getenv("QQCHAT_GROUP_CACHE_SALT", "") or "").strip()
-        if group_salt:
-            salt = f"{salt}+{group_salt}" if salt else group_salt
-    parts = [getattr(gp, n) for n in sorted(dir(gp)) if n.startswith("GROUP_SYSTEM_PROMPT_")]
-    parts.append(gp.MEMBER_CONTEXT_NOTES)
-    parts.append(
-        "consts:%s"
-        % repr(
-            (
-                GROUP_MAX_DIALOG_CHARS,
-                GROUP_MEMBER_MIN_LINES,
-                MEMBER_PROFILE_SAMPLES,
-                INTERACTION_DIGEST_PAIRS,
-                GROUP_AI_MAX_MEMBERS,
-                MAX_TOKENS_BY_DIM.get("group_dynamics"),
-                MAX_TOKENS_BY_DIM.get("group_topics"),
-                MAX_TOKENS_BY_DIM.get("group_emotion"),
-                MAX_TOKENS_BY_DIM.get("member_profiles"),
-            )
-        )
+    salt = _group_cache_salt(salt)
+    current = _group_fingerprint_inputs()
+    if normalize:
+        return _group_fingerprint_from_inputs(current, salt, compatible=_group_compat_format_matches())
+    prompt_values, context_notes, const_values = current
+    parts = list(prompt_values)
+    parts.append(context_notes)
+    parts.append("consts:%s" % repr(const_values))
+    parts += _group_source_parts(
+        (build_group_dialog, _fit_group_lines, _interaction_digest, _member_facts, _member_context),
+        normalize=False,
     )
-    fmt_funcs = (build_group_dialog, _fit_group_lines, _interaction_digest, _member_facts, _member_context)
-    try:
-        parts += [_hashed_source(f) if normalize else inspect.getsource(f) for f in fmt_funcs]
-    except (OSError, TypeError):
-        parts += [f"<source-unavailable:{f.__name__}>" for f in fmt_funcs]
-        logger.warning(
-            "无法读取群聊格式化函数源码（编译/打包环境），群聊指纹降级为函数名级——"
-            "改动群聊对话格式不会自动失效旧缓存；改过格式后请设 PROMPT_CACHE_SALT 手动换键"
-        )
     if salt:
         parts.append(f"salt:{salt}")
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
 GROUP_PROMPT_FINGERPRINT = group_prompt_fingerprint()
+
+
+def _unsampled_group_prompt_fingerprint(salt: "str | None" = None) -> str:
+    """未抽样输入复用同配置的历史键；预算变化仍需隔离维度缓存。"""
+    return group_prompt_fingerprint(salt)
+
+
+def group_sampled_prompt_fingerprint(salt: "str | None" = None) -> str:
+    """群聊触发预算抽样时的格式代次，保留未抽样缓存键。"""
+    funcs = (
+        _entry_line,
+        _fit_group_entries,
+        _trim_group_entries,
+        _render_group_entries,
+        _truncate_dialog_line,
+        _message_line,
+        _gap_mark,
+        _short_time,
+    )
+    parts = [
+        group_prompt_fingerprint(salt),
+        "group-sampled-dialog-v1",
+        *_group_source_parts(funcs),
+    ]
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
 #: 旧公式（按 getsource 原文哈希）的取值：只为读取 AST 归一之前写下的群聊缓存。
 #: **必须是字面量，不能改回 group_prompt_fingerprint(normalize=False)**：旧公式哈希的是
 #: 当前源码原文，任何一次对进指纹函数（build_group_dialog / _fit_group_lines /

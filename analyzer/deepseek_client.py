@@ -101,12 +101,18 @@ from analyzer.dialog import (
     MAX_DIALOG_CHARS,
     RELATIVE_MARK_MINUTES,
     TIME_MARK_MINUTES,
-    _build_dialog,
+    _build_dialog,  # noqa: F401 - public compatibility re-export
+    _build_dialog_with_meta,
     _conversation_stats,
+    _dialog_needs_sampling,
     _fit_lines,
+    _fit_message_context,
+    _gap_mark,
     _has_content,
     _message_line,
+    _render_message_lines,
     _short_time,
+    _truncate_dialog_line,  # noqa: F401 - public compatibility re-export
     _vision_digest,
 )
 
@@ -135,6 +141,16 @@ from analyzer.month_cache import (
 )
 
 logger = get_logger("deepseek")
+
+
+class _PromptText(str):
+    """保留原始 prompt 文本，同时把输入格式代次传给月份缓存层。"""
+
+    def __new__(cls, value: str, cache_fingerprint: str | None = None):
+        obj = super().__new__(cls, value)
+        obj.cache_fingerprint = cache_fingerprint
+        return obj
+
 
 #: 参与私聊提示词指纹的提示词**名单**，顺序即哈希顺序，不要动。
 #: 取值与排列必须与旧实现 `sorted(dir(analyzer.prompts)) 里 SYSTEM_PROMPT_*` 完全一致
@@ -465,6 +481,95 @@ def _canonical_ast(node) -> str:
     return fingerprint_utils.canonical_ast(node)
 
 
+_PRIVATE_COMPAT_FINGERPRINT = "23fa36bc1d2a"
+# The historical formula is safe only while every formatter that can affect
+# the prompt still has the reviewed implementation.  Keep this as a literal:
+# recomputing it at import time would make a source change look compatible again.
+_PRIVATE_COMPAT_FORMAT_DIGEST = "fcfe0c9d898bccd9c0e81ec64ea01ed594b75fb411a36c87e5ffe65ca1da6f5c"
+
+
+_PRIVATE_FORMAT_FUNCS = (
+    _build_dialog_with_meta,
+    _fit_message_context,
+    _render_message_lines,
+    _truncate_dialog_line,
+    _message_line,
+    _gap_mark,
+    _fit_lines,
+    _conversation_stats,
+    _short_time,
+)
+_PRIVATE_COMPAT_FORMAT_FUNCS = (
+    _build_dialog_with_meta,
+    _render_message_lines,
+    _message_line,
+    _gap_mark,
+    _fit_lines,
+    _conversation_stats,
+    _short_time,
+)
+
+
+def _private_fingerprint_inputs():
+    import analyzer.prompts as _prompts
+    from analyzer import vision
+
+    return (
+        tuple(getattr(_prompts, name) for name in _PRIVATE_PROMPT_NAMES),
+        (
+            MAX_DIALOG_CHARS,
+            TIME_MARK_MINUTES,
+            RELATIVE_MARK_MINUTES,
+            MAX_TOKENS_BY_DIM.get("emotion"),
+            MAX_TOKENS_BY_DIM.get("topics"),
+            MAX_TOKENS_BY_DIM.get("relationship"),
+            MAX_TOKENS_BY_DIM.get("habits"),
+            MAX_TOKENS_BY_DIM.get("profile"),
+            int(SESSION_GAP_MS),
+            vision.VISION_SYSTEM,
+            vision.VISION_DETAIL,
+            vision.VISION_MAX_PER_MONTH,
+            vision.VISION_MIN_SIDE,
+        ),
+    )
+
+
+def _private_compat_format_matches() -> bool:
+    try:
+        payload = "\n".join(_hashed_source(func) for func in _PRIVATE_COMPAT_FORMAT_FUNCS)
+    except (OSError, TypeError):
+        return False
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest() == _PRIVATE_COMPAT_FORMAT_DIGEST
+
+
+def _private_source_parts(funcs: tuple, normalize: bool) -> list[str]:
+    try:
+        return [_hashed_source(func) if normalize else inspect.getsource(func) for func in funcs]
+    except (OSError, TypeError):
+        logger.warning(
+            "无法读取格式化函数源码（编译/打包环境），指纹降级为函数名级——"
+            "改动对话格式不会自动失效旧缓存；改过格式后请设 PROMPT_CACHE_SALT"
+            " 为任意新值手动换键"
+        )
+        return [f"<source-unavailable:{func.__name__}>" for func in funcs]
+
+
+def _private_fingerprint_from_inputs(current, salt: str, normalize: bool, compatible: bool = False) -> str:
+    prompt_values, const_values = current
+    parts = list(prompt_values)
+    parts.append("consts:%s" % repr(const_values))
+    if compatible:
+        from analyzer.dialog_cache_compat import historical_source
+
+        parts.append(historical_source("_build_dialog"))
+        parts += _private_source_parts((_message_line, _fit_lines, _conversation_stats, _short_time), True)
+    else:
+        parts += _private_source_parts(_PRIVATE_FORMAT_FUNCS, normalize)
+    if salt:
+        parts.append(f"salt:{salt}")
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
 def _prompt_fingerprint(salt: "str | None" = None, normalize: bool = True) -> str:
     """提示词 + 对话格式的指纹，参与缓存键。
 
@@ -490,49 +595,36 @@ def _prompt_fingerprint(salt: "str | None" = None, normalize: bool = True) -> st
     函数名占位——提示词改动仍然会失效缓存，但格式逻辑改动不会，
     因此打一条警告并支持 PROMPT_CACHE_SALT 手动换键。
     """
-    import analyzer.prompts as _prompts
-
     if salt is None:
         salt = (os.getenv("PROMPT_CACHE_SALT", "") or "").strip()
-    parts = [getattr(_prompts, name) for name in _PRIVATE_PROMPT_NAMES]
-    # 影响模型输入的模块级常量也要进指纹：getsource 只覆盖函数体，函数引用的
-    # MAX_DIALOG_CHARS / 时间标记阈值 等常量改了源码也不变——只哈希函数会让
-    # "调小了对话预算"或"改了时间标记口径"之后继续命中旧缓存（输入其实变了）。
-    from analyzer import vision
+    current = _private_fingerprint_inputs()
+    # Rebuild the old formula with the actual configuration, including its budget.
+    # Only the reviewed formatter is compatible; subsequent format changes get a new key.
+    compatible = normalize and _private_compat_format_matches()
+    return _private_fingerprint_from_inputs(current, salt, normalize, compatible=compatible)
 
-    parts.append(
-        "consts:%s"
-        % repr(
-            (
-                MAX_DIALOG_CHARS,
-                TIME_MARK_MINUTES,
-                RELATIVE_MARK_MINUTES,
-                MAX_TOKENS_BY_DIM.get("emotion"),
-                MAX_TOKENS_BY_DIM.get("topics"),
-                MAX_TOKENS_BY_DIM.get("relationship"),
-                MAX_TOKENS_BY_DIM.get("habits"),
-                MAX_TOKENS_BY_DIM.get("profile"),
-                int(SESSION_GAP_MS),
-                # 视觉参数同样改变输入（图片摘要是 prompt 的一部分）
-                vision.VISION_SYSTEM,
-                vision.VISION_DETAIL,
-                vision.VISION_MAX_PER_MONTH,
-                vision.VISION_MIN_SIDE,
-            )
-        )
+
+def _unsampled_prompt_fingerprint(salt: "str | None" = None) -> str:
+    """未抽样输入复用同配置的历史键；预算变化仍需隔离维度缓存。"""
+    return _prompt_fingerprint(salt)
+
+
+def sampled_prompt_fingerprint(salt: "str | None" = None) -> str:
+    """私聊触发预算抽样时使用的格式代次，不污染未抽样缓存键。"""
+    funcs = (
+        _build_dialog_with_meta,
+        _fit_message_context,
+        _render_message_lines,
+        _truncate_dialog_line,
+        _message_line,
+        _gap_mark,
     )
-    fmt_funcs = (_build_dialog, _message_line, _fit_lines, _conversation_stats, _short_time)
-    try:
-        parts += [_hashed_source(f) if normalize else inspect.getsource(f) for f in fmt_funcs]
-    except (OSError, TypeError):
-        parts += [f"<source-unavailable:{f.__name__}>" for f in fmt_funcs]
-        logger.warning(
-            "无法读取格式化函数源码（编译/打包环境），指纹降级为函数名级——"
-            "改动对话格式不会自动失效旧缓存；改过格式后请设 PROMPT_CACHE_SALT"
-            " 为任意新值手动换键"
-        )
-    if salt:
-        parts.append(f"salt:{salt}")
+    source_parts = _private_source_parts(funcs, True)
+    parts = [
+        _prompt_fingerprint(salt),
+        "private-sampled-dialog-v1",
+        *source_parts,
+    ]
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
@@ -572,6 +664,33 @@ def fingerprint_for_dimension(dim: str) -> str:
     return PROMPT_FINGERPRINT
 
 
+def analysis_cache_fingerprint(dimension: str, chat: ChatData) -> str:
+    """按这份聊天是否真的触发上下文抽样选择维度级缓存指纹。
+
+    未超预算的输入继续使用既有维度键；只有会产生新抽样文本的输入进入新代，
+    这样旧的错误抽样结果不会遮住修复，同时普通月份不会整体失效。
+    """
+    private_monthly = {"emotion", "topics", "relationship"}
+    if dimension in private_monthly:
+        for messages in chat.months().values():
+            if _dialog_needs_sampling(
+                messages, chat.self_uid, chat.self_name, chat.other_name, MAX_DIALOG_CHARS
+            ):
+                return sampled_prompt_fingerprint()
+        return _unsampled_prompt_fingerprint()
+
+    from analyzer import group_client
+
+    if dimension in group_client.GROUP_DIMENSIONS:
+        if dimension == "member_profiles":
+            return group_client.GROUP_PROMPT_FINGERPRINT
+        for messages in chat.months().values():
+            if group_client._group_dialog_needs_sampling(chat, messages):
+                return group_client.group_sampled_prompt_fingerprint()
+        return group_client._unsampled_group_prompt_fingerprint()
+    return fingerprint_for_dimension(dimension)
+
+
 #: 私聊族的历史代链（最新一代在前）。设计见 legacy_fingerprints_for_dimension：
 #: 每次有意换代，把"当时的当前值"压进这里，读侧就会挨代找到旧缓存并搬到新键。
 #:
@@ -587,6 +706,10 @@ PRIVATE_FINGERPRINT_GENERATIONS = ("f4bd6aa06d52",)
 def _legacy_chain_for_fingerprint_value(fp: str) -> tuple:
     """某个族指纹**值**对应的历史代链（认不出该值 = 这族没有历史包袱，返回空链）。"""
     if fp == PROMPT_FINGERPRINT:
+        # The pinned historical chain belongs to the default configuration only.
+        # Custom budgets/salts must not migrate a result produced with other inputs.
+        if fp != _PRIVATE_COMPAT_FINGERPRINT:
+            return ()
         chain = (*PRIVATE_FINGERPRINT_GENERATIONS, PROMPT_FINGERPRINT_LEGACY)
         # 顺序：先按"上一代的当前键"找（AST 归一时代写的），再按更早的原文公式找；
         # 与当前键相同的值剔掉，否则会白读一次自己
@@ -594,6 +717,8 @@ def _legacy_chain_for_fingerprint_value(fp: str) -> tuple:
     from analyzer import group_client, recap_client
 
     if fp == group_client.GROUP_PROMPT_FINGERPRINT:
+        if fp != group_client._GROUP_COMPAT_FINGERPRINT:
+            return ()
         return (
             (group_client.GROUP_PROMPT_FINGERPRINT_LEGACY,)
             if group_client.GROUP_PROMPT_FINGERPRINT_LEGACY != fp
@@ -888,7 +1013,7 @@ def _analyze_periods(
         # 用户点了取消，或进程正在关闭（Ctrl+C）：都不该再往外发新请求
         return shutdown_requested() or bool(should_cancel and should_cancel())
 
-    def _keys_for(prompt: str) -> list:
+    def _keys_for(prompt: str, active_fingerprint: "str | None" = None) -> list:
         """该月 prompt 对应的缓存键：[当前键, 各历史代键…]（尝试顺序即链序）。
 
         历史代是为了读取"AST 归一之前"（以及未来任何一次换代之前）写下的月份缓存。
@@ -897,8 +1022,8 @@ def _analyze_periods(
         链按**指纹值**映射（调用方传进来的就是这个族的值），换代时只需把上一代
         当前值压进对应族的链头，这里不再逐族写 if。
         """
-        current_fp = fingerprint or PROMPT_FINGERPRINT
-        keys = [_month_key(system_prompt, prompt, fingerprint)]
+        current_fp = active_fingerprint or fingerprint or PROMPT_FINGERPRINT
+        keys = [_month_key(system_prompt, prompt, current_fp)]
         for legacy_fp in _legacy_chain_for_fingerprint_value(current_fp):
             if legacy_fp != current_fp:
                 keys.append(_month_key(system_prompt, prompt, legacy_fp))
@@ -912,7 +1037,7 @@ def _analyze_periods(
             prompt = make_prompt(period, msgs)
             if not prompt.strip():
                 return period, None
-            keys = _keys_for(prompt)
+            keys = _keys_for(prompt, getattr(prompt, "cache_fingerprint", None))
             key = keys[0]
             # 思考模式必须参与口径核对：思维链开与关产出的结果差别很大，让一次
             # "关了思考"的分析吃到"开着思考"算出来的月份，用户看到的就是配置静默失效
@@ -1097,12 +1222,19 @@ def _normalize_topic_weights(obj: dict) -> None:
 def _month_prompt(chat: ChatData, period: str, msgs: list, chat_hash: str = "") -> str:
     """构建单月 prompt；该月经过滤（系统/撤回/转发/空文本）后无有效消息时返回空串，
     由 _analyze_periods 跳过，避免为空月份白白消耗一次 API 调用。"""
-    dialog = _build_dialog(
-        msgs, chat.self_uid, chat.self_name, chat.other_name, chat_hash=chat_hash, vision_label=f"{period} 月"
+    dialog, sampled = _build_dialog_with_meta(
+        msgs,
+        chat.self_uid,
+        chat.self_name,
+        chat.other_name,
+        max_chars=MAX_DIALOG_CHARS,
+        chat_hash=chat_hash,
+        vision_label=f"{period} 月",
     )
     if not dialog.strip():
         return ""
-    return f"以下是 {period} 月的对话数据：\n\n{dialog}"
+    cache_fp = sampled_prompt_fingerprint() if sampled else _unsampled_prompt_fingerprint()
+    return _PromptText(f"以下是 {period} 月的对话数据：\n\n{dialog}", cache_fp)
 
 
 def analyze_emotion(

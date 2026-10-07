@@ -217,6 +217,294 @@ class TestMemberAwareSampling(unittest.TestCase):
             "预算充足却没兑现保底：说明行数字符单位又换算错了",
         )
 
+    def test_low_frequency_floor_is_reduced_after_high_frequency_rows(self):
+        """预算紧张时先削高频成员，不能把仍放得下的低频成员削成一条。"""
+        messages = [_msg("active", "活跃", i, "x" * 100) for i in range(100)]
+        messages.extend(_msg("rare", "低频", 100 + i, "short") for i in range(3))
+        names = {"active": "活跃", "rare": "低频"}
+        entries = []
+        previous_uid = previous_ts = None
+        for index, message in enumerate(messages):
+            line = gc._message_line(message, names[message.sender_uid], previous_uid, previous_ts)
+            entries.append((index, message.sender_uid, message, line))
+            previous_uid, previous_ts = message.sender_uid, message.timestamp
+
+        selected, lines, sampled = gc._fit_group_entries(
+            entries, 1000, lambda picked: gc._render_group_entries(picked, names.get)
+        )
+        counts: dict[str, int] = {}
+        for entry in selected:
+            counts[entry[1]] = counts.get(entry[1], 0) + 1
+        self.assertTrue(sampled)
+        self.assertEqual(counts.get("rare"), 3)
+        self.assertGreater(counts.get("active", 0), 0)
+        self.assertLessEqual(sum(len(line) + 1 for line in lines), 1000)
+
+    def test_large_group_quota_converges_without_row_by_row_rebuilds(self):
+        """大群配额收敛应按比例批量调整，不能每减一行就重绘全体候选。"""
+        entries = []
+        for seq in range(5_000):
+            uid = f"u{seq % 50}"
+            entries.append((seq, uid, f"消息-{seq}-" + "x" * 20))
+        calls = []
+
+        def render(selected):
+            calls.append(len(selected))
+            return [entry[2] for entry in selected]
+
+        kept, lines, sampled = gc._fit_group_entries(entries, 6_000, render)
+        self.assertTrue(sampled)
+        self.assertLessEqual(sum(len(line) + 1 for line in lines), 6_000)
+        self.assertLessEqual(len(calls), 20)
+        self.assertTrue(kept)
+
+    def test_many_members_in_separate_blocks_survive_budget_reduction(self):
+        """成员轮流成段发言时，也必须保留每个人，不能按尾部把前面的成员删掉。"""
+        messages = [_msg(f"u{i // 100}", f"N{i // 100}", i, "x" * 20) for i in range(5000)]
+        entries = []
+        previous_uid = previous_ts = None
+        for index, message in enumerate(messages):
+            line = gc._message_line(message, message.sender_name, previous_uid, previous_ts)
+            entries.append((index, message.sender_uid, message, line))
+            previous_uid, previous_ts = message.sender_uid, message.timestamp
+        calls = []
+
+        def render(selected):
+            calls.append(len(selected))
+            return gc._render_group_entries(selected, lambda uid: uid.replace("u", "N"))
+
+        selected, lines, sampled = gc._fit_group_entries(entries, 6000, render)
+        self.assertTrue(sampled)
+        self.assertEqual({entry[1] for entry in selected}, {f"u{i}" for i in range(50)})
+        self.assertLessEqual(sum(len(line) + 1 for line in lines), 6000)
+        self.assertLessEqual(len(calls), 20)
+
+    def test_many_frequent_members_do_not_crowd_out_a_low_frequency_floor(self):
+        """低频成员超过平均字符份额，也不能在高频成员仍可缩减时丢失保底。"""
+        messages = [_msg(f"u{i // 100}", f"N{i // 100}", i, "x") for i in range(4900)]
+        messages.extend(_msg("rare", "R", 4900 + i, "r" * 50) for i in range(3))
+        entries = []
+        previous_uid = previous_ts = None
+        for index, message in enumerate(messages):
+            line = gc._message_line(message, message.sender_name, previous_uid, previous_ts)
+            entries.append((index, message.sender_uid, message, line))
+            previous_uid, previous_ts = message.sender_uid, message.timestamp
+        selected, lines, sampled = gc._fit_group_entries(
+            entries,
+            2000,
+            lambda picked: gc._render_group_entries(
+                picked, lambda uid: "R" if uid == "rare" else uid.replace("u", "N")
+            ),
+        )
+        self.assertTrue(sampled)
+        self.assertEqual(sum(entry[1] == "rare" for entry in selected), 3)
+        self.assertEqual(len({entry[1] for entry in selected}), 50)
+        self.assertLessEqual(sum(len(line) + 1 for line in lines), 2000)
+
+    def test_long_first_message_does_not_remove_its_speakers_ordinary_messages(self):
+        """超长首条不能让该成员后面的普通发言一起从样本中消失。"""
+        messages = [_msg("a", "A", 0, "x" * 2000)]
+        messages.extend(_msg("a", "A", i, "short") for i in range(1, 101))
+        messages.extend(_msg("b", "B", 101 + i, "reply") for i in range(3))
+        entries = []
+        previous_uid = previous_ts = None
+        for index, message in enumerate(messages):
+            line = gc._message_line(message, message.sender_name, previous_uid, previous_ts)
+            entries.append((index, message.sender_uid, message, line))
+            previous_uid, previous_ts = message.sender_uid, message.timestamp
+        selected, lines, sampled = gc._fit_group_entries(
+            entries, 1000, lambda picked: gc._render_group_entries(picked, str.upper)
+        )
+        self.assertTrue(sampled)
+        self.assertEqual({entry[1] for entry in selected}, {"a", "b"})
+        self.assertEqual(sum(entry[1] == "b" for entry in selected), 3)
+        self.assertIn("short", "\n".join(lines))
+        self.assertLessEqual(sum(len(line) + 1 for line in lines), 1000)
+
+    def test_one_row_per_member_uses_affordable_representatives(self):
+        """首条各自可容纳但合计超预算时，要选择较短代表来保住所有成员。"""
+        entries = []
+        for member in range(40):
+            entries.extend(
+                (member * 3 + offset, f"u{member}", "x" * (700 if offset == 0 else 10)) for offset in range(3)
+            )
+        selected, lines, sampled = gc._fit_group_entries(
+            entries, 1000, lambda picked: [entry[2] for entry in picked]
+        )
+        self.assertTrue(sampled)
+        self.assertEqual(len({entry[1] for entry in selected}), 40)
+        self.assertLessEqual(sum(len(line) + 1 for line in lines), 1000)
+
+    def test_representative_cost_does_not_use_elided_original_prefix(self):
+        """第二条原来省略前缀，看似更短；单独保留时不能把更长正文误当便宜代表。"""
+        messages = []
+        for member in range(50):
+            messages.extend(
+                [
+                    _msg(f"u{member}", f"N{member}", member * 40, "short"),
+                    _msg(f"u{member}", f"N{member}", member * 40 + 1, "longer-message-20xxx"),
+                ]
+            )
+        entries = []
+        previous_uid = previous_ts = None
+        for index, message in enumerate(messages):
+            line = gc._message_line(message, message.sender_name, previous_uid, previous_ts)
+            entries.append((index, message.sender_uid, message, line))
+            previous_uid, previous_ts = message.sender_uid, message.timestamp
+        selected, lines, sampled = gc._fit_group_entries(
+            entries, 1400, lambda picked: gc._render_group_entries(picked, lambda uid: uid.replace("u", "N"))
+        )
+        self.assertTrue(sampled)
+        self.assertEqual(len({entry[1] for entry in selected}), 50)
+        self.assertLessEqual(sum(len(line) + 1 for line in lines), 1400)
+
+    def test_earliest_representatives_fit_when_shorter_bodies_add_time_markers(self):
+        """较短正文分散在不同时间段时，仍应尝试能放下所有成员的首条集合。"""
+        messages = [_msg(f"u{i}", f"N{i}", i, "x" * 10) for i in range(50)]
+        messages.extend(_msg(f"u{i}", f"N{i}", 1000 + i * 40, "x" * 9) for i in range(50))
+        entries = []
+        previous_uid = previous_ts = None
+        for index, message in enumerate(messages):
+            line = gc._message_line(message, message.sender_name, previous_uid, previous_ts)
+            entries.append((index, message.sender_uid, message, line))
+            previous_uid, previous_ts = message.sender_uid, message.timestamp
+        selected, lines, sampled = gc._fit_group_entries(
+            entries, 1000, lambda picked: gc._render_group_entries(picked, lambda uid: uid.replace("u", "N"))
+        )
+        self.assertTrue(sampled)
+        self.assertEqual(len({entry[1] for entry in selected}), 50)
+        self.assertLessEqual(sum(len(line) + 1 for line in lines), 1000)
+
+    def test_middle_representatives_keep_every_member_within_budget(self):
+        """首条太长、最短正文太分散时，集中在中段的代表仍能覆盖全部成员。"""
+        messages = [_msg(f"u{i}", f"N{i}", i, "x" * 200) for i in range(50)]
+        messages.extend(_msg(f"u{i}", f"N{i}", 1000 + i, "m" * 10) for i in range(50))
+        messages.extend(_msg(f"u{i}", f"N{i}", 2000 + i * 40, "z" * 9) for i in range(50))
+        entries = [(i, message.sender_uid, message, "") for i, message in enumerate(messages)]
+
+        def render(picked):
+            return gc._render_group_entries(picked, lambda uid: uid.replace("u", "N"))
+
+        entries = [(*entry[:3], line) for entry, line in zip(entries, render(entries), strict=True)]
+        middle = [entry for entry in entries if entry[2].text == "m" * 10]
+        self.assertLessEqual(sum(len(line) + 1 for line in render(middle)), 1000)
+        selected, lines, sampled = gc._fit_group_entries(entries, 1000, render)
+        self.assertTrue(sampled)
+        self.assertEqual(len({entry[1] for entry in selected}), 50)
+        self.assertEqual(lines, render(selected))
+        self.assertLessEqual(sum(len(line) + 1 for line in lines), 1000)
+
+    def test_short_representatives_survive_following_long_messages(self):
+        """长消息不能覆盖较短候选；旧的便宜候选也须能随时间窗口过期。"""
+        for early_short in (False, True):
+            with self.subTest(early_short=early_short):
+                messages = [
+                    _msg(f"u{i}", f"N{i}", i * 40, "e" * (8 if early_short else 200))
+                    for i in range(50 if early_short else 49)
+                ]
+                for i in range(50):
+                    messages.append(_msg(f"u{i}", f"N{i}", 3000 + i, "m" * 10))
+                    if i < 49:
+                        messages.append(_msg(f"u{i}", f"N{i}", 3000 + i + 0.1, "noise" * 40))
+                messages.extend(_msg(f"u{i}", f"N{i}", 5000 + i * 40, "z" * 9) for i in range(50))
+                messages.sort(key=lambda message: message.timestamp)
+                entries = [(i, message.sender_uid, message, "") for i, message in enumerate(messages)]
+
+                def render(picked):
+                    return gc._render_group_entries(picked, lambda uid: uid.replace("u", "N"))
+
+                entries = [(*entry[:3], line) for entry, line in zip(entries, render(entries), strict=True)]
+                middle = [entry for entry in entries if entry[2].text == "m" * 10]
+                self.assertLessEqual(sum(len(line) + 1 for line in render(middle)), 1000)
+                selected, lines, sampled = gc._fit_group_entries(entries, 1000, render)
+                self.assertTrue(sampled)
+                self.assertEqual(len({entry[1] for entry in selected}), 50)
+                self.assertEqual(lines, render(selected))
+                self.assertLessEqual(sum(len(line) + 1 for line in lines), 1000)
+
+    def test_body_truncation_preserves_all_affordable_speaker_prefixes(self):
+        """完整正文总和超预算时，仍应先保住每个人的完整身份和时间标记。"""
+        messages = [_msg(f"u{i}", f"N{i}", i * 40, "x" * 500) for i in range(50)]
+        entries = [(i, message.sender_uid, message, "") for i, message in enumerate(messages)]
+
+        def render(picked):
+            return gc._render_group_entries(picked, lambda uid: uid.replace("u", "N"))
+
+        entries = [(*entry[:3], line) for entry, line in zip(entries, render(entries), strict=True)]
+        selected, lines, sampled = gc._fit_group_entries(entries, 1000, render)
+        self.assertTrue(sampled)
+        self.assertEqual(len({entry[1] for entry in selected}), 50)
+        for entry, line in zip(selected, lines, strict=True):
+            prefix = gc._message_line(
+                _msg(entry[1], entry[2].sender_name, entry[0] * 40, ""), entry[2].sender_name
+            )
+            self.assertTrue(line.startswith(prefix), line)
+            self.assertTrue(line.endswith("…"), line)
+        self.assertLessEqual(sum(len(line) + 1 for line in lines), 1000)
+
+    def test_sampling_rebuilds_speaker_context(self):
+        """群聊抽样后换人标记只依据最终保留消息，不能沿用被抽走的前置行。"""
+        pattern = [("uA", "A"), ("uA", "A"), ("uB", "B"), ("uB", "B"), ("uA", "A"), ("uC", "C")]
+        messages = []
+        for i in range(30):
+            uid, name = pattern[i % len(pattern)]
+            messages.append(_msg(uid, name, i, f"sample-{i}-" + "x" * 50))
+        chat = _group(messages, self_name="A")
+        names = {"uA": "A", "uB": "B", "uC": "C"}
+        entries = []
+        previous_uid = previous_ts = None
+        for index, message in enumerate(chat.messages):
+            line = gc._message_line(message, names[message.sender_uid], previous_uid, previous_ts)
+            entries.append((index, message.sender_uid, message, line))
+            previous_uid, previous_ts = message.sender_uid, message.timestamp
+        selected, lines, sampled = gc._fit_group_entries(
+            entries,
+            1200,
+            lambda picked: gc._render_group_entries(picked, names.get),
+        )
+        self.assertTrue(sampled)
+        self.assertEqual([entry[0] for entry in selected], sorted(entry[0] for entry in selected))
+        self.assertEqual(
+            [entry[1] for entry in selected],
+            [chat.messages[entry[0]].sender_uid for entry in selected],
+        )
+        self.assertLessEqual(sum(len(line) + 1 for line in lines), 1200)
+        previous_uid = None
+        for entry, line in zip(selected, lines, strict=True):
+            if previous_uid is None or entry[1] != previous_uid:
+                name = names[entry[1]]
+                self.assertTrue(
+                    f"] {name}:" in line or line.startswith(f"{name}:") or line.startswith(f"{name}("),
+                    line,
+                )
+            previous_uid = entry[1]
+        dialog = gc.build_group_dialog(chat, chat.messages, max_chars=1200)
+        self.assertRegex(dialog, r"B(?:\(|:)")
+        self.assertRegex(dialog, r"C(?:\(|:)")
+
+    def test_sampling_uses_a_separate_dimension_cache_fingerprint(self):
+        """只有触发群聊抽样的聊天才切到新的维度缓存代次。"""
+        messages = [_msg("uA" if i % 2 else "uB", "我" if i % 2 else "小明", i, "x" * 100) for i in range(20)]
+        chat = _group(messages)
+        current = dc.analysis_cache_fingerprint("group_dynamics", chat)
+        with mock.patch.object(gc, "GROUP_MAX_DIALOG_CHARS", 300):
+            sampled = dc.analysis_cache_fingerprint("group_dynamics", chat)
+            self.assertNotEqual(sampled, current)
+            self.assertEqual(sampled, gc.group_sampled_prompt_fingerprint())
+
+    def test_single_long_message_stays_within_budget(self):
+        """群聊只有一条超长消息时，截断后的换行也必须计入预算。"""
+        chat = _group([_msg("uA", "我", 0, "x" * 1000)])
+        message = chat.messages[0]
+        line = gc._message_line(message, "我")
+        entries = [(0, "uA", message, line)]
+        selected, lines, sampled = gc._fit_group_entries(
+            entries, 100, lambda picked: gc._render_group_entries(picked, lambda uid: "我")
+        )
+        self.assertTrue(sampled)
+        self.assertEqual(len(selected), 1)
+        self.assertLessEqual(sum(len(line) + 1 for line in lines), 100)
+
     def test_no_sampling_when_within_budget(self):
         chat = _group(_small_group())
         dialog = gc.build_group_dialog(chat, chat.messages)
@@ -407,6 +695,42 @@ class TestFingerprintIsolation(unittest.TestCase):
         before = gc.group_prompt_fingerprint()
         with mock.patch.object(gp, "GROUP_SYSTEM_PROMPT_DYNAMICS", "完全不同的群聊提示词"):
             self.assertNotEqual(gc.group_prompt_fingerprint(), before)
+
+    def test_unsampled_custom_budget_keeps_historical_cache_key(self):
+        """同配置升级应保留历史键；不同预算不能混用维度缓存。"""
+        chat = _group([_msg("uA", "A", 0, "短消息"), _msg("uB", "B", 1, "回复")])
+        current = dc.analysis_cache_fingerprint("group_dynamics", chat)
+        with mock.patch.object(gc, "GROUP_MAX_DIALOG_CHARS", 10_000):
+            historical = "04a4e41ad76d"
+            self.assertNotEqual(historical, current)
+            self.assertEqual(dc.analysis_cache_fingerprint("group_dynamics", chat), historical)
+            self.assertEqual(gc._unsampled_group_prompt_fingerprint(), historical)
+            prompt = gc._group_month_prompt(chat, "2024-01", chat.messages)
+            self.assertEqual(getattr(prompt, "cache_fingerprint", None), historical)
+
+    def test_compat_fingerprint_detects_formatter_change(self):
+        """群聊固定历史指纹也必须确认格式源码仍是已审核版本。"""
+        import inspect
+
+        base = gc.group_prompt_fingerprint()
+        original = inspect.getsource
+
+        def changed_source(func):
+            source = original(func)
+            if func is gc.build_group_dialog:
+                return source.replace("统计：", "统计(修订)：")
+            return source
+
+        with mock.patch("inspect.getsource", side_effect=changed_source):
+            self.assertNotEqual(base, gc.group_prompt_fingerprint())
+
+    def test_sampled_fingerprint_falls_back_when_source_is_unavailable(self):
+        """打包环境读不到源码时，群聊抽样键仍须稳定地产生。"""
+        with mock.patch("inspect.getsource", side_effect=OSError("no source here")):
+            first = gc.group_sampled_prompt_fingerprint()
+            second = gc.group_sampled_prompt_fingerprint()
+        self.assertEqual(len(first), 12)
+        self.assertEqual(first, second)
 
     def test_private_fingerprint_ignores_group_module(self):
         """群聊提示词放独立模块，因此私聊指纹与月份键一个字都不变"""
