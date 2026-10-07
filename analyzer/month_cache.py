@@ -115,6 +115,11 @@ def configure_month_cache(directory: str) -> None:
         _MANIFEST_KEYS.clear()
 
 
+def month_cache_enabled() -> bool:
+    """返回月份级缓存是否已由应用层配置。"""
+    return bool(_MONTH_CACHE_DIR)
+
+
 def _month_key(system_prompt: str, user_content: str, fingerprint: "str | None" = None) -> str:
     """月份缓存的键：任何影响该月输出的因素（模型/提示词/格式/对话文本）都进哈希。
 

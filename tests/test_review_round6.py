@@ -51,6 +51,7 @@ from pathlib import Path
 from unittest import mock
 
 from _bootstrap import api_configured_patcher, bootstrap  # noqa: E402
+from result_fixtures import emotion as valid_emotion  # noqa: E402
 
 bootstrap()
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -102,7 +103,10 @@ def chat_payload(text="内容", months=1, msgs_per_month=4):
     ).encode("utf-8")
 
 
-def ok_resp(content='{"self_intensity": 5}'):
+_VALID_EMOTION_JSON = json.dumps(valid_emotion(), ensure_ascii=False)
+
+
+def ok_resp(content=_VALID_EMOTION_JSON):
     r = mock.MagicMock()
     r.choices = [mock.MagicMock()]
     r.choices[0].finish_reason = "stop"
@@ -124,7 +128,7 @@ class FakeCreate:
     自动创建的 Mock，函数对象传进去会被包成子 Mock，挂上去的属性就读不到了。
     """
 
-    def __init__(self, fail_from=None, content='{"self_intensity": 5}'):
+    def __init__(self, fail_from=None, content=_VALID_EMOTION_JSON):
         self.n = 0
         self.fail_from = fail_from
         self.content = content
@@ -136,7 +140,7 @@ class FakeCreate:
         return ok_resp(self.content)
 
 
-def make_create(fail_from=None, content='{"self_intensity": 5}'):
+def make_create(fail_from=None, content=_VALID_EMOTION_JSON):
     return FakeCreate(fail_from=fail_from, content=content)
 
 
@@ -436,7 +440,7 @@ class TestResurrectionGuards(CacheLifecycleCase):
 
         job_id = jobs._get_or_create_job(sid, "emotion", h, total=1)[0]
         with mock.patch.object(
-            jobs, "analyze_func_for", return_value=lambda *a, **k: {"2023-11": {"self_intensity": 5}}
+            jobs, "analyze_func_for", return_value=lambda *a, **k: {"2023-11": valid_emotion()}
         ):
             jobs._run_job(job_id, "emotion", filepath2, h)
         with jobs.JOBS_LOCK:
