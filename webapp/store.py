@@ -52,6 +52,7 @@ from analyzer.group_stats import compute_group_stats
 from analyzer import month_cache, purge_marks
 from analyzer.atomic_write import tmp_sibling, write_bytes_atomic, write_json_atomic, write_text_atomic
 from analyzer.deepseek_client import (
+    analysis_cache_fingerprint as analysis_cache_fingerprint,
     fingerprint_for_dimension,
     legacy_fingerprint_for_dimension,
     legacy_fingerprints_for_dimension,
@@ -690,7 +691,9 @@ def _stats_with_word_freq(stats: dict, chat_hash: str):
 # ---------------------------------------------------------------------------
 
 
-def _cache_path(dimension: str, chat_hash: str, legacy: bool = False) -> str:
+def _cache_path(
+    dimension: str, chat_hash: str, legacy: bool = False, fingerprint: "str | None" = None
+) -> str:
     # 键含提示词/格式指纹：由 SYSTEM_PROMPT_* 与对话格式化函数自动哈希而来，改了提示词或
     # 输入格式后旧缓存自动失效（不再依赖人工 bump 版本号）。**按维度取**：群聊维度用群聊
     # 指纹，私聊维度用私聊指纹——这样新增/修改群聊提示词不会让私聊缓存文件名发生变化
@@ -703,10 +706,12 @@ def _cache_path(dimension: str, chat_hash: str, legacy: bool = False) -> str:
     # 仍叫那个名字。_read_cache 会先按当前键找、找不到再看旧键，读到就改名（迁移），
     # 于是这次公式变更不会让任何人为同样的分析重新付费。
     suffix = "_think" if thinking_enabled(dimension) else ""
-    pick = legacy_fingerprint_for_dimension if legacy else fingerprint_for_dimension
-    return os.path.join(
-        AI_CACHE_DIR, f"{dimension}_{chat_hash}_{DEEPSEEK_MODEL}_{pick(dimension)}{suffix}.json"
-    )
+    if fingerprint is not None:
+        prompt_fp = fingerprint
+    else:
+        pick = legacy_fingerprint_for_dimension if legacy else fingerprint_for_dimension
+        prompt_fp = pick(dimension)
+    return os.path.join(AI_CACHE_DIR, f"{dimension}_{chat_hash}_{DEEPSEEK_MODEL}_{prompt_fp}{suffix}.json")
 
 
 #: 原子写入留下的临时后缀：既认新的唯一名（`.json.{pid}.{tid}.{rand}.tmp`），
@@ -840,7 +845,7 @@ def _load_cache_file(path: str):
     return data
 
 
-def _read_cache(dimension: str, chat_hash: str):
+def _read_cache(dimension: str, chat_hash: str, fingerprint: "str | None" = None):
     """读维度缓存；当前指纹下没有时，沿"历史代指纹链"逐代找并迁移到当前键。
 
     指纹公式从"源码原文"改成 AST 归一之后，既有用户的缓存文件名仍是旧指纹。
@@ -850,13 +855,21 @@ def _read_cache(dimension: str, chat_hash: str):
     链式（而非单值）：未来任何一次指纹换代都只需把"上一代的当前值"压进链头，
     这里会挨代找到旧缓存并搬到新键——第三次、第四次换代的老用户同样不再付费。
     """
-    current_path = _cache_path(dimension, chat_hash)
+    current_fp = fingerprint or fingerprint_for_dimension(dimension)
+    current_path = _cache_path(dimension, chat_hash, fingerprint=current_fp)
     data = _load_cache_file(current_path)
     if data is not None:
         return data
     suffix = "_think" if thinking_enabled(dimension) else ""
-    for legacy_fp in legacy_fingerprints_for_dimension(dimension):
-        if legacy_fp == fingerprint_for_dimension(dimension):
+    # A sampled dimension has its own current key and must never fall back to a
+    # pre-fix result that was generated from context-free sampled lines.
+    legacy_fps = (
+        legacy_fingerprints_for_dimension(dimension)
+        if current_fp == fingerprint_for_dimension(dimension)
+        else ()
+    )
+    for legacy_fp in legacy_fps:
+        if legacy_fp == current_fp:
             continue  # 两个指纹相同（没有历史包袱的干净环境），不必多查一次
         legacy_path = os.path.join(
             AI_CACHE_DIR, f"{dimension}_{chat_hash}_{DEEPSEEK_MODEL}_{legacy_fp}{suffix}.json"
@@ -874,7 +887,7 @@ def _read_cache(dimension: str, chat_hash: str):
     return None
 
 
-def _write_cache(dimension: str, chat_hash: str, result) -> None:
+def _write_cache(dimension: str, chat_hash: str, result, fingerprint: "str | None" = None) -> None:
     """原子写入：临时文件 + os.replace，避免进程中断留下半截 JSON。
 
     记录创建时间：命中读取会刷新 mtime（滑动窗口续期），若只有 mtime，
@@ -886,7 +899,7 @@ def _write_cache(dimension: str, chat_hash: str, result) -> None:
     if _is_recently_purged(chat_hash):
         logger.info("该聊天的缓存刚被清理，维度结果不落盘（避免复活）")
         return
-    path = _cache_path(dimension, chat_hash)
+    path = _cache_path(dimension, chat_hash, fingerprint=fingerprint)
     payload = {"_created": time.time(), "result": result}
     try:
         # 目录必须在这里补建，不能只在 create_app() 里建一次就假定它永远在：

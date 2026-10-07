@@ -96,7 +96,9 @@ def api_analyze(dimension: str):
 
     # 缓存命中（除非显式 refresh=1 强制重跑）
     if request.args.get("refresh") != "1":
-        cached = store._read_cache(dimension, chat_hash)
+        chat = store._load_chat_cached(filepath)
+        cache_fp = store.analysis_cache_fingerprint(dimension, chat)
+        cached = store._read_cache(dimension, chat_hash, fingerprint=cache_fp)
         if cached is not None:
             logger.info("%s 命中缓存，直接返回", ALL_DIMENSION_NAMES.get(dimension, dimension))
             return jsonify({"cached": True, "result": cached})
@@ -157,7 +159,10 @@ def api_analysis_result(dimension: str):
     filepath, err = _session_chat_file()
     if err:
         return jsonify({"error": err[0]}), err[1]
-    cached = store._read_cache(dimension, session.get("chat_hash") or store._chat_hash(filepath))
+    chat = store._load_chat_cached(filepath)
+    chat_hash = session.get("chat_hash") or store._chat_hash(filepath)
+    cache_fp = store.analysis_cache_fingerprint(dimension, chat)
+    cached = store._read_cache(dimension, chat_hash, fingerprint=cache_fp)
     if cached is None:
         return jsonify({"error": "暂无该维度的分析结果"}), 404
     return jsonify({"cached": True, "result": cached})
