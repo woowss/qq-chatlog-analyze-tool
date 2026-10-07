@@ -35,8 +35,8 @@ python -m ruff format --check .
 ```
 
 - 测试进程自带隔离与网络护栏（`tests/_bootstrap.py`）：数据目录指向进程独占的临时目录；
-  **没有配置真实 API Key 时禁止一切真实 LLM 调用**。确实要走真实网络，必须显式设置
-  `QQCHAT_TESTS_ALLOW_REAL_LLM=1` 并确认这是有意为之（否则可能真的花钱）。
+  **默认无条件禁止一切真实 LLM 调用，即使环境中配置了 API Key**。确实要走真实网络，必须显式设置
+  `QQCHAT_TESTS_ALLOW_REAL_LLM=1` 并确认这是有意为之（否则可能真的花钱）；其它取值仍保持护栏。
 - 新增或修改行为都要带回归用例；**隐私相关改动**（日志脱敏、缓存保留期、鉴权）请带护栏用例
   （参考 `tests/test_privacy_guards.py`），并在 PR 里说明"把修复还原后哪条用例会变红"。
 - 时序相关用例不要赌线程调度：上传后的统计是异步落盘的，需要它时用 `tests/_stats.py` 的

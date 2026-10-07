@@ -98,21 +98,21 @@ class TestDataDirBootstrap(unittest.TestCase):
 
 
 class TestLlmNetworkGuard(unittest.TestCase):
-    """真实 LLM 调用护栏：unittest 下同样要拦住没有 Key 的出网"""
+    """真实 LLM 调用护栏：unittest 下默认同样拦住所有出网"""
 
-    def test_guard_blocks_client_when_no_key_configured(self):
-        """没有配置 Key 时，_get_client 必须是"一调用就炸"的哨兵
+    def test_guard_blocks_client_even_when_key_is_configured(self):
+        """环境中有 Key 但未显式允许时，_get_client 仍必须是哨兵
 
-        护栏只在"未配置 Key"时安装（配置了真 Key 是本机排查用的合法场景，见 _bootstrap），
-        所以本机配了真 Key 时这条不负责拦截。
+        这是最重要的回归：开发机的 .env 不能改变默认测试安全策略。
 
         "是谁装的"不能写死：pytest 下 conftest.py 的 autouse fixture 也会换掉 `_get_client`
         ——那是比本模块更早的一道护栏，谁先装都算拦住了，不该因此判红。
         """
         from analyzer import deepseek_client as dc
 
-        if dc.is_api_configured():
-            self.skipTest("本机已配置真实 API Key：护栏按设计不安装")
+        with mock.patch.object(dc, "is_api_configured", return_value=True):
+            with mock.patch.dict(os.environ, {"QQCHAT_TESTS_ALLOW_REAL_LLM": ""}):
+                _bootstrap.install_llm_network_guard()
 
         with self.assertRaises(AssertionError):  # 任一护栏都必须让调用响亮失败
             dc._get_client()
@@ -120,6 +120,23 @@ class TestLlmNetworkGuard(unittest.TestCase):
             # 本模块的护栏（unittest 跑法）：断言到具体异常类型与提示
             with self.assertRaises(BlockedLlmCall):
                 dc._get_client()
+
+    def test_guard_can_only_be_disabled_by_explicit_one(self):
+        """只有 QQCHAT_TESTS_ALLOW_REAL_LLM=1 才允许联网测试关闭护栏"""
+        for value in ("", "0", "false", "yes"):
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {"QQCHAT_TESTS_ALLOW_REAL_LLM": value}),
+            ):
+                self.assertTrue(_bootstrap.install_llm_network_guard())
+
+        with mock.patch.dict(os.environ, {"QQCHAT_TESTS_ALLOW_REAL_LLM": "1"}):
+            with mock.patch("builtins.print") as printed:
+                self.assertFalse(_bootstrap.install_llm_network_guard())
+        self.assertTrue(
+            any("测试可能产生费用" in str(call) for call in printed.call_args_list),
+            "显式联网开关必须打印费用风险提示",
+        )
 
     def test_guard_installed_in_fresh_interpreter(self):
         """干净子进程（无 Key）里，护栏必须自动生效
