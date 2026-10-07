@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # 禁止一切真实 LLM 调用。两者都必须在 import 项目模块（config / analyzer.*）之前完成，
 # 否则 config 会把数据目录读成真实目录。实现与理由见 tests/_bootstrap.py。
 from _bootstrap import bootstrap  # noqa: E402
+from result_fixtures import emotion as valid_emotion, for_dimension  # noqa: E402
 
 bootstrap()
 # 月份缓存会跨用例复用同一份月份内容，使"调用次数"断言失去确定性；
@@ -533,15 +534,7 @@ class TestAiCache(unittest.TestCase):
         with client.session_transaction() as sess:
             uploaded_path = sess.get("filepath")
 
-        fake_result = {
-            "self_emotion": "平静",
-            "other_emotion": "快乐",
-            "self_intensity": 5,
-            "other_intensity": 7,
-            "self_keywords": ["在吗"],
-            "other_keywords": ["在的"],
-            "overall_tone": "轻松愉快",
-        }
+        fake_result = valid_emotion()
         cache_dir = Path(storemod.AI_CACHE_DIR)
         cache_before = set(cache_dir.glob("*")) if cache_dir.exists() else set()
         try:
@@ -1057,22 +1050,14 @@ class TestAnalyzeAll(unittest.TestCase):
         with client.session_transaction() as sess:
             uploaded_path = sess.get("filepath")
 
-        fake = {
-            "self_emotion": "平静",
-            "other_emotion": "快乐",
-            "self_intensity": 5,
-            "other_intensity": 7,
-            "self_keywords": [],
-            "other_keywords": [],
-            "overall_tone": "轻松愉快",
-            "topics": [],
-            "summary": "s",
-        }
         cache_dir = Path(storemod.AI_CACHE_DIR)
         cache_before = set(cache_dir.glob("*"))
         try:
             with (
-                mock.patch("analyzer.deepseek_client._call_api", return_value=fake) as m,
+                mock.patch(
+                    "analyzer.deepseek_client._call_api",
+                    side_effect=lambda *a, **kw: for_dimension(kw.get("tag", "emotion")),
+                ) as m,
                 mock.patch("webapp.api.is_api_configured", return_value=True),
             ):
                 r = client.post(
@@ -1287,15 +1272,7 @@ class TestJobDedup(unittest.TestCase):
         self.assertEqual(r.status_code, 302)
 
         release = threading.Event()
-        fake = {
-            "self_emotion": "平静",
-            "other_emotion": "平静",
-            "self_intensity": 5,
-            "other_intensity": 5,
-            "self_keywords": [],
-            "other_keywords": [],
-            "overall_tone": "平淡日常",
-        }
+        fake = valid_emotion()
 
         def blocking(*a, **k):
             self.assertTrue(release.wait(15), "测试超时未放行")

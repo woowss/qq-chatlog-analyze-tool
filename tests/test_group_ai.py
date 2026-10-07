@@ -51,6 +51,7 @@ import shutil as _shutil
 # 否则 config 会把数据目录读成真实目录。实现与理由见 tests/_bootstrap.py。
 from _bootstrap import api_configured_patcher, bootstrap  # noqa: E402
 from _stats import ensure_stats  # noqa: E402
+from result_fixtures import profile as valid_profile  # noqa: E402
 
 bootstrap()
 os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
@@ -556,7 +557,7 @@ class TestMemberProfiles(unittest.TestCase):
 
         def fake_call(system_prompt, user_content, **kwargs):
             calls.append((kwargs.get("tag"), user_content))
-            return {"name": "x", "verdict": "锐评"}
+            return valid_profile(group=True)
 
         with (
             mock.patch.object(gc, "_call_api", side_effect=fake_call),
@@ -597,7 +598,7 @@ class TestMemberProfiles(unittest.TestCase):
         def fake_call(*a, **k):
             calls["n"] += 1
             if calls["n"] == 1:
-                return {"name": "first"}
+                return valid_profile(group=True)
             raise dc.QuotaExhaustedError("额度耗尽")
 
         with (
@@ -1126,7 +1127,7 @@ class TestMemberCache(unittest.TestCase):
     def _run(self, chat, calls):
         def fake(*args, **kwargs):
             calls.append(1)
-            return {"name": "x"}
+            return valid_profile(group=True)
 
         with mock.patch.object(gc, "_call_api", side_effect=fake):
             return gc.analyze_member_profiles(chat, chat_hash="hashM")

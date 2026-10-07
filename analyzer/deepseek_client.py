@@ -77,6 +77,7 @@ from analyzer import llm_transport
 from analyzer import fingerprint_utils
 from analyzer.shutdown import shutdown_requested
 from analyzer.usage import record_call
+from analyzer.result_schema import ResultValidationError, supports_dimension, validate_result
 from analyzer.local_stats import SESSION_GAP_MS
 from analyzer.prompts import (
     SYSTEM_PROMPT_EMOTION,
@@ -134,6 +135,7 @@ from analyzer.month_cache import (
     configure_month_cache as configure_month_cache,
     migrate_month_cache,
     month_cache_path as month_cache_path,
+    month_cache_enabled as month_cache_enabled,
     purge_month_cache as purge_month_cache,
     sweep_orphan_month_cache as sweep_orphan_month_cache,
 )
@@ -286,6 +288,12 @@ class QuotaExhaustedError(RuntimeError):
 
 class AnalysisIncompleteError(RuntimeError):
     """至少一个有可分析内容的单元未能生成有效结果，汇总结果不可作为完成态缓存。"""
+
+
+def _validate_before_month_cache(dimension: str, result: Any) -> None:
+    """校验新模型结果；关闭月份缓存时不做无意义的校验。"""
+    if month_cache_enabled() and supports_dimension(dimension):
+        validate_result(dimension, result)
 
 
 # ---------------------------------------------------------------------------
@@ -991,7 +999,15 @@ def _analyze_periods(
     done = 0
     fatal: dict[str, str] = {}  # 配额耗尽等致命错误：中止剩余月份
     failed_periods: set[str] = set()  # 普通请求失败或模型输出无效的月份
+    invalid_periods: dict[str, str] = {}
+    failure_lock = threading.Lock()
     used_keys: set[str] = set()  # 本维度命中的月份缓存键，收尾时一次性写 manifest
+
+    def _mark_failed(period: str, path: str = "") -> None:
+        with failure_lock:
+            failed_periods.add(period)
+            if path:
+                invalid_periods[period] = path
 
     def _cancel_requested() -> bool:
         # 用户点了取消，或进程正在关闭（Ctrl+C）：都不该再往外发新请求
@@ -1052,7 +1068,16 @@ def _analyze_periods(
             else:
                 result = _call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag, dim=tag)
                 if not result:
-                    failed_periods.add(period)
+                    _mark_failed(period)
+                elif month_cache_enabled() and supports_dimension(tag):
+                    try:
+                        _validate_before_month_cache(tag, result)
+                    except ResultValidationError as e:
+                        # 日志只保留维度、月份和字段路径；不记录模型结果，避免把聊天原句
+                        # 或服务商错误正文带进日志。失败月份不会进入月份缓存，重试时会补它。
+                        _mark_failed(period, e.path)
+                        logger.warning("%s 月 AI 结果结构无效（字段 %s）", period, e.path)
+                        result = None
                 # 清理守卫：用户在这几分钟里换了文件，这一轮就不该把含聊天原句引用
                 # 的结果写回盘上（否则级联清理报称"已删除"的数据会原地复活）。
                 # 已经付费拿到的结果本身照常返回给这一轮，只是不缓存。
@@ -1067,7 +1092,7 @@ def _analyze_periods(
             fatal.setdefault("error", str(e))
             logger.error("%s 月 AI 分析中止（配额耗尽）", period)
         except Exception as e:
-            failed_periods.add(period)
+            _mark_failed(period)
             logger.error("%s 月 AI 分析失败: %s", period, e)
         return period, None
 
@@ -1120,6 +1145,12 @@ def _analyze_periods(
     if failed_periods and not _cancel_requested():
         # 成功月份已独立写入内容缓存。不要把缺月的汇总结果交给 jobs.py 写成完整维度缓存，
         # 否则之后的普通请求会永久命中这份残缺汇总，错过月份也不会再被补算。
+        if invalid_periods:
+            first_path = next(iter(invalid_periods.values()))
+            raise AnalysisIncompleteError(
+                f"{len(failed_periods)} 个月结果结构无效（字段 {first_path}）；"
+                "已完成月份已缓存，可重试失败月份"
+            )
         raise AnalysisIncompleteError(
             f"{len(failed_periods)} 个月没有得到有效结果；已完成月份已缓存，可重试补齐"
         )
@@ -1336,6 +1367,19 @@ def _analyze_person(
                 tag=tag,
                 dim=tag,
             )
+            if result and month_cache_enabled():
+                try:
+                    _validate_before_month_cache(tag, result)
+                except ResultValidationError as e:
+                    logger.warning(
+                        "%s 的 %s 结果结构无效（字段 %s）",
+                        mask_name(display_name),
+                        tag,
+                        e.path,
+                    )
+                    raise AnalysisIncompleteError(
+                        f"{mask_name(display_name)} 的 {tag} 结果结构无效（字段 {e.path}）；可重试该成员"
+                    ) from e
             if result and not purge_marks.is_marked(chat_hash):
                 _write_month_cache(cache_key, result, thinking=want_thinking)
         if result and chat_hash:
@@ -1346,6 +1390,8 @@ def _analyze_person(
             return result
     except QuotaExhaustedError:
         raise  # 配额耗尽需中止整个维度，不能被当作单人失败吞掉
+    except AnalysisIncompleteError:
+        raise
     except Exception as e:
         logger.error("%s 的 AI 分析失败: %s", mask_name(display_name), scrub_secrets(e))
     return None

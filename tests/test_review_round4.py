@@ -36,6 +36,7 @@ from unittest import mock
 # 禁止一切真实 LLM 调用。两者都必须在 import 项目模块（config / analyzer.*）之前完成，
 # 否则 config 会把数据目录读成真实目录。实现与理由见 tests/_bootstrap.py。
 from _bootstrap import bootstrap  # noqa: E402
+from result_fixtures import emotion as valid_emotion  # noqa: E402
 
 bootstrap()
 # 月份缓存会跨用例复用同一份月份内容，使"调用次数"断言失去确定性；
@@ -193,7 +194,7 @@ class TestMonthManifestBatching(unittest.TestCase):
 
     def _run(self, chat, chat_hash):
         def fake_api(*a, **kw):
-            return {"self_emotion": "平静", "other_emotion": "平静"}
+            return valid_emotion()
 
         with (
             mock.patch.object(dc, "_call_api", side_effect=fake_api),
@@ -336,7 +337,7 @@ class TestGracefulShutdown(unittest.TestCase):
 
         def fake_api(*a, **kw):
             calls.append(1)
-            return {"self_emotion": "平静", "other_emotion": "平静"}
+            return valid_emotion()
 
         def on_progress(done, total):
             sd.request_shutdown()  # 第一个月一完成就"按下 Ctrl+C"

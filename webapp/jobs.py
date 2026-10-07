@@ -37,6 +37,7 @@ from analyzer.deepseek_client import (
     end_run,
     scrub_secrets,
 )
+from analyzer.result_schema import ResultValidationError, validate_dimension_result
 from analyzer.group_client import GROUP_DIMENSIONS as GROUP_DIMENSIONS
 from analyzer.recap_client import RECAP_DIMENSIONS as RECAP_DIMENSIONS
 from analyzer import purge_marks
@@ -286,6 +287,7 @@ def _run_job(job_id: str, dimension: str, filepath: str, chat_hash: str) -> None
         # 先落盘缓存，再对外置 done：否则前端轮询到 done 立刻请求
         # /api/analysis/<dim> 时可能读不到缓存，反而重新发起一次付费分析
         if result and not cancelled:
+            validate_dimension_result(dimension, result)
             cache_fp = store.analysis_cache_fingerprint(dimension, chat)
             store._write_cache(dimension, chat_hash, result, fingerprint=cache_fp)
         with JOBS_LOCK:
@@ -315,6 +317,9 @@ def _run_job(job_id: str, dimension: str, filepath: str, chat_hash: str) -> None
         )
         if result and not cancelled:
             logger.info("%s 完成（任务 %s）", dim_name, job_id[:8])
+    except ResultValidationError as e:
+        logger.warning("%s 结果结构无效（字段 %s）", dim_name, e.path)
+        _fail_job(job_id, f"{dim_name} 结果结构无效（字段 {e.path}），请重试失败项")
     except Exception as e:
         # 洗一遍再落日志：上游/网关的错误正文里可能夹带 API Key（见 scrub_secrets）
         logger.error("%s 失败: %s", dim_name, scrub_secrets(e))
@@ -381,6 +386,7 @@ def _run_analyze_all(
                         # 缺的月份就再也不会补上）；已完成的月份仍在月份缓存里，不重复付费
                         summary[dim] = "cancelled"
                     elif result:
+                        validate_dimension_result(dim, result)
                         store._write_cache(dim, chat_hash, result, fingerprint=cache_fp)
                         summary[dim] = "done"
                     else:
@@ -390,6 +396,9 @@ def _run_analyze_all(
                     summary[dim] = "aborted"
                     _fail_job(job_id, f"{e}（已完成维度：{len(summary)}，其结果已缓存）")
                     return
+                except ResultValidationError as e:
+                    logger.warning("一键全量分析 %s 结果结构无效（字段 %s）", dim_name, e.path)
+                    summary[dim] = "invalid"
                 except Exception as e:
                     logger.error("一键全量分析 %s 失败: %s", dim_name, scrub_secrets(e))
                     summary[dim] = "error"

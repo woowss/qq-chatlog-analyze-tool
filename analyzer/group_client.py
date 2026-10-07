@@ -52,6 +52,7 @@ from analyzer.deepseek_client import (
     MAX_TOKENS_BY_DIM,
     _PromptText,
     QuotaExhaustedError,
+    ResultValidationError,
     _analyze_periods,
     _call_api,
     _fit_lines,
@@ -59,6 +60,8 @@ from analyzer.deepseek_client import (
     _has_content,
     _hashed_source,
     _message_line,
+    month_cache_enabled,
+    validate_result,
     _short_time,
     _truncate_dialog_line,
     _vision_digest,
@@ -725,6 +728,14 @@ def _analyze_member(
             logger.info("%s 命中成员缓存，跳过 API 调用", mask_name(member.name))
         else:
             result = _call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag, dim=tag)
+            if result and month_cache_enabled():
+                try:
+                    validate_result(tag, result)
+                except ResultValidationError as e:
+                    logger.warning("%s 的成员画像结果结构无效（字段 %s）", mask_name(member.name), e.path)
+                    raise AnalysisIncompleteError(
+                        f"{mask_name(member.name)} 的成员画像结果结构无效（字段 {e.path}）；可重试该成员"
+                    ) from e
             # 与私聊同一道清理守卫：这个聊天刚被级联清掉就不要把成员画像写回盘上
             if result and not dc.purge_marks.is_marked(chat_hash):
                 dc._write_month_cache(key, result, thinking=want_thinking)

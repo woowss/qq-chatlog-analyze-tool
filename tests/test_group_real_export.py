@@ -45,6 +45,12 @@ from unittest import mock
 from _bootstrap import api_configured_patcher  # noqa: E402
 from _bootstrap import bootstrap  # noqa: E402
 from _stats import ensure_stats  # noqa: E402
+from result_fixtures import (  # noqa: E402
+    group_dynamics as valid_group_dynamics,
+    group_emotion as valid_group_emotion,
+    group_topics as valid_group_topics,
+    profile as valid_profile,
+)
 
 bootstrap()
 os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
@@ -88,21 +94,12 @@ EXPORT = find_export()
 def _fake_call(system_prompt, user_content, max_tokens=2048, retry=2, tpm_wait=None, tag="unknown", dim=None):
     """假响应：形状与真实契约一致（字段齐全），用来驱动页面与渲染路径"""
     if tag == "member_profiles":
-        return {"name": "x", "verdict": "v", "group_specific": {"group_role": "捧哏王"}}
+        return valid_profile(group=True)
     if tag == "group_topics":
-        return {
-            "month_title": "《测试》",
-            "topics": [{"name": "话题", "weight": 1.0, "keywords": [], "key_members": [], "one_liner": "x"}],
-            "summary": "s",
-            "confidence": "high",
-        }
+        return valid_group_topics()
     if tag == "group_emotion":
-        return {"group_emotion": "热闹", "group_intensity": 7, "member_emotions": [], "confidence": "high"}
-    return {
-        "group_vibe": "v",
-        "core_members": [{"name": "甲", "role": "话题主导者", "evidence": "x"}],
-        "confidence": "high",
-    }
+        return valid_group_emotion()
+    return valid_group_dynamics()
 
 
 @unittest.skipIf(EXPORT is None, f"没有真实导出文件（可设 {EXPORT_ENV} 指定路径）")

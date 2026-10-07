@@ -28,6 +28,7 @@ import unittest
 from datetime import datetime
 
 from _bootstrap import api_configured_patcher, bootstrap  # noqa: E402
+from result_fixtures import ask as valid_ask  # noqa: E402
 
 bootstrap()
 
@@ -1131,7 +1132,7 @@ class TestAskAndDuplicateNotice(unittest.TestCase):
 
     def test_ask_cache_file_belongs_to_chat(self):
         """ask 文件名的 chat_hash 是完整段——级联清理/导出/回收自动覆盖它。"""
-        with mock.patch("analyzer.deepseek_client._call_api", return_value={"answer": "x"}):
+        with mock.patch("analyzer.deepseek_client._call_api", return_value=valid_ask()):
             guard = api_configured_patcher()
             guard.start()
             try:

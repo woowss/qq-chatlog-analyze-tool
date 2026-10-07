@@ -25,6 +25,7 @@ from flask import jsonify, request, send_file, session
 
 from analyzer.deepseek_client import QuotaExhaustedError, is_api_configured, test_connection
 from analyzer.logger import get_logger
+from analyzer.result_schema import ResultValidationError, validate_result
 from analyzer.usage import get_usage
 from config import UPLOAD_FOLDER
 from webapp import store
@@ -698,6 +699,11 @@ def api_ask():
         result = recap_client.answer_question(chat, question, chat_hash)
         if not result:
             return jsonify({"error": "这次提问没有拿到结果（材料不足或输出被截断），换个问法再试"}), 502
+        try:
+            validate_result("ask", result)
+        except ResultValidationError as e:
+            logger.warning("提问结果结构无效（字段 %s）", e.path)
+            return jsonify({"error": f"提问结果结构无效（字段 {e.path}），请重试"}), 502
         store.ask_cache_write(chat_hash, question, result)
         return jsonify({"ok": True, "result": result})
     except QuotaExhaustedError as e:
