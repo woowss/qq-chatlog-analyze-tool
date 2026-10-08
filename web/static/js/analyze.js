@@ -66,6 +66,11 @@ document.addEventListener('click', function askOnce() {
 // startAnalyze(dim, {refresh, onProgress(done,total), onDone(result), onError(msg)})
 // POST /api/analyze/<dim>：命中缓存立即回调；否则轮询后台任务进度
 function startAnalyze(dim, opts) {    opts.dim = dim;      // 轮询遇到 404 时用它回读磁盘缓存（见 pollAnalyzeJob）
+    var done = opts.onDone;
+    opts.onDone = function (result) {
+        done(result);
+        if (window.updateEvidence) window.updateEvidence(dim);
+    };
     var url = '/api/analyze/' + dim + (opts.refresh ? '?refresh=1' : '');
     $.post(url, function(data) {
         if (data.error) { opts.onError(data.error); return; }
@@ -200,6 +205,7 @@ function loadAnalysis(dim, cb) {
             try { sessionStorage.setItem('ai_' + dim, JSON.stringify(data.result)); } catch (e) { /* 配额满忽略 */ }
             setAnalysisEmptyState(dim, 'ready');
             cb(data.result);
+            if (window.updateEvidence) window.updateEvidence(dim);
         } else {
             setAnalysisEmptyState(dim, 'empty');
             cb(null);
@@ -210,7 +216,11 @@ function loadAnalysis(dim, cb) {
         try { raw = sessionStorage.getItem('ai_' + dim); } catch (e) { raw = null; }
         var parsed = null;
         try { parsed = raw ? JSON.parse(raw) : null; } catch (e) { parsed = null; }
-        if (parsed) { setAnalysisEmptyState(dim, 'ready'); cb(parsed); return; }
+        if (parsed) {
+            setAnalysisEmptyState(dim, 'ready'); cb(parsed);
+            if (window.updateEvidence) window.updateEvidence(dim);
+            return;
+        }
         // 服务端给了人话就直接用它（例如会话过期时的"请刷新页面重新登录"），
         // 比报一个裸 HTTP 状态码更可执行。
         var serverMsg = xhr && xhr.responseJSON && xhr.responseJSON.error;

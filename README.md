@@ -186,6 +186,15 @@ python app.py      # 方式 C，等价入口
 2. 配置了 API Key 时，按维度运行 AI 分析，或点「全量分析」跑完五个维度。
 3. 已分析的结果缓存在 `ai_cache/`，重开页面不会重复调用接口；需要重跑时勾选「强制重新分析」。
 
+强制重新分析会跳过该次所选维度的汇总、月份、人物或成员内容缓存，重新调用模型并产生费用；
+普通重跑仍复用成功单元。刷新失败或取消不会提前删除已有有效结果；图片摘要继续按既有策略复用。
+
+分析页下方的「原文证据核对」仅在本机匹配明确的引文字段，不调用模型。唯一匹配可直接查看
+原始时间线，重复短句可选择候选；未找到或信息不足时不会生成确定的消息链接。旧结果不需要
+重新分析。来源可定位不代表推断正确；含多个引文的自由文本、缺失或重复消息 ID 可能无法安全定位。
+若结果提供 `evidence_ids`，会额外核对当前允许的文本样本、发言人及日期；旧结果没有记录历史
+输入配置，核验不能证明当时实际发送了哪些消息。分享报告不附带此交互式入口或额外上下文。
+
 ## Windows 直装版
 
 Release 同时提供 Windows 10/11 x64 安装包与免安装压缩包：
@@ -421,6 +430,20 @@ python -m unittest discover -s tests -v      # 全量单测（含逐页冒烟、
 测试默认无条件阻止真实 LLM 客户端，即使开发机的 `.env` 配置了 API Key；pytest 与 unittest
 使用同一条护栏。只有明确执行联网测试时才设置 `QQCHAT_TESTS_ALLOW_REAL_LLM=1`，此时可能产生
 模型费用。其它取值（包括 `0`、`false`）仍保持护栏开启。
+
+浏览器流程使用编造数据和模拟模型，覆盖上传、图表、消息搜索/分页、任务轮询、证据弹窗和报告下载。
+普通单测默认跳过浏览器；需要 Chromium 时另装开发依赖（不属于运行依赖）：
+
+```bash
+pip install -e ".[browser-test]"
+python -m playwright install chromium
+# Linux 可加 --with-deps 安装浏览器系统依赖
+QQCHAT_BROWSER_TESTS=1 python -m unittest discover -s tests -p test_browser.py -v
+```
+
+PowerShell 将最后一行改为 `$env:QQCHAT_BROWSER_TESTS='1'`，然后执行该 `python -m unittest` 命令。
+截图、网络/控制台日志和 trace 写入被忽略的 `output/playwright/`，可用 `python -m playwright show-trace`
+查看 trace ZIP。CI 在 Linux 和 Windows 上运行这些流程并保存诊断文件；仅使用本机资源，不请求 CDN。
 
 用例数**刻意不写在这份文档里**：写死了就得每加一条用例同步改一次，而漏改的表现仅仅是
 "README 说了个过时的数字"——此前已经漂移过两次，且没有守卫能发现。数量以这条命令输出里的

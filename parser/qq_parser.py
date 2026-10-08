@@ -415,6 +415,8 @@ class ChatData:
     #: 是调用时读配置的（有用例专门钉这个语义，见 test_matrix_limit_reads_config_at_call_time），
     #: 用 top_k 当键会让"改配置后拿回旧上限的矩阵"。
     _matrix_cache: Optional[dict] = field(default=None, repr=False, compare=False)
+    # Browse/evidence indexes follow the parsed object's replacement/deletion lifecycle.
+    _message_index: Optional[object] = field(default=None, repr=False, compare=False)
 
     def statistical(self) -> list["Message"]:
         """参与统计与分析的消息子集（过滤系统/撤回/转发）"""

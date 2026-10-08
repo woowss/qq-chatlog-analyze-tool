@@ -10,6 +10,9 @@ jobs:
     runs-on: ubuntu-latest
     # 卡住挂起的作业：默认 6 小时才杀，一个卡住的 job 会把整条流水线占满
     timeout-minutes: 30
+    env:
+      # Ordinary CI must not auto-select real exports from a developer's machine.
+      QQCHAT_TEST_EXPORT: __ci_no_real_export__.json
     strategy:
       # 不 fail-fast：一个版本红就把其余三个取消，等于放弃"到底哪些版本真的受影响"
       # 这条信息（曾因此把一个只在 3.10 上暴露的竞态误读成"测试通过后被取消"）。
@@ -55,6 +58,44 @@ jobs:
 
       - name: Run unit tests (含逐页冒烟)
         run: python -m unittest discover -s tests -v
+
+  browser:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      QQCHAT_TEST_EXPORT: __ci_no_real_export__.json
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 50
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install package and browser test dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install ".[browser-test]"
+          python -m playwright install --with-deps chromium
+      - name: Check installed package entry point
+        run: qqchatlog --version
+      - name: Run core and template tests (including Windows)
+        run: python -m unittest discover -s tests -v
+      - name: Run synthetic browser flows
+        env:
+          QQCHAT_BROWSER_TESTS: "1"
+        run: python -m unittest discover -s tests -p test_browser.py -v
+      - name: Keep browser diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-${{ matrix.os }}
+          path: output/playwright/
+          if-no-files-found: ignore
 
   package:
     # 真正构建 wheel 并拆包核对：源码侧的 glob 模拟（tests/test_packaging.py）证明不了

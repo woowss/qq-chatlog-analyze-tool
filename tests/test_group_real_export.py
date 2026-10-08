@@ -31,6 +31,7 @@
 """
 
 import io
+import hashlib
 import json
 import os
 import sys
@@ -127,6 +128,7 @@ class TestRealExport(unittest.TestCase):
             guard.start()
         with open(EXPORT, "rb") as f:
             payload = f.read()
+        cls.source_digest = hashlib.sha256(payload).digest()
         resp = cls.client.post(
             "/upload", data={"file": (io.BytesIO(payload), "real.json")}, headers=cls.headers
         )
@@ -145,6 +147,7 @@ class TestRealExport(unittest.TestCase):
         for guard in cls.guards:
             guard.stop()
         store._purge_chat_caches(cls.chat_hash)
+        assert hashlib.sha256(EXPORT.read_bytes()).digest() == cls.source_digest, "original export changed"
 
     # ---------------------------------------------------------------- 解析与判定
 
@@ -272,6 +275,105 @@ class TestRealExport(unittest.TestCase):
         resp = self.client.post("/api/analyze/emotion", headers=self.headers)
         self.assertEqual(resp.status_code, 400)
         self.assertIn("不适用于当前记录", resp.get_json()["error"])
+
+    def test_p1_index_filters_and_context_match_original_timeline(self):
+        from webapp import api
+        from webapp.message_index import index_for
+
+        index = index_for(self.chat, api._browse_body, api._match_browse)
+        message = next(m for m in self.chat.messages if m.text and m.id and len(index.ids[m.id]) == 1)
+        day, month = message.time_str[:10], message.time_str[:7]
+        for query in ((message.text[:8].strip(), "", month, "", ""), ("", message.sender_uid, "", day, day)):
+            expected = [
+                i
+                for i, m in enumerate(self.chat.messages)
+                if api._match_browse(m, *query, self.chat.self_uid)
+            ]
+            self.assertTrue(list(index.query(*query)) == expected, "group index filter mismatch")
+        response = self.client.get(
+            "/api/messages", query_string={"q": message.text[:8], "around": message.id, "context": 1}
+        )
+        self.assertTrue(response.status_code == 200, "group context request failed")
+        position = index.ids[message.id][0]
+        expected = [
+            api._fmt_browse_message(m, self.chat.self_uid)
+            for m in self.chat.messages[max(0, position - 10) : position + 11]
+        ]
+        self.assertTrue(response.json["messages"] == expected, "group context differs from original timeline")
+
+    def test_p1_sources_validate_current_group_and_input(self):
+        from webapp import api
+        from webapp.evidence import verify_sources
+        from webapp.message_index import index_for
+        from test_private_real_export import locatable_source
+
+        index = index_for(self.chat, api._browse_body, api._match_browse)
+        source, quote, month = locatable_source(self.chat, index, "group_emotion")
+        claim = {
+            "quote": "「" + quote + "」",
+            "sender_uid": source.sender_uid,
+            "date": source.time_str[:10],
+            "evidence_ids": [source.id],
+        }
+        result = {month: {"group_evidence": claim}}
+        entries = verify_sources(self.chat, "group_emotion", result, index, api._fmt_browse_message)[
+            "entries"
+        ]
+        self.assertTrue(entries[0]["status"] == "unique", "group source ID was not confirmed")
+        claim["evidence_ids"] = ["synthetic-unknown-group-source"]
+        entries = verify_sources(self.chat, "group_emotion", result, index, api._fmt_browse_message)[
+            "entries"
+        ]
+        self.assertTrue(entries[0]["status"] == "not_found", "unknown group source ID was accepted")
+
+    def test_p1_member_refresh_with_real_sample_and_mock_model(self):
+        import tempfile
+        from analyzer import month_cache as mc
+        from analyzer.cache_policy import content_cache_policy
+
+        previous = mc._MONTH_CACHE_DIR
+        member = gc.select_ai_members(self.chat)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            mc.configure_month_cache(directory)
+            try:
+                with (
+                    mock.patch.object(gc, "_call_api", side_effect=_fake_call) as call,
+                    mock.patch.object(gc, "_vision_digest", return_value=""),
+                ):
+
+                    def run():
+                        return gc._analyze_member(
+                            self.chat,
+                            member,
+                            "test",
+                            "{display_name}\n{dialog}\n{context}",
+                            1000,
+                            "member_profiles",
+                        )
+
+                    self.assertTrue(bool(run()), "group member analysis failed")
+                    run()
+                    self.assertTrue(call.call_count == 1, "group member unit was not reused")
+                    with content_cache_policy(True):
+                        self.assertTrue(bool(run()), "group member refresh failed")
+                    self.assertTrue(call.call_count == 2, "group member refresh did not bypass cache")
+            finally:
+                mc.configure_month_cache(previous)
+
+    @unittest.skipUnless(os.getenv("QQCHAT_BROWSER_TESTS") == "1", "opt-in browser suite")
+    def test_p1_group_browser_without_persisting_diagnostics(self):
+        from webapp import api
+        from webapp.message_index import index_for
+        from test_private_real_export import TestPrivateRealExport, locatable_source
+
+        self.export_path = EXPORT
+        index = index_for(self.chat, api._browse_body, api._match_browse)
+        source, self.quote, month = locatable_source(self.chat, index, "group_emotion")
+        result = valid_group_emotion()
+        result["group_evidence"] = "「" + self.quote + "」"
+        fingerprint = store.analysis_cache_fingerprint("group_emotion", self.chat)
+        store._write_cache("group_emotion", self.chat_hash, {month: result}, fingerprint=fingerprint)
+        TestPrivateRealExport.test_real_private_browser_without_persisting_diagnostics(self)
 
 
 if __name__ == "__main__":
