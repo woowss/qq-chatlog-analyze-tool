@@ -32,6 +32,15 @@ from math import isfinite
 from typing import Any, Callable
 
 
+class CachedModelResult(dict):
+    """Disk-cache provenance retained in memory, never added to the JSON payload.
+
+    Older paid results remain readable even when a newer schema adds required
+    fields. Only the cache reader constructs this type; model JSON cannot opt
+    out of validation by supplying a flag in its payload.
+    """
+
+
 class ResultValidationError(ValueError):
     """A safe, user-facing description of a result contract violation."""
 
@@ -256,13 +265,17 @@ def _validate_profile(result: dict, dimension: str, *, group: bool = False) -> N
     personality = _object(
         _required(result, "personality_analysis", dimension), dimension, "personality_analysis"
     )
-    for key in ("core_type", "thinking_style", "humor_style", "social_tendency"):
+    for key in ("core_type", "social_tendency"):
         _string(
             _required(personality, key, dimension, f"personality_analysis.{key}"),
             dimension,
             f"personality_analysis.{key}",
             limit=_MAX_SHORT_TEXT,
         )
+    # 契约审计已确认这两项可缺失，渲染器会跳过；存在时仍须符合文本约束。
+    for key in ("thinking_style", "humor_style"):
+        if key in personality:
+            _string(personality[key], dimension, f"personality_analysis.{key}", limit=_MAX_SHORT_TEXT)
     for key in ("strengths", "weaknesses", "quirks"):
         _list(
             _required(personality, key, dimension, f"personality_analysis.{key}"),
@@ -412,7 +425,8 @@ def _validate_group_emotion(result: dict, dimension: str) -> None:
     def member_emotion(value: Any, path: str) -> None:
         item = _object(value, dimension, path)
         _required_text(item, "name", dimension, limit=500)
-        _required_enum(item, "emotion", dimension, _EMOTIONS)
+        # 群聊提示词只要求成员的情绪标签，不限定为私聊的枚举词表。
+        _required_text(item, "emotion", dimension, limit=_MAX_SHORT_TEXT)
         _integer(
             _required(item, "intensity", dimension, f"{path}.intensity"),
             dimension,
@@ -498,7 +512,7 @@ def validate_result(dimension: str, result: Any, *, scope: str | None = None) ->
 
 
 def validate_dimension_result(dimension: str, result: Any) -> None:
-    """Validate an aggregate returned by an analyzer before dimension caching."""
+    """Validate aggregate keys and fresh results, preserving cached legacy schemas."""
     if dimension in _MONTHLY_DIMENSIONS:
         aggregate = _object(result, dimension, "$")
         if not aggregate:
@@ -506,7 +520,8 @@ def validate_dimension_result(dimension: str, result: Any) -> None:
         for period, item in aggregate.items():
             if not isinstance(period, str):
                 _fail(dimension, "$", "月份键必须是字符串")
-            validate_result(dimension, item)
+            if not isinstance(item, CachedModelResult):
+                validate_result(dimension, item)
         return
     if dimension in _PEOPLE_DIMENSIONS:
         aggregate = _object(result, dimension, "$")
@@ -515,7 +530,8 @@ def validate_dimension_result(dimension: str, result: Any) -> None:
         for person, item in aggregate.items():
             if person not in ("self", "other"):
                 _fail(dimension, "members", "存在不允许的成员键")
-            validate_result(dimension, item)
+            if not isinstance(item, CachedModelResult):
+                validate_result(dimension, item)
         return
     if dimension == "member_profiles":
         aggregate = _object(result, dimension, "$")
@@ -524,7 +540,8 @@ def validate_dimension_result(dimension: str, result: Any) -> None:
         for uid, item in aggregate.items():
             if not isinstance(uid, str):
                 _fail(dimension, "$", "成员键必须是字符串")
-            validate_result(dimension, item)
+            if not isinstance(item, CachedModelResult):
+                validate_result(dimension, item)
         return
     validate_result(dimension, result)
 

@@ -1429,6 +1429,10 @@ def analyze_habits(
             )
         except QuotaExhaustedError:
             raise
+        except AnalysisIncompleteError:
+            # 双方独立分析；先保留另一方的有效缓存，再上报整个维度未完成。
+            incomplete = True
+            result = None
         if result:
             results[person_key] = result
         elif any(_has_content(m) and is_statistical(m) for m in msgs):
@@ -1436,7 +1440,7 @@ def analyze_habits(
         done += 1
         if on_progress:
             on_progress(done, total)
-    if incomplete and results and not (should_cancel and should_cancel()):
+    if incomplete and not (should_cancel and should_cancel()):
         raise AnalysisIncompleteError("habits 分析未能取得双方的完整结果；已完成的一方可从缓存复用")
     return results
 
@@ -1470,6 +1474,9 @@ def analyze_profile(
             )
         except QuotaExhaustedError:
             raise
+        except AnalysisIncompleteError:
+            incomplete = True
+            result = None
         if result:
             results[person_key] = result
         elif any(_has_content(m) and is_statistical(m) for m in msgs):
@@ -1477,7 +1484,7 @@ def analyze_profile(
         done += 1
         if on_progress:
             on_progress(done, total)
-    if incomplete and results and not (should_cancel and should_cancel()):
+    if incomplete and not (should_cancel and should_cancel()):
         raise AnalysisIncompleteError("profile 分析未能取得双方的完整结果；已完成的一方可从缓存复用")
     return results
 

@@ -1337,7 +1337,9 @@ class TestStratifiedProfileSample(unittest.TestCase):
             return None  # 不产生结果，只看 prompt
 
         with mock.patch.object(dc, "_call_api", side_effect=spy):
-            dc.analyze_profile(chat)
+            # 此用例故意不给结果；未完成应抛错，但不影响核对已捕获的抽样 prompt。
+            with self.assertRaises(dc.AnalysisIncompleteError):
+                dc.analyze_profile(chat)
 
         self.assertEqual(len(captured), 1)  # other 一方无发言
         prompt = captured[0]

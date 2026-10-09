@@ -773,6 +773,7 @@ def analyze_member_profiles(
     )
     total, done = len(members), 0
     used_keys: set = set()
+    incomplete = False
     for member in members:
         if should_cancel and should_cancel():
             break
@@ -792,14 +793,17 @@ def analyze_member_profiles(
             _record_member_usage(chat_hash, used_keys)
             raise
         except AnalysisIncompleteError:
-            _record_member_usage(chat_hash, used_keys)
-            raise
+            # 成员之间独立：一人的结构错误不应阻断其他人的分析与缓存。
+            incomplete = True
+            result = None
         if result:
             results[member.uid] = result
         done += 1
         if on_progress:
             on_progress(done, total)
     _record_member_usage(chat_hash, used_keys)
+    if incomplete and not (should_cancel and should_cancel()):
+        raise AnalysisIncompleteError("成员画像分析未取得全部成员的完整结果；已完成的成员可从缓存复用")
     return results
 
 

@@ -43,6 +43,7 @@ from analyzer import purge_marks
 from analyzer.cache_policy import refreshing, refresh_cancelled
 from analyzer.atomic_write import tmp_sibling, write_json_atomic
 from analyzer.logger import get_logger
+from analyzer.result_schema import CachedModelResult
 
 logger = get_logger("deepseek")
 
@@ -222,7 +223,8 @@ def _read_month_cache(
         pass
     if expect_thinking is not None and stamped is None:
         _restamp_month_cache(path, data, bool(expect_thinking), created, chat_hash)
-    return data
+    # 汇总时仍需区分旧缓存与新模型结果，否则更严格的必填字段会让旧缓存永远卡住重试。
+    return CachedModelResult(data)
 
 
 def _restamp_month_cache(path: str, data: dict, thinking: bool, created, chat_hash: str = "") -> None:
