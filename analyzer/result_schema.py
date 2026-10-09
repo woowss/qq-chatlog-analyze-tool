@@ -22,8 +22,8 @@ error.  Chat text and provider error payloads therefore cannot leak through a
 validation failure.
 
 Validation is applied to newly returned model results before they are cached.
-Readers intentionally remain migration-compatible: an existing cache entry is
-not rejected merely because this release made the contract stricter.
+Readers remain migration-compatible when older entries omit required fields;
+present known fields still satisfy their type, vocabulary, bounds and limits.
 """
 
 from __future__ import annotations
@@ -39,6 +39,21 @@ class CachedModelResult(dict):
     fields. Only the cache reader constructs this type; model JSON cannot opt
     out of validation by supplying a flag in its payload.
     """
+
+
+class _LegacyObject(dict):
+    """Validation-only view that permits absent keys, never invalid present values."""
+
+
+_MISSING = object()
+
+
+def _legacy_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return _LegacyObject(value)
+    if isinstance(value, list):
+        return [_LegacyObject(item) if isinstance(item, dict) else item for item in value]
+    return value
 
 
 class ResultValidationError(ValueError):
@@ -68,12 +83,16 @@ def _fail(dimension: str, path: str, reason: str) -> None:
 
 
 def _object(value: Any, dimension: str, path: str) -> dict:
+    if value is _MISSING:
+        return _LegacyObject()
     if not isinstance(value, dict):
         _fail(dimension, path, "必须是对象")
     return value
 
 
 def _string(value: Any, dimension: str, path: str, *, limit: int = _MAX_TEXT) -> str:
+    if value is _MISSING:
+        return ""
     if not isinstance(value, str):
         _fail(dimension, path, "必须是字符串")
     if len(value) > limit:
@@ -84,6 +103,8 @@ def _string(value: Any, dimension: str, path: str, *, limit: int = _MAX_TEXT) ->
 def _number(
     value: Any, dimension: str, path: str, *, lo: float | None = None, hi: float | None = None
 ) -> float:
+    if value is _MISSING:
+        return 0.0
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         _fail(dimension, path, "必须是数字")
     if not isfinite(float(value)):
@@ -96,6 +117,8 @@ def _number(
 
 
 def _integer(value: Any, dimension: str, path: str, *, lo: int | None = None, hi: int | None = None) -> int:
+    if value is _MISSING:
+        return 0
     if isinstance(value, bool) or not isinstance(value, int):
         _fail(dimension, path, "必须是整数")
     if lo is not None and value < lo:
@@ -106,12 +129,16 @@ def _integer(value: Any, dimension: str, path: str, *, lo: int | None = None, hi
 
 
 def _boolean(value: Any, dimension: str, path: str) -> bool:
+    if value is _MISSING:
+        return False
     if not isinstance(value, bool):
         _fail(dimension, path, "必须是布尔值")
     return value
 
 
 def _enum(value: Any, dimension: str, path: str, choices: tuple[str, ...]) -> str:
+    if value is _MISSING:
+        return ""
     _string(value, dimension, path, limit=_MAX_SHORT_TEXT)
     if value not in choices:
         _fail(dimension, path, "不是允许的枚举值")
@@ -121,13 +148,17 @@ def _enum(value: Any, dimension: str, path: str, choices: tuple[str, ...]) -> st
 def _required(obj: dict, key: str, dimension: str, path: str | None = None) -> Any:
     actual_path = path or key
     if key not in obj:
+        if isinstance(obj, _LegacyObject):
+            return _MISSING
         _fail(dimension, actual_path, "缺少必填字段")
-    return obj[key]
+    return _legacy_value(obj[key]) if isinstance(obj, _LegacyObject) else obj[key]
 
 
 def _list(
     value: Any, dimension: str, path: str, item: Callable[[Any, str], None], *, max_items: int = _MAX_LIST
 ) -> list:
+    if value is _MISSING:
+        return []
     if not isinstance(value, list):
         _fail(dimension, path, "必须是数组")
     if len(value) > max_items:
@@ -250,6 +281,8 @@ def _validate_habits(result: dict, dimension: str) -> None:
 
 
 def _scalar_text_or_number(value: Any, dimension: str, path: str) -> None:
+    if value is _MISSING:
+        return
     if isinstance(value, bool) or not isinstance(value, (str, int, float)):
         _fail(dimension, path, "必须是字符串或数字")
     if isinstance(value, str) and len(value) > _MAX_SHORT_TEXT:
@@ -512,7 +545,7 @@ def validate_result(dimension: str, result: Any, *, scope: str | None = None) ->
 
 
 def validate_dimension_result(dimension: str, result: Any) -> None:
-    """Validate aggregate keys and fresh results, preserving cached legacy schemas."""
+    """Validate aggregate keys, complete fresh results and present cached fields."""
     if dimension in _MONTHLY_DIMENSIONS:
         aggregate = _object(result, dimension, "$")
         if not aggregate:
@@ -520,8 +553,7 @@ def validate_dimension_result(dimension: str, result: Any) -> None:
         for period, item in aggregate.items():
             if not isinstance(period, str):
                 _fail(dimension, "$", "月份键必须是字符串")
-            if not isinstance(item, CachedModelResult):
-                validate_result(dimension, item)
+            _validate_aggregate_item(dimension, item)
         return
     if dimension in _PEOPLE_DIMENSIONS:
         aggregate = _object(result, dimension, "$")
@@ -530,8 +562,7 @@ def validate_dimension_result(dimension: str, result: Any) -> None:
         for person, item in aggregate.items():
             if person not in ("self", "other"):
                 _fail(dimension, "members", "存在不允许的成员键")
-            if not isinstance(item, CachedModelResult):
-                validate_result(dimension, item)
+            _validate_aggregate_item(dimension, item)
         return
     if dimension == "member_profiles":
         aggregate = _object(result, dimension, "$")
@@ -540,10 +571,25 @@ def validate_dimension_result(dimension: str, result: Any) -> None:
         for uid, item in aggregate.items():
             if not isinstance(uid, str):
                 _fail(dimension, "$", "成员键必须是字符串")
-            if not isinstance(item, CachedModelResult):
-                validate_result(dimension, item)
+            _validate_aggregate_item(dimension, item)
         return
     validate_result(dimension, result)
+
+
+def validate_cached_result(dimension: str, result: Any) -> None:
+    """Check every present known field, permitting missing legacy keys at any depth.
+
+    The temporary view only affects required-key lookup. It never adds defaults
+    to the actual payload or relaxes type, vocabulary, bounds or size checks.
+    """
+    validate_result(dimension, _legacy_value(result))
+
+
+def _validate_aggregate_item(dimension: str, result: Any) -> None:
+    if isinstance(result, CachedModelResult):
+        validate_cached_result(dimension, result)
+    else:
+        validate_result(dimension, result)
 
 
 def dimension_is_monthly(dimension: str) -> bool:

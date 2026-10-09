@@ -723,7 +723,7 @@ def _analyze_member(
         # 成员画像是最贵的一个维度，让"关了思考"的重跑吃到"开着思考"算出来的画像，
         # 用户看到的同样是配置静默失效。
         want_thinking = dc.thinking_enabled(tag)
-        result = dc._read_month_cache(key, expect_thinking=want_thinking, chat_hash=chat_hash)
+        result = dc._read_result_cache(key, tag, expect_thinking=want_thinking, chat_hash=chat_hash)
         if result is not None:
             logger.info("%s 命中成员缓存，跳过 API 调用", mask_name(member.name))
         else:

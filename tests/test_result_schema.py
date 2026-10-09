@@ -25,6 +25,7 @@ from analyzer import month_cache as mc  # noqa: E402
 from analyzer import group_client as gc  # noqa: E402
 from analyzer.cache_policy import content_cache_policy  # noqa: E402
 from analyzer.result_schema import (  # noqa: E402
+    CachedModelResult,
     ResultValidationError,
     validate_dimension_result,
     validate_result,
@@ -102,6 +103,41 @@ class TestResultSchemas(unittest.TestCase):
                     result["personality_analysis"][key] = []
                     with self.assertRaises(ResultValidationError):
                         validate_result(dimension, result)
+
+    def test_cached_results_check_present_fields_and_preserve_missing_fields(self):
+        cases = (
+            ("profile", {"personality_analysis": {"strengths": "not an array"}}),
+            ("profile", {"personality_analysis": None}),
+            ("profile", {"personality_analysis": {"strengths": [None]}}),
+            ("profile", {"scoring": {"expressiveness": float("nan")}}),
+            ("emotion", {"self_emotion": "unknown"}),
+            ("emotion", {"self_intensity": 11}),
+            ("emotion", {"self_intensity": True}),
+            ("emotion", {"self_evidence": "x" * 2_001}),
+            ("emotion", {"self_keywords": ["x"] * 17}),
+            ("group_topics", {"topics": [{"weight": 2}]}),
+            ("group_topics", {"topics": [None]}),
+            ("group_emotion", {"member_emotions": [{"intensity": -1}]}),
+            ("habits", {"signature_moment": None}),
+            ("member_profiles", {"group_specific": {"presence": []}}),
+        )
+        for dimension, payload in cases:
+            with self.subTest(dimension=dimension, payload_key=next(iter(payload))):
+                key = (
+                    "self"
+                    if dimension in ("profile", "habits")
+                    else "uid-1"
+                    if dimension == "member_profiles"
+                    else "2025-01"
+                )
+                with self.assertRaises(ResultValidationError):
+                    validate_dimension_result(dimension, {key: CachedModelResult(payload)})
+        partial = {"personality_analysis": {"strengths": ["合成优点"]}}
+        before = json.dumps(partial, ensure_ascii=False)
+        validate_dimension_result("profile", {"self": CachedModelResult(partial)})
+        self.assertEqual(json.dumps(partial, ensure_ascii=False), before)
+        with self.assertRaises(ResultValidationError):
+            validate_result("profile", partial)
 
     def test_unknown_enum_is_rejected_without_echoing_model_value(self):
         result = for_dimension("group_emotion")
@@ -312,6 +348,115 @@ class TestCacheValidationBoundary(unittest.TestCase):
         self.assertEqual(call.call_count, 1)
         self.assertEqual(result, {})
 
+    def test_bad_person_cache_recomputes_only_affected_person(self):
+        for dimension, runner, field in (
+            ("habits", dc.analyze_habits, "personality_tags"),
+            ("profile", dc.analyze_profile, "strengths"),
+        ):
+            with self.subTest(dimension=dimension):
+                with (
+                    mock.patch.object(
+                        dc, "_call_api", side_effect=lambda *a, dim=dimension, **k: for_dimension(dim)
+                    ),
+                    mock.patch.object(dc, "_write_month_cache", wraps=mc._write_month_cache) as writes,
+                ):
+                    original = runner(self._private_chat())
+                path = Path(mc.month_cache_path(writes.call_args_list[0].args[0]))
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if dimension == "profile":
+                    payload["personality_analysis"][field] = "invalid legacy field"
+                else:
+                    payload[field] = "invalid legacy field"
+                path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                with mock.patch.object(dc, "_call_api", return_value=for_dimension(dimension)) as call:
+                    repaired = runner(self._private_chat())
+                self.assertEqual(call.call_count, 1)
+                self.assertEqual(set(repaired), {"self", "other"})
+                self.assertEqual(repaired["other"], original["other"])
+                validate_dimension_result(dimension, repaired)
+
+    def test_bad_month_cache_recomputes_and_failed_recompute_stays_retryable(self):
+        key = mc._month_key("sys", "bad-old-month")
+        invalid = for_dimension("emotion")
+        invalid["self_intensity"] = "wrong type"
+        mc._write_month_cache(key, invalid)
+
+        def run():
+            return dc._analyze_periods(
+                {"2025-01": []}, "sys", lambda *a: "bad-old-month", 1024, tag="emotion"
+            )
+
+        with mock.patch.object(dc, "_call_api", return_value=invalid) as call:
+            with self.assertRaises(dc.AnalysisIncompleteError):
+                run()
+            self.assertEqual(call.call_count, 1)
+        with mock.patch.object(dc, "_call_api", return_value=for_dimension("emotion")) as call:
+            repaired = run()
+            self.assertEqual(call.call_count, 1)
+        validate_dimension_result("emotion", repaired)
+        with mock.patch.object(dc, "_call_api", side_effect=AssertionError("repaired cache missed")):
+            validate_dimension_result("emotion", run())
+
+    def test_bad_member_cache_recomputes_only_affected_member(self):
+        chat = load_chat(Path(__file__).parent / "fixtures/group_5p.json")
+        members = gc.select_ai_members(chat)[:2]
+        with mock.patch.object(gc, "select_ai_members", return_value=members):
+            with (
+                mock.patch.object(
+                    gc, "_call_api", side_effect=lambda *a, **k: for_dimension("member_profiles")
+                ),
+                mock.patch.object(dc, "_write_month_cache", wraps=mc._write_month_cache) as writes,
+            ):
+                original = gc.analyze_member_profiles(chat)
+            path = Path(mc.month_cache_path(writes.call_args_list[0].args[0]))
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["personality_analysis"]["strengths"] = "invalid legacy field"
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            with mock.patch.object(gc, "_call_api", return_value=for_dimension("member_profiles")) as call:
+                repaired = gc.analyze_member_profiles(chat)
+                self.assertEqual(call.call_count, 1)
+            self.assertEqual(repaired[members[1].uid], original[members[1].uid])
+            validate_dimension_result("member_profiles", repaired)
+
+    def test_valid_legacy_cache_replaces_bad_current_key_without_model_calls(self):
+        prompt = "legacy-repair"
+        current_key = mc._month_key("sys", prompt, "active")
+        old_key = mc._month_key("sys", prompt, "legacy")
+        bad = for_dimension("emotion")
+        bad["self_intensity"] = "wrong type"
+        mc._write_month_cache(current_key, bad)
+        old = for_dimension("emotion")
+        old.pop("self_evidence")
+        mc._write_month_cache(old_key, old)
+        with (
+            mock.patch.object(dc, "_legacy_chain_for_fingerprint_value", return_value=("legacy",)),
+            mock.patch.object(dc, "_call_api", side_effect=AssertionError("usable legacy cache missed")),
+        ):
+            for _ in range(2):
+                result = dc._analyze_periods(
+                    {"2025-01": []},
+                    "sys",
+                    lambda *a: prompt,
+                    1024,
+                    fingerprint="active",
+                    tag="emotion",
+                )
+                validate_dimension_result("emotion", result)
+                self.assertNotIn("self_evidence", result["2025-01"])
+        self.assertFalse(Path(mc.month_cache_path(old_key)).exists())
+        self.assertEqual(mc._read_month_cache(current_key)["self_intensity"], old["self_intensity"])
+
+    def test_legacy_migration_preserves_valid_current_destination(self):
+        current_key = mc._month_key("sys", "valid-current")
+        old_key = mc._month_key("sys", "valid-old")
+        current = for_dimension("emotion")
+        old = for_dimension("emotion")
+        old["self_intensity"] = 1
+        mc._write_month_cache(current_key, current)
+        mc._write_month_cache(old_key, old)
+        self.assertFalse(mc.migrate_month_cache(old_key, current_key, dimension="emotion"))
+        self.assertEqual(mc._read_month_cache(current_key)["self_intensity"], current["self_intensity"])
+
     def test_invalid_month_is_not_cached_and_retry_only_needs_that_month(self):
         invalid = {"self_emotion": "平静"}
         with mock.patch.object(dc, "_call_api", return_value=invalid):
@@ -339,7 +484,7 @@ class TestCacheValidationBoundary(unittest.TestCase):
         self.assertIn("2025-02", result)
         self.assertTrue([name for name in os.listdir(self.cache_dir) if name.startswith("month_")])
 
-    def test_existing_valid_cache_is_read_without_revalidation(self):
+    def test_existing_valid_cache_is_read_without_model_calls(self):
         prompt = "legacy-valid-prompt"
         key = mc._month_key("sys", prompt)
         mc._write_month_cache(key, for_dimension("emotion"))

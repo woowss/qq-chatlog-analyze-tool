@@ -459,7 +459,7 @@ class TestFingerprintMigration(unittest.TestCase):
                     "前提：群聊月份键与私聊月份键不是同一个键（两类缓存互不干扰）",
                 )
                 with open(mc.month_cache_path(legacy_key), "w", encoding="utf-8") as f:
-                    json.dump({"_created": 1.0, "group_emotion": "平静"}, f, ensure_ascii=False)
+                    json.dump({"_created": 1.0, "group_emotion": "平淡"}, f, ensure_ascii=False)
 
                 calls = []
 
@@ -478,7 +478,7 @@ class TestFingerprintMigration(unittest.TestCase):
                         fingerprint=group_fp,
                     )
                 self.assertEqual(calls, [], "旧键里的群聊月份结果可用时不该再调用 API")
-                self.assertEqual(out["2024-01"]["group_emotion"], "平静")
+                self.assertEqual(out["2024-01"]["group_emotion"], "平淡")
                 self.assertTrue(os.path.exists(mc.month_cache_path(new_key)), "应改名到当前键")
                 self.assertFalse(os.path.exists(mc.month_cache_path(legacy_key)))
                 manifest = json.load(io.open(mc._manifest_path("hashMigrateGroup2"), encoding="utf-8"))
