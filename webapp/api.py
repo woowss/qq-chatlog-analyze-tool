@@ -110,9 +110,12 @@ def api_analyze(dimension: str):
     _prune_jobs()
     # 全量任务已覆盖本维度：拒绝而不是另起一个任务（否则同一维度会被分析两遍、双倍计费）
     job_id, reused, conflict = _get_or_create_job(
-        session.sid, dimension, chat_hash, total=0, conflict_dimension="all"
+        session.sid, dimension, chat_hash, total=0, conflict_dimension="all", refresh=refresh
     )
     if conflict:
+        if conflict == dimension:
+            logger.info("已有 %s 任务的刷新模式不同，拒绝复用", dimension)
+            return jsonify({"error": "同维度分析正在运行，但刷新模式不同，请等它完成或先取消后重试"}), 409
         logger.info("已有全量任务在运行，拒绝重复启动 %s", dimension)
         return jsonify({"error": "一键全量分析正在运行，请等它完成或先取消（避免重复调用 API）"}), 409
     if reused:
@@ -193,12 +196,20 @@ def api_analyze_all():
 
     _prune_jobs()
     job_id, reused, conflict = _get_or_create_job(
-        session.sid, "all", chat_hash, total=len(dimensions_for_mode(is_group)), conflict_dimension="*"
+        session.sid,
+        "all",
+        chat_hash,
+        total=len(dimensions_for_mode(is_group)),
+        conflict_dimension="*",
+        refresh=refresh,
     )
     if reused:
         logger.info("复用进行中的一键全量任务 %s", job_id[:8])
         return jsonify({"job": job_id, "reused": True})
     if conflict:
+        if conflict == "all":
+            logger.info("已有全量任务的刷新模式不同，拒绝复用")
+            return jsonify({"error": "一键全量分析正在运行，但刷新模式不同，请等它完成或先取消后重试"}), 409
         # 已有单维度任务在跑：全量任务会把这些维度再跑一遍（重复计费），先拒绝
         logger.info("已有 %s 任务在运行，拒绝启动全量分析", conflict)
         return jsonify(

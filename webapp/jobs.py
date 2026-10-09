@@ -173,17 +173,27 @@ def _running_jobs_locked(sid: str, chat_hash: str) -> list[tuple[str, str]]:
 
 
 def _get_or_create_job(
-    sid: str, dimension: str, chat_hash: str, total: int, conflict_dimension: str | None = None
+    sid: str,
+    dimension: str,
+    chat_hash: str,
+    total: int,
+    conflict_dimension: str | None = None,
+    *,
+    refresh: bool = False,
 ):
     """在**同一把锁内**完成"查重复用 → 建任务"，避免 check-then-act 之间插进第二个任务。
 
     conflict_dimension：与之互斥的维度名；传 "*" 表示"任意其他维度"。
     命中互斥时返回 conflict，调用方应拒绝该请求，而不是让同一批消息被分析两遍（双倍计费）。
+    同维度只有刷新模式相同才能复用；模式不同也返回该维度作为 conflict，避免刷新请求
+    被普通任务吞掉。检查与创建在同一把锁内完成，模式冲突不会另起并行付费任务。
     返回 (job_id, reused, conflict)。
     """
     with JOBS_LOCK:
         for jid, dim in _running_jobs_locked(sid, chat_hash):
             if dim == dimension:
+                if JOBS[jid].get("refresh", False) != refresh:
+                    return None, False, dim
                 return jid, True, None
             if conflict_dimension == "*" or dim == conflict_dimension:
                 return None, False, dim
@@ -194,6 +204,7 @@ def _get_or_create_job(
             "done": 0,
             "total": total,
             "cancel": False,
+            "refresh": refresh,
             "chat_hash": chat_hash,
             "sid": sid,
             "created": time.time(),

@@ -172,16 +172,16 @@ class TestForceRefresh(unittest.TestCase):
                     jid, _, _ = jobs._get_or_create_job(sid, "emotion", chat_hash, 0)
                     jobs._run_job(jid, "emotion", filepath, chat_hash)
                     self.assertEqual(call.call_count, 1)
-                    jid, _, _ = jobs._get_or_create_job(sid, "emotion", chat_hash, 0)
+                    jid, _, _ = jobs._get_or_create_job(sid, "emotion", chat_hash, 0, refresh=True)
                     jobs._run_job(jid, "emotion", filepath, chat_hash, True)
                     self.assertEqual(call.call_count, 2)
                     with mock.patch.object(jobs, "dimensions_for_mode", return_value=["emotion"]):
-                        jid, _, _ = jobs._get_or_create_job(sid, "all", chat_hash, 1)
+                        jid, _, _ = jobs._get_or_create_job(sid, "all", chat_hash, 1, refresh=True)
                         jobs._run_analyze_all(jid, filepath, chat_hash, True)
                     self.assertEqual(call.call_count, 3)
                 before = store._read_cache("emotion", chat_hash, fp)
                 with mock.patch.object(dc, "_call_api", return_value=None):
-                    jid, _, _ = jobs._get_or_create_job(sid, "emotion", chat_hash, 0)
+                    jid, _, _ = jobs._get_or_create_job(sid, "emotion", chat_hash, 0, refresh=True)
                     jobs._run_job(jid, "emotion", filepath, chat_hash, True)
                     self.assertEqual(jobs.JOBS[jid]["status"], "error")
                 self.assertEqual(store._read_cache("emotion", chat_hash, fp), before)
@@ -196,6 +196,106 @@ class TestForceRefresh(unittest.TestCase):
         finally:
             jobs.JOBS.clear()
             store._purge_chat_caches(chat_hash)
+
+
+class TestRefreshJobDedup(unittest.TestCase):
+    """An in-flight cache-reusing job cannot fulfill a forced refresh request."""
+
+    def setUp(self):
+        configured = api_configured_patcher()
+        configured.start()
+        self.addCleanup(configured.stop)
+
+    def requests(self, dimension, is_group):
+        client = app.app.test_client()
+        client.get("/")
+        with client.session_transaction() as session:
+            headers = {"Origin": "http://localhost:5000", "X-CSRF-Token": session["csrf_token"]}
+        contents = (Path(__file__).parent / "fixtures/group_5p.json").read_bytes() if is_group else payload(4)
+        response = client.post(
+            "/upload", data={"file": (io.BytesIO(contents), "synthetic.json")}, headers=headers
+        )
+        self.assertEqual(response.status_code, 302)
+        with client.session_transaction() as session:
+            chat_hash, sid = session["chat_hash"], session.sid
+
+        def cleanup():
+            with jobs.JOBS_LOCK:
+                for jid in [jid for jid, job in jobs.JOBS.items() if job.get("sid") == sid]:
+                    jobs.JOBS.pop(jid)
+            store._purge_chat_caches(chat_hash)
+
+        self.addCleanup(cleanup)
+        endpoint = "/api/analyze-all" if dimension == "all" else f"/api/analyze/{dimension}"
+
+        def post(refresh):
+            return client.post(endpoint + ("?refresh=1" if refresh else ""), headers=headers)
+
+        return post
+
+    def check_conflict_and_retry(self, dimension, is_group, existing_refresh):
+        post = self.requests(dimension, is_group)
+        # Hold the worker before it starts, without depending on thread timing.
+        with (
+            mock.patch.object(api.threading, "Thread") as thread,
+            mock.patch.object(store, "_read_cache", return_value=None),
+        ):
+            first = post(existing_refresh)
+            self.assertEqual(first.status_code, 200)
+            jid = first.json["job"]
+            before = deepcopy(jobs.JOBS[jid])
+            rejected = post(not existing_refresh)
+            self.assertEqual(rejected.status_code, 409)
+            self.assertIn("刷新模式", rejected.json["error"])
+            self.assertNotIn("job", rejected.json)
+            self.assertEqual(jobs.JOBS[jid], before)
+            self.assertEqual(thread.call_count, 1)
+            self.assertEqual(thread.return_value.start.call_count, 1)
+            self.assertEqual(before["refresh"], existing_refresh)
+            with jobs.JOBS_LOCK:
+                jobs.JOBS[jid]["status"] = "done"
+            retry = post(not existing_refresh)
+            self.assertEqual(retry.status_code, 200)
+            self.assertNotEqual(retry.json["job"], jid)
+            self.assertEqual(jobs.JOBS[retry.json["job"]]["refresh"], not existing_refresh)
+            worker_args = thread.call_args.kwargs["args"]
+            self.assertEqual(worker_args[3 if dimension == "all" else 4], not existing_refresh)
+            self.assertEqual(thread.call_count, 2)
+
+    def test_dimension_refresh_mode_conflicts_and_can_retry_after_completion(self):
+        for dimension, is_group in (("emotion", False), ("member_profiles", True)):
+            for existing_refresh in (False, True):
+                with self.subTest(dimension=dimension, refresh=existing_refresh):
+                    self.check_conflict_and_retry(dimension, is_group, existing_refresh)
+
+    def test_all_refresh_mode_conflicts_and_can_retry_after_completion(self):
+        for is_group in (False, True):
+            for existing_refresh in (False, True):
+                with self.subTest(group=is_group, refresh=existing_refresh):
+                    self.check_conflict_and_retry("all", is_group, existing_refresh)
+
+    def test_same_refresh_mode_reuses_dimension_and_all_jobs(self):
+        for dimension, is_group in (
+            ("emotion", False),
+            ("member_profiles", True),
+            ("all", False),
+            ("all", True),
+        ):
+            for refresh in (False, True):
+                with self.subTest(dimension=dimension, group=is_group, refresh=refresh):
+                    post = self.requests(dimension, is_group)
+                    with (
+                        mock.patch.object(api.threading, "Thread") as thread,
+                        mock.patch.object(store, "_read_cache", return_value=None),
+                    ):
+                        first, repeated = post(refresh), post(refresh)
+                        self.assertEqual(first.status_code, 200)
+                        self.assertEqual(repeated.status_code, 200)
+                        self.assertEqual(first.json["job"], repeated.json["job"])
+                        self.assertTrue(repeated.json["reused"])
+                        self.assertEqual(jobs.JOBS[first.json["job"]]["refresh"], refresh)
+                        self.assertEqual(thread.call_count, 1)
+                        self.assertEqual(thread.return_value.start.call_count, 1)
 
 
 class TestMessageIndex(unittest.TestCase):
