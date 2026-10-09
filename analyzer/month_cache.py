@@ -40,6 +40,7 @@ from typing import Iterable, Optional
 
 from config import env_number
 from analyzer import purge_marks
+from analyzer.cache_policy import refreshing, refresh_cancelled
 from analyzer.atomic_write import tmp_sibling, write_json_atomic
 from analyzer.logger import get_logger
 
@@ -196,7 +197,7 @@ def _read_month_cache(
     首次切换模式会重算一次——没有补标记这一步的话，无标记文件会被任何模式永久放行，
     "切换后不再串模式"就只对升级后新写的文件成立。
     """
-    if not _MONTH_CACHE_DIR:
+    if not _MONTH_CACHE_DIR or refreshing():
         return None
     path = month_cache_path(key)
     if not path:  # 非法 key：month_cache_path 拒绝拼路径，这里如实当"没有缓存"
@@ -272,7 +273,7 @@ def _warn_write_failure(what: str, path: str, err: OSError) -> None:
 
 
 def _write_month_cache(key: str, result: dict, thinking: "Optional[bool]" = None) -> None:
-    if not _MONTH_CACHE_DIR:
+    if not _MONTH_CACHE_DIR or refresh_cancelled():
         return
     path = month_cache_path(key)
     if not path:  # 非法 key 不落盘（见 month_cache_path）

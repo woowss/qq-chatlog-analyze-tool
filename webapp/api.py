@@ -20,6 +20,7 @@ import io
 import os
 import threading
 import time
+from bisect import bisect_left
 
 from flask import jsonify, request, send_file, session
 
@@ -29,6 +30,7 @@ from analyzer.result_schema import ResultValidationError, validate_result
 from analyzer.usage import get_usage
 from config import UPLOAD_FOLDER
 from webapp import store
+from webapp.message_index import index_for
 from webapp.jobs import (
     ALL_DIMENSION_NAMES,
     JOBS,
@@ -96,7 +98,8 @@ def api_analyze(dimension: str):
     chat_hash = session.get("chat_hash") or store._chat_hash(filepath)
 
     # 缓存命中（除非显式 refresh=1 强制重跑）
-    if request.args.get("refresh") != "1":
+    refresh = request.args.get("refresh") == "1"
+    if not refresh:
         chat = store._load_chat_cached(filepath)
         cache_fp = store.analysis_cache_fingerprint(dimension, chat)
         cached = store._read_cache(dimension, chat_hash, fingerprint=cache_fp)
@@ -107,16 +110,21 @@ def api_analyze(dimension: str):
     _prune_jobs()
     # 全量任务已覆盖本维度：拒绝而不是另起一个任务（否则同一维度会被分析两遍、双倍计费）
     job_id, reused, conflict = _get_or_create_job(
-        session.sid, dimension, chat_hash, total=0, conflict_dimension="all"
+        session.sid, dimension, chat_hash, total=0, conflict_dimension="all", refresh=refresh
     )
     if conflict:
+        if conflict == dimension:
+            logger.info("已有 %s 任务的刷新模式不同，拒绝复用", dimension)
+            return jsonify({"error": "同维度分析正在运行，但刷新模式不同，请等它完成或先取消后重试"}), 409
         logger.info("已有全量任务在运行，拒绝重复启动 %s", dimension)
         return jsonify({"error": "一键全量分析正在运行，请等它完成或先取消（避免重复调用 API）"}), 409
     if reused:
         logger.info("复用进行中的 %s 任务 %s", dimension, job_id[:8])
         return jsonify({"job": job_id, "reused": True})
 
-    threading.Thread(target=_run_job, args=(job_id, dimension, filepath, chat_hash), daemon=True).start()
+    threading.Thread(
+        target=_run_job, args=(job_id, dimension, filepath, chat_hash, refresh), daemon=True
+    ).start()
     return jsonify({"job": job_id})
 
 
@@ -188,12 +196,20 @@ def api_analyze_all():
 
     _prune_jobs()
     job_id, reused, conflict = _get_or_create_job(
-        session.sid, "all", chat_hash, total=len(dimensions_for_mode(is_group)), conflict_dimension="*"
+        session.sid,
+        "all",
+        chat_hash,
+        total=len(dimensions_for_mode(is_group)),
+        conflict_dimension="*",
+        refresh=refresh,
     )
     if reused:
         logger.info("复用进行中的一键全量任务 %s", job_id[:8])
         return jsonify({"job": job_id, "reused": True})
     if conflict:
+        if conflict == "all":
+            logger.info("已有全量任务的刷新模式不同，拒绝复用")
+            return jsonify({"error": "一键全量分析正在运行，但刷新模式不同，请等它完成或先取消后重试"}), 409
         # 已有单维度任务在跑：全量任务会把这些维度再跑一遍（重复计费），先拒绝
         logger.info("已有 %s 任务在运行，拒绝启动全量分析", conflict)
         return jsonify(
@@ -538,20 +554,24 @@ def api_messages():
     except ValueError:
         return jsonify({"error": "page/per_page 必须是数字"}), 400
 
-    matched = [m for m in chat.messages if _match_browse(m, q, sender, month, dt_from, dt_to, chat.self_uid)]
-    total = len(matched)
-
+    index = index_for(chat, _browse_body, _match_browse)
     around = (args.get("around") or "").strip()
+    context_mode = bool(around) and args.get("context") == "1"
+    positions = range(len(chat.messages)) if context_mode else index.query(q, sender, month, dt_from, dt_to)
+    total = len(positions)
     if around:
         # 搜索结果点开的上下文要回到原始时间线，否则前后 10 条都会是相同关键词命中，
         # 看不到真正相邻的对话。旧调用仍沿用过滤后定位；新 UI 显式请求 context=1。
-        context_mode = args.get("context") == "1"
-        source = chat.messages if context_mode else matched
-        idx = next((i for i, m in enumerate(source) if m.id == around), None)
+        idx = None
+        for pos in index.ids.get(around, ()):
+            offset = bisect_left(positions, pos)
+            if offset < len(positions) and positions[offset] == pos:
+                idx = offset
+                break
         if idx is None:
             return jsonify({"error": "找不到该消息的上下文"}), 404
         lo = max(0, idx - 10)
-        window = source[lo : idx + 11]
+        window = [chat.messages[pos] for pos in positions[lo : idx + 11]]
         return jsonify(
             {
                 "total": total,
@@ -567,7 +587,10 @@ def api_messages():
             "page": page,
             "per_page": per_page,
             "pages": (total + per_page - 1) // per_page,
-            "messages": [_fmt_browse_message(m, chat.self_uid) for m in matched[lo : lo + per_page]],
+            "messages": [
+                _fmt_browse_message(chat.messages[pos], chat.self_uid)
+                for pos in positions[lo : lo + per_page]
+            ],
             "senders": [
                 {"uid": p.uid, "name": p.name, "raw_name": p.raw_name, "is_self": p.is_self}
                 for p in chat.participants()
@@ -575,6 +598,29 @@ def api_messages():
             "chat_mode": session.get("chat_mode", "private"),
         }
     )
+
+
+def api_evidence(dimension: str):
+    """Read-only verification of the current session's cached citations."""
+    bad = _dimension_guard(dimension)
+    if bad:
+        return bad
+    filepath, err = _session_chat_file()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    chat = store._load_chat_cached(filepath)
+    chat_hash = session.get("chat_hash") or store._chat_hash(filepath)
+    cached = store._read_cache(
+        dimension, chat_hash, fingerprint=store.analysis_cache_fingerprint(dimension, chat)
+    )
+    if cached is None:
+        return jsonify({"error": "暂无该维度的分析结果"}), 404
+    from webapp.evidence import verify_sources
+
+    result = verify_sources(
+        chat, dimension, cached, index_for(chat, _browse_body, _match_browse), _fmt_browse_message
+    )
+    return jsonify(result)
 
 
 def api_job_history():
@@ -738,4 +784,5 @@ def register(app):
     app.add_url_rule("/api/import", "api_import_chat", api_import_chat, methods=["POST"])
     app.add_url_rule("/api/ask", "api_ask", api_ask, methods=["POST"])
     app.add_url_rule("/api/messages", "api_messages", api_messages)
+    app.add_url_rule("/api/evidence/<dimension>", "api_evidence", api_evidence)
     app.add_url_rule("/api/jobs/history", "api_job_history", api_job_history)

@@ -41,6 +41,7 @@ from analyzer.result_schema import ResultValidationError, validate_dimension_res
 from analyzer.group_client import GROUP_DIMENSIONS as GROUP_DIMENSIONS
 from analyzer.recap_client import RECAP_DIMENSIONS as RECAP_DIMENSIONS
 from analyzer import purge_marks
+from analyzer.cache_policy import content_cache_policy
 from analyzer.logger import get_logger
 from analyzer.shutdown import shutdown_requested
 from webapp import store
@@ -172,17 +173,27 @@ def _running_jobs_locked(sid: str, chat_hash: str) -> list[tuple[str, str]]:
 
 
 def _get_or_create_job(
-    sid: str, dimension: str, chat_hash: str, total: int, conflict_dimension: str | None = None
+    sid: str,
+    dimension: str,
+    chat_hash: str,
+    total: int,
+    conflict_dimension: str | None = None,
+    *,
+    refresh: bool = False,
 ):
     """在**同一把锁内**完成"查重复用 → 建任务"，避免 check-then-act 之间插进第二个任务。
 
     conflict_dimension：与之互斥的维度名；传 "*" 表示"任意其他维度"。
     命中互斥时返回 conflict，调用方应拒绝该请求，而不是让同一批消息被分析两遍（双倍计费）。
+    同维度只有刷新模式相同才能复用；模式不同也返回该维度作为 conflict，避免刷新请求
+    被普通任务吞掉。检查与创建在同一把锁内完成，模式冲突不会另起并行付费任务。
     返回 (job_id, reused, conflict)。
     """
     with JOBS_LOCK:
         for jid, dim in _running_jobs_locked(sid, chat_hash):
             if dim == dimension:
+                if JOBS[jid].get("refresh", False) != refresh:
+                    return None, False, dim
                 return jid, True, None
             if conflict_dimension == "*" or dim == conflict_dimension:
                 return None, False, dim
@@ -193,6 +204,7 @@ def _get_or_create_job(
             "done": 0,
             "total": total,
             "cancel": False,
+            "refresh": refresh,
             "chat_hash": chat_hash,
             "sid": sid,
             "created": time.time(),
@@ -252,7 +264,7 @@ def _stop_requested(job_id: str) -> bool:
     return _job_cancelled(job_id) or shutdown_requested() or purge_marks.is_marked(_job_chat_hash(job_id))
 
 
-def _run_job(job_id: str, dimension: str, filepath: str, chat_hash: str) -> None:
+def _run_job(job_id: str, dimension: str, filepath: str, chat_hash: str, refresh: bool = False) -> None:
     """后台线程执行分析：更新进度、支持取消、成功后写磁盘缓存"""
     dim_name = DIMENSION_NAMES.get(dimension, dimension)
     # 一次运行 = 这一个维度：把调用计数清零，让 LLM_MAX_CALLS_PER_RUN 从 0 起算。
@@ -282,7 +294,8 @@ def _run_job(job_id: str, dimension: str, filepath: str, chat_hash: str) -> None
             return _stop_requested(job_id)
 
         logger.info("开始 %s ...（后台任务 %s）", dim_name, job_id[:8])
-        result = func(chat, on_progress=on_progress, should_cancel=should_cancel, chat_hash=chat_hash)
+        with content_cache_policy(refresh, should_cancel):
+            result = func(chat, on_progress=on_progress, should_cancel=should_cancel, chat_hash=chat_hash)
         cancelled = should_cancel()
         # 先落盘缓存，再对外置 done：否则前端轮询到 done 立刻请求
         # /api/analysis/<dim> 时可能读不到缓存，反而重新发起一次付费分析
@@ -378,9 +391,10 @@ def _run_analyze_all(
                             j["detail"] = f"{_idx}/{total} {_dim}（{_done_str(done, tot, _unit)}）"
 
                 try:
-                    result = analyze_func_for(dim)(
-                        chat, on_progress=on_inner, should_cancel=should_cancel, chat_hash=chat_hash
-                    )
+                    with content_cache_policy(refresh, should_cancel):
+                        result = analyze_func_for(dim)(
+                            chat, on_progress=on_inner, should_cancel=should_cancel, chat_hash=chat_hash
+                        )
                     if result and should_cancel():
                         # 取消/关闭打断的维度：不写缓存（残缺结果一旦落盘，重跑会命中它，
                         # 缺的月份就再也不会补上）；已完成的月份仍在月份缓存里，不重复付费

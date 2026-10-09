@@ -51,3 +51,6 @@ build/
 privacy-audit-report.md
 analysis-repo/
 _audit/
+
+# Synthetic browser traces, screenshots and downloaded reports
+output/playwright/

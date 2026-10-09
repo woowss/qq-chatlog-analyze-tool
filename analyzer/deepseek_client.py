@@ -1104,7 +1104,11 @@ def _analyze_periods(
                 # 只补足到并发上限：取消后窗口内的任务跑完即止，剩余月份不再启动
                 while pending and len(futures) < CONCURRENCY and not fatal and not _cancel_requested():
                     period, msgs = pending.pop(0)
-                    futures[pool.submit(_work, period, msgs)] = period
+                    # ContextVars do not propagate into pool workers automatically.
+                    # Each submitted month gets its own context, including refresh/cancel policy.
+                    from contextvars import copy_context
+
+                    futures[pool.submit(copy_context().run, _work, period, msgs)] = period
                 if not futures:
                     break
                 finished, _ = concurrent.futures.wait(

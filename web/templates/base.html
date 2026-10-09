@@ -47,6 +47,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     <script src="{{ url_for('static', filename='js/analyze.js') }}?v={{ asset_v }}"></script>
     {% endblock %}
     {% block head %}{% endblock %}
+    {% if request.endpoint in ['emotion', 'relationship', 'habits', 'topics', 'profile', 'recap'] %}
+    <script src="{{ url_for('static', filename='js/evidence.js') }}?v={{ asset_v }}"></script>
+    {% endif %}
 </head>
 <body>
     <nav class="navbar navbar-expand-lg mb-4">
@@ -154,6 +157,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         </div>
         {%- endif %}
         {% block content %}{% endblock %}
+        {% if request.endpoint in ['emotion', 'relationship', 'habits', 'topics', 'profile', 'recap'] %}
+        {% include '_evidence_panel.html' %}
+        {% endif %}
     </div>
 
     <footer class="footer mt-5 py-3 bg-light">

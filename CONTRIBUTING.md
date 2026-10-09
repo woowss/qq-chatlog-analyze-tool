@@ -25,6 +25,7 @@ pip install ruff==0.16.6                          # 与 CI 固定同一版本
 
 CI 矩阵跑 Python 3.10 / 3.12 / 3.13 / 3.14（**没有 3.11**：唯一的分支差异是标准库有没有
 `tomllib`，3.10 与 3.12 已经把两侧都覆盖了）。3.10 是最低支持线。
+另有 Linux / Windows 的 Python 3.12 安装、核心测试和 Chromium 浏览器任务。
 
 ## 提交前请全跑一遍
 
@@ -33,6 +34,16 @@ python -m unittest discover -s tests -v     # 与 CI 完全一致的跑法
 python -m ruff check .
 python -m ruff format --check .
 ```
+
+涉及浏览器交互时，按 README「开发与测试」安装 `.[browser-test]` 与 Chromium，设置
+`QQCHAT_BROWSER_TESTS=1` 后运行 `test_browser.py`。只允许编造数据与模拟 API；诊断文件输出至
+`output/playwright/`，不要提交真实数据的截图或 trace。设置 `QQCHAT_TEST_EXPORT=__ci_no_real_export__.json`
+可跳过开发机真实导出文件的可选测试，与 CI 保持一致。
+
+自有导出可用于本机补充验收：私聊显式设置 `QQCHAT_TEST_PRIVATE_EXPORT`，群聊设置
+`QQCHAT_TEST_EXPORT`，分别执行 `test_private_real_export.py` 和 `test_group_real_export.py`。
+设置 `QQCHAT_BROWSER_TESTS=1` 可同时验证真实数据的浏览器流程；这些流程不保存截图或 trace。
+模型返回值仍使用 mock，临时数据目录随测试进程退出回收。不要提交真实数据、终端输出或失败细节。
 
 - 测试进程自带隔离与网络护栏（`tests/_bootstrap.py`）：数据目录指向进程独占的临时目录；
   **默认无条件禁止一切真实 LLM 调用，即使环境中配置了 API Key**。确实要走真实网络，必须显式设置
