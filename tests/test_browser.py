@@ -2,6 +2,7 @@
 
 import os
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -104,6 +105,8 @@ class TestBrowserFlows(unittest.TestCase):
         self.page.locator("#submitBtn").click()
         self.page.wait_for_url("**/dashboard")
         expect(self.page.locator("canvas").first).to_be_visible()
+        # 图表可见时缓存 XHR 可能还未完成；等待真实界面状态，避免跳转取消正常请求。
+        expect(self.page.locator('[data-analysis-empty][data-state="checking"]')).to_have_count(0)
 
     def test_private_upload_search_task_evidence_and_report(self):
         from playwright.sync_api import expect
@@ -175,9 +178,19 @@ class TestBrowserFlows(unittest.TestCase):
 
     def test_group_upload_and_source_context(self):
         from playwright.sync_api import expect
+        import app
 
-        self.upload((Path(__file__).parent / "fixtures/group_5p.json").read_bytes())
-        self.page.goto(self.base + "/emotion")
+        # 慢响应会让仪表盘先画出图表、缓存读取仍在途，覆盖离页取消请求的 CI 竞态。
+        read_result = app.app.view_functions["api_analysis_result"]
+
+        def slow_result(dimension):
+            if dimension == "group_topics":
+                time.sleep(1)
+            return read_result(dimension)
+
+        with mock.patch.dict(app.app.view_functions, api_analysis_result=slow_result):
+            self.upload((Path(__file__).parent / "fixtures/group_5p.json").read_bytes())
+            self.page.goto(self.base + "/emotion")
         # Group pages use their shared controls, rather than private in-page controls.
         self.page.get_by_role("button", name="分析群聊情绪", exact=True).click()
         expect(self.page.locator("#evidenceList")).to_contain_text("原文唯一匹配", timeout=20_000)
