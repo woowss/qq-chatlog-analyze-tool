@@ -107,13 +107,18 @@ def _number(
         return 0.0
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         _fail(dimension, path, "必须是数字")
-    if not isfinite(float(value)):
+    try:
+        number = float(value)
+    except OverflowError:
+        # JSON 整数没有浮点上限；溢出也须走结构错误路径，才能补算坏缓存。
+        _fail(dimension, path, "必须是有限数字")
+    if not isfinite(number):
         _fail(dimension, path, "必须是有限数字")
     if lo is not None and value < lo:
         _fail(dimension, path, "数值超出允许范围")
     if hi is not None and value > hi:
         _fail(dimension, path, "数值超出允许范围")
-    return float(value)
+    return number
 
 
 def _integer(value: Any, dimension: str, path: str, *, lo: int | None = None, hi: int | None = None) -> int:

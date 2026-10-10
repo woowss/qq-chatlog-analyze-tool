@@ -1081,7 +1081,9 @@ def _analyze_periods(
                         continue
                     # 旧键里的结果照常可用：改名到当前键，并按**当前键**记账（下面 used_keys），
                     # 否则新文件会成为"无引用"，宽限期后被孤儿回收删掉。
-                    if migrate_month_cache(legacy_key, key, dimension=tag):
+                    if migrate_month_cache(
+                        legacy_key, key, dimension=tag, expect_thinking=want_thinking, chat_hash=chat_hash
+                    ):
                         logger.info("%s 命中旧指纹的月份缓存，已迁移到当前键", period)
                     else:
                         logger.info("%s 命中旧指纹的月份缓存", period)

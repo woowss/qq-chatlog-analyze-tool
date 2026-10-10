@@ -80,6 +80,30 @@ class TestResultSchemas(unittest.TestCase):
         with self.assertRaisesRegex(ResultValidationError, "initiator_ratio_self"):
             validate_result("relationship", result)
 
+    def test_overflowing_numbers_raise_safe_validation_errors_for_fresh_and_cached_results(self):
+        for dimension, field in (
+            ("topics", "topics[0].weight"),
+            ("group_topics", "topics[0].weight"),
+            ("relationship", "initiator_ratio_self"),
+            ("group_dynamics", "lurker_ratio"),
+        ):
+            for value in (10**309, -(10**309)):
+                for cached in (False, True):
+                    with self.subTest(dimension=dimension, negative=value < 0, cached=cached):
+                        result = for_dimension(dimension)
+                        if dimension in ("topics", "group_topics"):
+                            result["topics"][0]["weight"] = value
+                        else:
+                            result[field] = value
+                        with self.assertRaises(ResultValidationError) as caught:
+                            if cached:
+                                validate_dimension_result(dimension, {"2025-01": CachedModelResult(result)})
+                            else:
+                                validate_result(dimension, result)
+                        self.assertEqual(caught.exception.path, field)
+                        self.assertEqual(caught.exception.reason, "必须是有限数字")
+                        self.assertNotIn(str(value), str(caught.exception))
+
     def test_group_member_emotion_accepts_prompt_labels_but_requires_short_text(self):
         for label in ("轻松", "温馨", "低落", "期待"):
             with self.subTest(label=label):
@@ -418,6 +442,61 @@ class TestCacheValidationBoundary(unittest.TestCase):
             self.assertEqual(repaired[members[1].uid], original[members[1].uid])
             validate_dimension_result("member_profiles", repaired)
 
+    def test_overflowing_month_cache_recomputes_once_then_hits_repaired_cache(self):
+        for dimension in ("topics", "group_topics"):
+            for value in (10**309, -(10**309)):
+                with self.subTest(dimension=dimension, negative=value < 0):
+                    prompt = f"overflow-{dimension}-{value < 0}"
+                    key = mc._month_key("sys", prompt)
+                    bad = for_dimension(dimension)
+                    bad["topics"][0]["weight"] = value
+                    mc._write_month_cache(key, bad)
+                    with mock.patch.object(dc, "_call_api", return_value=for_dimension(dimension)) as call:
+                        for _ in range(2):
+                            result = dc._analyze_periods(
+                                {"2025-01": []}, "sys", lambda *a, text=prompt: text, 1024, tag=dimension
+                            )
+                            validate_dimension_result(dimension, result)
+                            self.assertEqual(call.call_count, 1)
+                    self.assertEqual(
+                        mc._read_month_cache(key)["topics"][0]["weight"],
+                        for_dimension(dimension)["topics"][0]["weight"],
+                    )
+
+    def test_legacy_migration_replaces_destination_from_other_thinking_mode(self):
+        for dimension in ("emotion", "group_topics"):
+            for thinking in (False, True):
+                with self.subTest(dimension=dimension, thinking=thinking):
+                    prompt = f"legacy-thinking-{dimension}-{thinking}"
+                    current_key = mc._month_key("sys", prompt, "active")
+                    old_key = mc._month_key("sys", prompt, "legacy")
+                    mc._write_month_cache(current_key, for_dimension(dimension), thinking=not thinking)
+                    old = for_dimension(dimension)
+                    old["confidence"] = "low"
+                    mc._write_month_cache(old_key, old, thinking=thinking)
+                    with (
+                        mock.patch.object(dc, "thinking_enabled", return_value=thinking),
+                        mock.patch.object(
+                            dc, "_legacy_chain_for_fingerprint_value", return_value=("legacy",)
+                        ),
+                        mock.patch.object(dc, "_call_api") as call,
+                    ):
+                        for _ in range(2):
+                            result = dc._analyze_periods(
+                                {"2025-01": []},
+                                "sys",
+                                lambda *a, text=prompt: text,
+                                1024,
+                                fingerprint="active",
+                                tag=dimension,
+                            )
+                            validate_dimension_result(dimension, result)
+                            self.assertEqual(result["2025-01"]["confidence"], "low")
+                            call.assert_not_called()
+                    self.assertFalse(Path(mc.month_cache_path(old_key)).exists())
+                    payload = json.loads(Path(mc.month_cache_path(current_key)).read_text(encoding="utf-8"))
+                    self.assertIs(payload["_thinking"], thinking)
+
     def test_valid_legacy_cache_replaces_bad_current_key_without_model_calls(self):
         prompt = "legacy-repair"
         current_key = mc._month_key("sys", prompt, "active")
@@ -447,15 +526,38 @@ class TestCacheValidationBoundary(unittest.TestCase):
         self.assertEqual(mc._read_month_cache(current_key)["self_intensity"], old["self_intensity"])
 
     def test_legacy_migration_preserves_valid_current_destination(self):
-        current_key = mc._month_key("sys", "valid-current")
-        old_key = mc._month_key("sys", "valid-old")
-        current = for_dimension("emotion")
-        old = for_dimension("emotion")
-        old["self_intensity"] = 1
-        mc._write_month_cache(current_key, current)
-        mc._write_month_cache(old_key, old)
-        self.assertFalse(mc.migrate_month_cache(old_key, current_key, dimension="emotion"))
-        self.assertEqual(mc._read_month_cache(current_key)["self_intensity"], current["self_intensity"])
+        for thinking in (None, False, True):
+            with self.subTest(thinking=thinking):
+                current_key = mc._month_key("sys", f"valid-current-{thinking}")
+                old_key = mc._month_key("sys", f"valid-old-{thinking}")
+                current = for_dimension("emotion")
+                old = for_dimension("emotion")
+                old["self_intensity"] = 1
+                mc._write_month_cache(current_key, current, thinking=thinking)
+                mc._write_month_cache(old_key, old, thinking=thinking)
+                self.assertFalse(
+                    mc.migrate_month_cache(
+                        old_key, current_key, dimension="emotion", expect_thinking=thinking
+                    )
+                )
+                self.assertFalse(Path(mc.month_cache_path(old_key)).exists())
+                self.assertEqual(
+                    mc._read_month_cache(current_key)["self_intensity"], current["self_intensity"]
+                )
+
+    def test_legacy_migration_replaces_overflowing_destination(self):
+        current_key = mc._month_key("sys", "overflow-current")
+        old_key = mc._month_key("sys", "valid-legacy-topics")
+        bad = for_dimension("topics")
+        bad["topics"][0]["weight"] = 10**309
+        mc._write_month_cache(current_key, bad, thinking=False)
+        old = for_dimension("topics")
+        mc._write_month_cache(old_key, old, thinking=False)
+        self.assertTrue(
+            mc.migrate_month_cache(old_key, current_key, dimension="topics", expect_thinking=False)
+        )
+        self.assertFalse(Path(mc.month_cache_path(old_key)).exists())
+        self.assertEqual(mc._read_month_cache(current_key), old)
 
     def test_invalid_month_is_not_cached_and_retry_only_needs_that_month(self):
         invalid = {"self_emotion": "平静"}

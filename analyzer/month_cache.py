@@ -147,7 +147,14 @@ def _month_key(system_prompt: str, user_content: str, fingerprint: "str | None" 
     return digest.hexdigest()[:20]
 
 
-def migrate_month_cache(old_key: str, new_key: str, *, dimension: str = "") -> bool:
+def migrate_month_cache(
+    old_key: str,
+    new_key: str,
+    *,
+    dimension: str = "",
+    expect_thinking: "Optional[bool]" = None,
+    chat_hash: str = "",
+) -> bool:
     """把"旧指纹写下的"月份缓存改名到新键，返回是否真的迁移了。
 
     读到旧键的缓存时调用（见 deepseek_client._analyze_periods）：结果本身完全可用，
@@ -155,7 +162,7 @@ def migrate_month_cache(old_key: str, new_key: str, *, dimension: str = "") -> b
     内容的留存翻倍。改名之后调用方会把**新键**记进 manifest，否则它会成为"无引用"
     的文件，在宽限期后被孤儿回收删掉（用户为它付过钱）。
 
-    目标已存在时优先保留新键；传入维度后，若新键内容无效则以有效的旧键替换。
+    目标已存在时优先保留新键；若新键内容无效或思考模式不符，则以有效的旧键替换。
     """
     if not _MONTH_CACHE_DIR or not old_key or old_key == new_key:
         return False
@@ -163,11 +170,11 @@ def migrate_month_cache(old_key: str, new_key: str, *, dimension: str = "") -> b
     try:
         if os.path.exists(dst):
             destination_valid = True
-            if supports_dimension(dimension):
-                existing = _read_month_cache(new_key)
+            if supports_dimension(dimension) or expect_thinking is not None:
+                existing = _read_month_cache(new_key, expect_thinking=expect_thinking, chat_hash=chat_hash)
                 if existing is None:
                     destination_valid = False
-                else:
+                elif supports_dimension(dimension):
                     try:
                         validate_cached_result(dimension, existing)
                     except ResultValidationError:
