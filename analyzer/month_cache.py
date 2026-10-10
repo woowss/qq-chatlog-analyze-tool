@@ -43,6 +43,12 @@ from analyzer import purge_marks
 from analyzer.cache_policy import refreshing, refresh_cancelled
 from analyzer.atomic_write import tmp_sibling, write_json_atomic
 from analyzer.logger import get_logger
+from analyzer.result_schema import (
+    CachedModelResult,
+    ResultValidationError,
+    supports_dimension,
+    validate_cached_result,
+)
 
 logger = get_logger("deepseek")
 
@@ -141,7 +147,14 @@ def _month_key(system_prompt: str, user_content: str, fingerprint: "str | None" 
     return digest.hexdigest()[:20]
 
 
-def migrate_month_cache(old_key: str, new_key: str) -> bool:
+def migrate_month_cache(
+    old_key: str,
+    new_key: str,
+    *,
+    dimension: str = "",
+    expect_thinking: "Optional[bool]" = None,
+    chat_hash: str = "",
+) -> bool:
     """把"旧指纹写下的"月份缓存改名到新键，返回是否真的迁移了。
 
     读到旧键的缓存时调用（见 deepseek_client._analyze_periods）：结果本身完全可用，
@@ -149,15 +162,26 @@ def migrate_month_cache(old_key: str, new_key: str) -> bool:
     内容的留存翻倍。改名之后调用方会把**新键**记进 manifest，否则它会成为"无引用"
     的文件，在宽限期后被孤儿回收删掉（用户为它付过钱）。
 
-    目标已存在时删掉旧的：内容等价（同一段对话 + 同一套提示词），新的那份才是被记账的。
+    目标已存在时优先保留新键；若新键内容无效或思考模式不符，则以有效的旧键替换。
     """
     if not _MONTH_CACHE_DIR or not old_key or old_key == new_key:
         return False
     src, dst = month_cache_path(old_key), month_cache_path(new_key)
     try:
         if os.path.exists(dst):
-            os.remove(src)
-            return False
+            destination_valid = True
+            if supports_dimension(dimension) or expect_thinking is not None:
+                existing = _read_month_cache(new_key, expect_thinking=expect_thinking, chat_hash=chat_hash)
+                if existing is None:
+                    destination_valid = False
+                elif supports_dimension(dimension):
+                    try:
+                        validate_cached_result(dimension, existing)
+                    except ResultValidationError:
+                        destination_valid = False
+            if destination_valid:
+                os.remove(src)
+                return False
         os.replace(src, dst)
         return True
     except OSError as e:
@@ -222,7 +246,8 @@ def _read_month_cache(
         pass
     if expect_thinking is not None and stamped is None:
         _restamp_month_cache(path, data, bool(expect_thinking), created, chat_hash)
-    return data
+    # 汇总时仍需区分旧缓存与新模型结果，否则更严格的必填字段会让旧缓存永远卡住重试。
+    return CachedModelResult(data)
 
 
 def _restamp_month_cache(path: str, data: dict, thinking: bool, created, chat_hash: str = "") -> None:

@@ -77,7 +77,12 @@ from analyzer import llm_transport
 from analyzer import fingerprint_utils
 from analyzer.shutdown import shutdown_requested
 from analyzer.usage import record_call
-from analyzer.result_schema import ResultValidationError, supports_dimension, validate_result
+from analyzer.result_schema import (
+    ResultValidationError,
+    supports_dimension,
+    validate_cached_result,
+    validate_result,
+)
 from analyzer.local_stats import SESSION_GAP_MS
 from analyzer.prompts import (
     SYSTEM_PROMPT_EMOTION,
@@ -294,6 +299,22 @@ def _validate_before_month_cache(dimension: str, result: Any) -> None:
     """校验新模型结果；关闭月份缓存时不做无意义的校验。"""
     if month_cache_enabled() and supports_dimension(dimension):
         validate_result(dimension, result)
+
+
+def _read_result_cache(
+    key: str, dimension: str, *, expect_thinking=None, chat_hash: str = ""
+) -> Optional[dict]:
+    result = _read_month_cache(key, expect_thinking=expect_thinking, chat_hash=chat_hash)
+    if not result:
+        return None
+    if supports_dimension(dimension):
+        try:
+            validate_cached_result(dimension, result)
+        except ResultValidationError as e:
+            # 错误类型不能随旧缓存放行；只补算该单元，不删除其他已付费的有效结果。
+            logger.warning("%s 内容缓存结构无效（字段 %s），重新分析该单元", dimension, e.path)
+            return None
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1044,7 +1065,7 @@ def _analyze_periods(
             # （维度缓存那侧早就用 `_think` 后缀把两者分开了，月份缓存这一侧一直漏着）。
             # 取值与 _call_api 实际用的那一次完全一致（它按 dim=tag 决定发不发 thinking）。
             want_thinking = thinking_enabled(tag)
-            result = _read_month_cache(key, expect_thinking=want_thinking, chat_hash=chat_hash)
+            result = _read_result_cache(key, tag, expect_thinking=want_thinking, chat_hash=chat_hash)
             if result is None:
                 # 必须**挨代**试，不能只看 keys[1]：链里现在可能有两代以上
                 # （私聊在"原文公式"之外又多了一代 AST 归一期的键，见
@@ -1053,12 +1074,16 @@ def _analyze_periods(
                 # 而这正是 legacy_fingerprints_for_dimension 当初泛化成链要防的事，
                 # 只是读侧漏跟着改。顺序即链序：最近的换代在前。
                 for legacy_key in keys[1:]:
-                    result = _read_month_cache(legacy_key, expect_thinking=want_thinking, chat_hash=chat_hash)
+                    result = _read_result_cache(
+                        legacy_key, tag, expect_thinking=want_thinking, chat_hash=chat_hash
+                    )
                     if result is None:
                         continue
                     # 旧键里的结果照常可用：改名到当前键，并按**当前键**记账（下面 used_keys），
                     # 否则新文件会成为"无引用"，宽限期后被孤儿回收删掉。
-                    if migrate_month_cache(legacy_key, key):
+                    if migrate_month_cache(
+                        legacy_key, key, dimension=tag, expect_thinking=want_thinking, chat_hash=chat_hash
+                    ):
                         logger.info("%s 命中旧指纹的月份缓存，已迁移到当前键", period)
                     else:
                         logger.info("%s 命中旧指纹的月份缓存", period)
@@ -1360,7 +1385,7 @@ def _analyze_person(
         cache_prompt = f"{system_prompt}\n[private-person:{tag}:{display_name}]"
         cache_key = _month_key(cache_prompt, user_content, fingerprint_for_dimension(tag))
         want_thinking = thinking_enabled(tag)
-        result = _read_month_cache(cache_key, expect_thinking=want_thinking, chat_hash=chat_hash)
+        result = _read_result_cache(cache_key, tag, expect_thinking=want_thinking, chat_hash=chat_hash)
         if result is not None:
             logger.info("%s 命中个人分析缓存，跳过 API 调用", mask_name(display_name))
         else:
@@ -1429,6 +1454,10 @@ def analyze_habits(
             )
         except QuotaExhaustedError:
             raise
+        except AnalysisIncompleteError:
+            # 双方独立分析；先保留另一方的有效缓存，再上报整个维度未完成。
+            incomplete = True
+            result = None
         if result:
             results[person_key] = result
         elif any(_has_content(m) and is_statistical(m) for m in msgs):
@@ -1436,7 +1465,7 @@ def analyze_habits(
         done += 1
         if on_progress:
             on_progress(done, total)
-    if incomplete and results and not (should_cancel and should_cancel()):
+    if incomplete and not (should_cancel and should_cancel()):
         raise AnalysisIncompleteError("habits 分析未能取得双方的完整结果；已完成的一方可从缓存复用")
     return results
 
@@ -1470,6 +1499,9 @@ def analyze_profile(
             )
         except QuotaExhaustedError:
             raise
+        except AnalysisIncompleteError:
+            incomplete = True
+            result = None
         if result:
             results[person_key] = result
         elif any(_has_content(m) and is_statistical(m) for m in msgs):
@@ -1477,7 +1509,7 @@ def analyze_profile(
         done += 1
         if on_progress:
             on_progress(done, total)
-    if incomplete and results and not (should_cancel and should_cancel()):
+    if incomplete and not (should_cancel and should_cancel()):
         raise AnalysisIncompleteError("profile 分析未能取得双方的完整结果；已完成的一方可从缓存复用")
     return results
 
