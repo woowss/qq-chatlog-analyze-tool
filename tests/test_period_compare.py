@@ -95,13 +95,13 @@ class PeriodCompareTests(unittest.TestCase):
 
     def test_out_of_range_neighbor_only_changes_boundary_warning(self):
         selected = [
-            message("in-a", "2025-06-02 00:05:00", "self"),
-            message("in-b", "2025-06-02 00:08:00", "other"),
+            message("in-a", "2025-03-02 00:05:00", "self"),
+            message("in-b", "2025-03-02 00:08:00", "other"),
         ]
-        with_neighbor = chat([message("out", "2025-06-01 23:55:00", "other"), *selected])
+        with_neighbor = chat([message("out", "2025-03-01 23:55:00", "other"), *selected])
         without_neighbor = chat(selected)
-        a = {"from": "2025-06-02", "to": "2025-06-02"}
-        b = {"from": "2025-06-03", "to": "2025-06-03"}
+        a = {"from": "2025-03-02", "to": "2025-03-02"}
+        b = {"from": "2025-03-03", "to": "2025-03-03"}
         with_result = compare_periods(with_neighbor, a, b)["a"]
         without_result = compare_periods(without_neighbor, a, b)["a"]
         self.assertEqual(with_result["metrics"]["session_starts"], 1)
@@ -123,17 +123,17 @@ class PeriodCompareTests(unittest.TestCase):
     def test_group_members_are_aligned_by_uid_and_hours_use_local_time(self):
         data = chat(
             [
-                message("a1", "2025-04-01 23:59:00", "uid-1", name="同名"),
-                message("a2", "2025-04-01 23:59:30", "uid-2", name="同名"),
-                message("b1", "2025-04-02 00:01:00", "uid-2", name="同名"),
-                message("b2", "2025-04-02 08:00:00", "uid-2", name="同名"),
+                message("a1", "2025-02-01 23:59:00", "uid-1", name="同名"),
+                message("a2", "2025-02-01 23:59:30", "uid-2", name="同名"),
+                message("b1", "2025-02-02 00:01:00", "uid-2", name="同名"),
+                message("b2", "2025-02-02 08:00:00", "uid-2", name="同名"),
             ],
             group=True,
         )
         result = compare_periods(
             data,
-            {"from": "2025-04-01", "to": "2025-04-01"},
-            {"from": "2025-04-02", "to": "2025-04-02"},
+            {"from": "2025-02-01", "to": "2025-02-01"},
+            {"from": "2025-02-02", "to": "2025-02-02"},
         )
         a, b = result["a"]["metrics"], result["b"]["metrics"]
         self.assertEqual(a["active_members"], 2)
@@ -150,12 +150,12 @@ class PeriodCompareTests(unittest.TestCase):
         for index in range(12):
             uid = f"uid-{index}"
             name = f"成员{index}"
-            messages.append(message(f"a-{index}", "2025-05-01 09:00:00", uid, name=name))
-            messages.append(message(f"b-{index}", "2025-05-02 09:00:00", uid, name=name))
+            messages.append(message(f"a-{index}", "2025-03-01 09:00:00", uid, name=name))
+            messages.append(message(f"b-{index}", "2025-03-02 09:00:00", uid, name=name))
         result = compare_periods(
             chat(messages, group=True),
-            {"from": "2025-05-01", "to": "2025-05-01"},
-            {"from": "2025-05-02", "to": "2025-05-02"},
+            {"from": "2025-03-01", "to": "2025-03-01"},
+            {"from": "2025-03-02", "to": "2025-03-02"},
         )
         self.assertEqual(len(result["a"]["metrics"]["member_shares"]), 12)
         self.assertEqual(len(result["b"]["metrics"]["member_shares"]), 12)

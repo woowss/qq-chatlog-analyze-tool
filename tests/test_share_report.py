@@ -41,17 +41,17 @@ def _group_chat():
         "QQ1234567",
         "",
         [
-            _message("m1", "2025-06-01 10:01:00", "QQ1234567", "同名", "今天2025-06-01见，账号QQ1234567"),
+            _message("m1", "2025-02-01 10:01:00", "QQ1234567", "同名", "今天2025-02-01见，账号QQ1234567"),
             _message(
                 "m2",
-                "2025-06-01 10:03:00",
+                "2025-02-01 10:03:00",
                 "QQ7654321",
                 "同名",
                 "OriginalUnique phrase <script>alert(1)</script>",
             ),
             _message(
                 "m3",
-                "2025-06-01 10:05:00",
+                "2025-02-01 10:05:00",
                 "unknownAccount",
                 "未知用户",
                 "placeholder UID unknownAccount",
@@ -70,10 +70,10 @@ def _group_stats():
             "total_days": 1,
             "active_days": 1,
             "avg_daily": 98765.0,
-            "first_day": "2025-06-01",
-            "last_day": "2025-06-01",
+            "first_day": "2025-02-01",
+            "last_day": "2025-02-01",
         },
-        "daily_counts": [{"date": "2025-06-01", "self": 98765, "other": 0}],
+        "daily_counts": [{"date": "2025-02-01", "self": 98765, "other": 0}],
         "hourly_dist": [{"hour": 10, "self": 98765, "other": 0}],
         "member_activity": [
             {
@@ -102,7 +102,7 @@ def _group_stats():
             "explicit_edges": [{"source": 0, "target": 1, "value": 1}],
             "truncated": False,
         },
-        "milestones": {"first_day": "2025-06-01", "last_day": "2025-06-01"},
+        "milestones": {"first_day": "2025-02-01", "last_day": "2025-02-01"},
     }
 
 
@@ -122,7 +122,7 @@ class ShareReportTests(unittest.TestCase):
         self.assertNotIn("unknownAccount", html)
         self.assertNotIn("OriginalUnique", html)
         self.assertNotIn("98765", html)
-        self.assertNotIn("2025-06-01", html)
+        self.assertNotIn("2025-02-01", html)
         self.assertNotIn("<script", html.lower())
         self.assertNotIn("href=", html.lower())
         self.assertIn("AI 自由文本", " ".join(warnings))
@@ -151,8 +151,8 @@ class ShareReportTests(unittest.TestCase):
         self.assertNotIn("同名", html)
         self.assertNotIn("QQ1234567", html)
         self.assertNotIn("QQ7654321", html)
-        self.assertNotIn("2025-06-01", html)
-        self.assertIn("2025-06", html)
+        self.assertNotIn("2025-02-01", html)
+        self.assertIn("2025-02", html)
         self.assertIn("接话矩阵", html)
         self.assertIn("98765", html)
 
@@ -168,7 +168,7 @@ class ShareReportTests(unittest.TestCase):
             html, _, _ = render_share_html(self.chat, self.stats, options)
         self.assertIn("同名", html)
         self.assertIn("QQ1234567", html)
-        self.assertIn("2025-06-01", html)
+        self.assertIn("2025-02-01", html)
         self.assertIn("OriginalUnique", html)
         self.assertNotIn("98765", html)
         self.assertNotIn("接话矩阵", html)
@@ -183,8 +183,8 @@ class ShareReportTests(unittest.TestCase):
         from webapp.share_report import _redact_dates
 
         self.assertEqual(
-            _redact_dates("2025/06/01, 2025年6月1日, 6月1号, 6/1/2025, 6/1"),
-            "2025-06, 2025年6月, 6月, 2025-06, 6月",
+            _redact_dates("2025/02/01, 2025年2月1日, 2月1号, 2/1/2025, 2/1"),
+            "2025-02, 2025年2月, 2月, 2025-02, 2月",
         )
 
     def test_read_only_stats_load_does_not_extend_cache_lifetime(self):
