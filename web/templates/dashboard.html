@@ -41,12 +41,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {%- if unknown %}
 {# 格式漂移提示：这些元素类型没能命中解析器的任何分支——不猜语义、不静默丢，
    如实告诉用户"有内容没被认出来"，并给出体检工具。（导出器改版后最值钱的一条告警） #}
-<div class="alert alert-warning small mb-3">
-    有 {{ unknown.values() | sum }} 个消息元素没有被识别（类型：
-    {%- for k, v in unknown | dictsort %} {{ k }}×{{ v }}{% if not loop.last %}、{% endif %}{% endfor -%}）。
-    它们没有进入统计与分析；若这不是预期中的空元素，可用
-    <code>python tools/inspect_chat.py &lt;导出文件&gt;</code> 体检确认。
-</div>
+{% include "_unknown_element_warning.html" %}
 {%- endif %}
 
 <div class="row mb-4" id="summaryMetrics">

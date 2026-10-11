@@ -74,6 +74,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                         </a>
                     </li>
                     {% set analysis_active = request.endpoint in ['emotion', 'relationship', 'habits', 'topics', 'profile', 'recap'] %}
+                    {% if analysis_active %}
+                    <li class="nav-item">
+                        <a class="nav-link active" href="/emotion" id="analysisNav"
+                           {% if request.endpoint == 'emotion' %}aria-current="page"{% endif %}>分析</a>
+                    </li>
+                    {% else %}
                     <li class="nav-item dropdown">
                         <a class="nav-link dropdown-toggle {{ 'active' if analysis_active }}" href="#" id="analysisNav"
                            role="button" data-bs-toggle="dropdown" aria-expanded="false">分析</a>
@@ -95,6 +101,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                             {% endif %}
                         </ul>
                     </li>
+                    {% endif %}
                     <li class="nav-item">
                         <a class="nav-link {{ 'active' if request.endpoint == 'messages_page' }}"
                            href="/messages" {% if request.endpoint == 'messages_page' %}aria-current="page"{% endif %}>消息</a>

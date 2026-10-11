@@ -308,6 +308,7 @@ class TestBrowserFlows(unittest.TestCase):
         expect(dialog).to_be_visible()
         expect(dialog.locator(".analysis-plan-table tbody tr")).to_have_count(2)
         expect(dialog).to_contain_text("预计费用")
+        expect(dialog).not_to_contain_text("success")
         self.assertEqual(self.calls.call_count, before)
 
         dialog.locator(".analysis-plan-table tbody tr").nth(1).locator("input").uncheck()
@@ -341,6 +342,120 @@ class TestBrowserFlows(unittest.TestCase):
         expect(self.page.locator("#analysisPlanDialog")).to_have_count(0)
         self.assertEqual(self.calls.call_count, before + 1)
         self.assertIsNone(self.page.evaluate("sessionStorage.getItem('ai_emotion')"))
+        self.assertFalse(self.errors, self.errors)
+
+    def test_plan_revalidation_keeps_focus_when_all_selected_units_disappear(self):
+        from playwright.sync_api import expect
+        from test_p1 import payload
+
+        self.upload(payload())
+        before = self.calls.call_count
+
+        def unit(key, label, uncertain=False):
+            return {
+                "key": key,
+                "dimension": "emotion",
+                "label": label,
+                "status": "待调用",
+                "cached": False,
+                "input_chars": 120,
+                "input_tokens_min": 30,
+                "input_tokens_max": 120,
+                "text_calls_min": 1,
+                "text_calls_max": 1,
+                "vision_calls_min": 0,
+                "vision_calls_max": 1 if uncertain else 0,
+                "vision_uncertain": uncertain,
+                "thinking": False,
+                "max_output_tokens": 500,
+            }
+
+        def plan(keys, incomplete):
+            return {
+                "plan_id": "synthetic-revalidation-plan",
+                "dimensions": ["emotion"],
+                "refresh": False,
+                "scope_summary": "合成测试范围",
+                "model": "synthetic-model",
+                "units": [
+                    unit(keys[0], "含图片的合成单元", uncertain=True),
+                    unit(keys[1], "纯文本合成单元"),
+                ],
+                "summary": {
+                    "unit_count": 2,
+                    "cache_hits": 0,
+                    "text_calls_min": 2,
+                    "text_calls_max": 2,
+                    "vision_calls_min": 0,
+                    "vision_calls_max": 1 if incomplete else 0,
+                    "input_tokens_min": 60,
+                    "input_tokens_max": 120,
+                    "output_tokens_max": 1000,
+                    "price_input_per_million": 2.0,
+                    "price_output_per_million": 8.0,
+                    "cost": {
+                        "min": 0.0001,
+                        "max": None if incomplete else 0.008,
+                        "currency": "CNY",
+                        "incomplete": incomplete,
+                    },
+                    "token_note": "合成 token 估算说明。",
+                    "vision_note": "合成图片摘要说明。",
+                    "cost_note": "合成费用说明。",
+                },
+            }
+
+        initial_plan = plan(["old-unit-a", "old-unit-b"], incomplete=True)
+        changed_plan = plan(["new-unit-a", "new-unit-b"], incomplete=False)
+        self.page.route(
+            "**/api/analysis-plan*",
+            lambda route: route.fulfill(status=200, json=initial_plan),
+        )
+        self.page.route(
+            "**/api/analyze-plan",
+            lambda route: route.fulfill(
+                status=409,
+                json={
+                    "changed": True,
+                    "error": "合成计划已变化，请检查更新后的计划。",
+                    "plan": changed_plan,
+                },
+            ),
+        )
+
+        self.page.locator(".analysis-options summary").click()
+        trigger = self.page.locator('.btn-analyze[data-dim="emotion"]')
+        trigger.click()
+        dialog = self.page.locator("#analysisPlanDialog")
+        expect(dialog).to_be_visible()
+        checkboxes = dialog.locator(".analysis-plan-table input[type=checkbox]")
+        expect(checkboxes).to_have_count(2)
+        incomplete_notice = dialog.locator(".analysis-plan-notice").filter(has_text="图片摘要输入暂时未知")
+        expect(incomplete_notice).to_be_visible()
+        expect(dialog.locator(".analysis-plan-summary")).to_contain_text("已知文本费用至少")
+
+        checkboxes.first.uncheck()
+        expect(incomplete_notice).to_be_hidden()
+        expect(dialog.locator(".analysis-plan-summary")).to_contain_text("预计费用 ¥")
+        checkboxes.first.check()
+        expect(incomplete_notice).to_be_visible()
+        expect(dialog.locator(".analysis-plan-summary")).to_contain_text("已知文本费用至少")
+
+        dialog.locator(".analysis-plan-footer .btn-primary").click()
+        expect(dialog).to_contain_text("合成计划已变化")
+        expect(dialog.locator(".analysis-plan-summary")).to_contain_text("0 / 2 个")
+        expect(dialog.locator(".analysis-plan-footer .btn-primary")).to_be_disabled()
+        expect(checkboxes).to_have_count(2)
+        expect(checkboxes.first).not_to_be_checked()
+        expect(checkboxes.last).not_to_be_checked()
+        expect(dialog.locator(".btn-close")).to_be_focused()
+        self.assertTrue(
+            dialog.evaluate("element => element.open && element.contains(document.activeElement)")
+        )
+
+        dialog.locator(".btn-close").click()
+        expect(trigger).to_be_focused()
+        self.assertEqual(self.calls.call_count, before)
         self.assertFalse(self.errors, self.errors)
 
     def test_local_period_comparison_for_private_and_group_chats(self):
@@ -489,13 +604,20 @@ class TestBrowserFlows(unittest.TestCase):
         self.upload(payload())
         before = self.calls.call_count
         button = self.page.locator("#btn-analyze-all")
-        for _ in range(2):
+        dialog = self.page.locator("#analysisPlanDialog")
+        for close_method in ("close", "cancel", "escape"):
             button.click()
-            expect(self.page.locator("#analysisPlanDialog")).to_be_visible()
+            expect(dialog).to_be_visible()
             expect(button).to_be_disabled()
-            self.page.keyboard.press("Escape")
-            expect(self.page.locator("#analysisPlanDialog")).to_have_count(0)
+            if close_method == "close":
+                dialog.locator(".btn-close").click()
+            elif close_method == "cancel":
+                dialog.locator(".analysis-plan-footer .btn-outline-secondary").click()
+            else:
+                self.page.keyboard.press("Escape")
+            expect(dialog).to_have_count(0)
             expect(button).to_be_enabled()
+            expect(button).to_be_focused()
         self.assertEqual(self.calls.call_count, before)
         self.assertFalse(self.errors, self.errors)
 
@@ -554,11 +676,306 @@ class TestBrowserFlows(unittest.TestCase):
         expect(dialog).to_be_visible()
         checkboxes = dialog.locator(".analysis-plan-table input[type=checkbox]")
         expect(checkboxes).to_have_count(2)
-        expect(dialog.locator(".analysis-plan-summary")).to_contain_text("当前选中 2 个单元")
+        expect(dialog.locator(".analysis-plan-summary")).to_contain_text("2 / 2 个")
         checkboxes.last.uncheck()
-        expect(dialog.locator(".analysis-plan-summary")).to_contain_text("当前选中 1 个单元")
+        expect(dialog.locator(".analysis-plan-summary")).to_contain_text("1 / 2 个")
         dialog.locator(".btn-close").click()
         self.assertEqual(self.calls.call_count, before)
+        self.assertFalse(self.errors, self.errors)
+
+    def test_plan_preview_mobile_cards_large_plan_and_force_refresh(self):
+        from playwright.sync_api import expect
+        from test_p1 import payload
+
+        self.upload(payload())
+        before = self.calls.call_count
+
+        units = []
+        for index in range(60):
+            uncertain = index == 0
+            units.append(
+                {
+                    "key": f"profile:person:synthetic-{index:02d}",
+                    "dimension": "profile",
+                    "label": f"合成成员-{index:02d}",
+                    "status": "待调用",
+                    "cached": False,
+                    "input_chars": 120 + index,
+                    "input_tokens_min": 30,
+                    "input_tokens_max": 120,
+                    "text_calls_min": 1,
+                    "text_calls_max": 1,
+                    "vision_calls_min": 0,
+                    "vision_calls_max": 1 if uncertain else 0,
+                    "vision_uncertain": uncertain,
+                    "thinking": False,
+                    "max_output_tokens": 500,
+                }
+            )
+        plan = {
+            "plan_id": "synthetic-large-plan",
+            "dimensions": ["profile"],
+            "refresh": True,
+            "scope_summary": "全量对话",
+            "model": "synthetic-model",
+            "units": units,
+            "summary": {
+                "unit_count": 60,
+                "cache_hits": 0,
+                "text_calls_min": 60,
+                "text_calls_max": 60,
+                "vision_calls_min": 1,
+                "vision_calls_max": 1,
+                "input_tokens_min": 1800,
+                "input_tokens_max": 0,
+                "output_tokens_max": 30000,
+                "price_input_per_million": 2.0,
+                "price_output_per_million": 8.0,
+                "cost": {"min": 0.0036, "max": None, "currency": "CNY", "incomplete": True},
+                "token_note": "合成 token 估算说明。",
+                "vision_note": "合成图片摘要说明。",
+                "cost_note": "合成费用说明。",
+            },
+        }
+
+        self.page.route(
+            "**/api/analysis-plan*",
+            lambda route: route.fulfill(status=200, json=plan),
+        )
+        self.page.locator(".analysis-options summary").click()
+        self.page.locator("#forceRefresh").check()
+        self.page.set_viewport_size({"width": 390, "height": 844})
+        trigger = self.page.locator('.btn-analyze[data-dim="profile"]')
+        trigger.click()
+
+        dialog = self.page.locator("#analysisPlanDialog")
+        expect(dialog).to_be_visible()
+        expect(dialog.locator(".analysis-plan-table tbody tr")).to_have_count(60)
+        expect(dialog.locator(".analysis-plan-summary")).to_contain_text("60 / 60 个")
+        expect(dialog.locator(".analysis-plan-summary")).to_contain_text("已知文本费用至少")
+        expect(dialog).to_contain_text("人物画像 · 合成成员-00")
+        expect(dialog).to_contain_text("已启用强制刷新")
+        expect(dialog).to_contain_text("图片 token 不计入文本 token 区间")
+        expect(dialog).to_contain_text("费用估算只显示已知文本的下限")
+        expect(dialog).not_to_contain_text("success")
+        expect(dialog.locator(".analysis-plan-notes")).not_to_have_attribute("open", "")
+        self.assertEqual(dialog.get_by_role("checkbox", name="选择人物画像：合成成员-00").count(), 1)
+
+        for width, height in ((390, 844), (390, 568), (650, 800), (1366, 900)):
+            self.page.set_viewport_size({"width": width, "height": height})
+            metrics = self.page.evaluate(
+                """() => {
+                    const dialog = document.querySelector('#analysisPlanDialog');
+                    const body = dialog.querySelector('.analysis-plan-body');
+                    const footer = dialog.querySelector('.analysis-plan-footer');
+                    const row = dialog.querySelector('.analysis-plan-table tbody tr');
+                    const rect = dialog.getBoundingClientRect();
+                    const footerRect = footer.getBoundingClientRect();
+                    return {
+                        dialogLeft: rect.left,
+                        dialogRight: rect.right,
+                        dialogWidth: dialog.clientWidth,
+                        dialogScrollWidth: dialog.scrollWidth,
+                        bodyClientHeight: body.clientHeight,
+                        bodyScrollHeight: body.scrollHeight,
+                        footerBottom: footerRect.bottom,
+                        rowDisplay: getComputedStyle(row).display,
+                        documentWidth: document.documentElement.scrollWidth
+                    };
+                }"""
+            )
+            self.assertGreaterEqual(metrics["dialogLeft"], 0, metrics)
+            self.assertLessEqual(metrics["dialogRight"], width + 1, metrics)
+            self.assertLessEqual(metrics["dialogScrollWidth"], metrics["dialogWidth"] + 1, metrics)
+            self.assertLessEqual(metrics["documentWidth"], width + 1, metrics)
+            self.assertLessEqual(metrics["footerBottom"], height + 1, metrics)
+            if width < 768:
+                self.assertEqual(metrics["rowDisplay"], "grid", metrics)
+            else:
+                self.assertEqual(metrics["rowDisplay"], "table-row", metrics)
+            if (width, height) == (390, 568):
+                self.assertGreater(metrics["bodyScrollHeight"], metrics["bodyClientHeight"], metrics)
+                mobile_controls = self.page.evaluate(
+                    """() => {
+                        const body = document.querySelector('#analysisPlanDialog .analysis-plan-body');
+                        const controls = body.querySelector('.analysis-plan-controls');
+                        const initialBodyTop = body.getBoundingClientRect().top;
+                        const initialControlsTop = controls.getBoundingClientRect().top;
+                        body.scrollTop = initialControlsTop - initialBodyTop + 8;
+                        const bodyRect = body.getBoundingClientRect();
+                        const controlsRect = controls.getBoundingClientRect();
+                        const button = controls.querySelector('button');
+                        const buttonRect = button.getBoundingClientRect();
+                        const hit = document.elementFromPoint(
+                            buttonRect.left + buttonRect.width / 2,
+                            buttonRect.top + buttonRect.height / 2
+                        );
+                        return {
+                            position: getComputedStyle(controls).position,
+                            bodyTop: bodyRect.top,
+                            controlsTop: controlsRect.top,
+                            buttonVisible: buttonRect.top >= bodyRect.top
+                                && buttonRect.bottom <= bodyRect.bottom,
+                            hitControls: Boolean(hit && hit.closest('.analysis-plan-controls'))
+                        };
+                    }"""
+                )
+                self.assertEqual(mobile_controls["position"], "sticky", mobile_controls)
+                self.assertAlmostEqual(mobile_controls["controlsTop"], mobile_controls["bodyTop"], delta=2)
+                self.assertTrue(mobile_controls["buttonVisible"], mobile_controls)
+                self.assertTrue(mobile_controls["hitControls"], mobile_controls)
+                dialog.locator(".analysis-plan-controls .btn").nth(1).click()
+                expect(dialog.locator(".analysis-plan-summary")).to_contain_text("0 / 60 个")
+                dialog.locator(".analysis-plan-controls .btn").first.click()
+                expect(dialog.locator(".analysis-plan-summary")).to_contain_text("60 / 60 个")
+            if width >= 768:
+                desktop_scroll = self.page.evaluate(
+                    """() => {
+                        const dialog = document.querySelector('#analysisPlanDialog');
+                        const body = dialog.querySelector('.analysis-plan-body');
+                        const controls = body.querySelector('.analysis-plan-controls');
+                        const thead = dialog.querySelector('.analysis-plan-table thead');
+                        const header = dialog.querySelector('.analysis-plan-header');
+                        const footer = dialog.querySelector('.analysis-plan-footer');
+                        const bodyRect = body.getBoundingClientRect();
+                        const maxScroll = body.scrollHeight - body.clientHeight;
+                        const samples = [Math.floor(maxScroll / 2), maxScroll];
+                        const states = samples.map(scrollTop => {
+                            body.scrollTop = scrollTop;
+                            const scrollport = body.getBoundingClientRect();
+                            const cells = Array.from(thead.querySelectorAll('th'));
+                            const firstCell = cells[0].getBoundingClientRect();
+                            const hit = document.elementFromPoint(
+                                firstCell.left + firstCell.width / 2,
+                                scrollport.top + Math.max(2, (firstCell.height || 0) / 2)
+                            );
+                            return {
+                                scrollTop: body.scrollTop,
+                                bodyTop: scrollport.top,
+                                headerCellTops: cells.map(cell => cell.getBoundingClientRect().top),
+                                headerHit: Boolean(hit && hit.closest('thead')),
+                                controlsHit: Boolean(hit && hit.closest('.analysis-plan-controls')),
+                                controlsBottom: controls.getBoundingClientRect().bottom,
+                                dialogHeaderTop: header.getBoundingClientRect().top,
+                                dialogFooterBottom: footer.getBoundingClientRect().bottom
+                            };
+                        });
+                        body.scrollTop = 0;
+                        return {
+                            position: getComputedStyle(controls).position,
+                            maxScroll,
+                            states,
+                            controlsAtTopVisible: controls.getBoundingClientRect().top >= bodyRect.top
+                                && controls.getBoundingClientRect().bottom <= bodyRect.bottom
+                        };
+                    }"""
+                )
+                self.assertEqual(desktop_scroll["position"], "static", desktop_scroll)
+                self.assertGreater(desktop_scroll["maxScroll"], 100, desktop_scroll)
+                first_state = desktop_scroll["states"][0]
+                for state in desktop_scroll["states"]:
+                    self.assertGreater(state["scrollTop"], 0, state)
+                    self.assertEqual(len(state["headerCellTops"]), 6, state)
+                    for header_top in state["headerCellTops"]:
+                        self.assertAlmostEqual(header_top, state["bodyTop"], delta=2, msg=str(state))
+                    self.assertTrue(state["headerHit"], state)
+                    self.assertFalse(state["controlsHit"], state)
+                    self.assertLessEqual(state["controlsBottom"], state["bodyTop"], state)
+                    self.assertAlmostEqual(state["dialogHeaderTop"], first_state["dialogHeaderTop"], delta=1)
+                    self.assertAlmostEqual(
+                        state["dialogFooterBottom"], first_state["dialogFooterBottom"], delta=1
+                    )
+                self.assertTrue(desktop_scroll["controlsAtTopVisible"], desktop_scroll)
+            self.assertTrue(dialog.get_by_role("button", name="忽略缓存并开始").is_visible())
+
+        dialog.locator(".analysis-plan-controls .btn").nth(1).click()
+        expect(dialog.locator(".analysis-plan-summary")).to_contain_text("0 / 60 个")
+        expect(dialog.locator(".analysis-plan-footer .btn-primary")).to_be_disabled()
+        dialog.locator(".analysis-plan-controls .btn").first.click()
+        expect(dialog.locator(".analysis-plan-summary")).to_contain_text("60 / 60 个")
+        expect(dialog.locator(".analysis-plan-footer .btn-primary")).to_be_enabled()
+        expect(dialog.get_by_role("checkbox")).to_have_count(60)
+        self.page.keyboard.press("Escape")
+        expect(trigger).to_be_focused()
+
+        plan["summary"]["cost"] = None
+        plan["summary"]["price_input_per_million"] = 0
+        plan["summary"]["price_output_per_million"] = 0
+        trigger.click()
+        expect(dialog).to_be_visible()
+        expect(dialog).to_contain_text("未配置可识别的模型价格，无法估算费用")
+        expect(dialog.locator(".analysis-plan-summary")).to_contain_text("未配置价格")
+        self.page.keyboard.press("Escape")
+        expect(trigger).to_be_focused()
+        self.assertEqual(self.calls.call_count, before)
+        self.assertFalse(self.errors, self.errors)
+
+    def test_analysis_navigation_has_one_dimension_bar_and_all_destinations(self):
+        from playwright.sync_api import expect
+        from test_p1 import payload
+
+        self.upload(payload())
+        top_nav_analysis = self.page.locator("#analysisNav")
+        expect(top_nav_analysis).to_have_attribute("data-bs-toggle", "dropdown")
+        top_nav_analysis.click()
+        expect(self.page.locator("#analysisNav + .dropdown-menu a")).to_have_count(6)
+
+        self.page.goto(self.base + "/emotion")
+        expect(self.page.locator("#analysisNav")).to_have_attribute("href", "/emotion")
+        expect(self.page.locator("#analysisNav")).not_to_have_attribute("data-bs-toggle", "dropdown")
+        subnav = self.page.locator("nav.analysis-subnav")
+        expect(subnav.locator("a")).to_have_count(6)
+        expect(subnav.locator('a[aria-current="page"]')).to_have_attribute("href", "/emotion")
+        for destination in ("/emotion", "/relationship", "/habits", "/topics", "/profile", "/recap"):
+            expect(subnav.locator(f'a[href="{destination}"]')).to_be_visible()
+
+        self.page.set_viewport_size({"width": 390, "height": 844})
+        self.page.evaluate("document.documentElement.setAttribute('data-theme', 'dark')")
+        toggler = self.page.locator(".navbar-toggler")
+        box = toggler.bounding_box()
+        self.assertGreaterEqual(box["width"], 44)
+        self.assertGreaterEqual(box["height"], 44)
+        colors = toggler.evaluate(
+            """button => ({
+                color: getComputedStyle(button).color,
+                bar: getComputedStyle(
+                    button.querySelector(".navbar-toggler-icon")
+                ).backgroundColor
+            })"""
+        )
+        self.assertEqual(colors["color"], colors["bar"])
+        toggler.click()
+        expect(self.page.locator("#navbarNav")).to_have_class("navbar-collapse collapse show")
+        expect(self.page.locator("#themeToggle")).to_be_visible()
+        self.assertFalse(self.errors, self.errors)
+
+    def test_unknown_element_warning_details_stay_collapsed_for_private_and_group(self):
+        from playwright.sync_api import expect
+        from test_p1 import payload
+
+        private = json.loads(payload().decode("utf-8"))
+        private["messages"][0]["content"]["elements"].append(
+            {"type": "synthetic_unknown_element", "data": {"synthetic": True}}
+        )
+        group = json.loads((Path(__file__).parent / "fixtures/group_5p.json").read_text(encoding="utf-8"))
+        group["messages"][0]["content"]["elements"].append(
+            {"type": "synthetic_unknown_element", "data": {"synthetic": True}}
+        )
+
+        for contents in (
+            json.dumps(private, ensure_ascii=False).encode("utf-8"),
+            json.dumps(group, ensure_ascii=False).encode("utf-8"),
+        ):
+            self.upload(contents)
+            warning = self.page.locator(".unknown-elements-warning")
+            expect(warning).to_be_visible()
+            expect(warning).to_contain_text("有 1 个消息元素无法识别")
+            expect(warning).to_contain_text("没有进入统计与分析")
+            details = warning.locator("details")
+            self.assertFalse(details.evaluate("element => element.open"))
+            details.locator("summary").click()
+            expect(details.get_by_text("synthetic_unknown_element", exact=True)).to_be_visible()
+            expect(details).to_contain_text("python tools/inspect_chat.py")
         self.assertFalse(self.errors, self.errors)
 
     def test_share_option_change_invalidates_pending_preview_success_and_failure(self):
