@@ -57,7 +57,7 @@ function openAnalysisPlan(dimensions, opts) {
         close.type = 'button';
         close.className = 'btn-close';
         close.setAttribute('aria-label', '关闭预览');
-        close.addEventListener('click', function () { closeWithError('已取消分析计划'); });
+        close.addEventListener('click', function () { closeWithError('分析已取消'); });
         header.appendChild(close);
         dialog.appendChild(header);
 
@@ -189,7 +189,7 @@ function openAnalysisPlan(dimensions, opts) {
         cancel.type = 'button';
         cancel.className = 'btn btn-outline-secondary';
         cancel.textContent = '取消';
-        cancel.addEventListener('click', function () { closeWithError('已取消分析计划'); });
+        cancel.addEventListener('click', function () { closeWithError('分析已取消'); });
         footer.appendChild(cancel);
         var run = document.createElement('button');
         run.type = 'button';
