@@ -756,6 +756,26 @@ class TestBrowserFlows(unittest.TestCase):
         expect(self.page.locator("#timelineSummary")).to_have_text("输入关键词后点“关键词时间线”。")
         expect(self.page.locator("#btnTimeline")).to_be_enabled()
         self.page.evaluate("() => { $.get = window.__searchOriginalGet; }")
+        # The upload helper first visits the dashboard, whose read-only
+        # bootstrap GETs can be cancelled when this test navigates to /messages
+        # on slower CI workers. Ignore only those explicit Chromium aborts;
+        # HTTP failures and unrelated failed requests must still fail the test.
+        self.errors = [
+            error
+            for error in self.errors
+            if not (
+                error.startswith("request:")
+                and "ERR_ABORTED" in error
+                and any(
+                    endpoint in error
+                    for endpoint in (
+                        "/api/jobs/history",
+                        "/api/usage",
+                        "/api/analysis-scope",
+                    )
+                )
+            )
+        ]
         self.assertFalse(self.errors, self.errors)
 
     def test_analysis_completion_and_get_cache_use_server_chat_scope_identity(self):
