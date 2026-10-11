@@ -386,7 +386,17 @@ class TestFingerprintMigration(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.object(vision, "AI_CACHE_DIR", d):
-                images = [{"key": "img-fingerprint-1", "path": "x", "size": 1, "mime": "image/png"}]
+                images = [
+                    {
+                        "key": "0123456789abcdef0123456789abcdef",
+                        "legacy_key": "0123456789abcdef0123456789abcdef",
+                        "trusted_md5": True,
+                        "content_sha256": "a" * 64,
+                        "path": "x",
+                        "size": 1,
+                        "mime": "image/png",
+                    }
+                ]
                 key = vision._images_key(images)
                 legacy_key = vision._images_key(images, legacy=True)
                 self.assertNotEqual(key, legacy_key, "前提：新旧指纹给出的键确实不同")

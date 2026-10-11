@@ -373,7 +373,7 @@ class TestGracefulShutdown(unittest.TestCase):
 
         with (
             mock.patch.dict(jobsmod.ANALYZE_FUNCS, {"emotion": fake_dim}),
-            mock.patch.object(jobsmod.store, "_load_chat_cached", return_value=object()),
+            mock.patch.object(jobsmod.store, "_load_chat_cached", return_value=_months_chat(1)),
             mock.patch.object(jobsmod.store, "_write_cache", side_effect=lambda *a: written.append(a)),
         ):
             jobsmod._run_job("jobSD", "emotion", filepath, "hashSD")

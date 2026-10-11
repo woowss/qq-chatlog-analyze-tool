@@ -63,27 +63,21 @@ document.addEventListener('click', function askOnce() {
     }
 });
 
-// startAnalyze(dim, {refresh, onProgress(done,total), onDone(result), onError(msg)})
-// POST /api/analyze/<dim>：命中缓存立即回调；否则轮询后台任务进度
+// startAnalyze(dim, {refresh, onProgress(done,total), onDone(result, meta), onError(msg)})
+// 先展示只读计划；确认所选单元后重新核对并派发任务。
 function startAnalyze(dim, opts) {    opts.dim = dim;      // 轮询遇到 404 时用它回读磁盘缓存（见 pollAnalyzeJob）
     var done = opts.onDone;
-    opts.onDone = function (result) {
-        done(result);
-        if (window.updateEvidence) window.updateEvidence(dim);
-    };
-    var url = '/api/analyze/' + dim + (opts.refresh ? '?refresh=1' : '');
-    $.post(url, function(data) {
-        if (data.error) { opts.onError(data.error); return; }
-        if (data.cached) {
-            if (opts.onProgress) opts.onProgress(1, 1);
-            opts.onDone(data.result);
+    opts.planMode = true;
+    opts.onDone = function (result, meta) {
+        if (meta && meta.partial) {
+            done(result, meta);
             return;
         }
-        if (data.job) pollAnalyzeJob(data.job, opts);
-        else opts.onError('未知响应格式');
-    }).fail(function(xhr) {
-        opts.onError((xhr.responseJSON && xhr.responseJSON.error) || '请求失败');
-    });
+        clearStaleStrategyWarning();
+        done(result, meta);
+        if (window.updateEvidence) window.updateEvidence(dim);
+    };
+    openAnalysisPlan([dim], opts);
 }
 
 // 轮询任务进度：指数退避 + 后台标签页降频。
@@ -126,15 +120,63 @@ function pollAnalyzeJob(jobId, opts) {
             if (opts.onProgress) opts.onProgress(s.done || 0, s.total || 0, s.detail || '');
             if (s.status === 'done') {
                 stop();
-                notifyAnalyzeDone('完成');
-                opts.onDone(s.result);
+                var resultMeta = {
+                    partial: !!s.partial, summary: s.summary || {},
+                    partialResults: s.partial_results || {}, results: s.results || {},
+                    chat_hash: s.chat_hash, scope_id: s.scope_id
+                };
+                if (!window.validateAnalysisIdentity) {
+                    opts.onError('无法确认当前聊天与分析范围，未显示任务结果。');
+                    return;
+                }
+                window.validateAnalysisIdentity(resultMeta, function(valid, identity, error) {
+                    if (!valid) {
+                        if (error && error.indexOf('正在刷新') !== -1) return;
+                        opts.onError(error || '无法确认当前聊天与分析范围，未显示任务结果。');
+                        return;
+                    }
+                    if (!resultMeta.partial && window.cacheAnalysisResult) {
+                        if (opts.dim) window.cacheAnalysisResult(opts.dim, s.result, identity);
+                        else Object.keys(resultMeta.results).forEach(function(dim) {
+                            window.cacheAnalysisResult(dim, resultMeta.results[dim], identity);
+                        });
+                    }
+                    notifyAnalyzeDone('完成');
+                    opts.onDone(s.result, resultMeta);
+                });
             } else if (s.status === 'error') {
                 stop();
-                notifyAnalyzeDone('失败');
-                opts.onError(s.error || '分析失败');
+                var errorMeta = {
+                    status: s.status, partial: !!s.partial, result: s.result,
+                    results: s.results || {}, summary: s.summary || {},
+                    partialResults: s.partial_results || {},
+                    chat_hash: s.chat_hash, scope_id: s.scope_id
+                };
+                validateTerminalIdentity(errorMeta, function(valid, error) {
+                    if (!valid) {
+                        if (error && error.indexOf('正在刷新') !== -1) return;
+                        opts.onError(error || '无法确认当前聊天与分析范围，未显示任务结果。');
+                        return;
+                    }
+                    notifyAnalyzeDone('失败');
+                    opts.onError(s.error || '分析失败', errorMeta);
+                });
             } else if (s.status === 'cancelled') {
                 stop();
-                opts.onError('分析已取消');
+                var cancelledMeta = {
+                    status: s.status, partial: !!s.partial, result: s.result,
+                    results: s.results || {}, summary: s.summary || {},
+                    partialResults: s.partial_results || {},
+                    chat_hash: s.chat_hash, scope_id: s.scope_id
+                };
+                validateTerminalIdentity(cancelledMeta, function(valid, error) {
+                    if (!valid) {
+                        if (error && error.indexOf('正在刷新') !== -1) return;
+                        opts.onError(error || '无法确认当前聊天与分析范围，未显示任务结果。');
+                        return;
+                    }
+                    opts.onError(s.error || '分析已取消', cancelledMeta);
+                });
             } else {
                 delay = Math.min(POLL_MAX_DELAY_MS, Math.round(delay * 1.5));
                 schedule();
@@ -143,9 +185,9 @@ function pollAnalyzeJob(jobId, opts) {
             stop();
             // 任务记录只在内存里（TTL 修剪 / 服务重启都会丢），但**已完成的维度结果已落盘**。
             // 这里若直接把"任务不存在"当失败报出去，用户会以为分析白跑了并再点一次（重复付费）。
-            if (xhr && xhr.status === 404 && opts.dim) {
-                loadAnalysis(opts.dim, function(result) {
-                    if (result) opts.onDone(result);
+            if (xhr && xhr.status === 404 && opts.dim && !opts.planMode) {
+                loadAnalysis(opts.dim, function(result, identity) {
+                    if (result) opts.onDone(result, identity);
                     else opts.onError('任务不存在（服务可能已重启），请重新发起分析');
                 });
                 return;
@@ -156,12 +198,12 @@ function pollAnalyzeJob(jobId, opts) {
             if (xhr && xhr.status === 0) {
                 var offline = '与服务的连接中断（服务可能已停止或重启）。已完成的维度结果已保存，'
                     + '刷新页面后即可查看；重启服务后重新发起也只会命中缓存，不会重复付费。';
-                if (!opts.dim) {                 // 一键全量：没有单一维度可回读，只能如实提示
+                if (!opts.dim || opts.planMode) { // 计划任务可能只完成了部分单元，不能回读旧维度结果冒充本次结果
                     opts.onError(offline);
                     return;
                 }
-                loadAnalysis(opts.dim, function(result) {
-                    if (result) opts.onDone(result);
+                loadAnalysis(opts.dim, function(result, identity) {
+                    if (result) opts.onDone(result, identity);
                     else opts.onError(offline);
                 });
                 return;
@@ -176,16 +218,20 @@ function pollAnalyzeJob(jobId, opts) {
     return stop;
 }
 
+function validateTerminalIdentity(metadata, callback) {
+    if (!window.validateAnalysisIdentity) {
+        callback(false, '无法确认当前聊天与分析范围，未显示任务结果。');
+        return;
+    }
+    window.validateAnalysisIdentity(metadata, function(valid, identity, error) {
+        callback(valid, error);
+    });
+}
+
 // 一键全量分析（五个维度顺序执行，进度按维度汇报）
 function startAnalyzeAll(opts) {
-    var url = '/api/analyze-all' + (opts.refresh ? '?refresh=1' : '');
-    $.post(url, function(data) {
-        if (data.error) { opts.onError(data.error); return; }
-        if (data.job) pollAnalyzeJob(data.job, opts);
-        else opts.onError('未知响应格式');
-    }).fail(function(xhr) {
-        opts.onError((xhr.responseJSON && xhr.responseJSON.error) || '请求失败');
-    });
+    opts.planMode = true;
+    openAnalysisPlan([], opts);
 }
 
 function cancelAnalyze(opts) {
@@ -195,32 +241,66 @@ function cancelAnalyze(opts) {
     });
 }
 
-// loadAnalysis(dim, cb)：优先读服务端磁盘缓存（跨标签页/重启浏览器仍有效），
-// 失败时回退 sessionStorage（兼容旧会话）。
+// loadAnalysis(dim, cb)：优先读服务端磁盘缓存；离线回退只使用身份匹配的会话缓存。
 // 注意区分"确实还没有分析结果"（404）与"读取失败"（网络/服务异常）：
 // 后者若也显示成"尚无分析结果"，用户会以为没跑过而重复付费分析。
 function loadAnalysis(dim, cb) {
     $.get('/api/analysis/' + dim, function(data) {
         if (data && data.result) {
-            try { sessionStorage.setItem('ai_' + dim, JSON.stringify(data.result)); } catch (e) { /* 配额满忽略 */ }
-            setAnalysisEmptyState(dim, 'ready');
-            cb(data.result);
-            if (window.updateEvidence) window.updateEvidence(dim);
+            if (!window.acceptAnalysisResult) {
+                setAnalysisEmptyState(dim, 'error', '无法确认当前聊天与分析范围，未显示该结果。');
+                cb(null);
+                return;
+            }
+            window.acceptAnalysisResult(dim, data.result, data, function(valid, identity, error) {
+                if (!valid) {
+                    var refreshing = error && error.indexOf('正在刷新') !== -1;
+                    setAnalysisEmptyState(dim, refreshing ? 'empty' : 'error', refreshing ? '分析范围已改变，正在刷新页面。' : error);
+                    cb(null);
+                    return;
+                }
+                if (data.stale_strategy) showStaleStrategyWarning();
+                else clearStaleStrategyWarning();
+                setAnalysisEmptyState(dim, 'ready');
+                cb(data.result, identity);
+                if (window.updateEvidence) window.updateEvidence(dim);
+            }, true);
         } else {
             setAnalysisEmptyState(dim, 'empty');
             cb(null);
         }
     }).fail(function(xhr) {
         var status = xhr && xhr.status;
-        var raw = null;
-        try { raw = sessionStorage.getItem('ai_' + dim); } catch (e) { raw = null; }
-        var parsed = null;
-        try { parsed = raw ? JSON.parse(raw) : null; } catch (e) { parsed = null; }
-        if (parsed) {
-            setAnalysisEmptyState(dim, 'ready'); cb(parsed);
-            if (window.updateEvidence) window.updateEvidence(dim);
+        var canFallback = status === 404 || status === 0;
+        function finishWithoutCache(identityError) {
+            // 服务端给了人话就直接用它（例如会话过期），比裸状态码更可执行。
+            var serverMsg = xhr && xhr.responseJSON && xhr.responseJSON.error;
+            if (status && status !== 404) {
+                showLoadWarning(identityError || serverMsg || ('读取分析结果失败（HTTP ' + status + '），请刷新页面重试；已生成的结果不会丢失。'));
+                setAnalysisEmptyState(dim, 'error');
+            } else {
+                setAnalysisEmptyState(dim, identityError ? 'error' : 'empty', identityError || null);
+            }
+            cb(null);
+        }
+        if (canFallback && window.getAnalysisPageIdentity && window.validateAnalysisIdentity && window.readCachedAnalysisResult) {
+            window.getAnalysisPageIdentity(function(pageIdentity, pageError) {
+                if (!pageIdentity) { finishWithoutCache(pageError || '无法确认当前聊天与分析范围，未读取会话缓存。'); return; }
+                window.validateAnalysisIdentity(pageIdentity, function(valid, identity, error) {
+                    if (!valid) { finishWithoutCache(error || '无法确认当前聊天与分析范围，未读取会话缓存。'); return; }
+                    var cached = window.readCachedAnalysisResult(dim, identity);
+                    if (cached) {
+                        setAnalysisEmptyState(dim, 'ready');
+                        cb(cached, identity);
+                        if (window.updateEvidence) window.updateEvidence(dim);
+                        return;
+                    }
+                    finishWithoutCache(status === 0 ? '当前无法连接服务，且没有可确认身份的本地结果。' : null);
+                });
+            });
             return;
         }
+        if (canFallback) { finishWithoutCache('无法确认当前聊天与分析范围，未读取会话缓存。'); return; }
         // 服务端给了人话就直接用它（例如会话过期时的"请刷新页面重新登录"），
         // 比报一个裸 HTTP 状态码更可执行。
         var serverMsg = xhr && xhr.responseJSON && xhr.responseJSON.error;
@@ -269,6 +349,17 @@ function showLoadWarning(message) {
     if (box.textContent !== message) box.textContent = message;
 }
 
+function showStaleStrategyWarning() {
+    showLoadWarning('当前显示的是旧版人物画像结果，原结果仍保留供查看；点击“运行人物锐评”或“运行成员画像”可按含对话上下文的新策略重新生成。');
+    var box = document.getElementById('loadWarnBox');
+    if (box) box.dataset.staleStrategy = 'true';
+}
+
+function clearStaleStrategyWarning() {
+    var box = document.getElementById('loadWarnBox');
+    if (box && box.dataset.staleStrategy === 'true') box.remove();
+}
+
 // 私聊维度页「页内运行本维度分析」的五页共用接线（此前只能回仪表盘触发，群聊页早有页内按钮）。
 // 页面模板提供 #inPageAnalyze 按钮 / #inPageStatus 状态区 / #inPageRefresh 复选框；
 // 没有这些元素的页面调用它会直接返回，因此对仪表盘、群聊页等零影响。
@@ -291,8 +382,14 @@ function analyzeInPage(dim, renderFn) {
                     $('#ipText').text('已完成 ' + done + '/' + total + ' 个月');
                 }
             },
-            onDone: function (result) {
-                try { sessionStorage.setItem('ai_' + dim, JSON.stringify(result)); } catch (e) { /* 配额满忽略 */ }
+            onDone: function (result, meta) {
+                if (meta && meta.partial) {
+                    setAnalysisEmptyState(dim, 'empty', '本次只分析了所选单元，尚未生成完整维度结果。');
+                    status.html('<div class="alert alert-warning py-1 mb-0 small">部分分析已显示，但未保存为完整结果；可重新预览并补齐。</div>');
+                    btn.prop('disabled', false).text(orig);
+                    if (renderFn) renderFn(result);
+                    return;
+                }
                 setAnalysisEmptyState(dim, 'ready');
                 status.html('<div class="alert alert-success py-1 mb-0 small">分析完成</div>');
                 btn.prop('disabled', false).text(orig);

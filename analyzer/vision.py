@@ -102,6 +102,38 @@ def _memo_put(key: str, text: str) -> None:
             _MEMO.pop(next(iter(_MEMO)))  # 淘汰最久未用
 
 
+def _memo_key(chat_hash: str, image_key: str) -> str:
+    """隔离不同聊天的进程内摘要，同时保留同一聊天内跨维度复用。"""
+    namespace = hashlib.sha256(str(chat_hash or "").encode("utf-8")).hexdigest()
+    return f"{namespace}:{image_key}"
+
+
+def purge_memo(chat_hash: str) -> int:
+    """删除指定聊天的进程内图片摘要，返回删除条目数。"""
+    if not chat_hash:
+        return 0
+    namespace = hashlib.sha256(str(chat_hash).encode("utf-8")).hexdigest()
+    prefix = f"{namespace}:"
+    with _MEMO_LOCK:
+        keys = [key for key in _MEMO if key.startswith(prefix)]
+        for key in keys:
+            _MEMO.pop(key, None)
+    return len(keys)
+
+
+def _memo_put_for_chat(chat_hash: str, image_key: str, text: str) -> bool:
+    """Write a chat memo unless cleanup has started; serialize the check with purge_memo."""
+    memo_key = _memo_key(chat_hash, image_key)
+    with _MEMO_LOCK:
+        if chat_hash and purge_marks.is_marked(chat_hash):
+            return False
+        _MEMO.pop(memo_key, None)
+        _MEMO[memo_key] = text
+        while len(_MEMO) > _MEMO_MAX:
+            _MEMO.pop(next(iter(_MEMO)))
+    return True
+
+
 def available(chat_hash: str = "") -> bool:
     """是否具备图片理解条件：开关打开 + 允许送图 + （配了媒体目录 或 本次上传过图片）"""
     if not (VISION_ENABLED and VISION_MAX_PER_MONTH > 0):
@@ -197,6 +229,36 @@ def _sample(msgs: list, limit: int) -> list:
     return picked
 
 
+def _normalize_md5(value: str) -> str | None:
+    """Return a normalized MD5 only for a complete hexadecimal digest."""
+    if not isinstance(value, str) or len(value) != 32:
+        return None
+    lowered = value.lower()
+    if any(char not in "0123456789abcdef" for char in lowered):
+        return None
+    return lowered
+
+
+def _file_fingerprints(path: str) -> tuple[str | None, str | None]:
+    """Hash the bytes actually resolved for a media entry, failing closed on oversized files."""
+    sha256 = hashlib.sha256()
+    md5 = hashlib.md5(usedforsecurity=False)
+    total = 0
+    try:
+        with open(path, "rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                total += len(chunk)
+                if total > VISION_MAX_BYTES:
+                    return None, None
+                sha256.update(chunk)
+                md5.update(chunk)
+    except OSError:
+        return None, None
+    if total == 0:
+        return None, None
+    return sha256.hexdigest(), md5.hexdigest()
+
+
 def plan_wanted(months: dict, limit_per_month: int = None) -> list[str]:
     """算出"要让模型看图的话，需要哪些图片"（返回导出器里的相对路径）。
 
@@ -244,10 +306,19 @@ def pick_images(msgs: list, limit: int = None, chat_hash: str = "") -> list[dict
             logger.info("图片摘要已达单次体积上限（%.1f MB），本月其余图片留到下次", total / 1048576)
             break
         total += size
+        media_id = str(getattr(m, "media_id", "") or "")
+        content_sha256, content_md5 = _file_fingerprints(path)
+        if not content_sha256:
+            continue
+        claimed_md5 = _normalize_md5(media_id)
+        trusted_md5 = bool(claimed_md5 and claimed_md5 == content_md5)
         picked.append(
             {
                 "path": path,
-                "key": m.media_id or m.media_path,
+                "key": media_id or m.media_path,
+                "legacy_key": media_id or m.media_path,
+                "trusted_md5": trusted_md5,
+                "content_sha256": content_sha256,
                 "size": size,
                 "mime": _SUPPORTED[ext],
                 "time": m.time_str,
@@ -257,12 +328,11 @@ def pick_images(msgs: list, limit: int = None, chat_hash: str = "") -> list[dict
     return picked
 
 
-def _images_key(images: list[dict], legacy: bool = False) -> str:
+def _images_key(images: list[dict], legacy: bool = False, *, legacy_content: bool = False) -> str:
     """摘要缓存键：图片指纹（md5）+ 顺序 + 模型/系统提示词/清晰度都要进哈希。
 
-    legacy=True 用"旧指纹公式"（源码原文版）的取值：图片摘要的键里也含
-    PROMPT_FINGERPRINT，指纹公式一改，既有用户的摘要缓存就不再命中——那些摘要也是
-    付费调出来的，所以要能读回来（见 digest 里的迁移）。
+    legacy=True 用源码原文指纹和原始图片标识；legacy_content=True 保留当前 AST
+    指纹但使用修复前的原始图片标识。两种旧键只用于 verified MD5 的缓存迁移。
     """
     from analyzer import deepseek_client as dc  # 延迟导入，避免循环依赖
 
@@ -272,19 +342,48 @@ def _images_key(images: list[dict], legacy: bool = False) -> str:
         digest.update(str(part).encode("utf-8"))
         digest.update(b"\x00")
     for img in images:
-        digest.update(str(img["key"]).encode("utf-8"))
+        if legacy or legacy_content:
+            identity = img.get("legacy_key", img["key"])
+        elif img.get("trusted_md5") is True:
+            identity = f"md5:{str(img['key']).lower()}:{img['content_sha256']}"
+        elif img.get("trusted_md5") is False:
+            content_sha256 = img.get("content_sha256")
+            if not isinstance(content_sha256, str) or len(content_sha256) != 64:
+                raise ValueError("无可信 MD5 的图片必须包含文件内容 SHA-256")
+            identity = f"sha256:{content_sha256}:{img.get('mime', '')}"
+        else:
+            identity = img["key"]
+        digest.update(str(identity).encode("utf-8"))
         digest.update(b"\x00")
     return digest.hexdigest()[:20]
 
 
-def _cache_path(chat_hash: str, key: str) -> str:
-    os.makedirs(AI_CACHE_DIR, exist_ok=True)
+def _can_migrate_legacy_cache(images: list[dict]) -> bool:
+    """Old keys contain no byte fingerprint, so migrate only verified MD5 identities."""
+    return bool(images) and all(image.get("trusted_md5") is True for image in images)
+
+
+def _legacy_cache_keys(images: list[dict]) -> list[str]:
+    """Return both historical formulas that used the raw, verified MD5 identity."""
+    return list(
+        dict.fromkeys(
+            (
+                _images_key(images, legacy_content=True),
+                _images_key(images, legacy=True),
+            )
+        )
+    )
+
+
+def _cache_path(chat_hash: str, key: str, *, create: bool = True) -> str:
+    if create:
+        os.makedirs(AI_CACHE_DIR, exist_ok=True)
     # 文件名里带上 chat_hash：删聊天/换文件时会被 _purge_chat_caches 一并回收，
     # 不会留下含图片描述的孤儿缓存
     return os.path.join(AI_CACHE_DIR, f"vision_{chat_hash}_{key}.json")
 
 
-def _read_cache(path: str):
+def _read_cache(path: str, *, touch: bool = True):
     """读摘要缓存；旧格式（只有 digest 字段）同样兼容"""
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -292,10 +391,11 @@ def _read_cache(path: str):
     except (OSError, json.JSONDecodeError):
         return None
     if isinstance(data, dict) and isinstance(data.get("digest"), str):
-        try:
-            os.utime(path, None)  # 命中续期，配合 30 天滑动窗口
-        except OSError:
-            pass
+        if touch:
+            try:
+                os.utime(path, None)  # 命中续期，配合 30 天滑动窗口
+            except OSError:
+                pass
         return data["digest"]
     return None
 
@@ -317,33 +417,39 @@ def digest(msgs: list, chat_hash: str = "", label: str = "") -> str:
 
     优先级：进程内缓存 → 磁盘缓存（跨维度、跨重跑复用）→ 调一次视觉模型。
     """
+    from analyzer.cache_policy import refreshing
+
+    force_refresh = refreshing()
     if not available(chat_hash):
         return ""
     images = pick_images(msgs, chat_hash=chat_hash)
     if not images:
         return ""
     key = _images_key(images)
-    hit = _memo_get(key)
+    memo_key = _memo_key(chat_hash, key)
+    hit = None if force_refresh else _memo_get(memo_key)
     if hit is not None:
         return hit
     chat_id = chat_hash or "nohash"
     path = _cache_path(chat_id, key)
-    cached = _read_cache(path)
-    if cached is None:
-        # 指纹公式改成 AST 归一之前，摘要文件用的是旧键。摘要同样是付费调用出来的，
-        # 所以认旧键并改名过来（改名而不是复制：这些文件含图片描述，不留第二份）。
-        legacy_key = _images_key(images, legacy=True)
-        if legacy_key != key:
+    cached = None if force_refresh else _read_cache(path)
+    if cached is None and not force_refresh and _can_migrate_legacy_cache(images):
+        for legacy_key in _legacy_cache_keys(images):
+            if legacy_key == key:
+                continue
             legacy_path = _cache_path(chat_id, legacy_key)
             cached = _read_cache(legacy_path)
-            if cached is not None:
+            if cached is None:
+                continue
+            if not (chat_hash and purge_marks.is_marked(chat_hash)):
                 try:
                     os.replace(legacy_path, path)
                     logger.info("命中旧指纹的图片摘要缓存并迁移到当前键（%d 张）", len(images))
                 except OSError as e:
                     logger.warning("图片摘要缓存迁移失败（结果仍可用）: %s", e)
+            break
     if cached is not None:
-        _memo_put(key, cached)
+        _memo_put_for_chat(chat_hash, key, cached)
         return cached
 
     from analyzer import deepseek_client as dc  # 延迟导入，避免循环依赖
@@ -356,14 +462,43 @@ def digest(msgs: list, chat_hash: str = "", label: str = "") -> str:
     # 含聊天图片描述的摘要写回盘上——清理报称"已删除"的数据不能原地复活。
     if chat_hash and purge_marks.is_marked(chat_hash):
         logger.info("该聊天的缓存刚被清理，本次图片摘要不落盘")
-        # memo 不能跟着跳过：同一批图片在本轮里被多个维度复用，拒收内存缓存等于
-        # 刚说"不落盘"转头又为同一批图再付一次 vision 调用。
-        _memo_put(key, text)
         return text
     _write_cache(path, text)
-    _memo_put(key, text)
+    _memo_put_for_chat(chat_hash, key, text)
     logger.info("图片摘要完成：%d 张（%s）", len(images), mask_name(label) if label else "本批")
     return text
+
+
+def preview_digest(msgs: list, chat_hash: str = "") -> tuple[str, bool]:
+    """只读查看摘要是否已存在；返回 (摘要文本, 是否需要视觉调用)。"""
+    from analyzer.cache_policy import refreshing
+
+    if not available(chat_hash):
+        return "", False
+    images = pick_images(msgs, chat_hash=chat_hash)
+    if not images:
+        return "", False
+    key = _images_key(images)
+    memo_key = _memo_key(chat_hash, key)
+    if not refreshing():
+        with _MEMO_LOCK:
+            cached = _MEMO.get(memo_key)
+        if cached is not None:
+            return cached, False
+        chat_id = chat_hash or "nohash"
+        path = _cache_path(chat_id, key, create=False)
+        cached = _read_cache(path, touch=False)
+        if cached is None and _can_migrate_legacy_cache(images):
+            for legacy_key in _legacy_cache_keys(images):
+                if legacy_key == key:
+                    continue
+                legacy_path = _cache_path(chat_id, legacy_key, create=False)
+                cached = _read_cache(legacy_path, touch=False)
+                if cached is not None:
+                    break
+        if cached is not None:
+            return cached, False
+    return "", True
 
 
 def _build_user_text(images: list[dict], label: str) -> str:

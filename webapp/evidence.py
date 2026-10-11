@@ -3,6 +3,7 @@
 import re
 
 from analyzer.dialog import _has_content, _message_line, _fit_lines, _fit_message_context
+from analyzer import person_context
 from parser.qq_parser import is_statistical
 
 
@@ -83,13 +84,32 @@ def _collect(result, dimension, chat):
             person_entry = (dimension in ("habits", "profile", "member_profiles") and len(path) == 1) or any(
                 key in path for key in ("member_emotions", "core_members")
             )
-            if sender is None and (citation or person_entry):
-                # Topic names describe a subject; only person/citation names
-                # are sender claims.
+            if sender is None and citation:
+                # A name inside a citation object can identify its source.
+                # A name on a profile entry identifies the analysis subject,
+                # which may differ from the speaker of contextual evidence.
                 sender = value.get("name")
             if isinstance(sender, str):
                 # An unknown supplied sender must not silently lose its constraint.
                 restrict_senders(scope, aliases.get(sender, {sender}))
+            if person_entry and isinstance(value.get("name"), str):
+                subject_key = path[0] if path else ""
+                if dimension == "member_profiles" and subject_key in {p.uid for p in participants}:
+                    expected_subjects = {subject_key}
+                elif dimension in ("habits", "profile") and subject_key == "self":
+                    expected_subjects = {chat.self_uid} if chat.self_uid else set()
+                elif dimension in ("habits", "profile") and subject_key == "other":
+                    expected_subjects = (
+                        {chat.other_uid}
+                        if chat.other_uid
+                        else {p.uid for p in participants if p.uid and p.uid != chat.self_uid}
+                    )
+                else:
+                    expected_subjects = set()
+                if expected_subjects and not (
+                    aliases.get(value["name"], {value["name"]}) & expected_subjects
+                ):
+                    scope["conflicting_subject"] = True
             if citation and ("evidence_ids" in value or "message_id" in value):
                 # A nested text/quote object must not erase its parent's IDs.
                 restrict_ids(scope, value["evidence_ids"] if "evidence_ids" in value else value["message_id"])
@@ -115,13 +135,8 @@ def _collect(result, dimension, chat):
                     child_scope["unit"] = key
                 elif dimension in ("habits", "profile") and key in ("self", "other"):
                     child_scope["unit"] = key
-                    if key == "self":
-                        restrict_senders(child_scope, {chat.self_uid})
-                    else:
-                        child_scope["exclude_self"] = True
                 elif dimension == "member_profiles" and key in {p.uid for p in participants}:
                     child_scope["unit"] = key
-                    restrict_senders(child_scope, {key})
                 is_evidence = key in _FIELDS or key in _QUOTED_FIELDS or (citation and key == "text")
                 if is_evidence and "evidence_ids" in value:
                     restrict_ids(child_scope, value["evidence_ids"])
@@ -145,7 +160,7 @@ def _collect(result, dimension, chat):
     return records
 
 
-def _input_lines(chat, dimension, unit):
+def _input_lines(chat, dimension, unit, person_context_enabled=None):
     """Reconstruct text selection only, without vision/network or prompt changes.
 
     Legacy results do not record their historical input configuration. This
@@ -176,20 +191,48 @@ def _input_lines(chat, dimension, unit):
             valid, chat.self_uid, chat.self_name, chat.other_name, dc.MAX_DIALOG_CHARS
         )
         return {id(m): line for m, line in zip(selected, lines, strict=True)}
-    if dimension in ("profile", "habits", "member_profiles"):
+    if dimension in ("profile", "member_profiles"):
         if dimension == "member_profiles":
-            valid = [m for m in valid if m.sender_uid == unit]
-            size, budget = gc.MEMBER_PROFILE_SAMPLES, gc.GROUP_MAX_DIALOG_CHARS
-            display_name = next((p.name for p in chat.participants() if p.uid == unit), "未知发送者")
+            target = [m for m in valid if m.sender_uid == unit]
+            sample_size, budget = gc.MEMBER_PROFILE_SAMPLES, gc.GROUP_MAX_DIALOG_CHARS
+            names = {p.uid: p.name for p in chat.participants()}
+
+            def name_of(message):
+                return names.get(message.sender_uid, "未知发送者")
         else:
-            valid = [m for m in valid if (m.sender_uid == chat.self_uid) == (unit == "self")]
-            size, budget = (500 if dimension == "habits" else 800), dc.MAX_DIALOG_CHARS
-            display_name = chat.self_name if unit == "self" else chat.other_name
-        if dimension != "habits" and len(valid) > size:
-            valid = valid[:: (len(valid) + size - 1) // size]
-        else:
-            valid = valid[-size:]
-        lines = [_InputLine(_message_line(m, display_name), m) for m in valid]
+            target = [m for m in valid if (m.sender_uid == chat.self_uid) == (unit == "self")]
+            target_uids = getattr(chat, "analysis_target_uids", None)
+            if target_uids is not None:
+                if unit == "self":
+                    target = target if chat.self_uid in target_uids else []
+                else:
+                    target = [m for m in target if m.sender_uid in target_uids]
+            sample_size, budget = 800, dc.MAX_DIALOG_CHARS
+
+            def name_of(message):
+                return chat.self_name if message.sender_uid == chat.self_uid else chat.other_name
+
+        selection = person_context.select_person_context(
+            messages,
+            target,
+            name_of,
+            sample_size,
+            budget,
+            stratified=True,
+            enabled=person_context_enabled,
+        )
+        return {id(entry.message): entry.line for entry in selection.entries}
+    if dimension == "habits":
+        valid = [m for m in valid if (m.sender_uid == chat.self_uid) == (unit == "self")]
+        target_uids = getattr(chat, "analysis_target_uids", None)
+        if target_uids is not None:
+            if unit == "self":
+                valid = valid if chat.self_uid in target_uids else []
+            else:
+                valid = [m for m in valid if m.sender_uid in target_uids]
+        size, budget = 500, dc.MAX_DIALOG_CHARS
+        display_name = chat.self_name if unit == "self" else chat.other_name
+        lines = [_InputLine(_message_line(m, display_name), m) for m in valid[-size:]]
         kept = _fit_lines(lines, budget)
         return {id(line.message): str(line) for line in kept}
     if dimension == "recap":
@@ -206,7 +249,7 @@ def _input_lines(chat, dimension, unit):
     return {}
 
 
-def verify_sources(chat, dimension, result, index, formatter):
+def verify_sources(chat, dimension, result, index, formatter, person_context_enabled=None):
     records = _collect(result, dimension, chat)
     matches = index.match_quotes(record["quote"] for record in records)
     input_scopes = {}
@@ -219,6 +262,7 @@ def verify_sources(chat, dimension, result, index, formatter):
             for pos in positions
             if (
                 not scope.get("conflicting_date")
+                and not scope.get("conflicting_subject")
                 and (not scope.get("date") or chat.messages[pos].time_str.startswith(scope["date"]))
                 and ("senders" not in scope or chat.messages[pos].sender_uid in scope["senders"])
                 and (not scope.get("exclude_self") or chat.messages[pos].sender_uid != chat.self_uid)
@@ -232,7 +276,7 @@ def verify_sources(chat, dimension, result, index, formatter):
             identified = [index.ids.get(mid, []) for mid in ids] if valid_ids else []
             unit = scope.get("unit", "")
             if unit not in input_scopes:
-                input_scopes[unit] = _input_lines(chat, dimension, unit)
+                input_scopes[unit] = _input_lines(chat, dimension, unit, person_context_enabled)
             allowed = input_scopes[unit]
             # Every declared ID must be unique, in the current chat/allowed text
             # selection, and consistent with quote, sender and date.
@@ -254,10 +298,17 @@ def verify_sources(chat, dimension, result, index, formatter):
                 not chat.messages[pos].id or len(index.ids[chat.messages[pos].id]) != 1 for pos in positions
             ):
                 status, positions = "insufficient", []
+        source_positions = getattr(chat, "_analysis_source_positions", None)
+        candidates = []
+        for pos in positions[:MAX_CANDIDATES]:
+            source_position = source_positions[pos] if source_positions is not None else pos
+            candidate = formatter(chat.messages[pos], chat.self_uid)
+            candidate["position"] = source_position
+            candidates.append(candidate)
         record.update(
             status=status,
             candidate_count=len(positions),
-            candidates=[formatter(chat.messages[pos], chat.self_uid) for pos in positions[:MAX_CANDIDATES]],
+            candidates=candidates,
         )
         out.append(record)
     return {"entries": out, "limit": MAX_ENTRIES, "source_only": True}

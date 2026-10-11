@@ -578,14 +578,14 @@ class TestMemberProfiles(unittest.TestCase):
         seen = []
 
         with (
-            mock.patch.object(gc, "_call_api", return_value={"name": "x"}),
+            mock.patch.object(gc, "_call_api", return_value=valid_profile(group=True)),
             mock.patch.object(gc, "GROUP_AI_MAX_MEMBERS", 3),
         ):
             gc.analyze_member_profiles(chat, on_progress=lambda d, t: seen.append((d, t)))
         self.assertEqual(seen, [(1, 3), (2, 3), (3, 3)])
 
         with (
-            mock.patch.object(gc, "_call_api", return_value={"name": "x"}),
+            mock.patch.object(gc, "_call_api", return_value=valid_profile(group=True)),
             mock.patch.object(gc, "GROUP_AI_MAX_MEMBERS", 3),
         ):
             result = gc.analyze_member_profiles(chat, should_cancel=lambda: True)
@@ -1054,11 +1054,15 @@ class TestRealFileShapedGroup(unittest.TestCase):
         ]
         chat = _group(msgs)
         me = next(p for p in chat.participants() if p.is_self)
-        context = gc._member_context(chat, me)
+        context = gc._member_context_from_sparse(chat, me)
+        legacy_context = gc._member_context(_group(msgs), me)
+        self.assertEqual(context, legacy_context, "稀疏摘要必须保留原画像上下文")
         self.assertIn("被精确回复 1 次", context)
         self.assertIn("主动回复别人 0 次", context)
         self.assertIn("主动 @ 别人 1 次", context)
         self.assertIn("导出者本人", context)
+        self.assertIsNone(chat._matrix_cache, "成员画像应直接读取稀疏摘要")
+        self.assertIsNotNone(chat._interaction_sparse_cache)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,10 @@
     var labels = { unique: '原文唯一匹配', multiple: '存在多个候选', not_found: '未找到一致来源', insufficient: '信息不足 / 非原文证据' };
 
     function messageRow(message, highlight) {
-        var row = $('<div>').addClass('msg-row').toggleClass('msg-hit', message.id === highlight);
+        var isHit = typeof highlight === 'number'
+            ? message.position === highlight
+            : message.id === highlight;
+        var row = $('<div>').addClass('msg-row').toggleClass('msg-hit', isHit);
         row.append($('<span>').addClass('msg-time').text(message.time + ' '));
         row.append($('<span>').addClass('msg-who').text((message.name || '未知') + '：'));
         row.append($('<span>').addClass('msg-body').text(message.text));
@@ -14,13 +17,17 @@
         return row;
     }
 
-    function openContext(messageId) {
+    function openContext(message) {
         var token = ++contextSequence;
         var host = $('#evidenceContext').empty().text('正在读取原始时间线…').attr('aria-busy', 'true');
-        $.get('/api/messages', { around: messageId, context: 1 }, function (result) {
+        var locator = Number.isInteger(message.position)
+            ? { around_pos: message.position, context: 1, scope_only: 1 }
+            : { around: message.id, context: 1, scope_only: 1 };
+        var highlight = Number.isInteger(message.position) ? message.position : message.id;
+        $.get('/api/messages', locator, function (result) {
             if (token !== contextSequence) return;
             host.empty().attr('aria-busy', 'false');
-            (result.messages || []).forEach(function (message) { host.append(messageRow(message, messageId)); });
+            (result.messages || []).forEach(function (message) { host.append(messageRow(message, highlight)); });
             var hit = host.find('.msg-hit')[0];
             if (hit) hit.scrollIntoView({ block: 'center' });
         }).fail(function (xhr) {
@@ -34,7 +41,7 @@
         var dialog = document.getElementById('evidenceDialog');
         if (!dialog.open) dialog.showModal();
         if (entry.status === 'unique') {
-            openContext(entry.candidates[0].id);
+            openContext(entry.candidates[0]);
             return;
         }
         ++contextSequence;
@@ -46,7 +53,7 @@
         entry.candidates.forEach(function (message) {
             var candidate = $('<button type="button">').addClass('btn btn-outline-secondary text-start w-100 mb-2');
             candidate.append(messageRow(message));
-            candidate.on('click', function () { openContext(message.id); });
+            candidate.on('click', function () { openContext(message); });
             host.append(candidate);
         });
     }

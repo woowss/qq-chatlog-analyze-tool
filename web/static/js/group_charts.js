@@ -914,8 +914,25 @@ function analyzeGroupDimension(dim, btn, containerId, renderer, onFinish) {
                 $('#aText').text('已完成 ' + done + '/' + total + '（' + unit + '）');
             } else { $('#aText').text('准备中…'); }
         },
-        onDone: function (result) {
-            try { sessionStorage.setItem('ai_' + dim, JSON.stringify(result)); } catch (e) { /* 配额满忽略 */ }
+        onDone: function (result, meta) {
+            if (meta && meta.partial) {
+                if (containerId) {
+                    var partialEl = document.getElementById(containerId);
+                    if (partialEl && renderer) {
+                        try { renderer(partialEl, result); } catch (e) {
+                            partialEl.textContent = '部分结果渲染失败：' + e.message;
+                        }
+                        var notice = document.createElement('div');
+                        notice.className = 'alert alert-warning small';
+                        notice.textContent = '本次只处理了所选单元，未标记为完整维度结果。';
+                        partialEl.prepend(notice);
+                    }
+                }
+                status.html('<div class="alert alert-warning mb-0">部分分析已返回；重新预览并选择全部单元后，才会生成完整维度缓存。</div>');
+                btn.prop('disabled', false).text(orig);
+                if (onFinish) onFinish();
+                return;
+            }
             setAnalysisEmptyState(dim, 'ready');
             if (containerId) {
                 var el = document.getElementById(containerId);

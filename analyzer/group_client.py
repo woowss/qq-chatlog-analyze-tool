@@ -47,6 +47,7 @@ from config import GROUP_AI_MAX_MEMBERS, env_number
 from parser.qq_parser import ChatData, is_statistical
 from parser.group_identity import Participant
 from analyzer import group_prompts as gp
+from analyzer import person_context
 from analyzer.deepseek_client import (
     AnalysisIncompleteError,
     MAX_TOKENS_BY_DIM,
@@ -60,14 +61,19 @@ from analyzer.deepseek_client import (
     _has_content,
     _hashed_source,
     _message_line,
-    month_cache_enabled,
     validate_result,
     _short_time,
     _truncate_dialog_line,
     _vision_digest,
+    scope_cache_fingerprint,
     logger,
 )
-from analyzer.group_stats import calc_interaction_matrix, calc_member_activity, is_unknown_message
+from analyzer.group_stats import (
+    calc_interaction_matrix,
+    calc_member_activity,
+    calc_member_interaction_summary,
+    is_unknown_message,
+)
 from analyzer.logger import mask_name
 
 #: 单个群聊月的对话文本上限（字符）。默认与私聊同档（准确性优先），
@@ -94,6 +100,9 @@ def select_ai_members(chat: ChatData, limit: int = 0) -> list[Participant]:
     """
     k = limit or GROUP_AI_MAX_MEMBERS
     people = chat.participants()
+    target_uids = getattr(chat, "analysis_target_uids", None)
+    if target_uids is not None:
+        people = [person for person in people if person.uid in target_uids]
     if not people:
         return []
     chosen = people[:k]
@@ -608,10 +617,13 @@ def _group_month_prompt(chat: ChatData, period: str, msgs: list, chat_hash: str 
         return ""
     return _PromptText(
         f"以下是 {period} 月「{chat.chat_name}」的群聊数据：\n\n{dialog}",
-        getattr(dialog, "cache_fingerprint", _unsampled_group_prompt_fingerprint()),
+        scope_cache_fingerprint(
+            chat, getattr(dialog, "cache_fingerprint", _unsampled_group_prompt_fingerprint())
+        ),
     )
 
 
+# Retained for historical group prompt fingerprint compatibility; production uses the sparse helper below.
 def _member_context(chat: ChatData, member: Participant) -> str:
     """成员画像的群上下文：本地精确算出的互动数字（事实与推断分开标注）"""
     # top_k=0 在这里的含义是**不截断**，而这不是"顺手传个 0"：下面要按 uid 取每位
@@ -660,7 +672,34 @@ def _member_context(chat: ChatData, member: Participant) -> str:
     return "\n".join(lines)
 
 
-def _member_cache_key(member: Participant, user_content: str) -> str:
+def _member_context_from_sparse(chat: ChatData, member: Participant) -> str:
+    """成员画像的群上下文：本地精确算出的互动数字（事实与推断分开标注）"""
+    interaction = calc_member_interaction_summary(chat, member.uid)
+    activity = {a["uid"]: a for a in calc_member_activity(chat)}
+    a = activity.get(member.uid, {})
+
+    def _top_partners(key: str) -> str:
+        """取稀疏边计数里该成员互动最多的前三位。"""
+        rows = interaction["top_explicit" if key == "explicit" else "top_inferred"]
+        return "、".join(f"{row['name']}（{row['count']} 次）" for row in rows) or "无"
+
+    lines = [
+        f"- 发言 {a.get('msg_count', 0)} 条（占全群 {a.get('share', 0) * 100:.1f}%），"
+        f"活跃 {a.get('active_days', 0)} 天，平均每条 {a.get('avg_chars', 0)} 字",
+        f"- 被精确回复 {interaction.get('explicit_replied_by', 0)} 次、"
+        f"主动回复别人 {interaction.get('explicit_replies_to', 0)} 次（事实）",
+        f"- 被 @ {interaction.get('mentions_received', 0)} 次、"
+        f"主动 @ 别人 {interaction.get('mentions_sent', 0)} 次（事实）",
+        f"- 被接话 {interaction.get('replied_by', 0)} 次、"
+        f"接别人话 {interaction.get('replies_to', 0)} 次（推断）",
+        f"- 主要互动对象（精确回复/@）：{_top_partners('explicit')}",
+    ]
+    if member.is_self:
+        lines.append("- 注意：这个人就是导出者本人（我），评价同样要客观")
+    return "\n".join(lines)
+
+
+def _member_cache_key(member: Participant, user_content: str, chat: ChatData | None = None) -> str:
     """成员画像的缓存键：内容寻址（模型 + 群聊指纹 + 该成员的提示词正文）
 
     复用月份缓存那套文件（同一目录、同一引用计数），只是键里多带了成员 uid 与提示词正文。
@@ -670,7 +709,82 @@ def _member_cache_key(member: Participant, user_content: str) -> str:
     """
     import analyzer.deepseek_client as dc
 
-    return dc._month_key(f"member_profiles:{member.uid}", user_content, group_prompt_fingerprint())
+    version = f":{person_context.STRATEGY_VERSION}" if person_context.PERSON_CONTEXT_ENABLED else ""
+    fingerprint = group_prompt_fingerprint()
+    if chat is not None:
+        fingerprint = scope_cache_fingerprint(chat, fingerprint, include_targets=True)
+    return dc._month_key(f"member_profiles{version}:{member.uid}", user_content, fingerprint)
+
+
+def _prepare_member_request(
+    chat: ChatData,
+    member: Participant,
+    prompt_template: str,
+    tag: str,
+    chat_hash: str = "",
+) -> Optional[dict]:
+    """Build the exact member prompt and cache identity used by execution and preview."""
+    msgs = [m for m in chat.messages if m.sender_uid == member.uid and _has_content(m) and is_statistical(m)]
+    if not msgs:
+        return None
+    if person_context.PERSON_CONTEXT_ENABLED:
+        names = {participant.uid: participant.name for participant in chat.participants()}
+        selection = person_context.select_person_context(
+            chat.messages,
+            msgs,
+            lambda message: names.get(message.sender_uid, "未知发送者"),
+            MEMBER_PROFILE_SAMPLES,
+            GROUP_MAX_DIALOG_CHARS,
+            stratified=True,
+        )
+        sample = selection.target_messages
+        if not sample:
+            return None
+        span_note = "，按时间均匀抽样覆盖整个时段" if len(msgs) > MEMBER_PROFILE_SAMPLES else ""
+        context_note = (
+            f"；另含 {selection.context_count} 条仅供理解的上下文消息" if selection.context_count else ""
+        )
+        head = (
+            f"统计：{member.name} 共发言 {len(msgs)} 条（目标样本 {len(sample)} 条{span_note}，"
+            f"图片 {sum(1 for m in sample if m.has_image)} 张{context_note}）"
+        )
+        if selection.sampled:
+            head += "，其余上下文受篇幅限制未展示"
+        dialog = f"{head}。\n\n{selection.text}"
+        # Images under the member's label must belong to that member.
+        vision_messages = selection.target_messages
+    else:
+        if len(msgs) > MEMBER_PROFILE_SAMPLES:
+            stride = (len(msgs) + MEMBER_PROFILE_SAMPLES - 1) // MEMBER_PROFILE_SAMPLES
+            sample = msgs[::stride]
+            span_note = "，按时间均匀抽样覆盖整个时段"
+        else:
+            sample = msgs
+            span_note = ""
+        lines = [_message_line(m, member.name) for m in sample]
+        original_n = len(lines)
+        lines = _fit_lines(lines, GROUP_MAX_DIALOG_CHARS)
+        head = f"统计：{member.name} 共发言 {len(msgs)} 条（样本 {len(sample)} 条{span_note}，"
+        head += f"图片 {sum(1 for m in sample if m.has_image)} 张）"
+        if len(lines) < original_n:
+            head += f"，因篇幅限制展示其中 {len(lines)} 条"
+        dialog = f"{head}。\n\n" + "\n".join(lines)
+        vision_messages = msgs
+    digest = _vision_digest(vision_messages, chat_hash, f"{member.name} 的发言中")
+    if digest:
+        dialog += f"\n\n图片内容摘要（由视觉模型识别，供参考）：\n{digest}"
+    context = _member_context_from_sparse(chat, member)
+    prompt = prompt_template.format(
+        display_name=member.name, group_name=chat.chat_name, context=context, dialog=dialog
+    )
+    import analyzer.deepseek_client as dc
+
+    return {
+        "messages": msgs,
+        "prompt": prompt,
+        "cache_key": _member_cache_key(member, prompt, chat),
+        "thinking": dc.thinking_enabled(tag),
+    }
 
 
 def _analyze_member(
@@ -689,46 +803,21 @@ def _analyze_member(
     只取最近 800 条会让变化根本不在样本里。
     """
     try:
-        msgs = [
-            m for m in chat.messages if m.sender_uid == member.uid and _has_content(m) and is_statistical(m)
-        ]
-        if not msgs:
+        request_data = _prepare_member_request(chat, member, prompt_template, tag, chat_hash)
+        if request_data is None:
             return None
-        if len(msgs) > MEMBER_PROFILE_SAMPLES:
-            stride = (len(msgs) + MEMBER_PROFILE_SAMPLES - 1) // MEMBER_PROFILE_SAMPLES
-            sample = msgs[::stride]
-            span_note = "，按时间均匀抽样覆盖整个时段"
-        else:
-            sample = msgs
-            span_note = ""
-        lines = [_message_line(m, member.name) for m in sample]
-        original_n = len(lines)
-        lines = _fit_lines(lines, GROUP_MAX_DIALOG_CHARS)
-        head = f"统计：{member.name} 共发言 {len(msgs)} 条（样本 {len(sample)} 条{span_note}，"
-        head += f"图片 {sum(1 for m in sample if m.has_image)} 张）"
-        if len(lines) < original_n:
-            head += f"，因篇幅限制展示其中 {len(lines)} 条"
-        dialog = f"{head}。\n\n" + "\n".join(lines)
-        digest = _vision_digest(msgs, chat_hash, f"{member.name} 的发言中")
-        if digest:
-            dialog += f"\n\n图片内容摘要（由视觉模型识别，供参考）：\n{digest}"
-        context = _member_context(chat, member)
-        prompt = prompt_template.format(
-            display_name=member.name, group_name=chat.chat_name, context=context, dialog=dialog
-        )
         import analyzer.deepseek_client as dc
 
-        key = _member_cache_key(member, prompt)
-        # 思考模式要进口径核对，与私聊月份缓存那条规则一致（见 month_cache._read_month_cache）：
-        # 成员画像是最贵的一个维度，让"关了思考"的重跑吃到"开着思考"算出来的画像，
-        # 用户看到的同样是配置静默失效。
-        want_thinking = dc.thinking_enabled(tag)
+        msgs = request_data["messages"]
+        prompt = request_data["prompt"]
+        key = request_data["cache_key"]
+        want_thinking = request_data["thinking"]
         result = dc._read_result_cache(key, tag, expect_thinking=want_thinking, chat_hash=chat_hash)
         if result is not None:
             logger.info("%s 命中成员缓存，跳过 API 调用", mask_name(member.name))
         else:
             result = _call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag, dim=tag)
-            if result and month_cache_enabled():
+            if result:
                 try:
                     validate_result(tag, result)
                 except ResultValidationError as e:
@@ -736,7 +825,6 @@ def _analyze_member(
                     raise AnalysisIncompleteError(
                         f"{mask_name(member.name)} 的成员画像结果结构无效（字段 {e.path}）；可重试该成员"
                     ) from e
-            # 与私聊同一道清理守卫：这个聊天刚被级联清掉就不要把成员画像写回盘上
             if result and not dc.purge_marks.is_marked(chat_hash):
                 dc._write_month_cache(key, result, thinking=want_thinking)
         if result is not None and used_keys is not None:
@@ -749,12 +837,27 @@ def _analyze_member(
             return result
         raise AnalysisIncompleteError(f"{mask_name(member.name)} 的成员画像未得到有效结果")
     except QuotaExhaustedError:
-        raise  # 配额耗尽要中止整个维度，不能被当作单人失败吞掉
+        raise
     except AnalysisIncompleteError:
         raise
     except Exception as e:
         logger.error("%s 的群内画像失败: %s", mask_name(member.name), e)
         raise AnalysisIncompleteError(f"{mask_name(member.name)} 的成员画像分析失败") from e
+
+
+def _member_prompt_template() -> str:
+    return (
+        "以下是 {display_name} 在群「{group_name}」里的发言样本与互动数字，"
+        "请分析他在这个群里扮演什么角色、是个什么样的人：\n\n"
+        + gp.MEMBER_CONTEXT_NOTES
+        + (
+            "\n\n样本行以[目标人物]标记成员本人发言，[仅供上下文]行只用于理解对话背景；"
+            "画像、用词特征与发言统计只根据[目标人物]消息。"
+            if person_context.PERSON_CONTEXT_ENABLED
+            else ""
+        )
+        + "\n\n## 发言样本\n{dialog}"
+    )
 
 
 def analyze_member_profiles(
@@ -765,12 +868,7 @@ def analyze_member_profiles(
     if not members:
         return {}
     results: dict = {}
-    template = (
-        "以下是 {display_name} 在群「{group_name}」里的发言样本与互动数字，"
-        "请分析他在这个群里扮演什么角色、是个什么样的人：\n\n"
-        + gp.MEMBER_CONTEXT_NOTES
-        + "\n\n## 发言样本\n{dialog}"
-    )
+    template = _member_prompt_template()
     total, done = len(members), 0
     used_keys: set = set()
     incomplete = False
@@ -788,9 +886,10 @@ def analyze_member_profiles(
                 chat_hash=chat_hash,
                 used_keys=used_keys,
             )
-        except QuotaExhaustedError:
+        except QuotaExhaustedError as exc:
             # 前面已完成的成员画像各自有内容缓存；重试时命中它们，只补尚未完成的成员。
             _record_member_usage(chat_hash, used_keys)
+            exc.partial_result = results
             raise
         except AnalysisIncompleteError:
             # 成员之间独立：一人的结构错误不应阻断其他人的分析与缓存。
@@ -803,7 +902,9 @@ def analyze_member_profiles(
             on_progress(done, total)
     _record_member_usage(chat_hash, used_keys)
     if incomplete and not (should_cancel and should_cancel()):
-        raise AnalysisIncompleteError("成员画像分析未取得全部成员的完整结果；已完成的成员可从缓存复用")
+        error = AnalysisIncompleteError("成员画像分析未取得全部成员的完整结果；已完成的成员可从缓存复用")
+        error.partial_result = results
+        raise error
     return results
 
 

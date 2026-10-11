@@ -29,6 +29,8 @@ tests/test_group_foundation.py 有用例钉住这一点（test_source_moves_do_n
 """
 
 from collections import Counter
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from typing import Optional
 
@@ -38,6 +40,18 @@ from analyzer.local_stats import _median, is_session_start
 from analyzer.logger import get_logger
 
 logger = get_logger("deepseek")
+_PREVIEW_VISION = ContextVar("analysis_preview_vision", default=None)
+
+
+@contextmanager
+def preview_vision_context():
+    """Build prompts without calling vision or changing its cache files."""
+    state = {"uncertain": []}
+    token = _PREVIEW_VISION.set(state)
+    try:
+        yield state
+    finally:
+        _PREVIEW_VISION.reset(token)
 
 
 # 单月对话文本上限（字符数）。**准确性优先**：默认 60 万字符（约 25-30 万 tokens），
@@ -389,6 +403,12 @@ def _vision_digest(messages: list, chat_hash: str, label: str) -> str:
     try:
         from analyzer import vision
 
+        preview = _PREVIEW_VISION.get()
+        if preview is not None:
+            digest, needs_call = vision.preview_digest(messages, chat_hash=chat_hash)
+            if needs_call:
+                preview["uncertain"].append(label)
+            return digest
         return vision.digest(messages, chat_hash=chat_hash, label=label)
     except QuotaExhaustedError:
         raise  # 额度耗尽要中止整体任务，不能悄悄吞掉

@@ -32,7 +32,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </p>
     <div class="mt-3">
         <button class="btn btn-primary no-print" onclick="window.print()">打印 / 导出 PDF</button>
-        <button class="btn btn-outline-secondary no-print ms-2" onclick="downloadReport()">下载 HTML</button>
+        <button class="btn btn-outline-secondary no-print ms-2" onclick="downloadReport()">下载完整 HTML（未脱敏）</button>
+        <a class="btn btn-outline-success no-print ms-2" href="{{ url_for('report_share') }}">制作脱敏分享副本</a>
     </div>
 </div>
 

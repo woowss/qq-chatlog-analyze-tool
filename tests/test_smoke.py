@@ -113,6 +113,7 @@ class TestPageSmoke(unittest.TestCase):
         "/topics",
         "/profile",
         "/report",
+        "/report/share",
         "/recap",
         "/messages",
     )

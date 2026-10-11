@@ -918,15 +918,7 @@ class TestEmptyMonthSkipped(unittest.TestCase):
             other_uid="other",
             messages=[sep_msg, oct_recalled],
         )
-        result = {
-            "self_emotion": "平静",
-            "other_emotion": "平静",
-            "self_intensity": 5,
-            "other_intensity": 5,
-            "self_keywords": [],
-            "other_keywords": [],
-            "overall_tone": "平淡日常",
-        }
+        result = valid_emotion()
         with mock.patch.object(dc, "_call_api", return_value=result) as m:
             out = dc.analyze_emotion(chat)
         self.assertEqual(m.call_count, 1)  # 十月整月无效，未调用

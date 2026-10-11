@@ -8,10 +8,14 @@ from bisect import bisect_left, bisect_right
 from collections import OrderedDict, defaultdict
 from threading import RLock
 
+from analyzer.local_stats import is_session_start
+
 
 MAX_QUERY_POSITIONS = 200_000
 MAX_QUERIES = 16
 MAX_NORMALIZED_CHARS = 8_000_000
+MAX_TIMELINE_QUERIES = 6
+MAX_TIMELINE_SEGMENTS = 120
 _BUILD_LOCK = RLock()
 
 
@@ -34,6 +38,7 @@ class MessageIndex:
         self.day_keys = [day for day, _ in self.days]
         self.queries = OrderedDict()
         self.cached_positions = 0
+        self.timelines = OrderedDict()
         self.lock = RLock()
 
     def _hay(self, message):
@@ -136,6 +141,107 @@ class MessageIndex:
             for quote in seen:
                 found[quote].append(pos)
         return found
+
+    def timeline(self, q="", side="", month="", dt_from="", dt_to=""):
+        """Aggregate the same indexed matches used by message search.
+
+        Only bounded buckets and recent segment summaries are retained; message text
+        is never copied into this cache.
+        """
+        q = (q or "").strip()
+        if not q:
+            raise ValueError("请输入关键词后再生成时间线")
+        key = (q.lower(), side, month, dt_from, dt_to)
+        with self.lock:
+            cached = self.timelines.get(key)
+            if cached is not None:
+                self.timelines.move_to_end(key)
+                return cached
+
+        from collections import Counter
+
+        positions = self.query(q, side=side, month=month, dt_from=dt_from, dt_to=dt_to)
+        daily, monthly = Counter(), Counter()
+        sources = Counter()
+        segments = []
+        total_segments = 0
+        literal_occurrences = 0
+        first_time = last_time = ""
+        last_ts = None
+        needle = q.lower()
+
+        for pos in positions:
+            message = self.chat.messages[pos]
+            day = message.time_str[:10]
+            month = message.time_str[:7]
+            daily[day] += 1
+            monthly[month] += 1
+            if not first_time:
+                first_time = message.time_str
+            last_time = message.time_str
+
+            fields = []
+            if message.text:
+                fields.append((message.text, "正文"))
+                if message.media_label:
+                    fields.append((message.media_label, "媒体标签"))
+                if message.face_names:
+                    fields.append((" ".join(message.face_names), "表情名"))
+            else:
+                # 空正文时，浏览器显示的媒体/表情占位是实际可搜索内容；
+                # 其中可能已经含 media_label 和 face_names，所以只计一次。
+                placeholder = self.body(message)
+                if placeholder:
+                    fields.append((placeholder, "媒体或表情占位"))
+            if message.sender_name:
+                fields.append((message.sender_name, "发言人名称"))
+            for value, source in fields:
+                count = value.lower().count(needle)
+                if count:
+                    sources[source] += count
+                    literal_occurrences += count
+
+            if is_session_start(last_ts, message.timestamp):
+                total_segments += 1
+                segments.append(
+                    {
+                        "start": message.time_str,
+                        "end": message.time_str,
+                        "start_ts": message.timestamp,
+                        "end_ts": message.timestamp,
+                        "first_date": day,
+                        "last_date": day,
+                        "count": 0,
+                    }
+                )
+                if len(segments) > MAX_TIMELINE_SEGMENTS:
+                    segments.pop(0)
+            segment = segments[-1]
+            segment["end"] = message.time_str
+            segment["end_ts"] = message.timestamp
+            segment["last_date"] = day
+            segment["count"] += 1
+            last_ts = message.timestamp
+
+        result = {
+            "query": q,
+            "matched_messages": len(positions),
+            "literal_occurrences": literal_occurrences,
+            "source_counts": dict(sources),
+            "first_match": first_time,
+            "last_match": last_time,
+            "daily": [{"date": day, "count": daily[day]} for day in sorted(daily)],
+            "monthly": [{"month": month, "count": monthly[month]} for month in sorted(monthly)],
+            "total_segments": total_segments,
+            "segments": segments,
+            "segments_truncated": max(0, total_segments - len(segments)),
+        }
+        with self.lock:
+            if key not in self.timelines:
+                while len(self.timelines) >= MAX_TIMELINE_QUERIES:
+                    self.timelines.popitem(last=False)
+                self.timelines[key] = result
+        return result
 
 
 def index_for(chat, body, matcher):

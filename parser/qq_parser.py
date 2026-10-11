@@ -407,16 +407,14 @@ class ChatData:
     #: 现在每个未知类型都记在这里，仪表盘给出提示、inspect_chat 逐类对账。
     #: 尾部带默认值的新字段：既有构造点与相等性语义不受影响。
     unknown_element_types: dict = field(default_factory=dict, repr=False, compare=False)
-    #: 互动矩阵的结果缓存：**生效上限 → 矩阵 dict**（见 group_stats.calc_interaction_matrix）。
-    #: 为什么必须缓存：成员画像那条路是"每位成员一次调用"，每次都要按 uid 取互动数字，
-    #: 而它要的是**不截断**的矩阵（top_k=0）。不缓存的话，一个几千人的群每分析一位成员
-    #: 就把 n×n 矩阵重算一遍——实测 n=3000 单次 4.4 秒 / 376 MB，×10 位成员就是 44 秒
-    #: 与上 GB 的反复分配。键取**已解析的生效上限**而不是入参 top_k：`_matrix_top_k()`
-    #: 是调用时读配置的（有用例专门钉这个语义，见 test_matrix_limit_reads_config_at_call_time），
-    #: 用 top_k 当键会让"改配置后拿回旧上限的矩阵"。
+    #: 密集展示矩阵按生效上限缓存；group_stats 限制最多保留 3 个不同展示尺寸。
     _matrix_cache: Optional[dict] = field(default=None, repr=False, compare=False)
     # Browse/evidence indexes follow the parsed object's replacement/deletion lifecycle.
     _message_index: Optional[object] = field(default=None, repr=False, compare=False)
+    #: 稀疏互动结果：实际出现的有向边与全员统计，作为画像和展示矩阵的共同数据源。
+    _interaction_sparse_cache: Optional[dict] = field(default=None, repr=False, compare=False)
+    #: 成员画像会逐人读取互动统计；缓存一次全群活跃表，避免每位成员都重扫全部消息。
+    _member_activity_cache: Optional[list] = field(default=None, repr=False, compare=False)
 
     def statistical(self) -> list["Message"]:
         """参与统计与分析的消息子集（过滤系统/撤回/转发）"""

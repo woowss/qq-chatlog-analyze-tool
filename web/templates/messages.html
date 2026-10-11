@@ -26,6 +26,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     原始记录浏览与搜索（全部在本机计算，不产生 API 费用）。撤回与系统消息如实列出并打标——
     这里就是"AI 结论可回溯"的那条退路：看到引用，能搜到原句、点开看上下文。
 </p>
+<div class="d-flex align-items-center gap-2 flex-wrap mb-3 message-scope-actions">
+    <button class="btn btn-outline-primary btn-sm" id="useSelectedMessages" type="button" disabled>将所选消息设为分析范围</button>
+    <span class="small text-muted" id="selectedMessageCount" aria-live="polite">已选 0 条（最多 5000 条）</span>
+</div>
 
 <form class="row g-2 align-items-end mb-3" id="filterForm" onsubmit="return false;">
     <div class="col-12 col-md-6">
@@ -38,6 +42,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </div>
     <div class="col-12 col-md-3 d-flex gap-2 align-items-end">
         <button class="btn btn-primary btn-sm" id="btnSearch" type="button" aria-controls="msgList">搜索</button>
+        <button class="btn btn-outline-primary btn-sm" id="btnTimeline" type="button">关键词时间线</button>
         <button class="btn btn-outline-secondary btn-sm" id="btnReset" type="button">清空</button>
     </div>
     <details class="filter-advanced col-12" id="advancedFilters">
@@ -61,6 +66,27 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         <span class="small text-muted" id="resultMeta" aria-live="polite"></span>
     </div>
 </form>
+
+<section class="card mb-3" id="keywordTimelineCard" aria-labelledby="keywordTimelineTitle">
+    <div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2">
+        <span id="keywordTimelineTitle">关键词时间线</span>
+        <div class="btn-group btn-group-sm" role="group" aria-label="时间线粒度">
+            <button class="btn btn-outline-secondary active" type="button" data-timeline-granularity="day" aria-pressed="true">按日</button>
+            <button class="btn btn-outline-secondary" type="button" data-timeline-granularity="month" aria-pressed="false">按月</button>
+        </div>
+    </div>
+    <div class="card-body">
+        <p class="small text-muted mb-2">复用当前搜索、发言人及日期规则。匹配消息数按消息去重；字面出现次数按可见正文、媒体/表情占位和发言人分别计数。</p>
+        <div id="timelineSummary" class="small text-muted" aria-live="polite">输入关键词后点“关键词时间线”。</div>
+        <div id="timelineBuckets" class="mt-2"></div>
+        <nav class="d-flex justify-content-between align-items-center mt-2 d-none" id="timelinePager" aria-label="时间线分页">
+            <button class="btn btn-outline-secondary btn-sm" type="button" id="timelinePrev" disabled>较早</button>
+            <span class="small text-muted" id="timelinePageInfo"></span>
+            <button class="btn btn-outline-secondary btn-sm" type="button" id="timelineNext" disabled>较新</button>
+        </nav>
+        <div id="timelineSegments" class="mt-3"></div>
+    </div>
+</section>
 
 <div class="alert alert-warning small d-none" id="msgWarn" role="alert"></div>
 <div id="msgList" class="msg-list" role="feed" aria-label="聊天消息搜索结果" aria-live="polite"></div>
@@ -93,12 +119,31 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     }
     var state = { page: 1, pages: 1, total: 0 };
     var sendersLoaded = false;
+    var selectedScopePositions = new Set();
+    var timelineResult = null;
+    var timelineGranularity = 'day';
+    var timelinePage = 0;
+    var timelineTimeWindow = null;
+    var timelineRequestId = 0;
+    // Search controls can change while a request is in flight. Ignore every
+    // completion except the newest one so rows and scope checkboxes stay tied
+    // to the query the user can currently see.
+    var searchRequestId = 0;
+
+    function updateSelectedMessageCount() {
+        $('#selectedMessageCount').text('已选 ' + selectedScopePositions.size + ' 条（最多 5000 条）');
+        $('#useSelectedMessages').prop('disabled', selectedScopePositions.size === 0 || selectedScopePositions.size > 5000);
+    }
 
     function params(extra) {
         var p = {};
         ['q', 'sender', 'month', 'from', 'to'].forEach(function(k) {
             p[k] = $('#' + k).val() || '';
         });
+        if (timelineTimeWindow) {
+            p.ts_from = timelineTimeWindow.from;
+            p.ts_to = timelineTimeWindow.to;
+        }
         p.page = state.page;
         if (extra) $.extend(p, extra);
         return p;
@@ -109,15 +154,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         $('#advancedFilterState').text(count ? ('已设 ' + count + ' 项') : '未设置');
     }
 
-    function rowHtml(m, highlightId) {
+    function rowHtml(m, highlightId, highlightPosition) {
         var cls = 'msg-row' + (m.system ? ' msg-system' : '') + (m.recalled ? ' msg-recalled' : '')
-                + (m.id === highlightId ? ' msg-hit' : '');
+                + ((highlightPosition != null ? m.position === highlightPosition : m.id === highlightId) ? ' msg-hit' : '');
         var tags = [];
         if (m.recalled) tags.push('<span class="badge bg-secondary">已撤回</span>');
         if (m.system) tags.push('<span class="badge bg-secondary">系统</span>');
         if (m.is_reply) tags.push('<span class="badge bg-info">回复</span>');
         if (m.mentions_all) tags.push('<span class="badge bg-warning text-dark">@全体</span>');
-        return '<div class="' + cls + '" data-id="' + esc(m.id) + '" tabindex="0" role="button">'
+        return '<div class="' + cls + '" data-id="' + esc(m.id) + '" data-position="' + esc(m.position) + '" tabindex="0" role="button">'
+            + '<label class="msg-scope-select" title="将此消息纳入分析范围"><input class="msg-scope-check" type="checkbox" data-position="' + esc(m.position) + '"'
+            + (selectedScopePositions.has(m.position) ? ' checked' : '') + '><span class="visually-hidden">将此消息纳入分析范围</span></label>'
             + '<span class="msg-time">' + esc(m.time) + '</span> '
             + '<span class="msg-who' + (m.is_self ? ' text-primary' : '') + '">' + esc(m.name || '未知') + ':</span> '
             + '<span class="msg-body">' + esc(m.text) + ' ' + tags.join(' ') + '</span>'
@@ -144,7 +191,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         }
     }
 
-    function formatMessages(messages, highlightId) {
+    function formatMessages(messages, highlightId, highlightPosition) {
         var lastDay = '';
         return messages.map(function(m) {
             var day = String(m.time || '').slice(0, 10);
@@ -153,18 +200,95 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                 divider = '<div class="day-divider" role="heading" aria-level="3">' + esc(day) + '</div>';
                 lastDay = day;
             }
-            return divider + rowHtml(m, highlightId);
+            return divider + rowHtml(m, highlightId, highlightPosition);
         }).join('');
     }
 
     function load(highlightId) {
+        var requestId = ++searchRequestId;
         $.get('/api/messages', params(highlightId ? { around: highlightId } : null), function(res) {
+            if (requestId !== searchRequestId) return;
             if (res.error) { $('#msgWarn').removeClass('d-none').text(res.error); return; }
             $('#msgWarn').addClass('d-none');
             render(res, highlightId);
         }).fail(function(xhr) {
+            if (requestId !== searchRequestId) return;
             $('#msgWarn').removeClass('d-none')
                 .text((xhr.responseJSON && xhr.responseJSON.error) || '查询失败（会话可能已过期，刷新页面重试）');
+        });
+    }
+
+    function renderTimeline() {
+        if (!timelineResult) return;
+        var data = timelineResult;
+        var sources = Object.entries(data.source_counts || {}).sort(function(a, b) { return b[1] - a[1]; })
+            .map(function(pair) { return esc(pair[0]) + ' ' + pair[1] + ' 次'; }).join(' · ');
+        $('#timelineSummary').text('“' + data.query + '”共命中 ' + data.matched_messages + ' 条消息，字面出现 ' +
+            data.literal_occurrences + ' 次；首次 ' + (data.first_match || '—') + '，最近 ' + (data.last_match || '—') +
+            (sources ? '；来源：' + sources : '；无匹配来源'));
+        var buckets = timelineGranularity === 'month' ? (data.monthly || []) : (data.daily || []);
+        var max = buckets.reduce(function(value, item) { return Math.max(value, item.count); }, 1);
+        var pageSize = 50;
+        var pageCount = Math.max(1, Math.ceil(buckets.length / pageSize));
+        timelinePage = Math.min(Math.max(0, timelinePage), pageCount - 1);
+        var pageBuckets = buckets.slice(timelinePage * pageSize, (timelinePage + 1) * pageSize);
+        var rows = pageBuckets.map(function(item) {
+            var from = timelineGranularity === 'month' ? item.month + '-01' : item.date;
+            var to = from;
+            if (timelineGranularity === 'month') {
+                var date = new Date(Date.UTC(Number(item.month.slice(0, 4)), Number(item.month.slice(5, 7)), 0));
+                to = item.month + '-' + String(date.getUTCDate()).padStart(2, '0');
+            }
+            var label = timelineGranularity === 'month' ? item.month : item.date;
+            var width = Math.max(2, Math.round(item.count / max * 100));
+            return '<tr><td><button type="button" class="btn btn-link btn-sm p-0 timeline-bucket" data-from="' + esc(from) +
+                '" data-to="' + esc(to) + '">' + esc(label) + '</button></td><td><div class="progress" style="height:8px">' +
+                '<div class="progress-bar" role="presentation" style="width:' + width + '%"></div></div></td>' +
+                '<td class="text-end">' + item.count + '</td></tr>';
+        }).join('');
+        $('#timelineBuckets').html(rows ? '<div class="table-responsive"><table class="table table-sm mb-0"><tbody>' + rows +
+            '</tbody></table></div>' : '<div class="text-muted small">没有命中消息</div>');
+        $('#timelinePager').toggleClass('d-none', buckets.length <= pageSize);
+        $('#timelinePrev').prop('disabled', timelinePage <= 0);
+        $('#timelineNext').prop('disabled', timelinePage >= pageCount - 1);
+        $('#timelinePageInfo').text((timelinePage + 1) + ' / ' + pageCount);
+
+        var segmentRows = (data.segments || []).slice().reverse().map(function(segment) {
+            return '<button type="button" class="btn btn-sm btn-outline-secondary me-1 mb-1 timeline-segment" data-from="' +
+                segment.start_ts + '" data-to="' + segment.end_ts + '" data-first-date="' + esc(segment.first_date) +
+                '" data-last-date="' + esc(segment.last_date) + '">' + esc(segment.start) + ' – ' + esc(segment.end) +
+                '（' + segment.count + ' 条命中）</button>';
+        }).join('');
+        var truncation = data.segments_truncated ? '<div class="small text-muted">还有 ' + data.segments_truncated +
+            ' 个较早片段未展开；趋势计数包含全部命中。</div>' : '';
+        $('#timelineSegments').html('<h6>相邻命中片段（间隔不超过 30 分钟）</h6>' + truncation +
+            (segmentRows || '<div class="text-muted small">没有命中片段</div>') +
+            '<div class="small text-muted mt-1">点击日期或片段筛选下方命中列表；点击列表中的消息可继续查看原文上下文。</div>');
+    }
+
+    function loadTimeline() {
+        var requestId = ++timelineRequestId;
+        var q = ($('#q').val() || '').trim();
+        if (!q) {
+            $('#btnTimeline').prop('disabled', false).text('关键词时间线');
+            $('#timelineSummary').text('先输入关键词，再生成时间线。');
+            return;
+        }
+        var button = $('#btnTimeline').prop('disabled', true).text('正在汇总…');
+        $.get('/api/messages/timeline', params({ page: null }), function(res) {
+            if (requestId !== timelineRequestId) return;
+            if (res.error) {
+                $('#timelineSummary').text(res.error);
+                return;
+            }
+            timelineResult = res;
+            timelinePage = 0;
+            renderTimeline();
+        }).fail(function(xhr) {
+            if (requestId !== timelineRequestId) return;
+            $('#timelineSummary').text((xhr.responseJSON && xhr.responseJSON.error) || '时间线加载失败，请刷新页面后重试。');
+        }).always(function() {
+            if (requestId === timelineRequestId) button.prop('disabled', false).text('关键词时间线');
         });
     }
 
@@ -173,13 +297,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         var list = $('#contextList');
         list.attr('aria-busy', 'true').html('<div class="text-muted small p-2">正在读取消息上下文…</div>');
         if (!dialog.open) dialog.showModal();
-        $.get('/api/messages', params({ around: id, context: 1, page: 1 }), function(res) {
+        $.get('/api/messages', params({ around_pos: id, context: 1, page: 1 }), function(res) {
             list.attr('aria-busy', 'false');
             if (res.error) {
                 list.empty().append($('<div>').addClass('alert alert-warning small mb-0').text(res.error));
                 return;
             }
-            var rows = formatMessages(res.messages || [], id);
+            var rows = formatMessages(res.messages || [], null, Number(id));
             if (!rows) {
                 list.empty().append($('<div>').addClass('text-muted small p-2').text('没有找到这条消息的上下文。'));
                 return;
@@ -193,10 +317,50 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         });
     }
 
-    $('#btnSearch').on('click', function() { state.page = 1; load(); });
-    $('#q').on('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); state.page = 1; load(); } });
+    $('#btnSearch').on('click', function() {
+        timelineTimeWindow = null;
+        state.page = 1; load();
+        if (timelineResult) loadTimeline();
+    });
+    $('#q').on('keydown', function(e) {
+        if (e.key === 'Enter') { e.preventDefault(); timelineTimeWindow = null; state.page = 1; load(); if (timelineResult) loadTimeline(); }
+    });
+    $('#btnTimeline').on('click', function() { timelineTimeWindow = null; state.page = 1; load(); loadTimeline(); });
+    $('[data-timeline-granularity]').on('click', function() {
+        timelineGranularity = this.getAttribute('data-timeline-granularity');
+        timelinePage = 0;
+        $('[data-timeline-granularity]').removeClass('active').attr('aria-pressed', 'false');
+        $(this).addClass('active').attr('aria-pressed', 'true');
+        renderTimeline();
+    });
+    $('#timelinePrev').on('click', function() { timelinePage--; renderTimeline(); });
+    $('#timelineNext').on('click', function() { timelinePage++; renderTimeline(); });
+    $('#timelineBuckets').on('click', '.timeline-bucket', function() {
+        timelineTimeWindow = null;
+        $('#month').val('');
+        $('#from').val(this.getAttribute('data-from'));
+        $('#to').val(this.getAttribute('data-to'));
+        updateFilterSummary();
+        state.page = 1;
+        load();
+    });
+    $('#timelineSegments').on('click', '.timeline-segment', function() {
+        $('#month').val('');
+        $('#from').val(this.getAttribute('data-first-date'));
+        $('#to').val(this.getAttribute('data-last-date'));
+        timelineTimeWindow = { from: this.getAttribute('data-from'), to: this.getAttribute('data-to') };
+        updateFilterSummary();
+        state.page = 1;
+        load();
+    });
     $('#btnReset').on('click', function() {
+        timelineRequestId++;
+        $('#btnTimeline').prop('disabled', false).text('关键词时间线');
         ['q', 'sender', 'month', 'from', 'to'].forEach(function(k) { $('#' + k).val(''); });
+        timelineTimeWindow = null;
+        timelineResult = null;
+        $('#timelineSummary').text('输入关键词后点“关键词时间线”。');
+        $('#timelineBuckets, #timelineSegments').empty();
         updateFilterSummary();
         state.page = 1; load();
     });
@@ -204,19 +368,38 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     $('#prevPage').on('click', function() { if (state.page > 1) { state.page--; load(); } });
     $('#nextPage').on('click', function() { if (state.page < state.pages) { state.page++; load(); } });
     // 上下文放在独立弹窗中打开，当前筛选结果和分页不会被替换。
-    $('#msgList').on('click', '.msg-row', function() { showContext(String($(this).data('id'))); });
+    $('#msgList').on('click', '.msg-row', function() { showContext(String($(this).data('position'))); });
     $('#msgList').on('keydown', '.msg-row', function(e) {
+        if (e.target !== this) return;
         if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault();
-            showContext(String($(this).data('id')));
+            showContext(String($(this).data('position')));
         }
     });
     $('#contextClose').on('click', function() { document.getElementById('contextDialog').close(); });
     $('#contextDialog').on('click', function(e) {
         if (e.target === this) this.close();
     });
+    $('#msgList, #contextList').on('click', '.msg-scope-check', function(e) { e.stopPropagation(); });
+    $('#msgList, #contextList').on('change', '.msg-scope-check', function() {
+        var position = Number(this.getAttribute('data-position'));
+        if (!Number.isInteger(position) || position < 0) { this.checked = false; return; }
+        if (this.checked) {
+            if (selectedScopePositions.size >= 5000) { this.checked = false; $('#msgWarn').removeClass('d-none').text('一次最多选择 5000 条消息。'); return; }
+            selectedScopePositions.add(position);
+        } else {
+            selectedScopePositions.delete(position);
+        }
+        updateSelectedMessageCount();
+    });
+    $('#useSelectedMessages').on('click', function() {
+        if (window.setAnalysisMessageScope) {
+            window.setAnalysisMessageScope(Array.from(selectedScopePositions), function() { window.location.href = '/dashboard'; });
+        }
+    });
 
     updateFilterSummary();
+    updateSelectedMessageCount();
     load();
 })();
 </script>

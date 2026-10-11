@@ -543,10 +543,22 @@ class TestResurrectionGuards(CacheLifecycleCase):
         )
 
     def test_vision_digest_not_written_after_purge(self):
-        """图片摘要是第四条复活路径（本轮 docstring 列了它，之前整段没人测）"""
+        """清理标记期间摘要可返回本轮，但不能写盘或留在 memo 供后续复用。"""
         import analyzer.vision as vision
 
-        img = [{"key": "vkey-1", "path": "resources/images/a.jpg", "w": 900, "h": 700}]
+        img = [
+            {
+                "key": "vkey-1",
+                "legacy_key": "vkey-1",
+                "trusted_md5": False,
+                "content_sha256": "a" * 64,
+                "path": "resources/images/a.jpg",
+                "size": 1,
+                "mime": "image/jpeg",
+                "time": "2023-11-14 22:13:20",
+                "sender": "合成成员",
+            }
+        ]
         with (
             mock.patch.object(vision, "available", return_value=True),
             mock.patch.object(vision, "pick_images", return_value=img),
@@ -558,17 +570,27 @@ class TestResurrectionGuards(CacheLifecycleCase):
             out = vision.digest([], chat_hash="hVision", label="2023-11")
             self.assertEqual(out, "一张截图", "已付费拿到的摘要照常返回给这一轮")
             self.assertEqual([n for n in self.ai_names() if n.startswith("vision_")], [], "但摘要不许落盘")
+            self.assertEqual(vision._MEMO, {}, "清理期间的摘要不能重新进入该聊天的 memo")
 
-            # 反向验证：把守卫写成"连 memo 一起跳过"（本轮最初的实现），下面这段变红——
-            # 同一批图在多个维度间复用，拒收内存缓存等于转头再为同一批付一次费。
-            n_calls = dc._call_vision.call_count if hasattr(dc._call_vision, "call_count") else None
             out2 = vision.digest([], chat_hash="hVision", label="2023-11 第二次")
             self.assertEqual(out2, "一张截图")
-            if n_calls is not None:
-                self.assertEqual(dc._call_vision.call_count, 1, "第二次必须吃到 memo，不再调用 API")
+            self.assertEqual(dc._call_vision.call_count, 2, "清理期间第二次不能复用已清理摘要")
+            self.assertEqual(vision._MEMO, {}, "第二次调用也不得留下 memo")
 
             purge_marks.unmark("hVision")
-            img2 = [{"key": "vkey-2", "path": "resources/images/b.jpg", "w": 900, "h": 700}]
+            img2 = [
+                {
+                    "key": "vkey-2",
+                    "legacy_key": "vkey-2",
+                    "trusted_md5": False,
+                    "content_sha256": "b" * 64,
+                    "path": "resources/images/b.jpg",
+                    "size": 1,
+                    "mime": "image/jpeg",
+                    "time": "2023-11-14 22:13:20",
+                    "sender": "合成成员",
+                }
+            ]
             with mock.patch.object(vision, "pick_images", return_value=img2):
                 vision.digest([], chat_hash="hVision", label="重传后")
             self.assertTrue(
