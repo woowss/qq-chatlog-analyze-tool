@@ -1,0 +1,14 @@
+<div class="alert alert-warning small mb-3 unknown-elements-warning" role="alert">
+    <strong>有 {{ unknown.values() | sum }} 个消息元素无法识别。</strong>
+    这些内容没有进入统计与分析。
+    <details>
+        <summary>查看类型与体检命令</summary>
+        <ul class="unknown-elements-list">
+            {% for type_name, count in unknown | dictsort %}
+            <li><code>{{ type_name }}</code> × {{ count }}</li>
+            {% endfor %}
+        </ul>
+        <p class="mb-0">如这不是预期中的空元素，可运行以下命令检查导出文件：</p>
+        <code>python tools/inspect_chat.py &lt;导出文件&gt;</code>
+    </details>
+</div>

@@ -32,12 +32,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {%- set unknown = overview.get('unknown_element_types') or {} %}
 {%- if unknown %}
 {# 与私聊仪表盘同一口径：未识别元素不静默丢，如实提示并引导体检。 #}
-<div class="alert alert-warning small mb-3">
-    有 {{ unknown.values() | sum }} 个消息元素没有被识别（类型：
-    {%- for k, v in unknown | dictsort %} {{ k }}×{{ v }}{% if not loop.last %}、{% endif %}{% endfor -%}）。
-    它们没有进入统计与分析；若这不是预期中的空元素，可用
-    <code>python tools/inspect_chat.py &lt;导出文件&gt;</code> 体检确认。
-</div>
+{% include "_unknown_element_warning.html" %}
 {%- endif %}
 
 <div class="row mb-4" id="groupSummary">
