@@ -32,11 +32,15 @@ from flask import session
 
 from config import JOB_TTL_SECONDS
 from analyzer.deepseek_client import (
+    AnalysisIncompleteError,
     QuotaExhaustedError,
     begin_run,
     end_run,
     scrub_secrets,
 )
+from analyzer import deepseek_client as dc
+from analyzer import group_client as gc
+from analyzer import recap_client
 from analyzer.result_schema import ResultValidationError, validate_dimension_result
 from analyzer.group_client import GROUP_DIMENSIONS as GROUP_DIMENSIONS
 from analyzer.recap_client import RECAP_DIMENSIONS as RECAP_DIMENSIONS
@@ -46,6 +50,7 @@ from analyzer.logger import get_logger
 from analyzer.shutdown import shutdown_requested
 from webapp import store
 from webapp import analysis_catalog
+from webapp.analysis_scope import apply_scope
 
 logger = get_logger("app")
 
@@ -180,6 +185,8 @@ def _get_or_create_job(
     conflict_dimension: str | None = None,
     *,
     refresh: bool = False,
+    identity: str | None = None,
+    scope_id: str | None = None,
 ):
     """在**同一把锁内**完成"查重复用 → 建任务"，避免 check-then-act 之间插进第二个任务。
 
@@ -192,10 +199,14 @@ def _get_or_create_job(
     with JOBS_LOCK:
         for jid, dim in _running_jobs_locked(sid, chat_hash):
             if dim == dimension:
+                if identity is not None and JOBS[jid].get("identity") != identity:
+                    return None, False, dim
+                if scope_id is not None and JOBS[jid].get("scope_id", "") != scope_id:
+                    return None, False, dim
                 if JOBS[jid].get("refresh", False) != refresh:
                     return None, False, dim
                 return jid, True, None
-            if conflict_dimension == "*" or dim == conflict_dimension:
+            if conflict_dimension == "*" or dim == conflict_dimension or dim == "plan":
                 return None, False, dim
         job_id = uuid.uuid4().hex
         job = {
@@ -208,6 +219,8 @@ def _get_or_create_job(
             "chat_hash": chat_hash,
             "sid": sid,
             "created": time.time(),
+            "identity": identity,
+            "scope_id": scope_id or "",
         }
         if dimension == "all":
             job["detail"] = ""
@@ -235,6 +248,36 @@ def _fail_job(job_id: str, message: str) -> None:
         j = JOBS.get(job_id)
         if j:
             j.update(status="error", error=message, finished_at=time.time())
+            if j.get("dim") == "plan":
+                j.setdefault("result", {})
+                j.setdefault("results", {})
+                j.setdefault("summary", {})
+                j.setdefault("partial_results", {})
+                j.setdefault("partial", True)
+
+
+def _validated_partial_result(dimension: str, exc: Exception) -> dict | None:
+    """Return only schema-valid unit results attached to an incomplete run."""
+    result = getattr(exc, "partial_result", None)
+    if not isinstance(result, dict) or not result:
+        return None
+    try:
+        validate_dimension_result(dimension, result)
+    except ResultValidationError as validation_error:
+        logger.warning("%s 部分结果结构无效（字段 %s），已丢弃", dimension, validation_error.path)
+        return None
+    return result
+
+
+def _save_partial_job_result(job_id: str, dimension: str, exc: Exception) -> None:
+    """Keep completed independent members visible when a later member fails."""
+    result = _validated_partial_result(dimension, exc)
+    if result is None:
+        return
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job and not store._is_recently_purged(job.get("chat_hash", "")):
+            job.update(result=result, partial_results=result, partial=True)
 
 
 def _job_cancelled(job_id: str) -> bool:
@@ -264,7 +307,14 @@ def _stop_requested(job_id: str) -> bool:
     return _job_cancelled(job_id) or shutdown_requested() or purge_marks.is_marked(_job_chat_hash(job_id))
 
 
-def _run_job(job_id: str, dimension: str, filepath: str, chat_hash: str, refresh: bool = False) -> None:
+def _run_job(
+    job_id: str,
+    dimension: str,
+    filepath: str,
+    chat_hash: str,
+    refresh: bool = False,
+    scope=None,
+) -> None:
     """后台线程执行分析：更新进度、支持取消、成功后写磁盘缓存"""
     dim_name = DIMENSION_NAMES.get(dimension, dimension)
     # 一次运行 = 这一个维度：把调用计数清零，让 LLM_MAX_CALLS_PER_RUN 从 0 起算。
@@ -278,7 +328,7 @@ def _run_job(job_id: str, dimension: str, filepath: str, chat_hash: str, refresh
             logger.warning("%s 中止：会话文件已被清理（%s…）", dim_name, chat_hash[:8])
             _fail_job(job_id, "会话文件已被清理（上传文件只保留 24 小时），请重新上传聊天记录")
             return
-        chat = store._load_chat_cached(filepath)
+        chat, _scope = apply_scope(store._load_chat_cached(filepath), scope)
         func = analyze_func_for(dimension)
         if func is None:
             _fail_job(job_id, f"未知维度: {dimension}")
@@ -332,10 +382,12 @@ def _run_job(job_id: str, dimension: str, filepath: str, chat_hash: str, refresh
             logger.info("%s 完成（任务 %s）", dim_name, job_id[:8])
     except ResultValidationError as e:
         logger.warning("%s 结果结构无效（字段 %s）", dim_name, e.path)
+        _save_partial_job_result(job_id, dimension, e)
         _fail_job(job_id, f"{dim_name} 结果结构无效（字段 {e.path}），请重试失败项")
     except Exception as e:
         # 洗一遍再落日志：上游/网关的错误正文里可能夹带 API Key（见 scrub_secrets）
         logger.error("%s 失败: %s", dim_name, scrub_secrets(e))
+        _save_partial_job_result(job_id, dimension, e)
         # _fail_job 的文本会经 /api/analyze-job 回给浏览器，同样先洗（用户会截图求助）
         _fail_job(job_id, f"AI 分析失败: {scrub_secrets(e)}")
     finally:
@@ -346,7 +398,7 @@ def _run_job(job_id: str, dimension: str, filepath: str, chat_hash: str, refresh
 
 
 def _run_analyze_all(
-    job_id: str, filepath: str, chat_hash: str, refresh: bool, is_group: bool = False
+    job_id: str, filepath: str, chat_hash: str, refresh: bool, is_group: bool = False, scope=None
 ) -> None:
     """一键全量分析：按维度顺序执行（维度内部已有月份级并发），
     已缓存的维度直接跳过（refresh 时强制重跑），单维度失败不阻断其余维度。
@@ -362,7 +414,7 @@ def _run_analyze_all(
             logger.warning("一键全量分析中止：会话文件已被清理（%s…）", chat_hash[:8])
             _fail_job(job_id, "会话文件已被清理（上传文件只保留 24 小时），请重新上传聊天记录")
             return
-        chat = store._load_chat_cached(filepath)
+        chat, _scope = apply_scope(store._load_chat_cached(filepath), scope)
         dims = dimensions_for_mode(is_group)
         total = len(dims)
         summary: dict[str, str] = {}
@@ -448,4 +500,395 @@ def _run_analyze_all(
         _fail_job(job_id, f"AI 分析失败: {scrub_secrets(e)}")
     finally:
         # 与 _run_job 同理：全量循环里的 return（配额/花费上限中止）也必须释放运行边界
+        end_run()
+
+
+def _plan_result_slice(dimension: str, cached: dict, selected_units: list[str]) -> dict:
+    """Select unit values from a complete dimension cache without changing it."""
+    if dimension == "recap":
+        return cached
+    if not isinstance(cached, dict):
+        return {}
+    unit_type = {
+        "habits": "person",
+        "profile": "person",
+        "member_profiles": "member",
+        "emotion": "month",
+        "topics": "month",
+        "relationship": "month",
+        "group_dynamics": "month",
+        "group_topics": "month",
+        "group_emotion": "month",
+    }.get(dimension)
+    if unit_type is None:
+        return {}
+    result = {}
+    for unit_key in selected_units:
+        parts = unit_key.split(":", 2)
+        if len(parts) != 3 or parts[0] != dimension or parts[1] != unit_type:
+            continue
+        item_key = parts[2]
+        if item_key in cached:
+            result[item_key] = cached[item_key]
+    return result
+
+
+def _run_selected_dimension(chat, dimension, unit_keys, on_progress, should_cancel, chat_hash):
+    """Execute only selected units of a dimension, using its normal unit cache path."""
+    from webapp import analysis_plan
+
+    if dimension in {"habits", "profile"}:
+        system_prompt, template, sample_size, stratified = analysis_plan._person_template(dimension)
+        result = {}
+        for index, unit_key in enumerate(unit_keys, 1):
+            if should_cancel():
+                break
+            person_key = unit_key.rsplit(":", 1)[-1]
+            messages = [
+                message
+                for message in chat.messages
+                if (message.sender_uid == chat.self_uid) == (person_key == "self")
+            ]
+            target_uids = getattr(chat, "analysis_target_uids", None)
+            if target_uids is not None:
+                if person_key == "self":
+                    messages = messages if chat.self_uid in target_uids else []
+                else:
+                    messages = [message for message in messages if message.sender_uid in target_uids]
+            if not messages:
+                raise AnalysisIncompleteError("人物画像计划已变化，请重新预览")
+            display_name = chat.self_name if person_key == "self" else chat.other_name
+            value = dc._analyze_person(
+                system_prompt,
+                sample_size,
+                messages,
+                display_name,
+                template,
+                max_tokens=dc.MAX_TOKENS_BY_DIM[dimension],
+                tag=dimension,
+                stratified=stratified,
+                chat_hash=chat_hash,
+                context_messages=chat.messages if dimension == "profile" else None,
+                speaker_name_of=(
+                    lambda message: chat.self_name if message.sender_uid == chat.self_uid else chat.other_name
+                )
+                if dimension == "profile"
+                else None,
+                scope_id=getattr(chat, "analysis_scope_id", ""),
+            )
+            if value:
+                result[person_key] = value
+            on_progress(index, len(unit_keys), display_name)
+        return result
+
+    if dimension == "member_profiles":
+        import analyzer.group_prompts as gp
+
+        members = {member.uid: member for member in gc.select_ai_members(chat)}
+        template = gc._member_prompt_template()
+        result = {}
+        used_keys = set()
+        failures = 0
+        quota_error = None
+        try:
+            for index, unit_key in enumerate(unit_keys, 1):
+                if should_cancel():
+                    break
+                uid = unit_key.rsplit(":", 1)[-1]
+                member = members.get(uid)
+                if member is None:
+                    failures += 1
+                    on_progress(index, len(unit_keys), uid)
+                    continue
+                try:
+                    value = gc._analyze_member(
+                        chat,
+                        member,
+                        gp.GROUP_SYSTEM_PROMPT_MEMBER_PROFILE,
+                        template,
+                        max_tokens=dc.MAX_TOKENS_BY_DIM[dimension],
+                        tag=dimension,
+                        chat_hash=chat_hash,
+                        used_keys=used_keys,
+                    )
+                except QuotaExhaustedError as exc:
+                    quota_error = exc
+                    break
+                except (AnalysisIncompleteError, ResultValidationError):
+                    value = None
+                if value:
+                    result[uid] = value
+                else:
+                    failures += 1
+                on_progress(index, len(unit_keys), member.name)
+        finally:
+            # Successful member files exist before the next member can fail; register
+            # them on every exit so the orphan sweep cannot discard paid work.
+            gc._record_member_usage(chat_hash, used_keys)
+        if quota_error is not None:
+            quota_error.partial_result = result
+            raise quota_error
+        if failures and not should_cancel():
+            error = AnalysisIncompleteError("成员画像分析未取得全部成员的完整结果；已完成的成员可从缓存复用")
+            error.partial_result = result
+            raise error
+        return result
+
+    if dimension == "recap":
+        return recap_client.analyze_recap(
+            chat,
+            on_progress=lambda done, total: on_progress(done, total, "整体总括"),
+            should_cancel=should_cancel,
+            chat_hash=chat_hash,
+        )
+
+    months = chat.months()
+    selected_months = {
+        key.rsplit(":", 1)[-1]: months[key.rsplit(":", 1)[-1]]
+        for key in unit_keys
+        if key.rsplit(":", 1)[-1] in months
+    }
+    if dimension in {"emotion", "topics", "relationship"}:
+        systems = {
+            "emotion": dc.SYSTEM_PROMPT_EMOTION,
+            "topics": dc.SYSTEM_PROMPT_TOPICS,
+            "relationship": dc.SYSTEM_PROMPT_RELATIONSHIP,
+        }
+        result = dc._analyze_periods(
+            selected_months,
+            systems[dimension],
+            lambda period, messages: dc._month_prompt(chat, period, messages, chat_hash),
+            max_tokens=dc.MAX_TOKENS_BY_DIM[dimension],
+            tag=dimension,
+            on_progress=lambda done, total: on_progress(done, total, "月份"),
+            should_cancel=should_cancel,
+            chat_hash=chat_hash,
+        )
+        if dimension == "topics":
+            for row in result.values():
+                dc._normalize_topic_weights(row)
+        elif dimension == "emotion":
+            for row in result.values():
+                dc._clamp_int(row, "self_intensity", 0, 10)
+                dc._clamp_int(row, "other_intensity", 0, 10)
+        else:
+            for row in result.values():
+                dc._clamp_int(row, "closeness_score", 1, 10)
+                dc._clamp_float(row, "initiator_ratio_self", 0.0, 1.0, 0.5)
+        return result
+
+    import analyzer.group_prompts as gp
+
+    systems = {
+        "group_dynamics": gp.GROUP_SYSTEM_PROMPT_DYNAMICS,
+        "group_topics": gp.GROUP_SYSTEM_PROMPT_TOPICS,
+        "group_emotion": gp.GROUP_SYSTEM_PROMPT_EMOTION,
+    }
+    result = gc._analyze_periods(
+        selected_months,
+        systems[dimension],
+        lambda period, messages: gc._group_month_prompt(chat, period, messages, chat_hash),
+        max_tokens=dc.MAX_TOKENS_BY_DIM[dimension],
+        tag=dimension,
+        on_progress=lambda done, total: on_progress(done, total, "月份"),
+        should_cancel=should_cancel,
+        chat_hash=chat_hash,
+        fingerprint=gc.group_prompt_fingerprint(),
+    )
+    if dimension == "group_topics":
+        for row in result.values():
+            dc._normalize_topic_weights(row)
+    elif dimension == "group_emotion":
+        for row in result.values():
+            dc._clamp_int(row, "group_intensity", 0, 10)
+            for item in row.get("member_emotions") or []:
+                if isinstance(item, dict):
+                    dc._clamp_int(item, "intensity", 0, 10)
+    return result
+
+
+def _run_selected_plan(job_id, filepath, chat_hash, refresh, plan, selected_units, scope=None):
+    """Plan job executor; partial dimensions never enter the complete dimension cache."""
+    begin_run()
+    try:
+        if not os.path.exists(filepath):
+            _fail_job(job_id, "会话文件已被清理（上传文件只保留 24 小时），请重新上传聊天记录")
+            return
+        chat, _scope = apply_scope(store._load_chat_cached(filepath), scope)
+        all_units = {unit["key"]: unit for unit in plan["units"]}
+        grouped = {dimension: [] for dimension in plan["dimensions"]}
+        for key in selected_units:
+            grouped[all_units[key]["dimension"]].append(key)
+        total = sum(len(keys) for keys in grouped.values())
+        summary = {}
+        results = {}
+        errors = {}
+        quota_exhausted = False
+        completed = 0
+
+        def should_cancel():
+            return _stop_requested(job_id)
+
+        for dimension in plan["dimensions"]:
+            keys = grouped[dimension]
+            if not keys:
+                summary[dimension] = "未选择"
+                continue
+            if should_cancel():
+                summary[dimension] = "cancelled"
+                continue
+            if quota_exhausted:
+                summary[dimension] = "aborted"
+                continue
+            dim_units = [
+                unit["key"]
+                for unit in plan["units"]
+                if unit["dimension"] == dimension and unit["status"] != "无可分析消息"
+            ]
+            all_selected = set(keys) == set(dim_units)
+            cache_fp = store.analysis_cache_fingerprint(dimension, chat)
+            cached = None if refresh else store._read_cache(dimension, chat_hash, fingerprint=cache_fp)
+            if cached is not None:
+                result = cached if all_selected else _plan_result_slice(dimension, cached, keys)
+                results[dimension] = result
+                summary[dimension] = "cached" if all_selected else "partial"
+                completed += len(keys)
+                with JOBS_LOCK:
+                    job = JOBS.get(job_id)
+                    if job:
+                        job.update(done=completed, detail=ALL_DIMENSION_NAMES.get(dimension, dimension))
+                continue
+
+            def on_progress(done, unit_total, detail, _base=completed, _dimension=dimension):
+                with JOBS_LOCK:
+                    job = JOBS.get(job_id)
+                    if job:
+                        job.update(
+                            done=min(total, _base + done),
+                            total=total,
+                            detail=(
+                                f"{ALL_DIMENSION_NAMES.get(_dimension, _dimension)}："
+                                f"{detail} {done}/{unit_total}"
+                            ),
+                        )
+
+            try:
+                if all_selected:
+                    func = analyze_func_for(dimension)
+
+                    def on_full_progress(done, unit_total, _dimension=dimension):
+                        on_progress(done, unit_total, _dimension)
+
+                    with content_cache_policy(refresh, should_cancel):
+                        result = func(
+                            chat,
+                            on_progress=on_full_progress,
+                            should_cancel=should_cancel,
+                            chat_hash=chat_hash,
+                        )
+                else:
+                    with content_cache_policy(refresh, should_cancel):
+                        result = _run_selected_dimension(
+                            chat, dimension, keys, on_progress, should_cancel, chat_hash
+                        )
+                if result:
+                    validate_dimension_result(dimension, result)
+                if should_cancel():
+                    summary[dimension] = "cancelled"
+                    if result:
+                        results[dimension] = result
+                elif result:
+                    if all_selected:
+                        store._write_cache(dimension, chat_hash, result, fingerprint=cache_fp)
+                        summary[dimension] = "done"
+                    else:
+                        summary[dimension] = "partial"
+                    results[dimension] = result
+                else:
+                    summary[dimension] = "empty"
+                    errors[dimension] = "未返回分析结果，请重试"
+            except QuotaExhaustedError as exc:
+                summary[dimension] = "aborted"
+                errors[dimension] = scrub_secrets(exc)
+                partial_result = _validated_partial_result(dimension, exc)
+                if partial_result is not None:
+                    results[dimension] = partial_result
+                quota_exhausted = True
+            except (AnalysisIncompleteError, ResultValidationError) as exc:
+                summary[dimension] = "error"
+                errors[dimension] = scrub_secrets(exc)
+                partial_result = _validated_partial_result(dimension, exc)
+                if partial_result is not None:
+                    results[dimension] = partial_result
+                logger.warning("计划分析 %s 未完成：%s", dimension, scrub_secrets(exc))
+            except Exception as exc:
+                summary[dimension] = "error"
+                errors[dimension] = scrub_secrets(exc)
+                logger.error("计划分析 %s 失败：%s", dimension, scrub_secrets(exc))
+            completed += len(keys)
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+                if job:
+                    job.update(done=completed, total=total)
+
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if not job:
+                return
+            # Recheck at the point the terminal result is attached. Cleanup marks
+            # before deleting files; checking before taking JOBS_LOCK leaves a race
+            # where cleanup clears/redacts this job and this thread then restores
+            # its partial results. Read the job's frozen chat identity while holding
+            # the lock, and inspect the cancel flag directly (should_cancel would
+            # acquire JOBS_LOCK again).
+            purged = purge_marks.is_marked(job.get("chat_hash", chat_hash))
+            cancelled = bool(job.get("cancel")) or shutdown_requested() or purged
+            if purged:
+                # Cache cleanup is a data deletion boundary, not a user request to
+                # keep the in-memory partial model output available to the old job.
+                results.clear()
+            failed = any(value in {"error", "aborted", "empty"} for value in summary.values())
+            partial = (
+                cancelled
+                or failed
+                or any(value in {"partial", "未选择", "cancelled"} for value in summary.values())
+            )
+            status = "cancelled" if cancelled else "error" if failed else "done"
+            error_message = None
+            if cancelled:
+                error_message = (
+                    "聊天已清理，分析结果已丢弃" if purged else "分析已取消（此前完成的结果已保留）"
+                )
+            elif errors:
+                error_message = "计划分析未完整完成：" + "；".join(
+                    f"{ALL_DIMENSION_NAMES.get(dimension, dimension)}：{message}"
+                    for dimension, message in errors.items()
+                )
+            job.update(
+                status=status,
+                result=summary if len(plan["dimensions"]) > 1 else results.get(plan["dimensions"][0], {}),
+                results=results,
+                summary=summary,
+                partial_results={
+                    key: value
+                    for key, value in results.items()
+                    if summary.get(key) in {"partial", "cancelled", "error", "aborted"}
+                },
+                partial=partial,
+                error=error_message,
+                finished_at=time.time(),
+            )
+            history = {
+                "t": job["finished_at"],
+                "dim": "plan",
+                "status": job["status"],
+                "done": job.get("done", 0),
+                "total": job.get("total", 0),
+                "chat": (chat_hash or "")[:12],
+            }
+        store.append_job_history(history)
+    except Exception as exc:
+        logger.error("计划分析失败：%s", scrub_secrets(exc))
+        _fail_job(job_id, f"AI 分析失败: {scrub_secrets(exc)}")
+    finally:
         end_run()

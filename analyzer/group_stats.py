@@ -78,6 +78,9 @@ def _matrix_top_k() -> int:
     return int(getattr(config, "GROUP_MATRIX_MEMBERS", 30) or 30)
 
 
+INTERACTION_MATRIX_CACHE_LIMIT = 3
+
+
 def _peak_window_ms() -> int:
     minutes = int(getattr(config, "GROUP_PEAK_WINDOW_MINUTES", 10) or 10)
     return max(1, minutes) * 60 * 1000
@@ -90,6 +93,9 @@ def calc_member_activity(chat: ChatData) -> list[dict]:
     avg_per_day（按记录跨度算，与总览的日均口径一致）/ share（占统计口径总条数）/
     first_day / last_day。
     """
+    if chat._member_activity_cache is not None:
+        return chat._member_activity_cache
+
     msgs, fields = _statistical(chat)
     total = len(msgs)
     span_days = chat.duration_days or 0
@@ -136,157 +142,56 @@ def calc_member_activity(chat: ChatData) -> list[dict]:
                 "last_day": entry["last"] or "",
             }
         )
+    chat._member_activity_cache = out
     return out
 
 
 def calc_interaction_matrix(chat: ChatData, top_k: Optional[int] = None) -> dict:
-    """互动矩阵：谁回应了谁。**推断的"接话"与精确的"回复/@点名"分开统计**。
+    """只在展示边界生成兼容用的密集矩阵。
 
-    三条信号的可信度完全不同，混在一起会得出似是而非的结论，所以各占一个矩阵：
-    1. directed（接话，推断）：相邻两条消息、换人、且在同一段对话内。口径是
-       is_session_start（间隔超过 SESSION_GAP_MINUTES 算新的一段）——新段的第一条不是
-       "接话"而是新话题的开口，算成回复会让所有跨时段发言都变成一次互动。
-    2. explicit_directed（回复，精确）：新版导出器的 reply 元素带被回复消息的 id，
-       回查得到发言人（实测绝大多数都能回查到发言人）。这是"真的按了回复"，比相邻推断硬。
-    3. mention_directed（@点名，精确）：at 元素带 uid（实测导出里全部带）。
-       @全体成员（atType=1）不是点名某个成员，只计入 mentions_all，绝不摊到人头上。
+    JSON 字段与方向保持不变：matrix[行][列] 表示列成员对行成员的动作。None 使用配置的
+    展示上限，正数选择对应人数，0 表示请求全员。
 
-    **三个矩阵使用同一约定**：`X[i][j]` 表示"j 对 i 的一次动作"（j 接 i 的话 /
-    j 回复 i / j 点名 i）。于是第 i 列之和 = i 对别人动作的次数，第 i 行之和 = 别人对
-    i 动作的次数——热力图的行列读法、totals 的字段都由这条约定决定，不能各写各的。
-
-    返回结构（前端热力图与力导向图直接可用）：
-    - members: [{uid, name, is_self}]，矩阵的轴（按发言量截断到 top_k；top_k=0 不截断）
-    - directed / undirected / edges：接话（推断）
-    - explicit_directed / explicit_undirected / explicit_edges：回复（精确）
-    - mention_directed / mentions_all_count：@点名（精确）
-    - totals: [{uid, replies_to, replied_by, explicit_replies_to, explicit_replied_by,
-      mentions_sent, mentions_received}]
-    - dropped / dropped_replies：因 top_k 截断而未进矩阵的成员数与互动数
-    - unknown_replies：一侧无归属（无 uid 或占位 sender）的接话次数
-    - reply_total / reply_located / reply_no_target / reply_resolved / reply_unresolved /
-      reply_unknown / reply_outside：回复信号的账目（举例：120 条回复标记 =
-      118 条可定位 + 2 条原消息已删除）；mention_total / mention_unknown / mention_outside
-      同理。任何一条没被计入的互动都是"悄悄消失的数据"，宁可单列也不让它凭空不见。
+    显式请求 0 仍会为兼容性分配多个成员数平方级数组。常规页面使用配置上限；成员画像走
+    稀疏摘要接口，不再请求全员密集矩阵。
     """
-    msgs, _fields = _statistical(chat)
-    # top_k 的三档语义（None=用配置的默认上限；0=不截断；k>0=截断到 k）：
-    # 这里绝不能写成 `top_k or _matrix_top_k()`。`or` 把 0 当成"没传"，于是
-    # 调用方显式要求"不截断"（写 top_k=0）反而拿回了默认上限——而矩阵是按发言量
-    # 截断的，落在 31 名以后的成员根本不在 totals 里。成员画像那条路
-    # （group_client._member_context）恰恰**专门**把不在前列的"我"选进去
-    # （见 select_ai_members），于是 `totals.get(uid, {})` 取到空 dict，
-    # 提示词里就写成"被精确回复 0 次、主动回复别人 0 次（事实）"——
-    # 一个标注为事实、模型被要求据此判断此人在群里的角色的数字，是编出来的。
-    # 这是本项目最贵的一个维度（每位成员一次付费调用）拿到假数据。
     limit = _matrix_top_k() if top_k is None else top_k
-    # 同一份聊天 + 同一个生效上限的结果是确定性的，而调用方会**重复**要同一份：
-    # group_client._member_context 是"每位成员一次"，每次都传 top_k=0（=不截断）。
-    # 不缓存的话，大群每分析一位成员就把 n×n 矩阵重算一遍（实测 n=3000 单次 4.4s /
-    # 376MB，成员画像最多 10 位 = 44 秒与上 GB 的反复分配）。缓存挂在 chat 对象上，
-    # 随它一起被回收（解析结果本就在 _CHAT_CACHE 里复用）。
-    # 键是**已解析的生效上限**：_matrix_top_k() 按调用时读配置，拿 top_k 当键会让
-    # "改了配置仍返回旧上限的矩阵"（有用例专门钉"读配置发生在调用时"）。
     cache = chat._matrix_cache
     if cache is None:
         cache = chat._matrix_cache = {}
     cached = cache.get(limit)
     if cached is not None:
         return cached
-    members = _members(chat)
+
+    sparse = _interaction_counts(chat)
+    members = sparse["members"]
     kept = members[:limit] if limit > 0 else members
     index = {p.uid: i for i, p in enumerate(kept)}
     n = len(kept)
     directed = [[0] * n for _ in range(n)]
     explicit = [[0] * n for _ in range(n)]
     mention = [[0] * n for _ in range(n)]
-    unknown_replies = 0
-    dropped_replies = 0
-    reply_total = reply_located = reply_no_target = 0
-    reply_resolved = reply_unresolved = reply_unknown = reply_outside = 0
-    mention_total = mention_unknown = mention_outside = 0
-    mentions_all_count = 0
 
-    prev = None
-    for m in msgs:
-        # —— 1) 接话（推断）——
-        if prev is not None and not (
-            not is_unknown_message(m) and not is_unknown_message(prev) and m.sender_uid == prev.sender_uid
-        ):
-            if not is_session_start(prev.timestamp, m.timestamp):
-                if is_unknown_message(m) or is_unknown_message(prev):
-                    unknown_replies += 1
-                else:
-                    i, j = index.get(prev.sender_uid), index.get(m.sender_uid)
-                    if i is not None and j is not None:
-                        directed[i][j] += 1
-                    else:
-                        # 至少一侧在矩阵之外（被 top_k 截断）：不硬塞进矩阵，但要记账
-                        dropped_replies += 1
-        prev = m
-
-        # —— 2) 回复（精确）——
-        # 账目必须闭合（举例：120 条回复标记 = 118 条有引用 id + 2 条原消息已删除）：
-        #   reply_total = reply_located + reply_no_target
-        #   reply_located = reply_resolved + reply_unresolved
-        #   reply_resolved = 进矩阵的 + reply_unknown + reply_outside
-        # 任何一条没被计入的回复都是"悄悄消失的数据"，宁可单列也不让它凭空不见。
-        # 判定取或：解析器在有 reply 元素时总会置 is_reply（"引用已删除"那条走的正是
-        # is_reply=True + reply_to_id 为空的分支）；反过来，若将来有调用方只填了
-        # reply_to_id 而没置 is_reply，也不该被漏掉——少算一条回复就是悄悄丢数据。
-        if m.is_reply or m.reply_to_id:
-            reply_total += 1
-            if not m.reply_to_id:
-                # 有回复标记但没有可定位的引用（原消息已删除，导出器给 null）
-                reply_no_target += 1
-            else:
-                reply_located += 1
-                if not m.reply_to_uid:
-                    # 引用的消息不在本次导出里：无法归属，如实单列
-                    reply_unresolved += 1
-                else:
-                    reply_resolved += 1
-                    if is_unknown_message(m) or is_placeholder_sender(m.reply_to_uid, ""):
-                        reply_unknown += 1
-                    else:
-                        i, j = index.get(m.reply_to_uid), index.get(m.sender_uid)
-                        if i is not None and j is not None:
-                            explicit[i][j] += 1
-                        else:
-                            reply_outside += 1
-
-        # —— 3) @点名（精确）——
-        if m.mentions_all:
-            mentions_all_count += 1
-        for target in m.mentions:
-            mention_total += 1
-            if is_placeholder_sender(target, ""):
-                mention_unknown += 1
-                continue
-            i, j = index.get(target), index.get(m.sender_uid)
+    def materialize(edges: Counter, matrix: list) -> int:
+        included = 0
+        for (target_uid, actor_uid), count in edges.items():
+            i, j = index.get(target_uid), index.get(actor_uid)
             if i is not None and j is not None:
-                mention[i][j] += 1
-            else:
-                # 点名对象在矩阵之外（被 top_k 截断）：不硬塞，但要记账
-                mention_outside += 1
+                matrix[i][j] += count
+                included += count
+        return included
+
+    directed_in_matrix = materialize(sparse["directed"], directed)
+    explicit_in_matrix = materialize(sparse["explicit"], explicit)
+    mention_in_matrix = materialize(sparse["mention"], mention)
+    dropped_replies = sum(sparse["directed"].values()) - directed_in_matrix
 
     def _symmetrize(matrix: list) -> list:
-        """把有向矩阵对称化。非对角项两边相加；**对角项保持原样**。
-
-        对角不能一起相加：explicit 的对角是可以非零的 —— 引用自己发的消息在 QQ 里
-        很常见（reply_to_uid 解析出来就是本人，见上面的 2) 分支），逐项相加会得到
-        2×自环：3 次自回复在 explicit_undirected 里报成 6 次。无向矩阵的对角按定义
-        就是"自己对自己"的次数本身，翻倍等于凭空多算一遍。
-        （directed 的对角恒为 0 —— 同一人连发在 1) 分支就被跳过 —— 所以这一改动
-        只影响精确回复矩阵，不影响既有的接话数字。）
-        """
+        """Merge opposite directions while keeping self-reply diagonal values unchanged."""
         return [[matrix[i][j] + matrix[j][i] if i != j else matrix[i][i] for j in range(n)] for i in range(n)]
 
     undirected = _symmetrize(directed)
     explicit_undirected = _symmetrize(explicit)
-    # 自回复的总量单独报出来：关系图的边只取 i<j（力导向画不出自环），
-    # 所以这几个次数不会出现在任何一条边上。不记一笔就是"悄悄消失的数据"，
-    # 而矩阵对角上又看得到它 —— 两边必须能对上账。
     self_replies = sum(explicit[i][i] for i in range(n))
 
     def _edges(matrix: list) -> list:
@@ -302,7 +207,6 @@ def calc_interaction_matrix(chat: ChatData, top_k: Optional[int] = None) -> dict
             "uid": kept[i].uid,
             "name": kept[i].name,
             "is_self": kept[i].is_self,
-            # 列和 = 我对别人动作的次数；行和 = 别人对我动作的次数
             "replies_to": sum(directed[j][i] for j in range(n)),
             "replied_by": sum(directed[i]),
             "explicit_replies_to": sum(explicit[j][i] for j in range(n)),
@@ -320,37 +224,177 @@ def calc_interaction_matrix(chat: ChatData, top_k: Optional[int] = None) -> dict
         "explicit_directed": explicit,
         "explicit_undirected": explicit_undirected,
         "explicit_edges": _edges(explicit_undirected),
-        # 自回复（引用自己的消息）：矩阵对角上看得到，但关系图的边只取 i<j，
-        # 所以单独给一个总数，别让这几次数在图上凭空消失
         "self_replies": self_replies,
         "mention_directed": mention,
-        "mentions_all_count": mentions_all_count,
+        "mentions_all_count": sparse["mentions_all_count"],
         "totals": totals,
         "truncated": len(members) > n,
         "dropped": max(0, len(members) - n),
         "dropped_replies": dropped_replies,
         "matrix_limit": limit,
+        "unknown_replies": sparse["unknown_replies"],
+        "reply_total": sparse["reply_total"],
+        "reply_located": sparse["reply_located"],
+        "reply_no_target": sparse["reply_no_target"],
+        "reply_resolved": sparse["reply_resolved"],
+        "reply_unresolved": sparse["reply_unresolved"],
+        "reply_unknown": sparse["reply_unknown"],
+        "reply_outside": max(0, sparse["reply_resolved"] - sparse["reply_unknown"] - explicit_in_matrix),
+        "mention_total": sparse["mention_total"],
+        "mention_unknown": sparse["mention_unknown"],
+        "mention_outside": max(0, sparse["mention_total"] - sparse["mention_unknown"] - mention_in_matrix),
+    }
+    # Dense outputs vary by display limit; retain only a few projections per chat object.
+    while len(cache) >= INTERACTION_MATRIX_CACHE_LIMIT:
+        cache.pop(next(iter(cache)))
+    cache[limit] = result
+    return result
+
+
+def _interaction_counts(chat: ChatData) -> dict:
+    """Build sparse interaction edges and all-member totals in one linear scan."""
+    cached = chat._interaction_sparse_cache
+    if cached is not None:
+        return cached
+
+    msgs, _fields = _statistical(chat)
+    members = _members(chat)
+    member_by_uid = {p.uid: p for p in members}
+    directed: Counter = Counter()
+    explicit: Counter = Counter()
+    mention: Counter = Counter()
+    unknown_replies = 0
+    reply_total = reply_located = reply_no_target = 0
+    reply_resolved = reply_unresolved = reply_unknown = 0
+    mention_total = mention_unknown = 0
+    mentions_all_count = 0
+
+    prev = None
+    for m in msgs:
+        # Matrix convention: key is (target, actor); the later speaker acts on the previous one.
+        if prev is not None and not (
+            not is_unknown_message(m) and not is_unknown_message(prev) and m.sender_uid == prev.sender_uid
+        ):
+            if not is_session_start(prev.timestamp, m.timestamp):
+                if is_unknown_message(m) or is_unknown_message(prev):
+                    unknown_replies += 1
+                else:
+                    directed[(prev.sender_uid, m.sender_uid)] += 1
+        prev = m
+
+        if m.is_reply or m.reply_to_id:
+            reply_total += 1
+            if not m.reply_to_id:
+                reply_no_target += 1
+            else:
+                reply_located += 1
+                if not m.reply_to_uid:
+                    reply_unresolved += 1
+                else:
+                    reply_resolved += 1
+                    if is_unknown_message(m) or is_placeholder_sender(m.reply_to_uid, ""):
+                        reply_unknown += 1
+                    else:
+                        explicit[(m.reply_to_uid, m.sender_uid)] += 1
+
+        if m.mentions_all:
+            mentions_all_count += 1
+        for target in m.mentions:
+            mention_total += 1
+            if is_placeholder_sender(target, ""):
+                mention_unknown += 1
+            else:
+                mention[(target, m.sender_uid)] += 1
+
+    totals = {
+        p.uid: {
+            "uid": p.uid,
+            "name": p.name,
+            "is_self": p.is_self,
+            "replies_to": 0,
+            "replied_by": 0,
+            "explicit_replies_to": 0,
+            "explicit_replied_by": 0,
+            "mentions_sent": 0,
+            "mentions_received": 0,
+        }
+        for p in members
+    }
+    inferred_partners: dict[str, Counter] = {uid: Counter() for uid in totals}
+    explicit_partners: dict[str, Counter] = {uid: Counter() for uid in totals}
+
+    for (target_uid, actor_uid), count in directed.items():
+        if target_uid in totals and actor_uid in totals:
+            totals[actor_uid]["replies_to"] += count
+            totals[target_uid]["replied_by"] += count
+            if target_uid != actor_uid:
+                inferred_partners[target_uid][actor_uid] += count
+                inferred_partners[actor_uid][target_uid] += count
+    for (target_uid, actor_uid), count in explicit.items():
+        if target_uid in totals and actor_uid in totals:
+            totals[actor_uid]["explicit_replies_to"] += count
+            totals[target_uid]["explicit_replied_by"] += count
+            if target_uid != actor_uid:
+                explicit_partners[target_uid][actor_uid] += count
+                explicit_partners[actor_uid][target_uid] += count
+    for (target_uid, actor_uid), count in mention.items():
+        if target_uid in totals and actor_uid in totals:
+            totals[actor_uid]["mentions_sent"] += count
+            totals[target_uid]["mentions_received"] += count
+
+    cached = {
+        "members": members,
+        "directed": directed,
+        "explicit": explicit,
+        "mention": mention,
         "unknown_replies": unknown_replies,
-        # 回复信号的覆盖率与归属情况：无法归属的部分如实单列，不猜也不丢
-        # reply_total = reply_located + reply_no_target
-        # reply_located = reply_resolved + reply_unresolved
-        # reply_resolved = （进矩阵的）+ reply_unknown + reply_outside
         "reply_total": reply_total,
         "reply_located": reply_located,
         "reply_no_target": reply_no_target,
         "reply_resolved": reply_resolved,
         "reply_unresolved": reply_unresolved,
         "reply_unknown": reply_unknown,
-        "reply_outside": reply_outside,
-        # @点名的账目同样闭合：mention_total = （进矩阵的）+ mention_unknown + mention_outside
         "mention_total": mention_total,
         "mention_unknown": mention_unknown,
-        "mention_outside": mention_outside,
+        "mentions_all_count": mentions_all_count,
+        "member_totals": totals,
+        "inferred_partners": inferred_partners,
+        "explicit_partners": explicit_partners,
+        "member_by_uid": member_by_uid,
     }
-    # 结果只读：所有调用点（成员画像、群聊统计、前端热力图）都只读它。
-    # 共享同一个 dict 是缓存的意义所在（复制一份 n×n 等于把省下的开销又花回去），
-    # 所以约定写在这里：**调用方不得就地修改返回值**。
-    cache[limit] = result
+    chat._interaction_sparse_cache = cached
+    return cached
+
+
+def calc_member_interaction_summary(chat: ChatData, uid: str) -> dict:
+    """Return one member's whole-group counts and main partners without making a matrix."""
+    sparse = _interaction_counts(chat)
+    result = dict(sparse["member_totals"].get(uid, {}))
+    if not result:
+        return {
+            "uid": uid,
+            "replies_to": 0,
+            "replied_by": 0,
+            "explicit_replies_to": 0,
+            "explicit_replied_by": 0,
+            "mentions_sent": 0,
+            "mentions_received": 0,
+            "top_explicit": [],
+            "top_inferred": [],
+        }
+
+    def top(partners: dict[str, Counter]) -> list[dict]:
+        choices = [
+            (count, sparse["member_by_uid"][partner_uid].name, partner_uid)
+            for partner_uid, count in partners.get(uid, {}).items()
+        ]
+        choices.sort(reverse=True)
+        return [
+            {"uid": partner_uid, "name": name, "count": count} for count, name, partner_uid in choices[:3]
+        ]
+
+    result["top_explicit"] = top(sparse["explicit_partners"])
+    result["top_inferred"] = top(sparse["inferred_partners"])
     return result
 
 

@@ -54,6 +54,7 @@ from analyzer.atomic_write import tmp_sibling, write_bytes_atomic, write_json_at
 from analyzer.deepseek_client import (
     analysis_cache_fingerprint as analysis_cache_fingerprint,
     fingerprint_for_dimension,
+    legacy_person_context_fingerprint,
     legacy_fingerprint_for_dimension,
     legacy_fingerprints_for_dimension,
     purge_month_cache,
@@ -460,7 +461,7 @@ def _tmp_sibling(path: str) -> str:
     return tmp_sibling(path)
 
 
-def _load_stats(chat_hash: str, expect_mode: str = STATS_MODE_PRIVATE):
+def _load_stats(chat_hash: str, expect_mode: str = STATS_MODE_PRIVATE, *, read_only: bool = False):
     """读统计缓存。expect_mode 决定接受哪一套形状：
 
     - private（默认，兼容既有调用点）：`_v == STATS_SCHEMA_VERSION` 且没有 mode 字段
@@ -486,10 +487,11 @@ def _load_stats(chat_hash: str, expect_mode: str = STATS_MODE_PRIVATE):
     want_v = GROUP_STATS_SCHEMA_VERSION if expect_mode == STATS_MODE_GROUP else STATS_SCHEMA_VERSION
     if data.get("_v") != want_v:
         return None
-    try:
-        os.utime(_stats_path(chat_hash), None)
-    except OSError:
-        pass
+    if not read_only:
+        try:
+            os.utime(_stats_path(chat_hash), None)
+        except OSError:
+            pass
     # _created 是"绝对 90 天"硬上限的依据，只给清理任务看：命中续期 mtime 之后，
     # 判定过期全靠它。摘掉再返回，调用方拿到的形状与加这个字段之前完全一致
     # （与月份缓存的读取口径相同，见 deepseek_client._read_month_cache）。
@@ -812,6 +814,12 @@ def _purge_chat_caches(chat_hash: str) -> int:
     try:
         from analyzer import vision  # 延迟导入，避免 store→vision 模块级依赖
 
+        removed += vision.purge_memo(chat_hash)
+    except Exception as e:  # 回收失败不影响主流程，但必须继续清理磁盘副本
+        logger.warning("进程内图片摘要回收失败: %s", e)
+    try:
+        from analyzer import vision  # 延迟导入，避免 store→vision 模块级依赖
+
         removed += vision.purge_session_media(chat_hash)
     except Exception as e:  # 回收失败不影响主流程
         logger.warning("图片副本回收失败: %s", e)
@@ -826,7 +834,7 @@ def _purge_chat_caches(chat_hash: str) -> int:
     return removed
 
 
-def _load_cache_file(path: str):
+def _load_cache_file(path: str, *, touch: bool = True):
     """读一个维度缓存文件（不含任何回退逻辑）：读不到返回 None"""
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -838,14 +846,21 @@ def _load_cache_file(path: str):
         data = data["result"]
     # 命中即续期：清理任务按 mtime 判断过期，只读不写会让天天用的缓存
     # 在 30 天后照样被删掉（然后重新花钱分析）
-    try:
-        os.utime(path, None)
-    except OSError:
-        pass
+    if touch:
+        try:
+            os.utime(path, None)
+        except OSError:
+            pass
     return data
 
 
-def _read_cache(dimension: str, chat_hash: str, fingerprint: "str | None" = None):
+def _read_cache(
+    dimension: str,
+    chat_hash: str,
+    fingerprint: "str | None" = None,
+    *,
+    read_only: bool = False,
+):
     """读维度缓存；当前指纹下没有时，沿"历史代指纹链"逐代找并迁移到当前键。
 
     指纹公式从"源码原文"改成 AST 归一之后，既有用户的缓存文件名仍是旧指纹。
@@ -857,7 +872,7 @@ def _read_cache(dimension: str, chat_hash: str, fingerprint: "str | None" = None
     """
     current_fp = fingerprint or fingerprint_for_dimension(dimension)
     current_path = _cache_path(dimension, chat_hash, fingerprint=current_fp)
-    data = _load_cache_file(current_path)
+    data = _load_cache_file(current_path, touch=not read_only)
     if data is not None:
         return data
     suffix = "_think" if thinking_enabled(dimension) else ""
@@ -874,17 +889,31 @@ def _read_cache(dimension: str, chat_hash: str, fingerprint: "str | None" = None
         legacy_path = os.path.join(
             AI_CACHE_DIR, f"{dimension}_{chat_hash}_{DEEPSEEK_MODEL}_{legacy_fp}{suffix}.json"
         )
-        data = _load_cache_file(legacy_path)
+        data = _load_cache_file(legacy_path, touch=not read_only)
         if data is None:
             continue
-        try:
-            os.replace(legacy_path, current_path)
-            logger.info("命中旧指纹的维度缓存并迁移到当前键: %s", dimension)
-        except OSError as e:
-            # 迁移失败不影响这次的结果（已经在 data 里了）；下次读还会再看到旧文件
-            logger.warning("维度缓存迁移失败（结果仍可用，只是留在旧文件名下）: %s", e)
+        if not read_only:
+            try:
+                os.replace(legacy_path, current_path)
+                logger.info("命中旧指纹的维度缓存并迁移到当前键: %s", dimension)
+            except OSError as e:
+                # 迁移失败不影响这次的结果（已经在 data 里了）；下次读还会再看到旧文件
+                logger.warning("维度缓存迁移失败（结果仍可用，只是留在旧文件名下）: %s", e)
         return data
     return None
+
+
+def _read_legacy_person_context_cache(dimension: str, chat_hash: str):
+    """Read an old profile result for display without treating it as a current-strategy hit."""
+    from analyzer import person_context
+
+    if not person_context.PERSON_CONTEXT_ENABLED or dimension not in person_context.CONTEXT_DIMENSIONS:
+        return None
+    return _read_cache(
+        dimension,
+        chat_hash,
+        fingerprint=legacy_person_context_fingerprint(dimension),
+    )
 
 
 def _write_cache(dimension: str, chat_hash: str, result, fingerprint: "str | None" = None) -> None:

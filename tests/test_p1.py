@@ -363,11 +363,18 @@ class TestEvidenceSources(unittest.TestCase):
         )
         self.index = index_for(self.chat, api._browse_body, api._match_browse)
 
-    def verify(self, value, dimension="emotion"):
+    def verify(self, value, dimension="emotion", person_context_enabled=None):
         with mock.patch.object(
             dc, "_call_api", side_effect=AssertionError("local checks must not call model")
         ):
-            return verify_sources(self.chat, dimension, value, self.index, api._fmt_browse_message)["entries"]
+            return verify_sources(
+                self.chat,
+                dimension,
+                value,
+                self.index,
+                api._fmt_browse_message,
+                person_context_enabled=person_context_enabled,
+            )["entries"]
 
     def test_unique_duplicate_missing_partial_and_insufficient(self):
         result = {
@@ -454,13 +461,21 @@ class TestEvidenceSources(unittest.TestCase):
         line = _message_line(self.chat.messages[-1], self.chat.self_name)
         result = {"self": {"evidence": {"quote": "原句唯一", "evidence_ids": ["0"]}}}
         with mock.patch.object(dc, "MAX_DIALOG_CHARS", len(line) + 1):
-            self.assertEqual(self.verify(result, "profile")[0]["status"], "not_found")
+            self.assertEqual(
+                self.verify(result, "profile", person_context_enabled=False)[0]["status"], "not_found"
+            )
             result["self"]["evidence"]["evidence_ids"] = [self.chat.messages[-1].id]
-            self.assertEqual(self.verify(result, "profile")[0]["status"], "unique")
+            self.assertEqual(
+                self.verify(result, "profile", person_context_enabled=False)[0]["status"], "unique"
+            )
         with mock.patch.object(dc, "MAX_DIALOG_CHARS", len(line) - len("尾部内容")):
-            self.assertEqual(self.verify(result, "profile")[0]["status"], "unique")
+            self.assertEqual(
+                self.verify(result, "profile", person_context_enabled=False)[0]["status"], "unique"
+            )
             result["self"]["evidence"]["quote"] = "尾部内容"
-            self.assertEqual(self.verify(result, "profile")[0]["status"], "not_found")
+            self.assertEqual(
+                self.verify(result, "profile", person_context_enabled=False)[0]["status"], "not_found"
+            )
 
     def test_id_outside_sample_or_recalled_input_is_not_confirmed(self):
         self.chat.messages[1].recalled = True

@@ -84,6 +84,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </div>
 </div>
 
+{% include "_period_compare.html" %}
+
 <details class="media-details mb-4">
     <summary>媒体与图片 · 图片 {{ overview.total_images }} · 文件 {{ overview.get('total_files', 0) }} · 视频 {{ overview.get('total_videos', 0) }}</summary>
     <small class="media-breakdown text-muted">
@@ -318,13 +320,19 @@ $('.btn-analyze').on('click', function() {
                 $('#aText').text('准备中…');
             }
         },
-        onDone: function(result) {
-            sessionStorage.setItem('ai_' + dim, JSON.stringify(result));
+        onDone: function(result, meta) {
+            if (meta && meta.partial) {
+                status.html('<div class="alert alert-warning mb-0">本次只处理了所选单元，未标记为完整维度结果；可重新预览并补齐。</div>');
+                btn.prop('disabled', false).text(orig);
+                return;
+            }
             status.html('<div class="alert alert-success mb-0">分析完成，正在跳转…</div>');
             setTimeout(function() { window.location.href = '/' + dim; }, 600);
         },
-        onError: function(msg) {
-            status.html('<div class="alert alert-danger mb-0">' + esc(msg) + '</div>');
+        onError: function(msg, meta) {
+            var retained = Object.keys((meta && meta.results) || {});
+            var suffix = retained.length ? '；任务响应中保留了这些维度的结果：' + retained.join('、') : '';
+            status.html('<div class="alert ' + (retained.length ? 'alert-warning' : 'alert-danger') + ' mb-0">' + esc(msg + suffix) + '</div>');
             btn.prop('disabled', false).text(orig);
         }
     };
@@ -360,17 +368,25 @@ $('#btn-analyze-all').on('click', function() {
             $('#aProg').css('width', pct + '%');
             $('#aText').text(detail ? ('维度 ' + detail) : '准备中…');
         },
-        onDone: function(summary) {
+        onDone: function(summary, meta) {
             const parts = Object.entries(summary || {}).map(function(kv) {
                 const label = {emotion:'情绪',topics:'话题',relationship:'关系',habits:'习惯',profile:'锐评'}[kv[0]] || kv[0];
                 const st = {done:'新分析', cached:'命中缓存', empty:'无结果', error:'失败', aborted:'中止'}[kv[1]] || kv[1];
                 return label + ' ' + st;
             });
+            if (meta && meta.partial) {
+                status.html('<div class="alert alert-warning mb-0">本次包含部分单元分析，未写入完整维度缓存。' + esc(parts.join(' · ')) + '</div>');
+                $('.btn-analyze').prop('disabled', false);
+                btn.prop('disabled', false).text('全量分析');
+                return;
+            }
             status.html('<div class="alert alert-success mb-0">全量完成：' + esc(parts.join(' · ')) + '，正在跳转报告…</div>');
             setTimeout(function() { window.location.href = '/report'; }, 1200);
         },
-        onError: function(msg) {
-            status.html('<div class="alert alert-danger mb-0">' + esc(msg) + '</div>');
+        onError: function(msg, meta) {
+            const retained = Object.keys((meta && meta.results) || {});
+            const suffix = retained.length ? '；任务响应中保留了这些维度的结果：' + retained.join('、') : '';
+            status.html('<div class="alert ' + (retained.length ? 'alert-warning' : 'alert-danger') + ' mb-0">' + esc(msg + suffix) + '</div>');
             $('.btn-analyze').prop('disabled', false);
             btn.prop('disabled', false).text('全量分析');
         }
@@ -531,4 +547,8 @@ renderMonthlyTrendChart('monthlyTrendChart', {{ trends.months | tojson }},
     {{ overview.self_name | tojson }}, {{ overview.other_name | tojson }});
 {% endif %}
 </script>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/period_compare.js') }}?v={{ asset_v }}"></script>
 {% endblock %}

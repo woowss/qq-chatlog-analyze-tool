@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>聊天分析分享报告</title>
+    <style>
+        :root { color-scheme: light; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: #202633; background: #fff; }
+        body { max-width: 1040px; margin: 0 auto; padding: 2rem 1.2rem; line-height: 1.6; }
+        h1 { text-align: center; margin: .5rem 0; font-size: 1.8rem; }
+        h2 { margin-top: 2rem; padding-bottom: .35rem; border-bottom: 1px solid #d8dee8; font-size: 1.2rem; }
+        .meta, .note { color: #596273; font-size: .9rem; }
+        .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .7rem; }
+        .metric, .message { border: 1px solid #d8dee8; border-radius: .5rem; padding: .8rem; }
+        .metric-label { display: block; color: #596273; font-size: .84rem; }
+        .metric-value { font-size: 1.35rem; font-weight: 650; overflow-wrap: anywhere; }
+        table { width: 100%; border-collapse: collapse; margin: .7rem 0 1rem; }
+        th, td { text-align: left; border: 1px solid #d8dee8; padding: .45rem .55rem; vertical-align: top; }
+        th { background: #f1f4f8; }
+        .bar-row { display: grid; grid-template-columns: minmax(90px, 170px) 1fr minmax(45px, auto); gap: .55rem; align-items: center; margin: .4rem 0; }
+        .bar-track { height: .65rem; background: #edf1f6; border-radius: 1rem; overflow: hidden; }
+        .bar { height: 100%; background: #5276ca; border-radius: inherit; }
+        .muted { color: #667085; }
+        .matrix-wrap { overflow-x: auto; }
+        .matrix { min-width: max-content; font-size: .78rem; }
+        .matrix th, .matrix td { min-width: 2.8rem; padding: .3rem; text-align: center; }
+        .matrix .row-label { min-width: 7rem; text-align: left; }
+        .messages { display: grid; gap: .55rem; }
+        .message-head { color: #596273; font-size: .82rem; margin-bottom: .25rem; }
+        .message-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+        @media print { body { max-width: none; padding: 0; } h2 { break-after: avoid; } .metric, .message, tr { break-inside: avoid; } }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>聊天分析分享报告</h1>
+        <p class="meta">{{ report.period_label }} · {{ '群聊本地统计' if report.group else '私聊本地统计' }}</p>
+    </header>
+
+    {% if report.hide_statistics %}
+    <section>
+        <h2>统计概览</h2>
+        <p class="note">统计数字、图表、表格与互动矩阵已隐藏。</p>
+    </section>
+    {% else %}
+    <section>
+        <h2>统计概览</h2>
+        <div class="metrics">
+            {% for metric in report.metrics %}
+            <div class="metric"><span class="metric-label">{{ metric.label }}</span><span class="metric-value">{{ metric.value }}</span></div>
+            {% endfor %}
+        </div>
+    </section>
+
+    {% if report.activity %}
+    <section>
+        <h2>{{ report.activity_granularity }}消息量</h2>
+        {% for item in report.activity %}
+        <div class="bar-row"><span>{{ item.label }}</span><div class="bar-track"><div class="bar" style="width: {{ item.width }}%"></div></div><span>{{ item.count }}</span></div>
+        {% endfor %}
+    </section>
+    {% endif %}
+
+    {% if report.hourly %}
+    <section>
+        <h2>活跃时段</h2>
+        {% for item in report.hourly %}
+        {% if item.count %}<div class="bar-row"><span>{{ item.label }}</span><div class="bar-track"><div class="bar" style="width: {{ item.width }}%"></div></div><span>{{ item.count }}</span></div>{% endif %}
+        {% endfor %}
+    </section>
+    {% endif %}
+
+    {% if report.group and report.members %}
+    <section>
+        <h2>成员发言统计</h2>
+        <div class="matrix-wrap"><table>
+            <thead><tr><th>成员</th><th>发言</th><th>占比</th><th>平均字数</th><th>活跃天数</th></tr></thead>
+            <tbody>{% for member in report.members %}<tr><td>{{ member.name }}</td><td>{{ member.messages }}</td><td>{{ member.share }}%</td><td>{{ member.avg_chars }}</td><td>{{ member.active_days }}</td></tr>{% endfor %}</tbody>
+        </table></div>
+    </section>
+    {% endif %}
+
+    {% if report.group and report.interaction_names and report.interaction_matrix %}
+    <section>
+        <h2>接话矩阵</h2>
+        <p class="note">纵向为先说话的成员，横向为接话成员；矩阵按当前报告统计范围生成。</p>
+        <div class="matrix-wrap"><table class="matrix">
+            <thead><tr><th class="row-label">先说 / 接话</th>{% for name in report.interaction_names %}<th>{{ name }}</th>{% endfor %}</tr></thead>
+            <tbody>{% for row in report.interaction_matrix %}<tr><th class="row-label">{{ report.interaction_names[loop.index0] }}</th>{% for value in row %}<td>{{ value }}</td>{% endfor %}</tr>{% endfor %}</tbody>
+        </table></div>
+        {% if report.interaction_truncated %}<p class="note">互动矩阵沿用报告的成员展示上限。</p>{% endif %}
+    </section>
+    {% endif %}
+
+    {% if report.group and report.explicit_edges %}
+    <section>
+        <h2>明确回复与 @ 关系</h2>
+        <table><thead><tr><th>成员</th><th>互动对象</th><th>次数</th></tr></thead>
+            <tbody>{% for edge in report.explicit_edges %}<tr><td>{{ edge.from }}</td><td>{{ edge.to }}</td><td>{{ edge.count }}</td></tr>{% endfor %}</tbody>
+        </table>
+    </section>
+    {% endif %}
+    {% endif %}
+
+    {% if report.include_original_text %}
+    <section>
+        <h2>原始消息摘录</h2>
+        <div class="messages">
+            {% for message in report.original_messages %}
+            <div class="message"><div class="message-head">{{ message.time }} · {{ message.sender }}</div><div class="message-text">{{ message.text }}</div></div>
+            {% else %}<p class="note">没有可显示的原文摘录。</p>{% endfor %}
+        </div>
+    </section>
+    {% endif %}
+
+    <footer class="note">
+        <p>本副本由用户选择的字段生成。AI 自由文本、成员画像段落、证据引用、词频词项和表情名称未包含。</p>
+    </footer>
+</body>
+</html>

@@ -208,7 +208,11 @@ def _manifest_path(chat_hash: str) -> str:
 
 
 def _read_month_cache(
-    key: str, expect_thinking: "Optional[bool]" = None, chat_hash: str = ""
+    key: str,
+    expect_thinking: "Optional[bool]" = None,
+    chat_hash: str = "",
+    *,
+    read_only: bool = False,
 ) -> Optional[dict]:
     """读月份缓存。expect_thinking 不是 None 时，思考模式对不上的那份算未命中。
 
@@ -221,7 +225,7 @@ def _read_month_cache(
     首次切换模式会重算一次——没有补标记这一步的话，无标记文件会被任何模式永久放行，
     "切换后不再串模式"就只对升级后新写的文件成立。
     """
-    if not _MONTH_CACHE_DIR or refreshing():
+    if not _MONTH_CACHE_DIR or (refreshing() and not read_only):
         return None
     path = month_cache_path(key)
     if not path:  # 非法 key：month_cache_path 拒绝拼路径，这里如实当"没有缓存"
@@ -240,11 +244,12 @@ def _read_month_cache(
         # 口径不一致：当成没有缓存，让调用方重新发一次请求（结果会带标记落盘）
         logger.info("月份缓存是另一种思考模式算出来的，本轮重新分析: %s", key[:12])
         return None
-    try:
-        os.utime(path, None)  # 命中即续期，避免常用缓存被 30 天 TTL 回收
-    except OSError:
-        pass
-    if expect_thinking is not None and stamped is None:
+    if not read_only:
+        try:
+            os.utime(path, None)  # 命中即续期，避免常用缓存被 30 天 TTL 回收
+        except OSError:
+            pass
+    if not read_only and expect_thinking is not None and stamped is None:
         _restamp_month_cache(path, data, bool(expect_thinking), created, chat_hash)
     # 汇总时仍需区分旧缓存与新模型结果，否则更严格的必填字段会让旧缓存永远卡住重试。
     return CachedModelResult(data)

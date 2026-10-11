@@ -124,6 +124,14 @@ class TestMemberActivity(unittest.TestCase):
         names = [a["name"] for a in gs.calc_member_activity(chat)]
         self.assertEqual(sorted(names), ["小明#uA", "小明#uB"])
 
+    def test_repeated_member_activity_reads_reuse_the_parsed_chat_cache(self):
+        chat = self._chat()
+        with mock.patch.object(gs, "_statistical", wraps=gs._statistical) as statistical:
+            first = gs.calc_member_activity(chat)
+            second = gs.calc_member_activity(chat)
+        self.assertIs(first, second)
+        statistical.assert_called_once_with(chat)
+
 
 class TestInteractionMatrix(unittest.TestCase):
     """互动矩阵：谁接了谁的话（口径必须与 SESSION_GAP_MINUTES 一致）"""
@@ -234,6 +242,45 @@ class TestInteractionMatrix(unittest.TestCase):
         self.assertEqual(gs.calc_interaction_matrix(chat)["matrix_limit"], config.GROUP_MATRIX_MEMBERS)
         with mock.patch.object(config, "GROUP_MATRIX_MEMBERS", 3):
             self.assertEqual(gs.calc_interaction_matrix(chat)["matrix_limit"], 3)
+
+    def test_sparse_member_summary_preserves_reply_mention_and_self_counts(self):
+        first = _msg("uA", "我", 0)
+        reply = _msg("uB", "小明", 1)
+        reply.is_reply = True
+        reply.reply_to_id = first.id
+        reply.reply_to_uid = "uA"
+        reply.mentions = ["uA"]
+        reply.mentions_all = True
+        self_reply = _msg("uA", "我", 2)
+        self_reply.is_reply = True
+        self_reply.reply_to_id = first.id
+        self_reply.reply_to_uid = "uA"
+        chat = _group([first, reply, self_reply])
+
+        summary = gs.calc_member_interaction_summary(chat, "uA")
+
+        self.assertEqual(summary["replies_to"], 1)
+        self.assertEqual(summary["replied_by"], 1)
+        self.assertEqual(summary["explicit_replies_to"], 1)
+        self.assertEqual(summary["explicit_replied_by"], 2)
+        self.assertEqual(summary["mentions_received"], 1)
+        self.assertEqual(summary["top_explicit"][0]["uid"], "uB")
+        self.assertIsNone(chat._matrix_cache, "画像摘要不能生成全员密集矩阵")
+
+        matrix = gs.calc_interaction_matrix(chat, top_k=0)
+        self.assertEqual(matrix["self_replies"], 1)
+        self.assertEqual(matrix["mentions_all_count"], 1)
+
+    def test_large_member_summary_keeps_only_sparse_edges(self):
+        chat = _group([_msg(f"u{i}", f"成员{i}", i) for i in range(500)])
+
+        summary = gs.calc_member_interaction_summary(chat, "u250")
+
+        self.assertEqual(summary["replies_to"], 1)
+        self.assertEqual(summary["replied_by"], 1)
+        self.assertIsNone(chat._matrix_cache)
+        self.assertEqual(len(chat._interaction_sparse_cache["directed"]), 499)
+        self.assertEqual(sum(chat._interaction_sparse_cache["directed"].values()), 499)
 
 
 class TestMemberHourlyAndOverview(unittest.TestCase):

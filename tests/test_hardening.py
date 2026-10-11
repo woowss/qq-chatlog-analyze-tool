@@ -216,7 +216,9 @@ class TestCancelActuallyStops(unittest.TestCase):
 
         calls = []
         with (
-            mock.patch.object(dc, "_call_api", side_effect=lambda *a, **kw: calls.append(1) or {"x": 1}),
+            mock.patch.object(
+                dc, "_call_api", side_effect=lambda *a, **kw: calls.append(1) or valid_emotion()
+            ),
             mock.patch.object(dc, "CALL_MIN_INTERVAL", 0.0),
         ):
             res = dc._analyze_periods(
@@ -286,8 +288,11 @@ class TestJobOverlapGuard(unittest.TestCase):
         return {"Origin": "http://localhost:5000", "X-CSRF-Token": self.token}
 
     def _fake_running_job(self, dim):
+        from webapp.analysis_scope import scope_identity
+
         with self.client.session_transaction() as sess:
             sid, chash = sess.sid, sess.get("chat_hash")
+            identity = scope_identity(sess.get("analysis_scope"))
         with jobsmod.JOBS_LOCK:
             jobsmod.JOBS["testjob"] = {
                 "status": "running",
@@ -297,6 +302,7 @@ class TestJobOverlapGuard(unittest.TestCase):
                 "cancel": False,
                 "chat_hash": chash,
                 "sid": sid,
+                "identity": identity,
                 "created": time.time(),
             }
 

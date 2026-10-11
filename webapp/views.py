@@ -18,6 +18,7 @@
 
 import os
 import uuid
+from datetime import date
 
 from flask import flash, jsonify, redirect, render_template, request, send_file, session, url_for
 
@@ -30,6 +31,78 @@ from webapp.security import BYPASS_ENDPOINTS, _guard_post, wants_json
 from web import ASSET_VERSION
 
 logger = get_logger("app")
+
+
+def _analysis_page_identity():
+    """Return a trustworthy identity for this rendered document without parsing chat data."""
+    chat_hash = session.get("chat_hash")
+    if not isinstance(chat_hash, str) or not chat_hash:
+        return None
+    scope = session.get("analysis_scope", {})
+    if scope is None:  # normalize_scope(None, chat) is the valid full-chat scope.
+        scope = {}
+    if not isinstance(scope, dict):
+        return None
+    expected = {"date_from", "date_to", "target_uids", "allowed_uids", "message_positions"}
+    if set(scope) - expected:
+        return None
+    # Older signed sessions may contain a sparse but otherwise canonical scope.
+    # Fill fields the API normalizer always supplies, without opening/reparsing the chat.
+    canonical_scope = {
+        "date_from": scope.get("date_from", ""),
+        "date_to": scope.get("date_to", ""),
+        "target_uids": scope.get("target_uids"),
+        "allowed_uids": scope.get("allowed_uids"),
+        "message_positions": scope.get("message_positions"),
+    }
+    date_from, date_to = canonical_scope["date_from"], canonical_scope["date_to"]
+    if date_from is None:
+        date_from = canonical_scope["date_from"] = ""
+    if date_to is None:
+        date_to = canonical_scope["date_to"] = ""
+    if not isinstance(date_from, str) or not isinstance(date_to, str):
+        return None
+    try:
+        parsed_from = date.fromisoformat(date_from) if date_from else None
+        parsed_to = date.fromisoformat(date_to) if date_to else None
+    except ValueError:
+        return None
+    if (parsed_from and parsed_from.isoformat() != date_from) or (
+        parsed_to and parsed_to.isoformat() != date_to
+    ):
+        return None
+    if parsed_from and parsed_to and parsed_from > parsed_to:
+        return None
+    for field in ("target_uids", "allowed_uids"):
+        values = canonical_scope[field]
+        if values is not None and (
+            not isinstance(values, list)
+            or not values
+            or any(not isinstance(value, str) or not value for value in values)
+            or values != sorted(set(values))
+        ):
+            return None
+    positions = canonical_scope["message_positions"]
+    if positions is not None and (
+        not isinstance(positions, list)
+        or not positions
+        or any(type(position) is not int or position < 0 for position in positions)
+        or positions != sorted(set(positions))
+    ):
+        return None
+    if not any(
+        (
+            date_from,
+            date_to,
+            canonical_scope["target_uids"],
+            canonical_scope["allowed_uids"],
+            canonical_scope["message_positions"],
+        )
+    ):
+        canonical_scope = {}
+    from webapp.analysis_scope import scope_identity
+
+    return {"chat_hash": chat_hash, "scope_id": scope_identity(canonical_scope)}
 
 
 def log_request():
@@ -82,6 +155,7 @@ def inject_stats_flag():
     # is_group_chat：导航栏按模式切换文案与链接。取自 session（上传时写好的解析口径），
     # 不在这里重新解析文件——那意味着每个请求都要把几十 MB 的导出再读一遍。
     is_group = session.get("chat_mode") == "group"
+    analysis_page_identity = _analysis_page_identity()
     if "overview" in session:  # 兼容旧会话
         return {
             "overview": session["overview"],
@@ -89,12 +163,14 @@ def inject_stats_flag():
             "api_ok": is_api_configured(),
             "asset_v": ASSET_VERSION,
             "is_group_chat": is_group,
+            "analysis_page_identity": analysis_page_identity,
         }
     return {
         "has_stats": bool(session.get("chat_hash")),
         "api_ok": is_api_configured(),
         "asset_v": ASSET_VERSION,
         "is_group_chat": is_group,
+        "analysis_page_identity": analysis_page_identity,
     }
 
 
@@ -237,6 +313,8 @@ def upload():
     session["other_name"] = chat.other_name
     session["filepath"] = filepath
     session["chat_hash"] = new_hash
+    # Message IDs and date/member choices belong to the uploaded chat identity.
+    session.pop("analysis_scope", None)
     session["total_messages"] = len(chat.messages)
     # 本次解析用的口径（private/group/two_party）：页面与统计缓存都靠它判断走哪条轨，
     # 不能在请求里重新判定——那意味着每个请求都重新解析一次大文件。
@@ -517,6 +595,13 @@ def report():
     return _render_by_mode("group_report.html", "report.html", _private)
 
 
+def report_share_builder():
+    """Show the independent share-copy editor; the source report stays available."""
+    if not session.get("chat_hash"):
+        return redirect(url_for("index"))
+    return render_template("share_report_builder.html")
+
+
 def face_image(key: str):
     """提供缓存里的表情原图（键是受控格式，路径穿越无从谈起）"""
     from analyzer import face_images
@@ -565,5 +650,6 @@ def register(app):
     app.add_url_rule("/topics", "topics", topics)
     app.add_url_rule("/profile", "profile", profile)
     app.add_url_rule("/report", "report", report)
+    app.add_url_rule("/report/share", "report_share", report_share_builder)
     app.add_url_rule("/face/<key>", "face_image", face_image)
     app.add_url_rule("/health", "health", health)

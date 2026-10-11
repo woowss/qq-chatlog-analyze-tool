@@ -1,0 +1,305 @@
+{
+  "dataset_id": "qqchatlog-analysis-benchmark",
+  "dataset_version": "1.0.0",
+  "description": "完全编造的中文聊天场景，仅用于离线分析质量评测。",
+  "categories": [
+    "identity_attribution",
+    "irony",
+    "early_reference",
+    "conflict_reconciliation",
+    "insufficient_evidence",
+    "time_change",
+    "cross_talk",
+    "low_frequency_member"
+  ],
+  "scenarios": [
+    {
+      "id": "identity-01",
+      "category": "identity_attribution",
+      "messages": [
+        {"id": "i01-m1", "time": "2025-01-03T09:00:00+08:00", "speaker": "青禾", "text": "今天的海报我先排了标题。"},
+        {"id": "i01-m2", "time": "2025-01-03T09:01:00+08:00", "speaker": "闻溪", "text": "配色部分是我改的，文件在共享盘。"},
+        {"id": "i01-m3", "time": "2025-01-03T09:02:00+08:00", "speaker": "青禾", "text": "收到，我把两块合起来。"}
+      ],
+      "facts": [{"id": "i01-f1", "statement": "青禾负责标题和合并，闻溪修改了配色。", "evidence_ids": ["i01-m1", "i01-m2", "i01-m3"]}],
+      "acceptable_interpretations": ["两人分工协作完成海报。"],
+      "rejected_overclaims": ["闻溪负责了整张海报。", "青禾不愿意让别人参与。"]
+    },
+    {
+      "id": "identity-02",
+      "category": "identity_attribution",
+      "messages": [
+        {"id": "i02-m1", "time": "2025-02-10T18:20:00+08:00", "speaker": "南乔", "text": "我把路线图发给大家了。"},
+        {"id": "i02-m2", "time": "2025-02-10T18:21:00+08:00", "speaker": "知遥", "text": "看到了，第三站的时间我补上。"},
+        {"id": "i02-m3", "time": "2025-02-10T18:22:00+08:00", "speaker": "南乔", "text": "好，其他安排先不动。"}
+      ],
+      "facts": [{"id": "i02-f1", "statement": "南乔发了路线图，知遥提出补充第三站时间。", "evidence_ids": ["i02-m1", "i02-m2"]}],
+      "acceptable_interpretations": ["路线安排仍在协作完善。"],
+      "rejected_overclaims": ["知遥已经改动了所有行程。", "南乔否决了知遥的意见。"]
+    },
+    {
+      "id": "identity-03",
+      "category": "identity_attribution",
+      "messages": [
+        {"id": "i03-m1", "time": "2025-03-08T11:00:00+08:00", "speaker": "予安", "text": "我今天可以带转换头。"},
+        {"id": "i03-m2", "time": "2025-03-08T11:01:00+08:00", "speaker": "小满", "text": "那我带延长线。"},
+        {"id": "i03-m3", "time": "2025-03-08T11:02:00+08:00", "speaker": "予安", "text": "记下了，别和投影线混在一起。"}
+      ],
+      "facts": [{"id": "i03-f1", "statement": "予安说带转换头，小满说带延长线。", "evidence_ids": ["i03-m1", "i03-m2"]}],
+      "acceptable_interpretations": ["两人正在分配活动用品。"],
+      "rejected_overclaims": ["小满已经带来了延长线。", "予安负责活动全部设备。"]
+    },
+    {
+      "id": "irony-01",
+      "category": "irony",
+      "messages": [
+        {"id": "ir01-m1", "time": "2025-01-14T22:00:00+08:00", "speaker": "闻溪", "text": "构建又卡在同一个地方。"},
+        {"id": "ir01-m2", "time": "2025-01-14T22:01:00+08:00", "speaker": "青禾", "text": "它可真会挑时间，专等我准备下班。"},
+        {"id": "ir01-m3", "time": "2025-01-14T22:02:00+08:00", "speaker": "闻溪", "text": "我看了日志，是依赖版本没对上。"}
+      ],
+      "facts": [{"id": "ir01-f1", "statement": "构建失败与依赖版本不一致有关。", "evidence_ids": ["ir01-m1", "ir01-m3"]}],
+      "acceptable_interpretations": ["青禾用反讽表达对构建失败时机的不满。"],
+      "rejected_overclaims": ["青禾真的认为构建系统有主观意图。", "青禾因这件事讨厌闻溪。"]
+    },
+    {
+      "id": "irony-02",
+      "category": "irony",
+      "messages": [
+        {"id": "ir02-m1", "time": "2025-02-02T13:00:00+08:00", "speaker": "知遥", "text": "雨下得比预报还大，球场取消了。"},
+        {"id": "ir02-m2", "time": "2025-02-02T13:01:00+08:00", "speaker": "南乔", "text": "这天气真是太适合户外运动了。"},
+        {"id": "ir02-m3", "time": "2025-02-02T13:03:00+08:00", "speaker": "知遥", "text": "我们改成室内桌游吧。"}
+      ],
+      "facts": [{"id": "ir02-f1", "statement": "因为大雨，球场活动取消并改提室内桌游。", "evidence_ids": ["ir02-m1", "ir02-m3"]}],
+      "acceptable_interpretations": ["南乔是在反讽天气并非真的适合户外运动。"],
+      "rejected_overclaims": ["南乔喜欢雨天运动。", "南乔责怪知遥选错了场地。"]
+    },
+    {
+      "id": "irony-03",
+      "category": "irony",
+      "messages": [
+        {"id": "ir03-m1", "time": "2025-03-12T16:40:00+08:00", "speaker": "小满", "text": "我把表格公式拖错了一列，已经修好了。"},
+        {"id": "ir03-m2", "time": "2025-03-12T16:41:00+08:00", "speaker": "予安", "text": "完美，公式终于学会了跨栏旅行。"},
+        {"id": "ir03-m3", "time": "2025-03-12T16:42:00+08:00", "speaker": "小满", "text": "哈哈，这回我给列名加粗提醒自己。"}
+      ],
+      "facts": [{"id": "ir03-f1", "statement": "小满修复了拖错列的公式，并打算加粗列名提醒自己。", "evidence_ids": ["ir03-m1", "ir03-m3"]}],
+      "acceptable_interpretations": ["予安以轻松玩笑回应小满的失误。"],
+      "rejected_overclaims": ["予安严厉批评了小满。", "小满反复犯了同一种错误。"]
+    },
+    {
+      "id": "reference-01",
+      "category": "early_reference",
+      "messages": [
+        {"id": "er01-m1", "time": "2025-01-05T08:00:00+08:00", "speaker": "青禾", "text": "下周演示用蓝色封面，文件名先叫晨雾。"},
+        {"id": "er01-m2", "time": "2025-01-05T08:05:00+08:00", "speaker": "闻溪", "text": "目录我整理好了。"},
+        {"id": "er01-m3", "time": "2025-01-08T10:00:00+08:00", "speaker": "青禾", "text": "晨雾那份我今晚再检查一遍。"}
+      ],
+      "facts": [{"id": "er01-f1", "statement": "晨雾是蓝色封面的演示文件名。", "evidence_ids": ["er01-m1", "er01-m3"]}],
+      "acceptable_interpretations": ["青禾计划再次检查演示文件。"],
+      "rejected_overclaims": ["晨雾是一个人的昵称。", "闻溪负责制作演示封面。"]
+    },
+    {
+      "id": "reference-02",
+      "category": "early_reference",
+      "messages": [
+        {"id": "er02-m1", "time": "2025-02-01T19:10:00+08:00", "speaker": "南乔", "text": "我把旧收据放进白色文件夹了。"},
+        {"id": "er02-m2", "time": "2025-02-02T09:00:00+08:00", "speaker": "知遥", "text": "找到了，谢谢。"},
+        {"id": "er02-m3", "time": "2025-02-07T14:20:00+08:00", "speaker": "南乔", "text": "白夹子里还留着那张复印件。"}
+      ],
+      "facts": [{"id": "er02-f1", "statement": "白色文件夹里有一张收据复印件。", "evidence_ids": ["er02-m1", "er02-m3"]}],
+      "acceptable_interpretations": ["南乔在说明复印件仍保存在文件夹中。"],
+      "rejected_overclaims": ["知遥已经报销了收据。", "文件夹里有全部原始票据。"]
+    },
+    {
+      "id": "reference-03",
+      "category": "early_reference",
+      "messages": [
+        {"id": "er03-m1", "time": "2025-03-02T12:00:00+08:00", "speaker": "予安", "text": "第二版地图把桥边入口标成了北门。"},
+        {"id": "er03-m2", "time": "2025-03-02T12:10:00+08:00", "speaker": "小满", "text": "我稍后核对现场牌子。"},
+        {"id": "er03-m3", "time": "2025-03-04T18:30:00+08:00", "speaker": "小满", "text": "那边牌子写的是西门，我把地图备注补上了。"}
+      ],
+      "facts": [{"id": "er03-f1", "statement": "现场牌子写西门，地图备注已补充这一点。", "evidence_ids": ["er03-m1", "er03-m3"]}],
+      "acceptable_interpretations": ["地图标注与现场牌子存在差异，后来添加了备注。"],
+      "rejected_overclaims": ["小满已经重绘了整张地图。", "北门和西门是同一个入口。"]
+    },
+    {
+      "id": "repair-01",
+      "category": "conflict_reconciliation",
+      "messages": [
+        {"id": "cr01-m1", "time": "2025-01-20T15:00:00+08:00", "speaker": "闻溪", "text": "你没确认就改了排期，我有点被动。"},
+        {"id": "cr01-m2", "time": "2025-01-20T15:03:00+08:00", "speaker": "青禾", "text": "抱歉，我应该先问你。我们把周五的版本改回去。"},
+        {"id": "cr01-m3", "time": "2025-01-20T15:10:00+08:00", "speaker": "闻溪", "text": "好，我一起更新文档。"}
+      ],
+      "facts": [{"id": "cr01-f1", "statement": "闻溪表达了被动感，青禾道歉并提议恢复周五版本，闻溪同意一起更新。", "evidence_ids": ["cr01-m1", "cr01-m2", "cr01-m3"]}],
+      "acceptable_interpretations": ["两人通过道歉和共同修改来处理分歧。"],
+      "rejected_overclaims": ["两人彻底解决了所有合作问题。", "闻溪已经原谅青禾。"]
+    },
+    {
+      "id": "repair-02",
+      "category": "conflict_reconciliation",
+      "messages": [
+        {"id": "cr02-m1", "time": "2025-02-16T20:00:00+08:00", "speaker": "知遥", "text": "刚才那句听起来像是在否定我的安排。"},
+        {"id": "cr02-m2", "time": "2025-02-16T20:04:00+08:00", "speaker": "南乔", "text": "我是在担心预算，不是说你的安排不行。表达得太急了。"},
+        {"id": "cr02-m3", "time": "2025-02-16T20:07:00+08:00", "speaker": "知遥", "text": "明白，我们把预算上限写清楚再决定。"}
+      ],
+      "facts": [{"id": "cr02-f1", "statement": "南乔说明担忧的是预算，并承认表达急；知遥提出先写清预算上限。", "evidence_ids": ["cr02-m2", "cr02-m3"]}],
+      "acceptable_interpretations": ["误解得到澄清，接下来准备按预算条件讨论。"],
+      "rejected_overclaims": ["知遥完全没有不满。", "两人已经决定采用某个具体方案。"]
+    },
+    {
+      "id": "repair-03",
+      "category": "conflict_reconciliation",
+      "messages": [
+        {"id": "cr03-m1", "time": "2025-03-10T09:30:00+08:00", "speaker": "小满", "text": "分工表里我的名字被漏掉了。"},
+        {"id": "cr03-m2", "time": "2025-03-10T09:34:00+08:00", "speaker": "予安", "text": "抱歉，是我整理时漏看了。已经补上你负责的校对。"},
+        {"id": "cr03-m3", "time": "2025-03-10T09:36:00+08:00", "speaker": "小满", "text": "看到了，感谢修正。"}
+      ],
+      "facts": [{"id": "cr03-f1", "statement": "予安承认遗漏并补上小满负责的校对，小满确认看到了。", "evidence_ids": ["cr03-m1", "cr03-m2", "cr03-m3"]}],
+      "acceptable_interpretations": ["遗漏已在分工表中修正。"],
+      "rejected_overclaims": ["予安故意排除小满。", "小满负责了整个项目的校对。"]
+    },
+    {
+      "id": "uncertain-01",
+      "category": "insufficient_evidence",
+      "messages": [
+        {"id": "ue01-m1", "time": "2025-01-11T08:00:00+08:00", "speaker": "青禾", "text": "嗯。"},
+        {"id": "ue01-m2", "time": "2025-01-11T08:10:00+08:00", "speaker": "闻溪", "text": "我先去开会。"}
+      ],
+      "facts": [{"id": "ue01-f1", "statement": "现有片段不足以判断青禾的情绪或态度。", "evidence_ids": ["ue01-m1", "ue01-m2"]}],
+      "acceptable_interpretations": ["青禾回复简短，但原因未知。", "证据不足以推断双方关系变化。"],
+      "rejected_overclaims": ["青禾生气了。", "青禾故意冷落闻溪。"]
+    },
+    {
+      "id": "uncertain-02",
+      "category": "insufficient_evidence",
+      "messages": [
+        {"id": "ue02-m1", "time": "2025-02-18T17:20:00+08:00", "speaker": "南乔", "text": "周末有空吗？"},
+        {"id": "ue02-m2", "time": "2025-02-18T17:22:00+08:00", "speaker": "知遥", "text": "还不确定。"}
+      ],
+      "facts": [{"id": "ue02-f1", "statement": "知遥尚未确认周末是否有空。", "evidence_ids": ["ue02-m1", "ue02-m2"]}],
+      "acceptable_interpretations": ["周末安排尚未确定。"],
+      "rejected_overclaims": ["知遥拒绝了邀约。", "两人已经约好周末见面。"]
+    },
+    {
+      "id": "uncertain-03",
+      "category": "insufficient_evidence",
+      "messages": [
+        {"id": "ue03-m1", "time": "2025-03-21T10:00:00+08:00", "speaker": "予安", "text": "那个版本不太一样。"},
+        {"id": "ue03-m2", "time": "2025-03-21T10:02:00+08:00", "speaker": "小满", "text": "我晚点看看。"}
+      ],
+      "facts": [{"id": "ue03-f1", "statement": "对话没有说明哪个版本、差异内容或后续结论。", "evidence_ids": ["ue03-m1", "ue03-m2"]}],
+      "acceptable_interpretations": ["双方提到一个尚未核查的版本差异。"],
+      "rejected_overclaims": ["新版本包含严重错误。", "小满答应修复该版本。"]
+    },
+    {
+      "id": "change-01",
+      "category": "time_change",
+      "messages": [
+        {"id": "tc01-m1", "time": "2025-01-04T09:00:00+08:00", "speaker": "闻溪", "text": "我先按旧表整理，不动原文件。"},
+        {"id": "tc01-m2", "time": "2025-02-04T09:00:00+08:00", "speaker": "闻溪", "text": "这次我直接在副本上改完了，旧表保留着。"},
+        {"id": "tc01-m3", "time": "2025-02-04T09:05:00+08:00", "speaker": "青禾", "text": "这样就方便对照了。"}
+      ],
+      "facts": [{"id": "tc01-f1", "statement": "闻溪一月表示不改原文件，二月改为编辑副本并保留旧表。", "evidence_ids": ["tc01-m1", "tc01-m2"]}],
+      "acceptable_interpretations": ["处理文件的方式在两段时间之间发生了变化。"],
+      "rejected_overclaims": ["闻溪从一开始就习惯直接改文件。", "旧表已经被删除。"]
+    },
+    {
+      "id": "change-02",
+      "category": "time_change",
+      "messages": [
+        {"id": "tc02-m1", "time": "2025-01-07T21:00:00+08:00", "speaker": "南乔", "text": "这周我都自己做晚饭。"},
+        {"id": "tc02-m2", "time": "2025-02-07T21:00:00+08:00", "speaker": "南乔", "text": "最近三天都和室友轮流做饭。"},
+        {"id": "tc02-m3", "time": "2025-02-07T21:02:00+08:00", "speaker": "知遥", "text": "轮着来应该省点时间。"}
+      ],
+      "facts": [{"id": "tc02-f1", "statement": "南乔一月说自己做晚饭，二月说最近与室友轮流做饭。", "evidence_ids": ["tc02-m1", "tc02-m2"]}],
+      "acceptable_interpretations": ["做晚饭的安排在二月发生了变化。"],
+      "rejected_overclaims": ["南乔长期每天独自做饭。", "南乔和室友关系变好了。"]
+    },
+    {
+      "id": "change-03",
+      "category": "time_change",
+      "messages": [
+        {"id": "tc03-m1", "time": "2025-02-01T14:00:00+08:00", "speaker": "小满", "text": "我先不参加周报轮值。"},
+        {"id": "tc03-m2", "time": "2025-03-01T14:00:00+08:00", "speaker": "小满", "text": "下周我可以试着写一次周报。"},
+        {"id": "tc03-m3", "time": "2025-03-01T14:05:00+08:00", "speaker": "予安", "text": "我把模板发你。"}
+      ],
+      "facts": [{"id": "tc03-f1", "statement": "小满二月暂不参加轮值，三月表示愿意试写一次周报。", "evidence_ids": ["tc03-m1", "tc03-m2"]}],
+      "acceptable_interpretations": ["小满对参与周报轮值的态度或安排有所变化。"],
+      "rejected_overclaims": ["小满已经成为固定周报负责人。", "小满之前拒绝是因为不喜欢团队。"]
+    },
+    {
+      "id": "crosstalk-01",
+      "category": "cross_talk",
+      "messages": [
+        {"id": "ct01-m1", "time": "2025-01-19T12:00:00+08:00", "speaker": "青禾", "text": "午饭我想吃面。"},
+        {"id": "ct01-m2", "time": "2025-01-19T12:00:10+08:00", "speaker": "闻溪", "text": "打印机的纸我补好了。"},
+        {"id": "ct01-m3", "time": "2025-01-19T12:00:20+08:00", "speaker": "南乔", "text": "我也可以，附近那家还开着。"},
+        {"id": "ct01-m4", "time": "2025-01-19T12:00:30+08:00", "speaker": "闻溪", "text": "谢谢，我继续测一下。"}
+      ],
+      "facts": [{"id": "ct01-f1", "statement": "青禾和南乔在讨论午饭，闻溪在讨论打印机纸并继续测试。", "evidence_ids": ["ct01-m1", "ct01-m2", "ct01-m3", "ct01-m4"]}],
+      "acceptable_interpretations": ["同一时间出现了午饭和打印机两个话题。"],
+      "rejected_overclaims": ["闻溪答应和青禾一起吃面。", "南乔在回应打印机测试。"]
+    },
+    {
+      "id": "crosstalk-02",
+      "category": "cross_talk",
+      "messages": [
+        {"id": "ct02-m1", "time": "2025-02-09T20:00:00+08:00", "speaker": "知遥", "text": "猫咪今天不肯吃新粮。"},
+        {"id": "ct02-m2", "time": "2025-02-09T20:00:05+08:00", "speaker": "予安", "text": "我把明天的会议挪到三点了。"},
+        {"id": "ct02-m3", "time": "2025-02-09T20:00:20+08:00", "speaker": "小满", "text": "先少量混旧粮试试？"},
+        {"id": "ct02-m4", "time": "2025-02-09T20:00:30+08:00", "speaker": "予安", "text": "新的邀请已经发出。"}
+      ],
+      "facts": [{"id": "ct02-f1", "statement": "知遥和小满在聊猫咪吃新粮，予安在说会议调整。", "evidence_ids": ["ct02-m1", "ct02-m2", "ct02-m3", "ct02-m4"]}],
+      "acceptable_interpretations": ["消息流中交错了宠物和会议两个话题。"],
+      "rejected_overclaims": ["小满负责给猫咪换粮。", "予安的会议调整是为了照顾猫咪。"]
+    },
+    {
+      "id": "crosstalk-03",
+      "category": "cross_talk",
+      "messages": [
+        {"id": "ct03-m1", "time": "2025-03-18T18:30:00+08:00", "speaker": "南乔", "text": "我把窗边那盆薄荷换了位置。"},
+        {"id": "ct03-m2", "time": "2025-03-18T18:30:08+08:00", "speaker": "青禾", "text": "预算表里的交通费也改好了。"},
+        {"id": "ct03-m3", "time": "2025-03-18T18:30:20+08:00", "speaker": "知遥", "text": "那盆早上光线应该更好。"},
+        {"id": "ct03-m4", "time": "2025-03-18T18:30:40+08:00", "speaker": "青禾", "text": "我把变更标黄了。"}
+      ],
+      "facts": [{"id": "ct03-f1", "statement": "南乔和知遥在聊薄荷摆放，青禾在聊预算表交通费。", "evidence_ids": ["ct03-m1", "ct03-m2", "ct03-m3", "ct03-m4"]}],
+      "acceptable_interpretations": ["群内短时间内交错讨论了植物和预算表。"],
+      "rejected_overclaims": ["青禾改了薄荷的位置。", "知遥确认了预算表金额。"]
+    },
+    {
+      "id": "rare-01",
+      "category": "low_frequency_member",
+      "messages": [
+        {"id": "lf01-m1", "time": "2025-01-02T09:00:00+08:00", "speaker": "常青", "text": "资料收到。"},
+        {"id": "lf01-m2", "time": "2025-01-20T17:00:00+08:00", "speaker": "常青", "text": "我周五可以核对最后一页。"},
+        {"id": "lf01-m3", "time": "2025-01-20T17:01:00+08:00", "speaker": "青禾", "text": "好，其他页我来检查。"}
+      ],
+      "facts": [{"id": "lf01-f1", "statement": "常青在片段中发言较少，并表示周五可以核对最后一页。", "evidence_ids": ["lf01-m1", "lf01-m2"]}],
+      "acceptable_interpretations": ["可描述常青在这段样本中的发言较少，但无法据此断定其长期角色。"],
+      "rejected_overclaims": ["常青长期不参与群聊。", "常青是群里的资料负责人。"]
+    },
+    {
+      "id": "rare-02",
+      "category": "low_frequency_member",
+      "messages": [
+        {"id": "lf02-m1", "time": "2025-02-03T08:30:00+08:00", "speaker": "知遥", "text": "车站出口我确认是东口。"},
+        {"id": "lf02-m2", "time": "2025-02-03T08:40:00+08:00", "speaker": "客串的云", "text": "地图上东口施工，建议走南口。"},
+        {"id": "lf02-m3", "time": "2025-02-03T08:45:00+08:00", "speaker": "知遥", "text": "谢谢提醒，我再查一下公告。"}
+      ],
+      "facts": [{"id": "lf02-f1", "statement": "低频发言者客串的云提醒东口施工并建议南口，知遥表示会再查公告。", "evidence_ids": ["lf02-m2", "lf02-m3"]}],
+      "acceptable_interpretations": ["该成员提供了一条需要核实的路线信息。"],
+      "rejected_overclaims": ["南口一定畅通。", "客串的云长期负责交通路线。"]
+    },
+    {
+      "id": "rare-03",
+      "category": "low_frequency_member",
+      "messages": [
+        {"id": "lf03-m1", "time": "2025-03-05T12:00:00+08:00", "speaker": "青禾", "text": "下午三点开始分组。"},
+        {"id": "lf03-m2", "time": "2025-03-05T12:10:00+08:00", "speaker": "纸飞机", "text": "我只能参加前半小时，之后要离开。"},
+        {"id": "lf03-m3", "time": "2025-03-05T12:11:00+08:00", "speaker": "青禾", "text": "收到，我先安排你负责开场。"}
+      ],
+      "facts": [{"id": "lf03-f1", "statement": "纸飞机只能参加前半小时，青禾安排其负责开场。", "evidence_ids": ["lf03-m2", "lf03-m3"]}],
+      "acceptable_interpretations": ["分工考虑了纸飞机的可用时间。"],
+      "rejected_overclaims": ["纸飞机不愿意参加活动。", "纸飞机担任了整个活动主持。"]
+    }
+  ]
+}

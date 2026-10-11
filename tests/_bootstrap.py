@@ -163,6 +163,7 @@ _AMBIENT_KEYS_TO_CLEAR = (
     "QQCHAT_COOKIE_SECURE",  # Secure cookie 的显式覆盖
     "LOG_REDACT_NAMES",  # 日志脱敏（有源码级守卫用例依赖默认开）
     "QQCHAT_GROUP_CHAT",  # 私聊轨 / 群聊轨 / 两方归并——会整类改变断言
+    "QQCHAT_PERSON_CONTEXT",  # 人物画像上下文策略的显式回退开关
     "QQCHAT_ALLOW_MULTI_PARTY",  # 上面那个的旧别名
     "QQCHAT_FACE_IMAGES",  # 打开会影响习惯页/报告页的渲染
     "QQCHAT_MEDIA_DIR",  # 影响"图片理解是否可用"

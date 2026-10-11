@@ -602,16 +602,10 @@ class TestAskQuotaErrorIsJsonNot500(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 批 7：互动矩阵按"生效上限"缓存（大群不再每人重算一遍 n×n）
+# 批 7：稀疏互动计数为主缓存，密集展示矩阵按尺寸有限缓存
 # ---------------------------------------------------------------------------
 class TestInteractionMatrixIsMemoisedPerEffectiveLimit(unittest.TestCase):
-    """`_member_context` 是"每位成员一次调用"，每次都要不截断的矩阵。
-
-    不缓存时几千人的群每分析一位成员就重算 n×n（实测 n=3000 单次 4.4s / 376MB）。
-    键取**已解析的生效上限**而不是入参 top_k：配置是调用时读的，用 top_k 当键会让
-    "改了配置仍拿回旧上限的矩阵"（既有用例 test_matrix_limit_reads_config_at_call_time
-    钉的就是这条语义）。
-    """
+    """Sparse interaction counts are primary; dense projections stay bounded."""
 
     def _chat(self, n_members=4):
         msgs = []
@@ -661,6 +655,15 @@ class TestInteractionMatrixIsMemoisedPerEffectiveLimit(unittest.TestCase):
         """两份不同的聊天不许互相命中（缓存挂在 chat 对象上，不挂在模块上）。"""
         a, b = self._chat(4), self._chat(3)
         self.assertIsNot(gs.calc_interaction_matrix(a, top_k=0), gs.calc_interaction_matrix(b, top_k=0))
+
+    def test_dense_projection_cache_is_bounded(self):
+        chat = self._chat(8)
+        for limit in (1, 2, 3, 4, 5):
+            gs.calc_interaction_matrix(chat, top_k=limit)
+        self.assertEqual(len(chat._matrix_cache), 3)
+        self.assertEqual(set(chat._matrix_cache), {3, 4, 5})
+        last = gs.calc_interaction_matrix(chat, top_k=5)
+        self.assertIs(last, chat._matrix_cache[5])
 
 
 # ---------------------------------------------------------------------------

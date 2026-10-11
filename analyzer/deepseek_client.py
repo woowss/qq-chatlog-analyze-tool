@@ -75,6 +75,7 @@ from analyzer.logger import get_logger, mask_name
 from analyzer import purge_marks
 from analyzer import llm_transport
 from analyzer import fingerprint_utils
+from analyzer import person_context
 from analyzer.shutdown import shutdown_requested
 from analyzer.usage import record_call
 from analyzer.result_schema import (
@@ -296,15 +297,20 @@ class AnalysisIncompleteError(RuntimeError):
 
 
 def _validate_before_month_cache(dimension: str, result: Any) -> None:
-    """校验新模型结果；关闭月份缓存时不做无意义的校验。"""
-    if month_cache_enabled() and supports_dimension(dimension):
+    """校验新模型结果；结构契约与是否保留缓存无关。"""
+    if supports_dimension(dimension):
         validate_result(dimension, result)
 
 
 def _read_result_cache(
-    key: str, dimension: str, *, expect_thinking=None, chat_hash: str = ""
+    key: str,
+    dimension: str,
+    *,
+    expect_thinking=None,
+    chat_hash: str = "",
+    read_only: bool = False,
 ) -> Optional[dict]:
-    result = _read_month_cache(key, expect_thinking=expect_thinking, chat_hash=chat_hash)
+    result = _read_month_cache(key, expect_thinking=expect_thinking, chat_hash=chat_hash, read_only=read_only)
     if not result:
         return None
     if supports_dimension(dimension):
@@ -685,6 +691,17 @@ def fingerprint_for_dimension(dim: str) -> str:
     return PROMPT_FINGERPRINT
 
 
+def legacy_person_context_fingerprint(dim: str) -> str:
+    """Return the pre-context dimension fingerprint for display-only cache fallback."""
+    if dim == "profile":
+        return PROMPT_FINGERPRINT
+    if dim == "member_profiles":
+        from analyzer import group_client
+
+        return group_client.GROUP_PROMPT_FINGERPRINT
+    return fingerprint_for_dimension(dim)
+
+
 def analysis_cache_fingerprint(dimension: str, chat: ChatData) -> str:
     """按这份聊天是否真的触发上下文抽样选择维度级缓存指纹。
 
@@ -697,19 +714,46 @@ def analysis_cache_fingerprint(dimension: str, chat: ChatData) -> str:
             if _dialog_needs_sampling(
                 messages, chat.self_uid, chat.self_name, chat.other_name, MAX_DIALOG_CHARS
             ):
-                return sampled_prompt_fingerprint()
-        return _unsampled_prompt_fingerprint()
+                return scope_cache_fingerprint(chat, sampled_prompt_fingerprint())
+        return scope_cache_fingerprint(chat, _unsampled_prompt_fingerprint())
 
     from analyzer import group_client
 
     if dimension in group_client.GROUP_DIMENSIONS:
         if dimension == "member_profiles":
-            return group_client.GROUP_PROMPT_FINGERPRINT
+            return scope_cache_fingerprint(
+                chat,
+                person_context.strategy_fingerprint(group_client.GROUP_PROMPT_FINGERPRINT, dimension),
+                include_targets=True,
+            )
         for messages in chat.months().values():
             if group_client._group_dialog_needs_sampling(chat, messages):
-                return group_client.group_sampled_prompt_fingerprint()
-        return group_client._unsampled_group_prompt_fingerprint()
-    return fingerprint_for_dimension(dimension)
+                return scope_cache_fingerprint(chat, group_client.group_sampled_prompt_fingerprint())
+        return scope_cache_fingerprint(chat, group_client._unsampled_group_prompt_fingerprint())
+    base_fingerprint = fingerprint_for_dimension(dimension)
+    if dimension == "recap" and getattr(chat, "analysis_input_scope_id", ""):
+        # Scoped recaps generated with the export's full duration used wrong
+        # daily averages. Keep full-chat recap caches compatible.
+        base_fingerprint = hashlib.sha256(
+            f"{base_fingerprint}:scoped-duration-v2".encode("utf-8")
+        ).hexdigest()[:12]
+    return scope_cache_fingerprint(
+        chat,
+        person_context.strategy_fingerprint(base_fingerprint, dimension),
+        include_targets=dimension in {"habits", "profile"},
+    )
+
+
+def scope_cache_fingerprint(chat: ChatData, fingerprint: str, *, include_targets: bool = False) -> str:
+    """Put message scope in cache identity; target-only changes affect profile dimensions."""
+    scope_id = getattr(
+        chat,
+        "analysis_scope_id" if include_targets else "analysis_input_scope_id",
+        "",
+    )
+    if not scope_id:
+        return fingerprint
+    return hashlib.sha256(f"{fingerprint}:scope:{scope_id}".encode("utf-8")).hexdigest()[:16]
 
 
 #: 私聊族的历史代链（最新一代在前）。设计见 legacy_fingerprints_for_dimension：
@@ -1094,7 +1138,7 @@ def _analyze_periods(
                 result = _call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag, dim=tag)
                 if not result:
                     _mark_failed(period)
-                elif month_cache_enabled() and supports_dimension(tag):
+                elif supports_dimension(tag):
                     try:
                         _validate_before_month_cache(tag, result)
                     except ResultValidationError as e:
@@ -1262,7 +1306,9 @@ def _month_prompt(chat: ChatData, period: str, msgs: list, chat_hash: str = "") 
     )
     if not dialog.strip():
         return ""
-    cache_fp = sampled_prompt_fingerprint() if sampled else _unsampled_prompt_fingerprint()
+    cache_fp = scope_cache_fingerprint(
+        chat, sampled_prompt_fingerprint() if sampled else _unsampled_prompt_fingerprint()
+    )
     return _PromptText(f"以下是 {period} 月的对话数据：\n\n{dialog}", cache_fp)
 
 
@@ -1330,6 +1376,99 @@ def analyze_relationship(
     return results
 
 
+def _prepare_person_request(
+    system_prompt: str,
+    sample_size: int,
+    msgs: list,
+    display_name: str,
+    prompt_template: str,
+    tag: str = "unknown",
+    stratified: bool = False,
+    chat_hash: str = "",
+    context_messages: list | None = None,
+    speaker_name_of: Callable[[Any], str] | None = None,
+    scope_id: str = "",
+) -> Optional[dict]:
+    """Build the exact person prompt and content-cache identity used by execution."""
+    valid_all = [m for m in msgs if _has_content(m) and is_statistical(m)]
+    use_person_context = tag == "profile" and person_context.PERSON_CONTEXT_ENABLED
+    if use_person_context:
+        source_messages = msgs if context_messages is None else context_messages
+        speaker_name_of = speaker_name_of or (lambda _message: display_name)
+        selection = person_context.select_person_context(
+            source_messages,
+            valid_all,
+            speaker_name_of,
+            sample_size,
+            MAX_DIALOG_CHARS,
+            stratified=stratified,
+        )
+        sample = selection.target_messages
+        valid = sample
+        lines = []
+        span_note = "，按时间均匀抽样覆盖整个时段" if len(valid_all) > sample_size else ""
+    elif stratified and len(valid_all) > sample_size:
+        # 向上取整步长：保证抽样后条数 <= sample_size 且覆盖整个时间轴
+        stride = (len(valid_all) + sample_size - 1) // sample_size
+        sample = valid_all[::stride]
+        span_note = "，按时间均匀抽样覆盖整个时段"
+        valid = sample
+        lines = [_message_line(m, display_name) for m in valid]
+    else:
+        sample = valid_all[-sample_size:]
+        span_note = ""
+        valid = sample
+        lines = [_message_line(m, display_name) for m in valid]
+    if not valid:
+        return None
+    if use_person_context:
+        context_note = (
+            f"；另含 {selection.context_count} 条仅供理解的上下文消息" if selection.context_count else ""
+        )
+        head = (
+            f"统计：{display_name} 共发言 {len(valid_all)} 条（目标样本 {len(sample)} 条{span_note}，"
+            f"图片 {sum(1 for m in valid if m.has_image)} 张{context_note}）"
+        )
+        if selection.sampled:
+            head += "，其余上下文受篇幅限制未展示"
+        dialog = f"{head}。\n\n{selection.text}"
+        # The digest is labeled as the target's images; neighbors keep their
+        # speaker labels in the text but must not contribute images here.
+        vision_messages = selection.target_messages
+    else:
+        original_n = len(lines)
+        lines = _fit_lines(lines, MAX_DIALOG_CHARS)
+        head = f"统计：{display_name} 共发言 {len(valid_all)} 条（样本 {len(valid)} 条{span_note}，图片 "
+        # Keep this legacy count wording stable: it is part of the prompt/cache contract.
+        head += f"{sum(1 for m in valid if m.has_image)} 张）"
+        if len(lines) < original_n:
+            head += f"，因篇幅限制展示其中 {len(lines)} 条"
+        dialog = f"{head}。\n\n" + "\n".join(lines)
+        vision_messages = valid_all
+    digest = _vision_digest(vision_messages, chat_hash, f"{display_name} 的发言中")
+    if digest:
+        dialog += f"\n\n图片内容摘要（由视觉模型识别，供参考）：\n{digest}"
+    if not dialog.strip():
+        return None
+    user_content = prompt_template.format(display_name=display_name, dialog=dialog)
+    cache_version = f":{person_context.STRATEGY_VERSION}" if use_person_context else ""
+    cache_prompt = f"{system_prompt}\n[private-person:{tag}:{display_name}{cache_version}]"
+    cache_key = _month_key(
+        cache_prompt,
+        user_content,
+        hashlib.sha256(f"{fingerprint_for_dimension(tag)}:scope:{scope_id}".encode("utf-8")).hexdigest()[:16]
+        if scope_id
+        else fingerprint_for_dimension(tag),
+    )
+    return {
+        "valid_all": valid_all,
+        "sample": sample,
+        "user_content": user_content,
+        "cache_key": cache_key,
+        "thinking": thinking_enabled(tag),
+    }
+
+
 def _analyze_person(
     system_prompt: str,
     sample_size: int,
@@ -1340,6 +1479,9 @@ def _analyze_person(
     tag: str = "unknown",
     stratified: bool = False,
     chat_hash: str = "",
+    context_messages: list | None = None,
+    speaker_name_of: Callable[[Any], str] | None = None,
+    scope_id: str = "",
 ) -> Optional[dict]:
     """单人的习惯/锐评分析：先过滤再取样本，失败仅记日志。
 
@@ -1348,43 +1490,25 @@ def _analyze_person(
     要求的"这段时间的变化"根本不在样本里，模型只能编或写数据不足。
     """
     try:
-        valid_all = [m for m in msgs if _has_content(m) and is_statistical(m)]
-        if stratified and len(valid_all) > sample_size:
-            # 向上取整步长：保证抽样后条数 <= sample_size 且覆盖整个时间轴
-            stride = (len(valid_all) + sample_size - 1) // sample_size
-            sample = valid_all[::stride]
-            span_note = "，按时间均匀抽样覆盖整个时段"
-        else:
-            sample = valid_all[-sample_size:]
-            span_note = ""
-        valid = sample
-        if not valid:
+        request_data = _prepare_person_request(
+            system_prompt,
+            sample_size,
+            msgs,
+            display_name,
+            prompt_template,
+            tag=tag,
+            stratified=stratified,
+            chat_hash=chat_hash,
+            context_messages=context_messages,
+            speaker_name_of=speaker_name_of,
+            scope_id=scope_id,
+        )
+        if request_data is None:
             return None
-        lines = [_message_line(m, display_name) for m in valid]
-        original_n = len(lines)
-        lines = _fit_lines(lines, MAX_DIALOG_CHARS)
-        head = f"统计：{display_name} 共发言 {len(valid_all)} 条（样本 {len(valid)} 条{span_note}，图片 "
-        # 已知口径分歧（故意保留，与 analyzer.dialog / group_client._member_facts 同批）：
-        # 这里按"含图消息条数"，仪表盘按张。本函数虽不在指纹集合里，但它生成的文本进
-        # 月份缓存的 user_content 哈希——单改这里会让私聊五个维度内部又分两种口径，
-        # 而三处一起改要等指纹换代的多代迁移链。统一方案见
-        # docs/reviews/2026-09-26-round6-precommit-review.md P1-3。
-        head += f"{sum(1 for m in valid if m.has_image)} 张）"
-        if len(lines) < original_n:
-            head += f"，因篇幅限制展示其中 {len(lines)} 条"
-        dialog = f"{head}。\n\n" + "\n".join(lines)
-        # 这一方的图片摘要（同一批图在所有维度间复用，只花一次视觉调用）
-        digest = _vision_digest(valid_all, chat_hash, f"{display_name} 的发言中")
-        if digest:
-            dialog += f"\n\n图片内容摘要（由视觉模型识别，供参考）：\n{digest}"
-        if not dialog.strip():
-            return None
-        user_content = prompt_template.format(display_name=display_name, dialog=dialog)
-        # 双方分析各自独立计费。按人物内容缓存成功的一方，额度或临时错误后重试时
-        # 只补失败的一方；命名空间与逐月缓存分开，提示词指纹变动仍会自动换键。
-        cache_prompt = f"{system_prompt}\n[private-person:{tag}:{display_name}]"
-        cache_key = _month_key(cache_prompt, user_content, fingerprint_for_dimension(tag))
-        want_thinking = thinking_enabled(tag)
+        valid_all = request_data["valid_all"]
+        user_content = request_data["user_content"]
+        cache_key = request_data["cache_key"]
+        want_thinking = request_data["thinking"]
         result = _read_result_cache(cache_key, tag, expect_thinking=want_thinking, chat_hash=chat_hash)
         if result is not None:
             logger.info("%s 命中个人分析缓存，跳过 API 调用", mask_name(display_name))
@@ -1396,7 +1520,7 @@ def _analyze_person(
                 tag=tag,
                 dim=tag,
             )
-            if result and month_cache_enabled():
+            if result:
                 try:
                     _validate_before_month_cache(tag, result)
                 except ResultValidationError as e:
@@ -1426,31 +1550,65 @@ def _analyze_person(
     return None
 
 
+def _person_analysis_spec(dimension: str) -> tuple[str, str, int, bool]:
+    """Return the model prompt and sample policy shared by preview and execution."""
+    if dimension == "habits":
+        return (
+            SYSTEM_PROMPT_HABITS,
+            "分析以下 {display_name} 的发言，总结其说话风格：\n\n{dialog}",
+            500,
+            False,
+        )
+    if dimension == "profile":
+        template = "以下是 {display_name} 在私聊中的发言记录，请对其进行深度性格分析：\n"
+        if person_context.PERSON_CONTEXT_ENABLED:
+            template += (
+                "样本行以[目标人物]标记其本人发言，[仅供上下文]行只用于理解对话背景；"
+                "画像、用词特征与发言统计只根据[目标人物]消息。\n"
+            )
+        return SYSTEM_PROMPT_PROFILE, template + "\n{dialog}", 800, True
+    raise ValueError(f"unsupported person-analysis dimension: {dimension}")
+
+
 def analyze_habits(
     chat: ChatData, on_progress=None, should_cancel=None, chat_hash: str = ""
 ) -> dict[str, Any]:  # chat_hash 保留以统一调用签名
     """分析双方的语言习惯"""
+    target_uids = getattr(chat, "analysis_target_uids", None)
     self_msgs = [m for m in chat.messages if m.sender_uid == chat.self_uid]
     other_msgs = [m for m in chat.messages if m.sender_uid != chat.self_uid]
+    if target_uids is not None:
+        if chat.self_uid not in target_uids:
+            self_msgs = []
+        other_msgs = [m for m in other_msgs if m.sender_uid in target_uids]
 
     results: dict[str, Any] = {}
     incomplete = False
-    template = "分析以下 {display_name} 的发言，总结其说话风格：\n\n{dialog}"
-    total, done = 2, 0
-    for person_key, msgs in [("self", self_msgs), ("other", other_msgs)]:
+    system_prompt, template, sample_size, stratified = _person_analysis_spec("habits")
+    people = [("self", self_msgs), ("other", other_msgs)]
+    if target_uids is not None:
+        people = [
+            (key, msgs)
+            for key, msgs in people
+            if (chat.self_uid in target_uids if key == "self" else bool(msgs))
+        ]
+    total, done = len(people), 0
+    for person_key, msgs in people:
         if should_cancel and should_cancel():
             break
         display_name = chat.self_name if person_key == "self" else chat.other_name
         try:
             result = _analyze_person(
-                SYSTEM_PROMPT_HABITS,
-                500,
+                system_prompt,
+                sample_size,
                 msgs,
                 display_name,
                 template,
                 max_tokens=MAX_TOKENS_BY_DIM["habits"],
                 tag="habits",
+                stratified=stratified,
                 chat_hash=chat_hash,
+                scope_id=getattr(chat, "analysis_scope_id", ""),
             )
         except QuotaExhaustedError:
             raise
@@ -1466,7 +1624,10 @@ def analyze_habits(
         if on_progress:
             on_progress(done, total)
     if incomplete and not (should_cancel and should_cancel()):
-        raise AnalysisIncompleteError("habits 分析未能取得双方的完整结果；已完成的一方可从缓存复用")
+        error = AnalysisIncompleteError("habits 分析未能取得双方的完整结果；已完成的一方可从缓存复用")
+        if results:
+            error.partial_result = results
+        raise error
     return results
 
 
@@ -1474,28 +1635,45 @@ def analyze_profile(
     chat: ChatData, on_progress=None, should_cancel=None, chat_hash: str = ""
 ) -> dict[str, Any]:  # chat_hash 保留以统一调用签名
     """AI 人物锐评 — 分析双方的性格画像"""
+    target_uids = getattr(chat, "analysis_target_uids", None)
     self_msgs = [m for m in chat.messages if m.sender_uid == chat.self_uid]
     other_msgs = [m for m in chat.messages if m.sender_uid != chat.self_uid]
+    if target_uids is not None:
+        if chat.self_uid not in target_uids:
+            self_msgs = []
+        other_msgs = [m for m in other_msgs if m.sender_uid in target_uids]
 
     results: dict[str, Any] = {}
     incomplete = False
-    template = "以下是 {display_name} 在私聊中的发言记录，请对其进行深度性格分析：\n\n{dialog}"
-    total, done = 2, 0
-    for person_key, msgs in [("self", self_msgs), ("other", other_msgs)]:
+    system_prompt, template, sample_size, stratified = _person_analysis_spec("profile")
+    people = [("self", self_msgs), ("other", other_msgs)]
+    if target_uids is not None:
+        people = [
+            (key, msgs)
+            for key, msgs in people
+            if (chat.self_uid in target_uids if key == "self" else bool(msgs))
+        ]
+    total, done = len(people), 0
+    for person_key, msgs in people:
         if should_cancel and should_cancel():
             break
         display_name = chat.self_name if person_key == "self" else chat.other_name
         try:
             result = _analyze_person(
-                SYSTEM_PROMPT_PROFILE,
-                800,
+                system_prompt,
+                sample_size,
                 msgs,
                 display_name,
                 template,
                 max_tokens=MAX_TOKENS_BY_DIM["profile"],
                 tag="profile",
-                stratified=True,
+                stratified=stratified,
                 chat_hash=chat_hash,
+                context_messages=chat.messages,
+                speaker_name_of=lambda message: (
+                    chat.self_name if message.sender_uid == chat.self_uid else chat.other_name
+                ),
+                scope_id=getattr(chat, "analysis_scope_id", ""),
             )
         except QuotaExhaustedError:
             raise
@@ -1510,7 +1688,10 @@ def analyze_profile(
         if on_progress:
             on_progress(done, total)
     if incomplete and not (should_cancel and should_cancel()):
-        raise AnalysisIncompleteError("profile 分析未能取得双方的完整结果；已完成的一方可从缓存复用")
+        error = AnalysisIncompleteError("profile 分析未能取得双方的完整结果；已完成的一方可从缓存复用")
+        if results:
+            error.partial_result = results
+        raise error
     return results
 
 
