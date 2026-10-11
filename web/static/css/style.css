@@ -582,7 +582,9 @@ li { margin-bottom: .15rem; }
 .context-dialog-header h3 { margin: 0; font-size: 1rem; }
 .context-dialog-body { padding: .5rem .75rem; }
 .context-dialog .msg-list { max-height: 62dvh; overflow: auto; }
-.analysis-plan-dialog { width: min(1080px, calc(100vw - 24px)); max-width: none; max-height: min(88dvh, 900px); overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem; color: var(--text); background: var(--surface); box-shadow: var(--shadow-2); }
+.analysis-plan-dialog { box-sizing: border-box; width: min(1080px, calc(100vw - 24px)); max-width: none; max-height: min(88dvh, 900px); overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem; color: var(--text); background: var(--surface); box-shadow: var(--shadow-2); }
+.analysis-plan-dialog[open] { display: flex; flex-direction: column; }
+.analysis-plan-dialog[open] > :not(.analysis-plan-table-wrap) { flex: 0 0 auto; }
 .analysis-plan-dialog::backdrop { background: rgba(12, 18, 28, .58); }
 .analysis-plan-header, .analysis-plan-footer, .analysis-plan-controls { display: flex; align-items: center; justify-content: space-between; gap: .6rem; }
 .analysis-plan-header { margin-bottom: .75rem; }
@@ -590,7 +592,7 @@ li { margin-bottom: .15rem; }
 .analysis-plan-summary { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: .7rem; margin-bottom: .6rem; background: var(--surface-2); font-size: .9rem; }
 .analysis-plan-notes { margin-bottom: .6rem; }
 .analysis-plan-controls { justify-content: flex-start; margin-bottom: .5rem; }
-.analysis-plan-table-wrap { max-height: 55dvh; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.analysis-plan-table-wrap { flex: 0 1 auto; min-height: 0; max-height: 55dvh; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); }
 .analysis-plan-table { margin-bottom: 0; min-width: 760px; font-size: .82rem; }
 .analysis-plan-table thead { position: sticky; top: 0; z-index: 1; background: var(--surface-2); }
 .analysis-plan-table td, .analysis-plan-table th { padding: .45rem .5rem; }

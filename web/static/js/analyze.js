@@ -395,8 +395,18 @@ function analyzeInPage(dim, renderFn) {
                 btn.prop('disabled', false).text(orig);
                 if (renderFn) renderFn(result);
             },
-            onError: function (msg) {
+            onError: function (msg, meta) {
                 var cancelled = msg === '分析已取消';
+                var partialResult = meta && meta.partial && meta.partialResults
+                    && meta.partialResults[dim];
+                if (partialResult && typeof partialResult === 'object'
+                    && !Array.isArray(partialResult) && Object.keys(partialResult).length > 0) {
+                    setAnalysisEmptyState(dim, 'empty', '本次分析未完整完成，当前显示已完成部分。');
+                    status.html('<div class="alert alert-warning py-1 mb-0 small">分析未完整完成；已显示可用的部分结果，未保存为完整维度结果。</div>');
+                    btn.prop('disabled', false).text(orig);
+                    if (renderFn) renderFn(partialResult);
+                    return;
+                }
                 setAnalysisEmptyState(dim, cancelled ? 'empty' : 'error', cancelled ? null : msg);
                 status.html('<div class="alert alert-' + (cancelled ? 'secondary' : 'danger')
                     + ' py-1 mb-0 small">' + esc(msg) + '</div>');
