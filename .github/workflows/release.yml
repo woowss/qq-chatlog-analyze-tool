@@ -152,7 +152,7 @@ jobs:
           ls -l .tmp_dist
 
       - name: 下载 Windows 发布物
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: windows-package
           path: .tmp_windows_dist
