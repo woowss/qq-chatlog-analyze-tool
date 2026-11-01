@@ -91,7 +91,7 @@ jobs:
         run: python -m unittest discover -s tests -p test_browser.py -v
       - name: Keep browser diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: browser-${{ matrix.os }}
           path: output/playwright/
