@@ -89,7 +89,7 @@ jobs:
           if ($process.ExitCode -ne 0) { throw "冻结程序版本入口失败" }
 
       - name: 保存 Windows 发布物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-package
           path: |
