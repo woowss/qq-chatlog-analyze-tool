@@ -471,5 +471,103 @@ class TestFrontendGuards(unittest.TestCase):
         self.assertNotIn("--bs-body-bg", code, "页面底不是图表的容身色")
 
 
+class TestFrontendRegressionGuards(unittest.TestCase):
+    """前端踩过的坑：用静态断言守住，避免改回去"""
+
+    JS = ROOT / "web" / "static" / "js" / "charts.js"
+    # 导出分享版报告的代码（VENDOR_CDN 表、CDN 重写、表情图内联、快照构建）2026-09-12 起
+    # 抽到 partial：私聊报告与群聊报告共用同一份实现（两处各存一份必然漏改一处，
+    # 而 SRI 对不上时浏览器是静默拦掉资源）。断言与语义不变，只是校验对象跟着代码走。
+    REPORT = ROOT / "web" / "templates" / "_report_assets.html"
+    INDEX = ROOT / "web" / "templates" / "index.html"
+
+    def test_heatmap_uses_theme_tokens_not_hardcoded_colors(self):
+        """热力图曾写死浅色（#6b7280/#e4e7eb/#ffffff）：深色主题下格子描边发白"""
+        src = self.JS.read_text(encoding="utf-8")
+        heatmap = src.split("function renderHeatmapChart")[1].split("function render")[0]
+        # 注释里会提到旧写法作为说明，只检查真正的代码行
+        code = "\n".join(ln for ln in heatmap.splitlines() if not ln.strip().startswith("//"))
+        self.assertNotIn("#ffffff", code)
+        self.assertNotIn("#6b7280", code)
+        self.assertNotIn("#e4e7eb", code)
+        self.assertIn("T.axis", code)
+        self.assertIn("T.surface", code)
+
+    def test_chart_entry_points_guard_missing_dom(self):
+        """图表入口都要能在节点缺失时安全返回，否则一处 TypeError 会打断整块渲染"""
+        src = self.JS.read_text(encoding="utf-8")
+        for fn in (
+            "renderEmotionCharts",
+            "renderTopicsCharts",
+            "renderRelationshipInsight",
+            "renderHabitsInsight",
+        ):
+            body = src.split("function %s(" % fn)[1].split("\nfunction ")[0]
+            self.assertIn("if (!data) return;", body, f"{fn} 缺少 data 判空")
+
+    def test_report_keeps_style_link_when_inlining_failed(self):
+        """样式没取到时不能把 <link> 也删掉，否则导出的报告只剩 Bootstrap"""
+        # 导出机制在 partial（_report_assets.html），而 asList 这类"渲染期兜底"仍在
+        # report.html 的渲染脚本里——两处都要看，才覆盖这条用例原本想守的东西。
+        report_tpl = ROOT / "web" / "templates" / "report.html"
+        src = self.REPORT.read_text(encoding="utf-8") + report_tpl.read_text(encoding="utf-8")
+        self.assertIn("if (cssText) {", src)
+        # 删 <link> 必须发生在这个守卫之内：取不到样式就保留原链接，别让报告裸奔
+        self.assertLess(
+            src.index("if (cssText) {"),
+            src.index('link[href^="/static/css/"]'),
+            "删样式表链接的代码要在 cssText 守卫之内",
+        )
+        self.assertIn("asList", src, "模型返回值先兜底成数组，避免一处 TypeError 打断报告")
+
+    def test_report_replaces_unavailable_face_images(self):
+        src = self.REPORT.read_text(encoding="utf-8")
+        self.assertIn("replaceChild", src, "内联失败的表情图要降级成文字，不能留裂图")
+        self.assertIn("getAttribute('alt')", src, "降级文字取自 alt（表情名）")
+
+    def test_index_reports_partial_upload_failure(self):
+        """分批上传失败时不能静默跳转，要如实说明还剩多少没传"""
+        src = self.INDEX.read_text(encoding="utf-8")
+        self.assertIn("中途失败", src)
+        self.assertIn("服务端跳过", src)
+
+
+class TestRouteSurfaceUnchanged(unittest.TestCase):
+    """webapp 拆分是搬家不是改建：路由与端点名必须原样"""
+
+    def test_all_endpoints_registered(self):
+        import app as appmod
+
+        endpoints = {r.endpoint for r in appmod.app.url_map.iter_rules()}
+        for e in (
+            "index",
+            "upload",
+            "dashboard",
+            "emotion",
+            "relationship",
+            "habits",
+            "topics",
+            "profile",
+            "report",
+            "login",
+            "static",
+            "api_analyze",
+            "api_analyze_job",
+            "api_analyze_cancel",
+            "api_analysis_result",
+            "api_analyze_all",
+            "api_usage",
+            "api_status",
+        ):
+            self.assertIn(e, endpoints, f"端点 {e} 在拆分后消失了")
+
+    def test_url_rules_point_where_expected(self):
+        import app as appmod
+
+        rules = {r.rule: r.endpoint for r in appmod.app.url_map.iter_rules()}
+        self.assertEqual(rules["/api/analyze-all"], "api_analyze_all")
+        self.assertEqual(rules["/upload"], "upload")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

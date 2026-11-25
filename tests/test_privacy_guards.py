@@ -1255,5 +1255,120 @@ class TestBundleImportBinding(unittest.TestCase):
         self.assertFalse(store._cache_belongs_to(a.replace(self.H, "0" * 16), self.H))
 
 
+class TestLogPrivacy(unittest.TestCase):
+    """日志：脱敏助手 + 保留天数来自配置"""
+
+    def test_mask_name_keeps_first_char(self):
+        import analyzer.logger as L
+
+        with mock.patch.object(L, "LOG_REDACT_NAMES", True):
+            self.assertEqual(L.mask_name("阿甜"), "阿*")
+            self.assertEqual(L.mask_name("甜"), "*")  # 单字也不泄露全名
+            self.assertEqual(L.mask_name(""), "*")
+        with mock.patch.object(L, "LOG_REDACT_NAMES", False):
+            self.assertEqual(L.mask_name("阿甜"), "阿甜")
+
+    def test_timed_rotating_handler_with_retention(self):
+        from logging.handlers import TimedRotatingFileHandler
+        import analyzer.logger as L
+        import config
+
+        base = L.get_logger()
+        handlers = [h for h in base.handlers if isinstance(h, TimedRotatingFileHandler)]
+        self.assertEqual(len(handlers), 1, "文件 handler 必须是按天轮转且只有一个")
+        self.assertEqual(handlers[0].backupCount, config.LOG_RETENTION_DAYS)
+        self.assertLessEqual(handlers[0].backupCount, 90, "日志保留必须有上界，5×5MB 式无限留存不得回潮")
+
+
+class TestPathContainment(unittest.TestCase):
+    """导出文件是可以被构造的：其中的路径字段不能把读取范围带出允许的目录"""
+
+    def test_vision_refuses_path_outside_media_root(self):
+        from analyzer import vision
+        from parser.qq_parser import Message
+
+        base = tempfile.mkdtemp(prefix="qqchatlog-traversal-")
+        media_root = os.path.join(base, "exports")
+        os.makedirs(media_root, exist_ok=True)
+        outside = os.path.join(base, "private.png")  # 媒体根目录之外的图片
+        with open(outside, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + b"x" * 32)
+        inside = os.path.join(media_root, "ok.png")
+        with open(inside, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + b"y" * 32)
+        try:
+            with mock.patch.object(vision, "MEDIA_ROOT", media_root):
+                self.assertIsNone(vision.resolve("../private.png"), "不得解析到媒体根目录之外的文件")
+                self.assertIsNone(vision.resolve("..\\private.png"))
+                self.assertIsNone(vision.resolve("resources/../../private.png"))
+                self.assertEqual(vision.resolve("ok.png"), inside)
+            # 也不该被挑进"要送给模型的图片"
+            msg = Message(
+                id="1",
+                timestamp=1704067200000,
+                time_str="",
+                sender_name="我",
+                sender_uid="uA",
+                text="",
+                raw_text="",
+                msg_type="type_3",
+                has_image=True,
+                is_reply=False,
+                media_path="../private.png",
+                media_w=1080,
+                media_h=2400,
+                media_id="X",
+            )
+            with (
+                mock.patch.object(vision, "MEDIA_ROOT", media_root),
+                mock.patch.object(vision, "VISION_MIN_SIDE", 100),
+            ):
+                self.assertEqual(vision.pick_images([msg], limit=5), [])
+        finally:
+            import shutil
+
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_face_pack_refuses_path_outside_pack_dir(self):
+        from analyzer import face_images as fi
+
+        pack = tempfile.mkdtemp(prefix="qqchatlog-pack2-")
+        base = os.path.dirname(pack)
+        evil = os.path.join(base, "evil.gif")
+        with open(evil, "wb") as f:
+            f.write(b"GIF89a" + b"z" * 8)
+        try:
+            self.assertIsNone(
+                fi.local_pack_path("n1", "../../evil", local_dir=pack), "表情名里的 ../ 不能被带出表情包目录"
+            )
+        finally:
+            import shutil
+
+            shutil.rmtree(pack, ignore_errors=True)
+            if os.path.exists(evil):
+                os.remove(evil)
+
+    def test_origin_header_is_sanitized_in_logs(self):
+        """Origin 是请求方给的：写日志前要清掉换行/控制字符，避免伪造日志行。
+
+        真实 HTTP 头里发不出裸换行（Werkzeug 也会拒绝），但 U+2028 这类分隔符
+        能进来并且在很多查看器里渲染成换行，所以清洗放在服务端做。
+        """
+        import app as appmod
+        from webapp import security
+
+        self.assertEqual(security._safe_for_log("http://a\n[ERROR] 伪造"), "http://a[ERROR] 伪造")
+        self.assertEqual(security._safe_for_log("http://a\u2028伪造"), "http://a伪造")
+        self.assertEqual(security._safe_for_log("http://a\t伪造"), "http://a伪造")
+        self.assertEqual(len(security._safe_for_log("x" * 500)), 120, "日志长度要有上限")
+
+        client = appmod.app.test_client()
+        client.get("/")
+        with client.session_transaction() as s:
+            token = s["csrf_token"]
+        r = client.post("/upload", data={"csrf_token": token}, headers={"Origin": "http://evil.example.com"})
+        self.assertEqual(r.status_code, 403, "非白名单来源仍必须被拦下")
+
+
 if __name__ == "__main__":
     unittest.main()

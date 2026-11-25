@@ -783,6 +783,7 @@ class TestCacheWriteFailuresAreLoud(unittest.TestCase):
         usage_mod._PENDING["dims"].clear()
         for k in usage_mod._PENDING["total"]:
             usage_mod._PENDING["total"][k] = 0
+        usage_mod._DIRTY = False
 
 
 class TestUsageRetention(unittest.TestCase):
@@ -1369,6 +1370,104 @@ class TestFingerprintMigrationChain(unittest.TestCase):
                     os.remove(p)
                 except OSError:
                     pass
+
+
+class TestCleanupTriggeredWithoutUpload(unittest.TestCase):
+    """清理不再只挂在上传路径：任何请求都会按小时去抖触发"""
+
+    def test_get_request_triggers_maybe_cleanup(self):
+        import app as appmod
+        from webapp import cleanup as cleanupmod
+
+        with (
+            mock.patch.object(cleanupmod, "_last_cleanup", [0.0]),
+            mock.patch.object(cleanupmod, "cleanup_old_files") as co,
+        ):
+            appmod.app.test_client().get("/")
+            self.assertTrue(co.called, "GET / 也必须触发过期回收")
+
+    def test_debounce_prevents_rescan(self):
+        from webapp import cleanup as cleanupmod
+
+        with (
+            mock.patch.object(cleanupmod, "_last_cleanup", [time.time()]),
+            mock.patch.object(cleanupmod, "cleanup_old_files") as co,
+        ):
+            cleanupmod.maybe_cleanup(3600)
+            self.assertFalse(co.called, "一小时内重复请求不该反复扫描目录")
+
+
+class TestFingerprintRobustness(unittest.TestCase):
+    """源码不可读时指纹降级不崩；PROMPT_CACHE_SALT 可手动换键"""
+
+    def test_fallback_when_source_unavailable(self):
+        import analyzer.deepseek_client as dc
+
+        with (
+            mock.patch("inspect.getsource", side_effect=OSError("no source here")),
+            mock.patch.dict(os.environ, {"PROMPT_CACHE_SALT": ""}),
+        ):
+            fp = dc._prompt_fingerprint()
+            fp2 = dc._prompt_fingerprint()  # 必须在同一个降级上下文里比稳定性
+        self.assertEqual(len(fp), 12)
+        self.assertNotEqual(fp, dc.PROMPT_FINGERPRINT, "降级指纹应与正常指纹不同")
+        self.assertEqual(fp, fp2, "降级指纹仍须稳定")
+
+    def test_salt_changes_fingerprint(self):
+        import analyzer.deepseek_client as dc
+
+        with mock.patch.dict(os.environ, {"PROMPT_CACHE_SALT": "2026-08-a"}):
+            fp1 = dc._prompt_fingerprint()
+            fp2 = dc._prompt_fingerprint()
+        with mock.patch.dict(os.environ, {"PROMPT_CACHE_SALT": "2026-08-b"}):
+            fp3 = dc._prompt_fingerprint()
+        self.assertEqual(fp1, fp2)
+        self.assertNotEqual(fp1, fp3)
+        self.assertNotEqual(fp1, dc.PROMPT_FINGERPRINT)
+
+    def test_grace_hours_env_invalid_does_not_crash(self):
+        import config
+
+        with mock.patch.dict(os.environ, {"LLM_MONTH_CACHE_GRACE_HOURS": "abc"}):
+            val = config.env_number("LLM_MONTH_CACHE_GRACE_HOURS", 24, 0, 720)
+        self.assertEqual(val, 24)  # 回退默认而不是 ValueError 崩在 import
+
+
+class TestUsageBatchWrite(unittest.TestCase):
+    """50 次调用合并成一次落盘；读接口永远能立刻看到最新值"""
+
+    def test_batching_and_read_your_write(self):
+        import analyzer.usage as usage
+
+        fd, tmp = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        os.remove(tmp)
+        usage.flush()  # 清掉别的测试可能留下的未决增量
+        orig_file, orig_dump = usage.TOKEN_USAGE_FILE, usage._dump
+        writes = []
+
+        def counting_dump(d):
+            writes.append(1)
+            orig_dump(d)
+
+        usage.TOKEN_USAGE_FILE = tmp
+        usage._dump = counting_dump
+        try:
+            for _ in range(50):
+                usage.record_call("deepseek-flash", "emotion", 100, 20)
+            self.assertEqual(len(writes), 0, "增量不该逐次落盘")
+            u = usage.get_usage()
+            self.assertEqual(u["total"]["calls"], 50)
+            self.assertEqual(u["dims"]["emotion|deepseek-flash"]["calls"], 50)
+            self.assertEqual(len(writes), 1, "读前应恰好冲刷一次")
+            usage.get_usage()
+            self.assertEqual(len(writes), 1, "无增量的读不该再写盘")
+        finally:
+            usage._dump = orig_dump
+            usage.TOKEN_USAGE_FILE = orig_file
+            usage.flush()
+            if os.path.exists(tmp):
+                os.remove(tmp)
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -1449,6 +1449,258 @@ class TestConnectionPing(unittest.TestCase):
             ok, detail = dc.test_connection()
         self.assertTrue(ok)
         self.assertIn("延迟", detail)
+
+
+_FIX_CST = timezone(timedelta(hours=8))
+
+
+def _fix_chat_payload(uids_to_msgs):
+    msgs = []
+    base = int(datetime(2025, 3, 1, 20, 0, tzinfo=_FIX_CST).timestamp() * 1000)
+    i = 0
+    for uid, texts in uids_to_msgs.items():
+        for t in texts:
+            msgs.append(
+                {
+                    "id": str(i),
+                    "timestamp": base + i * 60000,
+                    "time": "2025-03-01 20:%02d:00" % (i % 60),
+                    "sender": {"uid": uid, "name": "人" + uid[-1]},
+                    "content": t,
+                }
+            )
+            i += 1
+    return _fix_wrap(msgs, {k: "人" + k[-1] for k in uids_to_msgs})
+
+
+def _fix_wrap(msgs, senders, self_uid="uA"):
+    """按导出格式包装（msgs 为完整消息字典，便于构造 system/type_23 等特殊条目）"""
+    return json.dumps(
+        {
+            "chatInfo": {
+                "name": senders.get("uB", "对方"),
+                "selfUid": self_uid,
+                "selfName": senders.get(self_uid, "我"),
+            },
+            "statistics": {
+                "senders": [{"uid": uid, "name": name} for uid, name in senders.items()],
+                "totalMessages": len(msgs),
+            },
+            "messages": msgs,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+class TestJobsHygiene(unittest.TestCase):
+    """任务表：TTL 收紧、轮询即修剪、条数上限、running 永不淘汰"""
+
+    def _mk(self, n, status, finished_at):
+        from webapp import jobs as jobsmod
+
+        with jobsmod.JOBS_LOCK:
+            for i in range(n):
+                jobsmod.JOBS[f"j{i}-{status}-{finished_at}"] = {
+                    "status": status,
+                    "dim": "emotion",
+                    "done": 0,
+                    "total": 0,
+                    "cancel": False,
+                    "chat_hash": "h",
+                    "sid": "s",
+                    "created": finished_at,
+                    "finished_at": finished_at,
+                }
+
+    def test_default_ttl_is_short(self):
+        import config
+
+        self.assertLessEqual(config.JOB_TTL_SECONDS, 3600)
+
+    def test_expired_and_overflow_pruned_running_kept(self):
+        from webapp import jobs as jobsmod
+
+        jobsmod.JOBS.clear()
+        old = time.time() - 99999
+        self._mk(3, "done", old)  # 超 TTL
+        self._mk(2, "running", time.time())  # 进行中
+        self._mk(jobsmod.MAX_JOBS_KEPT + 10, "done", time.time())
+        jobsmod._prune_jobs()
+        statuses = [v["status"] for v in jobsmod.JOBS.values()]
+        self.assertNotIn("expired", statuses)
+        self.assertEqual(statuses.count("running"), 2, "running 条目绝不能被数量上限淘汰")
+        self.assertLessEqual(len(jobsmod.JOBS), jobsmod.MAX_JOBS_KEPT)
+        jobsmod.JOBS.clear()
+
+    def test_running_job_survives_ttl_prune(self):
+        """长任务不能在自己的轮询里把自己删掉。
+
+        _prune_jobs 就在 api_analyze_job 入口调用，而一键全量分析（5 维度 × 多月 ×
+        思考模式）跑过默认 15 分钟是常态：曾经 running 也按 created 走 TTL，于是
+        任务把自己删掉，之后每次轮询都 404，用户看到"任务不存在（服务可能已重启）"。
+        注意 created 取的是**过去**的时间——旧用例把 running 的 created 设成 now，
+        恰好绕开了这个场景。
+        """
+        from webapp import jobs as jobsmod
+
+        jobsmod.JOBS.clear()
+        started_long_ago = time.time() - (jobsmod.JOB_TTL_SECONDS + 60)
+        self._mk(2, "running", started_long_ago)
+        jobsmod._prune_jobs()
+        statuses = [v["status"] for v in jobsmod.JOBS.values()]
+        self.assertEqual(statuses.count("running"), 2, "running 条目不能按 TTL 淘汰")
+        jobsmod.JOBS.clear()
+
+    def test_stale_running_entry_has_hard_cap(self):
+        """线程异常死亡没来得及写 finished_at 时，running 条目靠硬上限兜底，不会永久滞留"""
+        from webapp import jobs as jobsmod
+
+        jobsmod.JOBS.clear()
+        self.assertGreater(
+            jobsmod.JOB_RUNNING_MAX_SECONDS,
+            jobsmod.JOB_TTL_SECONDS,
+            "running 的硬上限必须显著长于 TTL，否则等于没修",
+        )
+        self._mk(2, "running", time.time() - (jobsmod.JOB_RUNNING_MAX_SECONDS + 60))
+        jobsmod._prune_jobs()
+        self.assertEqual(jobsmod.JOBS, {}, "超过硬上限的滞留 running 条目必须被回收")
+        jobsmod.JOBS.clear()
+
+    def test_poll_prunes_even_without_new_jobs(self):
+        import app as appmod
+        from webapp import jobs as jobsmod
+
+        jobsmod.JOBS.clear()
+        old = time.time() - 99999
+        jobsmod.JOBS["stale"] = {
+            "status": "done",
+            "dim": "emotion",
+            "done": 0,
+            "total": 0,
+            "cancel": False,
+            "chat_hash": "h",
+            "sid": "other",
+            "created": old,
+            "finished_at": old,
+        }
+        client = appmod.app.test_client()
+        r = client.get("/api/analyze-job/nonexistent")
+        self.assertEqual(r.status_code, 404)
+        self.assertNotIn("stale", jobsmod.JOBS, "轮询入口必须顺手修剪过期条目")
+        jobsmod.JOBS.clear()
+
+
+class TestStatsInBackground(unittest.TestCase):
+    """上传响应不再背着统计计算；首个页面请求自动等它收口"""
+
+    def _upload(self, client, token, payload):
+        return client.post(
+            "/upload",
+            data={"file": (io.BytesIO(payload), "c.json")},
+            headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token},
+        )
+
+    def test_dashboard_waits_for_background_stats(self):
+        import app as appmod
+        from webapp import store as storemod
+
+        payload = _fix_chat_payload({"uA": ["在吗", "今晚吃啥"], "uB": ["在的", "火锅"]})
+        client = appmod.app.test_client()
+        client.get("/")
+        with client.session_transaction() as sess:
+            token = sess["csrf_token"]
+        r = self._upload(client, token, payload)
+        self.assertEqual(r.status_code, 302)
+        with client.session_transaction() as sess:
+            chat_hash, path = sess["chat_hash"], sess["filepath"]
+        try:
+            # 不手动 wait：dashboard 的 _current_stats 必须自己等到数据就绪
+            page = client.get("/dashboard")
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("总消息数", page.get_data(as_text=True))
+            stats = storemod._load_stats(chat_hash)
+            self.assertIsNotNone(stats)
+            self.assertIn("milestones", stats)
+            self.assertNotIn("word_freq", stats, "词频仍应是懒算，不进后台统计")
+        finally:
+            storemod.wait_for_stats(chat_hash, timeout=30)
+            storemod._purge_chat_caches(chat_hash)
+            if path and os.path.exists(path):
+                os.remove(path)
+
+    def test_purge_after_upload_does_not_resurrect_stats(self):
+        """级联清理发生时统计线程仍在跑：它收尾时不得把刚删的缓存复活；
+        而用户之后重新上传同一内容（新会话）必须能正常重算——标记要撤销"""
+        import threading
+        from webapp import store as storemod
+
+        stats = {"overview": {"x": 1}}
+        started, release = threading.Event(), threading.Event()
+
+        def blocking_compute(chat):
+            started.set()
+            self.assertTrue(release.wait(10), "测试超时未放行")
+            return stats
+
+        with mock.patch.object(storemod, "compute_stats", side_effect=blocking_compute):
+            storemod.start_stats_job(object(), "hashG")
+            started.wait(10)  # 线程已进入计算
+            storemod._purge_chat_caches("hashG")  # 用户在它落盘前清掉了这个聊天
+            release.set()
+            storemod.wait_for_stats("hashG", timeout=10)
+            self.assertIsNone(storemod._load_stats("hashG"), "被清理的哈希不能由晚到的线程复活成孤儿缓存")
+
+            # 同一内容重新上传：新任务的正当写入不能被旧标记误拦
+            release.set()
+            started.clear()
+            storemod.start_stats_job(object(), "hashG")
+            storemod.wait_for_stats("hashG", timeout=10)
+            self.assertIsNotNone(storemod._load_stats("hashG"))
+            storemod._purge_chat_caches("hashG")
+
+
+class TestFailureSurfacedToUser(unittest.TestCase):
+    """异步化之后，失败必须有人告诉用户——静默跳回首页是最糟的失败方式"""
+
+    def _upload(self, client, token, payload):
+        return client.post(
+            "/upload",
+            data={"file": (io.BytesIO(payload), "c.json")},
+            headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token},
+        )
+
+    def test_stats_failure_is_shown_on_home(self):
+        import app as appmod
+        from webapp import store as storemod
+
+        payload = _fix_chat_payload({"uA": ["在吗"], "uB": ["在的"]})
+        client = appmod.app.test_client()
+        client.get("/")
+        with client.session_transaction() as s:
+            token = s["csrf_token"]
+        with mock.patch.object(storemod, "compute_stats", side_effect=RuntimeError("磁盘炸了")):
+            r = self._upload(client, token, payload)
+            self.assertEqual(r.status_code, 302, "上传本身应成功（解析没问题）")
+            with client.session_transaction() as s:
+                chat_hash = s["chat_hash"]
+            storemod.wait_for_stats(chat_hash, timeout=20)
+            home = client.get("/").get_data(as_text=True)
+        self.assertIn("本地统计计算失败", home)
+        self.assertIn("磁盘炸了", home)
+        # 仪表盘没有数据可渲染，回首页——但首页必须解释原因
+        self.assertEqual(client.get("/dashboard").status_code, 302)
+        storemod._STATS_ERRORS.pop(chat_hash, None)
+        storemod._purge_chat_caches(chat_hash)
+
+    def test_csrf_failure_message_is_actionable(self):
+        import app as appmod
+
+        client = appmod.app.test_client()
+        r = client.post("/upload", data={}, headers={"Origin": "http://localhost:5000"})
+        self.assertEqual(r.status_code, 400)
+        body = r.get_data(as_text=True)
+        self.assertIn("CSRF", body)  # 保留原有语义（安全测试依赖）
+        self.assertIn("刷新", body)  # 并且告诉用户怎么办
 
 
 if __name__ == "__main__":

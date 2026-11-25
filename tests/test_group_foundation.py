@@ -53,6 +53,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from parser import qq_parser  # noqa: E402
 from parser.qq_parser import ChatData, Message, load_chat  # noqa: E402
 from analyzer import deepseek_client as dc  # noqa: E402
+from webapp import store as storemod  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
 _BASE_MS = int(datetime(2025, 3, 1, 20, 0, tzinfo=CST).timestamp() * 1000)
@@ -975,6 +976,232 @@ class TestGroupSaltSplit(unittest.TestCase):
 
         with mock.patch.dict(os.environ, {"QQCHAT_GROUP_CACHE_SALT": "redo-group"}):
             self.assertEqual(_prompt_fingerprint(), base_p, "群盐绝不能动私聊指纹（那会让私聊用户重新付费）")
+
+
+_FIX_CST = timezone(timedelta(hours=8))
+
+
+def _fix_chat_payload(uids_to_msgs):
+    msgs = []
+    base = int(datetime(2025, 3, 1, 20, 0, tzinfo=_FIX_CST).timestamp() * 1000)
+    i = 0
+    for uid, texts in uids_to_msgs.items():
+        for t in texts:
+            msgs.append(
+                {
+                    "id": str(i),
+                    "timestamp": base + i * 60000,
+                    "time": "2025-03-01 20:%02d:00" % (i % 60),
+                    "sender": {"uid": uid, "name": "人" + uid[-1]},
+                    "content": t,
+                }
+            )
+            i += 1
+    return _fix_wrap(msgs, {k: "人" + k[-1] for k in uids_to_msgs})
+
+
+def _fix_wrap(msgs, senders, self_uid="uA"):
+    """按导出格式包装（msgs 为完整消息字典，便于构造 system/type_23 等特殊条目）"""
+    return json.dumps(
+        {
+            "chatInfo": {
+                "name": senders.get("uB", "对方"),
+                "selfUid": self_uid,
+                "selfName": senders.get(self_uid, "我"),
+            },
+            "statistics": {
+                "senders": [{"uid": uid, "name": name} for uid, name in senders.items()],
+                "totalMessages": len(msgs),
+            },
+            "messages": msgs,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _fix_bulk(uid, name, n, start=0, text="在吗", **extra):
+    """批量构造某人的 n 条普通消息"""
+    base = int(datetime(2025, 3, 1, 20, 0, tzinfo=_FIX_CST).timestamp() * 1000)
+    out = []
+    for i in range(n):
+        m = {
+            "id": str(start + i),
+            "timestamp": base + (start + i) * 60000,
+            "time": "2025-03-01 20:%02d:00" % ((start + i) % 60),
+            "sender": {"uid": uid, "name": name},
+            "content": text,
+        }
+        m.update(extra)
+        out.append(m)
+    return out
+
+
+def _fix_write_tmp(payload):
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        f.write(payload)
+        return f.name
+
+
+class TestGroupChatGuard(unittest.TestCase):
+    """多人（群聊）导出必须被拦下，而不是静默把所有人并进"对方"。
+
+    另一面同样重要：QQChatExporter 会给系统类消息安排占位 sender
+    （name="系统消息"），实测真实私聊导出里这类条目 system 标记并不齐全，
+    早期版本因此把正常私聊误判成群聊直接拒收——这里用真实形态回归。
+    """
+
+    def test_three_participant_export_is_detected_as_group(self):
+        """3 位有实质发言者 = 群聊：2026-09-12 起按群聊分析（不再是拒收）
+
+        这是本项目**唯一一次有意的行为变更**，因此在这里写清两件事：
+        - 默认（QQCHAT_GROUP_CHAT=auto）识别为群聊，各自统计；
+        - 设为 off 时完全回到升级前的拒收行为（下一条用例钉住它）。
+        """
+        msgs = (
+            _fix_bulk("uA", "我", 20)
+            + _fix_bulk("uB", "对方", 20, start=20)
+            + _fix_bulk("uC", "第三人", 6, start=40)
+        )
+        path = _fix_write_tmp(_fix_wrap(msgs, {"uA": "我", "uB": "对方", "uC": "第三人"}))
+        try:
+            from parser.qq_parser import load_chat
+
+            with mock.patch.dict(os.environ, {"QQCHAT_GROUP_CHAT": "auto"}):
+                chat = load_chat(path)
+            self.assertTrue(chat.is_group_chat)
+            self.assertEqual(chat.mode, "group")
+            self.assertEqual(len(chat.participants()), 3)
+            self.assertEqual(chat.other_uid, "", "群聊没有单一「对方」")
+        finally:
+            os.remove(path)
+
+    def test_group_export_rejected_when_switched_off(self):
+        """QQCHAT_GROUP_CHAT=off：回到升级前的拒收（文案仍说明原因与两条出路）"""
+        msgs = (
+            _fix_bulk("uA", "我", 20)
+            + _fix_bulk("uB", "对方", 20, start=20)
+            + _fix_bulk("uC", "第三人", 6, start=40)
+        )
+        path = _fix_write_tmp(_fix_wrap(msgs, {"uA": "我", "uB": "对方", "uC": "第三人"}))
+        try:
+            from parser.qq_parser import load_chat
+
+            with mock.patch.dict(os.environ, {"QQCHAT_GROUP_CHAT": "off"}):
+                with self.assertRaises(ValueError) as ctx:
+                    load_chat(path)
+            self.assertIn("群聊", str(ctx.exception))
+            self.assertIn("3 位有实质发言", str(ctx.exception))
+            self.assertIn("QQCHAT_GROUP_CHAT", str(ctx.exception), "文案要指向新开关")
+        finally:
+            os.remove(path)
+
+    def test_system_placeholder_sender_is_not_group_chat(self):
+        """真实形态：占位 sender（系统消息）里混了一条无 system 标记的 type_23"""
+        msgs = _fix_bulk("uA", "我", 30) + _fix_bulk("uB", "对方", 28, start=30)
+        placeholder = _fix_bulk("未知uid未知", "系统消息", 4, start=100, system=True)
+        placeholder.append(
+            {  # 唯一没有 system 标记的占位消息
+                "id": "999",
+                "timestamp": int(datetime(2025, 3, 2, 9, 0, tzinfo=CST).timestamp() * 1000),
+                "time": "2025-03-02 09:00:00",
+                "sender": {"uid": "未知uid未知", "name": "系统消息"},
+                "type": "type_23",
+                "content": "商城表情",
+            }
+        )
+        path = _fix_write_tmp(
+            _fix_wrap(msgs + placeholder, {"uA": "我", "uB": "对方", "未知uid未知": "系统消息"})
+        )
+        try:
+            from parser.qq_parser import load_chat
+
+            chat = load_chat(path)  # 不得抛异常
+            self.assertEqual(chat.self_uid, "uA")
+            self.assertEqual(len(chat.messages), 63)
+        finally:
+            os.remove(path)
+
+    def test_stray_few_messages_do_not_reject(self):
+        """偶发第三方条目（未达"实质参与"门槛）不该把私聊判成群聊"""
+        msgs = _fix_bulk("uA", "我", 25) + _fix_bulk("uB", "对方", 24, start=25)
+        stray = _fix_bulk("uX", "路人", 2, start=60)
+        path = _fix_write_tmp(_fix_wrap(msgs + stray, {"uA": "我", "uB": "对方", "uX": "路人"}))
+        try:
+            from parser.qq_parser import load_chat
+
+            self.assertEqual(len(load_chat(path).messages), 51)
+        finally:
+            os.remove(path)
+
+    def test_env_override_allows_multi_party(self):
+        msgs = (
+            _fix_bulk("uA", "我", 20)
+            + _fix_bulk("uB", "对方", 20, start=20)
+            + _fix_bulk("uC", "第三人", 6, start=40)
+        )
+        path = _fix_write_tmp(_fix_wrap(msgs, {"uA": "我", "uB": "对方", "uC": "第三人"}))
+        try:
+            from parser.qq_parser import load_chat
+
+            with mock.patch.dict(os.environ, {"QQCHAT_ALLOW_MULTI_PARTY": "1"}):
+                chat = load_chat(path)
+            self.assertEqual(len(chat.messages), 46)
+            # 放行时仍按"我 vs 其他人"两类归并（口径写死在错误文案里，用户知情）
+            self.assertEqual(chat.self_uid, "uA")
+        finally:
+            os.remove(path)
+
+    def test_two_participant_upload_still_fine(self):
+        import app as appmod
+
+        payload = _fix_chat_payload({"uA": ["在吗"], "uB": ["在的"]})
+        client = appmod.app.test_client()
+        client.get("/")
+        with client.session_transaction() as sess:
+            token = sess["csrf_token"]
+        r = client.post(
+            "/upload",
+            data={"file": (io.BytesIO(payload), "ok.json")},
+            headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token},
+        )
+        self.assertEqual(r.status_code, 302)
+        with client.session_transaction() as sess:
+            p, h = sess.get("filepath"), sess.get("chat_hash")
+        storemod.wait_for_stats(h)
+        try:
+            storemod._purge_chat_caches(h)
+        finally:
+            if p and os.path.exists(p):
+                os.remove(p)
+
+
+class TestOtherUidDerivation(unittest.TestCase):
+    """对方的 UID 必须取"发言最多的非自己一方"，不能被占位 sender 抢走"""
+
+    def test_placeholder_sender_does_not_take_other_uid(self):
+        from parser.qq_parser import load_chat
+
+        # 占位 sender 排在文件最前面，且有一条非 system 消息（真实导出就是这样）
+        msgs = (
+            [
+                {
+                    "id": "0",
+                    "timestamp": 1704067200000,
+                    "time": "2024-01-01 08:00:00",
+                    "sender": {"uid": "未知uid未知", "name": "系统消息"},
+                    "content": "验证消息",
+                }
+            ]
+            + _fix_bulk("uA", "我", 20, start=1)
+            + _fix_bulk("uB", "对方", 18, start=21)
+        )
+        path = _fix_write_tmp(_fix_wrap(msgs, {"uA": "我", "uB": "对方", "未知uid未知": "系统消息"}))
+        try:
+            chat = load_chat(path)
+            self.assertEqual(chat.other_uid, "uB")
+            self.assertEqual(chat.other_name, "对方")
+        finally:
+            os.remove(path)
 
 
 if __name__ == "__main__":

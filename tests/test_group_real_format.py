@@ -794,5 +794,222 @@ class TestOtherMediaFix(unittest.TestCase):
         self.assertEqual(ov["total_other_media"], 1)
 
 
+def _fix_wrap(msgs, senders, self_uid="uA"):
+    """按导出格式包装（msgs 为完整消息字典，便于构造 system/type_23 等特殊条目）"""
+    return json.dumps(
+        {
+            "chatInfo": {
+                "name": senders.get("uB", "对方"),
+                "selfUid": self_uid,
+                "selfName": senders.get(self_uid, "我"),
+            },
+            "statistics": {
+                "senders": [{"uid": uid, "name": name} for uid, name in senders.items()],
+                "totalMessages": len(msgs),
+            },
+            "messages": msgs,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _fix_write_tmp(payload):
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        f.write(payload)
+        return f.name
+
+
+class TestMediaParticipation(unittest.TestCase):
+    """文件/视频/转发/卡片/通话/商城表情都要参与统计与分析（真实导出里的形态）"""
+
+    @staticmethod
+    def _msg_with(el_type, data, msg_type=None, text="", **kw):
+        m = {
+            "id": "1",
+            "timestamp": 1704067200000,
+            "time": "2024-01-01T00:00:00.000Z",
+            "sender": {"uid": "uA", "name": "我"},
+            "type": msg_type or el_type,
+            "content": {"text": text, "elements": [{"type": el_type, "data": data}]},
+        }
+        m.update(kw)
+        return m
+
+    def _load(self, msgs):
+        path = _fix_write_tmp(_fix_wrap(msgs, {"uA": "我", "uB": "对方"}))
+        try:
+            from parser.qq_parser import load_chat
+
+            return load_chat(path)
+        finally:
+            os.remove(path)
+
+    def test_file_and_video_carry_labels_but_not_body_text(self):
+        chat = self._load(
+            [
+                self._msg_with(
+                    "file", {"filename": "example.zip", "size": "12345"}, text="[文件:example.zip]"
+                ),
+                self._msg_with("video", {"filename": "clip.mp4", "size": "999"}, text="[视频:clip.mp4]"),
+            ]
+        )
+        f, v = chat.messages
+        self.assertEqual((f.media_kind, f.media_label), ("file", "example.zip"))
+        self.assertEqual((v.media_kind, v.media_label), ("video", "clip.mp4"))
+        # 正文保持干净：文件名不能灌进词频/句长口径
+        self.assertEqual(f.text, "")
+        self.assertEqual(v.text, "")
+
+    def test_forward_card_gets_title_and_count(self):
+        chat = self._load(
+            [
+                self._msg_with(
+                    "forward",
+                    {"title": "小明和小红的聊天记录", "messageCount": "25"},
+                    msg_type="json",
+                    text="[转发消息: 25条]",
+                )
+            ]
+        )
+        m = chat.messages[0]
+        self.assertEqual(m.media_kind, "forward")
+        self.assertIn("25条", m.media_label)
+        self.assertIn("聊天记录", m.media_label)
+
+    def test_call_record_and_json_card_and_wallet(self):
+        chat = self._load(
+            [
+                self._msg_with("av_record", {}, msg_type="type_19", text="通话 - 未接听，点击回拨"),
+                self._msg_with("json", {}, msg_type="json", text="[JSON消息]"),
+                self._msg_with(
+                    "wallet", {"summary": "红包/钱包消息"}, msg_type="type_10", text="红包/钱包消息"
+                ),
+            ]
+        )
+        kinds = [m.media_kind for m in chat.messages]
+        self.assertEqual(kinds, ["av_record", "json", "wallet"])
+        self.assertIn("未接听", chat.messages[0].media_label)
+
+    def test_market_face_counts_as_face_and_is_not_skipped(self):
+        """type_17（商城大表情）此前被整个跳过，是 277 条白白丢掉的信号"""
+        chat = self._load(
+            [self._msg_with("market_face", {"name": "[[叉腰]]"}, msg_type="type_17", text="[[叉腰]]")]
+        )
+        m = chat.messages[0]
+        self.assertEqual(m.face_names, ["叉腰"])
+        from parser.qq_parser import is_statistical
+
+        self.assertTrue(is_statistical(m), "商城表情不该被当成不可分析的卡片")
+        from analyzer.local_stats import calc_face_stats, calc_overview
+
+        self.assertEqual(calc_overview(chat)["total_faces"], 1)
+        self.assertEqual(calc_face_stats(chat)["self"], {"叉腰": 1})
+
+    def test_media_messages_enter_ai_dialog_with_markers(self):
+        import analyzer.deepseek_client as dc
+
+        chat = self._load(
+            [
+                self._msg_with("file", {"filename": "示例表.xlsx"}, text="[文件:示例表.xlsx]"),
+                self._msg_with(
+                    "forward",
+                    {"title": "小明和小红的聊天记录", "messageCount": "4"},
+                    msg_type="json",
+                    text="[转发消息: 4条]",
+                ),
+                self._msg_with("av_record", {}, msg_type="type_19", text="通话 - 未接听"),
+            ]
+        )
+        for m in chat.messages:
+            self.assertTrue(dc._has_content(m), "媒体消息必须能进 AI 对话")
+        lines = [dc._message_line(m, "我") for m in chat.messages]
+        self.assertIn("[文件:示例表.xlsx]", lines[0])
+        self.assertIn("转发:", lines[1])
+        self.assertIn("通话:", lines[2])
+
+    def test_media_does_not_pollute_length_or_word_stats(self):
+        from analyzer.local_stats import calc_message_length_stats
+
+        long_name = "a" * 80 + ".zip"
+        chat = self._load([self._msg_with("file", {"filename": long_name}, text=f"[文件:{long_name}]")])
+        stats = calc_message_length_stats(chat)
+        self.assertEqual(stats["self"]["max"], 0, "文件名不该计入发言长度")
+
+    def test_overview_counts_media_by_kind(self):
+        from analyzer.local_stats import calc_overview
+
+        chat = self._load(
+            [
+                self._msg_with("file", {"filename": "a.zip"}),
+                self._msg_with("file", {"filename": "b.zip"}),
+                self._msg_with("video", {"filename": "c.mp4"}),
+                self._msg_with("forward", {"title": "t", "messageCount": "3"}, msg_type="json"),
+                self._msg_with("wallet", {"summary": "红包"}),
+            ]
+        )
+        ov = calc_overview(chat)
+        self.assertEqual(ov["total_files"], 2)
+        self.assertEqual(ov["total_videos"], 1)
+        self.assertEqual(ov["total_forwards"], 1)
+        self.assertEqual(ov["total_other_media"], 1)
+
+    def test_media_volume_and_dedup(self):
+        """导出器给到的 size/md5 用于体积与去重统计（同一张图反复发只算一张）"""
+        from analyzer.local_stats import calc_overview
+
+        img = {"filename": "a.jpg", "size": "2048", "md5": "AAA"}
+        chat = self._load(
+            [
+                self._msg_with("image", img),
+                self._msg_with("image", img),  # 同一张图重复发送
+                self._msg_with("image", {"filename": "b.jpg", "size": "1024", "md5": "BBB"}),
+                self._msg_with("file", {"filename": "c.zip", "size": "4096", "md5": "CCC"}),
+            ]
+        )
+        ov = calc_overview(chat)
+        self.assertEqual(ov["total_images"], 3)
+        self.assertEqual(ov["image_bytes"], 2048 * 2 + 1024)
+        self.assertEqual(ov["unique_images"], 2)
+        self.assertEqual(ov["other_media_bytes"], 4096, "文件体积计入非图片媒体，不计入图片体积")
+
+    def test_media_size_dirty_values_do_not_crash(self):
+        from analyzer.local_stats import calc_overview
+
+        chat = self._load([self._msg_with("image", {"filename": "x.jpg", "size": "未知", "md5": None})])
+        ov = calc_overview(chat)
+        self.assertEqual(ov["image_bytes"], 0)
+        self.assertIsNone(ov["unique_images"], "没有 md5 时应给 None 而不是假装 0")
+
+
+class TestTimeNormalization(unittest.TestCase):
+    """时间字符串必须与统计口径一致（新版导出器写的是 UTC ISO 时间）"""
+
+    def test_iso_utc_time_is_converted_to_cst(self):
+        from parser.qq_parser import load_chat
+
+        msgs = [
+            {
+                "id": "1",
+                "timestamp": 1704067200000,
+                "time": "2024-01-01T00:00:00.000Z",
+                "sender": {"uid": "uA", "name": "我"},
+                "content": {"text": "在吗", "elements": [{"type": "text", "data": {"text": "在吗"}}]},
+            }
+        ]
+        path = _fix_write_tmp(_fix_wrap(msgs, {"uA": "我", "uB": "对方"}))
+        try:
+            chat = load_chat(path)
+        finally:
+            os.remove(path)
+        self.assertEqual(chat.messages[0].time_str, "2024-01-01 08:00:00")
+
+    def test_iso_fallback_when_timestamp_missing(self):
+        from parser.qq_parser import _parse_timestamp
+
+        ts = _parse_timestamp(None, "2024-01-01T00:00:00.000Z")
+        self.assertIsNotNone(ts, "缺 timestamp 时应能从 ISO 字符串回退解析")
+        self.assertEqual(ts, 1704067200000)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

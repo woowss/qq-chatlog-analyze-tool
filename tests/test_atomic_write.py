@@ -40,6 +40,7 @@ from pathlib import Path
 from unittest import mock
 
 # 测试隔离 + 网络护栏：见 tests/_bootstrap.py（必须在 import 项目模块之前完成）
+from datetime import datetime, timedelta, timezone
 from _bootstrap import bootstrap  # noqa: E402
 
 bootstrap()
@@ -326,6 +327,89 @@ class TestMonthCacheTempNamesAndRestamp(unittest.TestCase):
         mc._read_month_cache(key, expect_thinking=True)
         with open(path, encoding="utf-8") as f:
             self.assertTrue(json.load(f).get("_thinking"))
+
+
+_FIX_CST = timezone(timedelta(hours=8))
+
+
+def _fix_chat_payload(uids_to_msgs):
+    msgs = []
+    base = int(datetime(2025, 3, 1, 20, 0, tzinfo=_FIX_CST).timestamp() * 1000)
+    i = 0
+    for uid, texts in uids_to_msgs.items():
+        for t in texts:
+            msgs.append(
+                {
+                    "id": str(i),
+                    "timestamp": base + i * 60000,
+                    "time": "2025-03-01 20:%02d:00" % (i % 60),
+                    "sender": {"uid": uid, "name": "人" + uid[-1]},
+                    "content": t,
+                }
+            )
+            i += 1
+    return _fix_wrap(msgs, {k: "人" + k[-1] for k in uids_to_msgs})
+
+
+def _fix_wrap(msgs, senders, self_uid="uA"):
+    """按导出格式包装（msgs 为完整消息字典，便于构造 system/type_23 等特殊条目）"""
+    return json.dumps(
+        {
+            "chatInfo": {
+                "name": senders.get("uB", "对方"),
+                "selfUid": self_uid,
+                "selfName": senders.get(self_uid, "我"),
+            },
+            "statistics": {
+                "senders": [{"uid": uid, "name": name} for uid, name in senders.items()],
+                "totalMessages": len(msgs),
+            },
+            "messages": msgs,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+class TestSaveAndHash(unittest.TestCase):
+    """保存即哈希：与落盘后重读的结果一致"""
+
+    def test_hash_equals_reread(self):
+        from webapp import store as storemod
+
+        class FS:
+            def __init__(self, data):
+                self.stream = io.BytesIO(data)
+
+        data = json.dumps({"hello": "世界" * 500}).encode("utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "f.json")
+            fs = FS(data)
+            size, h = storemod.save_and_hash(fs, dest)
+            self.assertEqual(size, len(data))
+            self.assertEqual(h, storemod._chat_hash(dest))
+
+    def test_upload_records_hash_from_stream(self):
+        import app as appmod
+
+        payload = _fix_chat_payload({"uA": ["在吗"], "uB": ["在的"]})
+        client = appmod.app.test_client()
+        client.get("/")
+        with client.session_transaction() as sess:
+            token = sess["csrf_token"]
+        r = client.post(
+            "/upload",
+            data={"file": (io.BytesIO(payload), "h.json")},
+            headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token},
+        )
+        self.assertEqual(r.status_code, 302)
+        with client.session_transaction() as sess:
+            path, h = sess["filepath"], sess["chat_hash"]
+        try:
+            self.assertEqual(h, storemod._chat_hash(path))
+        finally:
+            storemod._purge_chat_caches(h)
+            if path and os.path.exists(path):
+                os.remove(path)
 
 
 if __name__ == "__main__":
