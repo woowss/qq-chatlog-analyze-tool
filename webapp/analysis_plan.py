@@ -280,21 +280,32 @@ def _build_units(chat, chat_hash, dimension, dimension_cache, refresh):
                     )
                 )
         elif dimension == "recap":
-            digest = recap_client._recap_digest(chat)
-            units.append(
-                _unit(
-                    "recap:all",
-                    dimension,
-                    "完整对话",
-                    len(recap_client.SYSTEM_PROMPT_RECAP) + len(digest),
-                    status="维度缓存命中" if dimension_cached else "待调用",
-                    thinking=dc.thinking_enabled(dimension),
-                    refresh=refresh,
-                    identity=hashlib.sha256(
-                        (recap_client.RECAP_PROMPT_FINGERPRINT + digest).encode("utf-8")
-                    ).hexdigest(),
+            if not any(dc._has_content(m) for m in chat.statistical()):
+                units.append(
+                    _unit(
+                        "recap:all",
+                        dimension,
+                        "完整对话",
+                        0,
+                        status="无可分析消息",
+                    )
                 )
-            )
+            else:
+                digest = recap_client._recap_digest(chat)
+                units.append(
+                    _unit(
+                        "recap:all",
+                        dimension,
+                        "完整对话",
+                        len(recap_client.SYSTEM_PROMPT_RECAP) + len(digest),
+                        status="维度缓存命中" if dimension_cached else "待调用",
+                        thinking=dc.thinking_enabled(dimension),
+                        refresh=refresh,
+                        identity=hashlib.sha256(
+                            (recap_client.RECAP_PROMPT_FINGERPRINT + digest).encode("utf-8")
+                        ).hexdigest(),
+                    )
+                )
     return units
 
 

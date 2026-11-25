@@ -229,7 +229,7 @@ def _max_tokens(dim: str, default: int) -> int:
         return default
     try:
         value = int(float(raw))
-    except ValueError:
+    except (TypeError, ValueError, OverflowError):
         logger.warning("%s=%r 不是数字，已回退为 %d", env_name, raw, default)
         return default
     if not 256 <= value <= 384_000:
@@ -922,7 +922,7 @@ def _call_api(
             THINKING_MIN_TOKENS,
         )
     tpm_wait = TPM_WAIT_SECONDS if tpm_wait is None else tpm_wait
-    max_attempts = max(retry, TPM_MAX_ATTEMPTS - 1) + 1
+    max_attempts = retry + TPM_MAX_ATTEMPTS
 
     while True:
         # partial 而不是闭包：把当前的 think 值**绑定**进参数里（闭包会跟着

@@ -713,7 +713,8 @@ def _cache_path(
     else:
         pick = legacy_fingerprint_for_dimension if legacy else fingerprint_for_dimension
         prompt_fp = pick(dimension)
-    return os.path.join(AI_CACHE_DIR, f"{dimension}_{chat_hash}_{DEEPSEEK_MODEL}_{prompt_fp}{suffix}.json")
+    model_key = _cache_model_key()
+    return os.path.join(AI_CACHE_DIR, f"{dimension}_{chat_hash}_{model_key}_{prompt_fp}{suffix}.json")
 
 
 #: 原子写入留下的临时后缀：既认新的唯一名（`.json.{pid}.{tid}.{rand}.tmp`），
@@ -815,6 +816,12 @@ def _purge_chat_caches(chat_hash: str) -> int:
         from analyzer import vision  # 延迟导入，避免 store→vision 模块级依赖
 
         removed += vision.purge_memo(chat_hash)
+        try:
+            from analyzer import face_images
+
+            face_images.purge_collect_memo(chat_hash)
+        except Exception:
+            pass
     except Exception as e:  # 回收失败不影响主流程，但必须继续清理磁盘副本
         logger.warning("进程内图片摘要回收失败: %s", e)
     try:
@@ -883,11 +890,12 @@ def _read_cache(
         if current_fp == fingerprint_for_dimension(dimension)
         else ()
     )
+    model_key = _cache_model_key()
     for legacy_fp in legacy_fps:
         if legacy_fp == current_fp:
             continue  # 两个指纹相同（没有历史包袱的干净环境），不必多查一次
         legacy_path = os.path.join(
-            AI_CACHE_DIR, f"{dimension}_{chat_hash}_{DEEPSEEK_MODEL}_{legacy_fp}{suffix}.json"
+            AI_CACHE_DIR, f"{dimension}_{chat_hash}_{model_key}_{legacy_fp}{suffix}.json"
         )
         data = _load_cache_file(legacy_path, touch=not read_only)
         if data is None:
@@ -1016,13 +1024,34 @@ def read_chat_bundle(stream, confirm_overwrite: bool = False, live_hash: str = "
 # ---------------------------------------------------------------------------
 
 
+_SAFE_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _cache_model_key(model=None) -> str:
+    """将模型名映射为单段安全文件名，避免 `/`、`\\`、`:` 等字符破坏路径。"""
+    raw = str(DEEPSEEK_MODEL if model is None else model).strip()
+    if (
+        raw
+        and ".." not in raw
+        and "/" not in raw
+        and "\\" not in raw
+        and "\x00" not in raw
+        and _SAFE_MODEL_RE.match(raw)
+    ):
+        return raw
+    slug = re.sub(r"[^A-Za-z0-9.-]+", "-", raw)
+    slug = re.sub(r"\.{2,}", ".", slug).strip(".-") or "model"
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{slug[:40]}-{digest}"
+
+
 def _ask_path(chat_hash: str, question: str) -> str:
     from analyzer import recap_client
 
     q_hash = hashlib.sha1(question.strip().encode("utf-8")).hexdigest()[:16]
     return os.path.join(
         AI_CACHE_DIR,
-        f"ask_{chat_hash}_{DEEPSEEK_MODEL}_{recap_client.ASK_PROMPT_FINGERPRINT}_{q_hash}.json",
+        f"ask_{chat_hash}_{_cache_model_key()}_{recap_client.ASK_PROMPT_FINGERPRINT}_{q_hash}.json",
     )
 
 

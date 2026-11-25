@@ -815,11 +815,11 @@ function renderGroupEmotionTrend(data, chart) {
     if (!el) return;
     var months = monthsOf(data);
     if (!months.length) return;
-    chart = chart || mountChart('emotionTrend');
-    if (!chart) return;
     el.classList.remove('d-none');
     var empty = document.getElementById('emotionTrendEmpty');
     if (empty) empty.classList.add('d-none');
+    chart = chart || mountChart('emotionTrend');
+    if (!chart) return;
     chart.setOption(applyChartTheme({
         tooltip: { trigger: 'axis' },
         grid: { left: 8, right: 16, top: 24, bottom: 24, containLabel: true },
@@ -946,9 +946,16 @@ function analyzeGroupDimension(dim, btn, containerId, renderer, onFinish) {
             btn.prop('disabled', false).text(orig);
             if (onFinish) onFinish();
         },
-        onError: function (msg) {
+        onError: function (msg, meta) {
             var cancelled = msg === '分析已取消';
-            setAnalysisEmptyState(dim, cancelled ? 'empty' : 'error', cancelled ? null : msg);
+            var partial = meta && meta.partialResults && meta.partialResults[dim];
+            var hasPartial = partial && (typeof partial !== 'object' || Object.keys(partial).length > 0);
+            if (hasPartial && onSuccess) {
+                onSuccess(partial);
+                setAnalysisEmptyState(dim, 'ready');
+            } else {
+                setAnalysisEmptyState(dim, cancelled ? 'empty' : 'error', cancelled ? null : msg);
+            }
             status.html('<div class="alert alert-' + (cancelled ? 'secondary' : 'danger')
                 + ' mb-0">' + esc(msg) + '</div>');
             btn.prop('disabled', false).text(orig);

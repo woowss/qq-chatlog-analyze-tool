@@ -42,7 +42,9 @@ def request_with_retry(
 ) -> tuple[Any, Optional[str]]:
     """执行带重试的 API 调用，返回响应或可恢复失败原因。"""
     tpm_hits = 0
-    for attempt in range(max_attempts):
+    generic_failures = 0
+    last_tpm = False
+    for _attempt in range(max_attempts):
         # 计费闸门在 try 之外，调用上限错误不能被当成网络波动重试。
         count_call()
         try:
@@ -63,6 +65,7 @@ def request_with_retry(
             if is_plan_exhausted(e):
                 raise quota_exhausted_error(fatal_message) from e
             if is_tpm_throttle(e):
+                last_tpm = True
                 tpm_hits += 1
                 if tpm_hits < tpm_max_attempts:
                     logger.warning(
@@ -75,15 +78,17 @@ def request_with_retry(
                     sleep(tpm_wait)
                     continue
                 return None, "tpm"
-            if attempt < generic_retries:
-                delay = 2**attempt
+            last_tpm = False
+            if generic_failures < generic_retries:
+                generic_failures += 1
+                delay = 2 ** (generic_failures - 1)
                 logger.warning(
                     "API 调用失败（第 %s 次，%ss 后重试）: %s",
-                    attempt + 1,
+                    generic_failures,
                     delay,
                     scrub_secrets(e),
                 )
                 sleep(delay)
                 continue
             raise
-    return None, "error"
+    return None, ("tpm" if last_tpm else "error")

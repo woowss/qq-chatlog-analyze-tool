@@ -220,6 +220,8 @@ def analyze_recap(
     if dc.shutdown_requested() or (should_cancel and should_cancel()):
         logger.info("recap：已请求停止，跳过本次调用")
         return None
+    if not any(dc._has_content(m) for m in chat.statistical()):
+        return None
     digest = _recap_digest(chat)
     if not digest.strip():
         return None

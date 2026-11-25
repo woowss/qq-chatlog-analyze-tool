@@ -163,6 +163,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                 </p>
             </div>
             {% endif %}
+            {% if self_names | length > 1 %}
+            <div class="col-md-4">
+                <div class="stat-label">我的称呼变迁（{{ overview.self_name }}）</div>
+                <p class="small mb-0">
+                    {%- for n in self_names %}
+                    <strong>{{ n.name }}</strong>（{{ n.first_month }}{% if n.last_month != n.first_month %}~{{ n.last_month }}{% endif %}，{{ n.count }} 条）{% if not loop.last %} → {% endif %}
+                    {%- endfor %}
+                </p>
+            </div>
+            {% endif %}
         </div>
     </div>
 </div>
@@ -478,7 +488,10 @@ $('#btn-delete-chat').on('click', function() {
 <script>
 (function() {
     const DIM_LABEL = {emotion:'情绪',topics:'话题',relationship:'关系',habits:'习惯',profile:'锐评',
-                       vision:'图片理解',unknown:'其他',all:'一键全量',recap:'整体总括'};
+                       vision:'图片理解',unknown:'其他',all:'一键全量',recap:'整体总括',
+                       ask:'对话追问',plan:'按需计划',group_activity:'群活跃',
+                       group_emotion:'群情绪',group_relations:'群关系',group_topics:'群话题',
+                       member_profiles:'成员分析'};
     function fmt(n) { return (n || 0).toLocaleString(); }
 
     // 任务历史独立于用量：还没产生任何调用时（全被取消/失败），这张表也要能出现

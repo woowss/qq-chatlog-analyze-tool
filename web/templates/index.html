@@ -273,6 +273,9 @@ $(function() {
     // 合法操作，所以不禁止、只要求一次明确确认；而"随手导入一个来路不明的 zip 就
     // 把自己当前的结论换掉"这条路被这一眼拦下（服务端的归属校验是另一道）。
     var importConfirmed = false;
+    $('#importFile').on('change', function() {
+        importConfirmed = false;
+    });
     $('#importForm').on('submit', function(e) {
         e.preventDefault();
         var file = $('#importFile')[0].files[0];

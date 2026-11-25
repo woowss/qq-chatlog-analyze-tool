@@ -357,6 +357,8 @@ def login():
         return redirect(url_for("index"))
     error = None
     if request.method == "POST":
+        if not _origin_allowed():
+            return "非法来源", 403
         ip = request.remote_addr or "127.0.0.1"
         # 一次加锁内完成"判超限 + 记下这次尝试"：拆成两步会留下并发窗口，
         # 让实际允许的尝试次数变成 上限 + 并发数（见 _register_login_attempt）。
@@ -384,8 +386,15 @@ def login():
             nxt = request.args.get("next") or ""
             # 防开放重定向：反斜杠先归一为斜杠再判断。浏览器把 `/\evil.com` 当作
             # 协议相对地址（等价于 //evil.com），只查 "//" 会被这样绕过。
-            safe_next = nxt.replace("\\", "/")
-            if not safe_next.startswith("/") or safe_next.startswith("//"):
+            safe_next = (nxt or "").strip().replace("\\", "/")
+            parsed_next = urlparse(safe_next)
+            if (
+                not safe_next.startswith("/")
+                or safe_next.startswith("//")
+                or parsed_next.scheme
+                or parsed_next.netloc
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in safe_next)
+            ):
                 safe_next = url_for("index")
             logger.info("登录成功 [%s]", ip)
             return redirect(safe_next)

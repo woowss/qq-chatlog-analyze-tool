@@ -173,7 +173,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
     function render(res, highlightId) {
         state.total = res.total || 0;
-        if (res.pages) state.pages = res.pages;
+        state.pages = res.pages || 0;
         $('#msgList').html(formatMessages(res.messages || [], highlightId)
             || '<div class="text-muted small p-2">没有符合条件的消息</div>');
         $('#resultMeta').text('共 ' + state.total + ' 条');

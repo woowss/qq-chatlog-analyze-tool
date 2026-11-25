@@ -68,6 +68,11 @@ loadAnalysis('group_emotion', function (data) {
     if (!data) return;
     var box = document.getElementById('sec-emotion');
     if (box) renderGroupEmotion(box, data);
+    if (!monthsOf(data).length) return;
+    var trendEl = document.getElementById('emotionTrend');
+    if (trendEl) trendEl.classList.remove('d-none');
+    var empty = document.getElementById('emotionTrendEmpty');
+    if (empty) empty.classList.add('d-none');
     var chart = mountChart('emotionTrend');
     if (!chart) return;
     renderGroupEmotionTrend(data, chart);

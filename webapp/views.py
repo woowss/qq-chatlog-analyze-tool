@@ -192,6 +192,10 @@ def health():
     - 不能写日志、不能触发清理：同上，高频调用会把日志刷爆。
     具体豁免见 webapp.security.BYPASS_ENDPOINTS。
     """
+    from analyzer.shutdown import shutdown_requested
+
+    if shutdown_requested():
+        return "shutting down", 503
     return "ok", 200
 
 

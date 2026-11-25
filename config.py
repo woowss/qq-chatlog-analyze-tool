@@ -219,7 +219,8 @@ VISION_ENABLED = env_bool("LLM_VISION", True)
 # 准确性优先：默认 20 张（约 2 万 tokens/月，成本可忽略），能覆盖更多截图与表情包。
 VISION_MAX_PER_MONTH = env_int("LLM_VISION_MAX_PER_MONTH", 20, 0, 50)
 # 送图清晰度：high 保留原图（截图里的字才看得清）；low 压到 512x512（更省 token）
-VISION_DETAIL = os.getenv("LLM_VISION_DETAIL", "high").strip().lower() or "high"
+_vision_detail_raw = os.getenv("LLM_VISION_DETAIL", "high").strip().lower() or "high"
+VISION_DETAIL = _vision_detail_raw if _vision_detail_raw in ("high", "low", "auto") else "high"
 # 太小的图基本是表情包/缩略图，跳过以省 token（按最长边像素判断）
 VISION_MIN_SIDE = env_int("LLM_VISION_MIN_SIDE", 200, 0, 4000)
 # 单张图片体积上限（官方 base64 上限 32 MiB，这里留一半余量）
@@ -241,6 +242,18 @@ FACE_IMAGES_ENABLED = env_bool("QQCHAT_FACE_IMAGES", False)
 # 一次抓取的上限与超时：失败逐条跳过，抓不到就继续用 emoji/文字
 FACE_FETCH_LIMIT = env_int("QQCHAT_FACE_FETCH_LIMIT", 300, 1, 2000)
 FACE_FETCH_TIMEOUT = env_int("QQCHAT_FACE_FETCH_TIMEOUT", 6, 1, 60)
+
+
+def _write_secret_file(target: Path, key: str) -> None:
+    """以 0o600 权限原子写入或收紧 .secret_key（Windows 无 POSIX 权限位时静默忽略）。"""
+    os.makedirs(target.parent, exist_ok=True)
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(key)
+    try:
+        os.chmod(target, 0o600)
+    except OSError:
+        pass
 
 
 def _load_or_create_secret() -> str:
@@ -265,15 +278,18 @@ def _load_or_create_secret() -> str:
             continue
         if index > 0:  # 旧位置的密钥：顺手迁到数据目录
             try:
-                os.makedirs(DATA_DIR, exist_ok=True)
-                target.write_text(key, encoding="utf-8")
+                _write_secret_file(target, key)
+            except OSError:
+                pass
+        else:
+            try:
+                os.chmod(target, 0o600)
             except OSError:
                 pass
         return key
     key = os.urandom(24).hex()
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        target.write_text(key, encoding="utf-8")
+        _write_secret_file(target, key)
     except OSError:
         pass  # 写失败时退化为本次进程内随机值
     return key

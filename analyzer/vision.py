@@ -203,29 +203,64 @@ def resolve(media_path: str, chat_hash: str = ""):
         candidates.append(os.path.join(MEDIA_ROOT, "resources", rel))
     for cand in candidates:
         if os.path.isfile(cand) and _within(MEDIA_ROOT, cand):
-            return cand
+            return os.path.normpath(cand)
     return None
 
 
-def _sample(msgs: list, limit: int) -> list:
-    """按"去重 → 跳过小图 → 等间隔抽样"的规则挑消息（不检查文件是否存在）"""
+def _message_images(m) -> list[tuple[str, str, int, int]]:
+    """返回单条消息中各图片的 (path, id, width, height)，兼容仅构造了 media_* 的旧测试对象。"""
+    items = getattr(m, "image_items", None)
+    if items:
+        return [
+            (
+                str(it.get("path") or ""),
+                str(it.get("id") or ""),
+                int(it.get("w") or 0),
+                int(it.get("h") or 0),
+            )
+            for it in items
+        ]
+    return [
+        (
+            str(getattr(m, "media_path", "") or ""),
+            str(getattr(m, "media_id", "") or ""),
+            int(getattr(m, "media_w", 0) or 0),
+            int(getattr(m, "media_h", 0) or 0),
+        )
+    ]
+
+
+def _sample_items(msgs: list, limit: int) -> list[tuple]:
+    """按"去重 → 跳过小图 → 等间隔抽样"的规则挑出图片条目（不检查文件是否存在）"""
     picked: list = []
     seen: set = set()
     for m in msgs:
         if not m.has_image:
             continue
-        if m.media_w and m.media_h and max(m.media_w, m.media_h) < VISION_MIN_SIDE:
-            continue  # 小图基本是表情包/缩略图，不值得花 token
-        key = m.media_id or m.media_path
-        if not key or key in seen:
-            continue  # 同一张图反复发只算一次
-        if not m.media_path:
-            continue
-        seen.add(key)
-        picked.append(m)
+        for media_path, media_id, media_w, media_h in _message_images(m):
+            if media_w and media_h and max(media_w, media_h) < VISION_MIN_SIDE:
+                continue  # 小图基本是表情包/缩略图，不值得花 token
+            key = media_id or media_path
+            if not key or key in seen:
+                continue  # 同一张图反复发只算一次
+            if not media_path:
+                continue
+            seen.add(key)
+            picked.append((m, media_path, media_id))
     if limit and len(picked) > limit:
         stride = (len(picked) + limit - 1) // limit
         picked = picked[::stride][:limit]
+    return picked
+
+
+def _sample(msgs: list, limit: int) -> list:
+    """按"去重 → 跳过小图 → 等间隔抽样"的规则挑消息（不检查文件是否存在）"""
+    picked: list = []
+    seen_msgs: set[int] = set()
+    for m, _media_path, _media_id in _sample_items(msgs, limit):
+        if id(m) not in seen_msgs:
+            seen_msgs.add(id(m))
+            picked.append(m)
     return picked
 
 
@@ -271,8 +306,8 @@ def plan_wanted(months: dict, limit_per_month: int = None) -> list[str]:
     wanted: list[str] = []
     seen: set = set()
     for msgs in months.values():
-        for m in _sample(msgs, limit):
-            rel = str(m.media_path)
+        for _m, media_path, _media_id in _sample_items(msgs, limit):
+            rel = str(media_path)
             base = os.path.basename(rel.replace("\\", "/"))
             if base and base not in seen:
                 seen.add(base)
@@ -289,8 +324,8 @@ def pick_images(msgs: list, limit: int = None, chat_hash: str = "") -> list[dict
     limit = VISION_MAX_PER_MONTH if limit is None else limit
     picked: list[dict] = []
     total = 0
-    for m in _sample(msgs, limit):
-        path = resolve(m.media_path, chat_hash)
+    for m, media_path, media_id in _sample_items(msgs, limit):
+        path = resolve(media_path, chat_hash)
         if not path:
             continue
         ext = os.path.splitext(path)[1].lower()
@@ -306,7 +341,7 @@ def pick_images(msgs: list, limit: int = None, chat_hash: str = "") -> list[dict
             logger.info("图片摘要已达单次体积上限（%.1f MB），本月其余图片留到下次", total / 1048576)
             break
         total += size
-        media_id = str(getattr(m, "media_id", "") or "")
+        media_id = str(media_id or "")
         content_sha256, content_md5 = _file_fingerprints(path)
         if not content_sha256:
             continue
@@ -315,8 +350,8 @@ def pick_images(msgs: list, limit: int = None, chat_hash: str = "") -> list[dict
         picked.append(
             {
                 "path": path,
-                "key": media_id or m.media_path,
-                "legacy_key": media_id or m.media_path,
+                "key": media_id or media_path,
+                "legacy_key": media_id or media_path,
                 "trusted_md5": trusted_md5,
                 "content_sha256": content_sha256,
                 "size": size,

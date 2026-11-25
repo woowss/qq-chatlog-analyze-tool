@@ -155,8 +155,15 @@ def read_chat_bundle(
         if len(infos) > max_entries:
             return {"error": f"导出包条目过多（{len(infos)}），拒绝"}
 
+        max_meta_bytes = 64 * 1024
         try:
-            meta_raw = zf.read(meta_name)
+            meta_info = zf.getinfo(meta_name)
+            if meta_info.file_size > max_meta_bytes:
+                return {"error": "导出包元信息过大"}
+            with zf.open(meta_info) as meta_src:
+                meta_raw = meta_src.read(max_meta_bytes + 1)
+            if len(meta_raw) > max_meta_bytes:
+                return {"error": "导出包元信息过大"}
         except KeyError:
             return {"error": "结果包缺少 meta.json，无法确认它属于哪份聊天，已拒绝"}
         except Exception as e:
@@ -195,14 +202,15 @@ def read_chat_bundle(
         if total > max_total_bytes:
             return {"error": "导出包解压体积超限，已中止（导入不完整）"}
 
-        written = 0
+        actual_total = 0
+        staged: list[tuple[str, str, bytes]] = []
         for info, head, leaf in importable:
             target_dir = ai_cache_dir if head == "ai_cache" else stats_cache_dir
             path = os.path.join(target_dir, leaf)
             try:
                 with zf.open(info) as src:
-                    # 文件大小由 ZIP 元数据提供；限长读取，避免损坏或伪造元数据导致
-                    # 单条目在 JSON 大小校验前先把过量解压数据读入内存。
+                    # 文件大小由 ZIP 元数据提供；限长读取并累计实际解压字节数，
+                    # 防止伪造 header file_size 的条目把总解压体积撑破上限。
                     raw = src.read(MAX_PAYLOAD_BYTES + 1)
             except Exception as e:
                 logger.warning("结果包条目 %s 读不出来（%s），已跳过", leaf, type(e).__name__)
@@ -212,10 +220,17 @@ def read_chat_bundle(
                 logger.warning("结果包条目 %s 超过单文件大小上限，已跳过", leaf)
                 skipped += 1
                 continue
+            actual_total += len(raw)
+            if actual_total > max_total_bytes:
+                return {"error": "导出包解压体积超限，已中止（导入不完整）"}
             if not payload_ok(head, leaf, raw):
                 logger.warning("结果包条目 %s 形状不对，已跳过", leaf)
                 skipped += 1
                 continue
+            staged.append((path, target_dir, raw))
+
+        written = 0
+        for path, target_dir, raw in staged:
             try:
                 write_bytes_atomic(path, raw, mkdir=target_dir)
                 written += 1
