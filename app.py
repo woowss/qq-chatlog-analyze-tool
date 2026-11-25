@@ -52,6 +52,7 @@ from config import (
     SESSION_FILE_DIR,
     STATS_CACHE_DIR,
     UPLOAD_FOLDER,
+    env_number,
 )
 from analyzer.deepseek_client import (
     CALL_MIN_INTERVAL,
@@ -257,7 +258,7 @@ def _startup_report() -> bool:
 
 #: 收到中断信号后，留给"正在跑的那一个月"的收尾时间（秒）。
 #: 设 0 即恢复"按下就退出"的行为。
-SHUTDOWN_GRACE_SECONDS = float(os.getenv("QQCHAT_SHUTDOWN_GRACE_SECONDS") or 5)
+SHUTDOWN_GRACE_SECONDS = env_number("QQCHAT_SHUTDOWN_GRACE_SECONDS", 5.0, 0.0, 300.0)
 
 
 def _on_shutdown_signal(signum, _frame) -> None:
