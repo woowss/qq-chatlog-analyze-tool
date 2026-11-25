@@ -360,6 +360,173 @@ function clearStaleStrategyWarning() {
     if (box && box.dataset.staleStrategy === 'true') box.remove();
 }
 
+function _isAnalyzeCancelled(msg, meta) {
+    return Boolean(
+        (meta && meta.status === 'cancelled')
+        || (typeof msg === 'string' && msg.indexOf('分析已取消') === 0)
+    );
+}
+
+function _renderStatusAlert(statusEl, level, text, compact) {
+    if (!statusEl || !statusEl.length) return;
+    var cls = 'alert alert-' + level + (compact ? ' py-1 small' : '') + ' mb-0';
+    statusEl.empty().append($('<div>').addClass(cls).text(text));
+}
+
+function _mountAnalyzeProgress(statusEl, opts, ui) {
+    var progId = (ui && ui.progId) || 'aProg';
+    var textId = (ui && ui.textId) || 'aText';
+    var cancelId = (ui && ui.cancelId) || 'aCancel';
+    var inline = Boolean(ui && ui.inline);
+    if (inline) {
+        statusEl.html(
+            '<div class="d-flex align-items-center gap-2 flex-wrap">' +
+            '<div class="spinner-border spinner-border-sm text-primary" role="status"></div>' +
+            '<div class="progress" style="min-width:160px;height:8px;">' +
+            '<div id="' + progId + '" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div></div>' +
+            '<span id="' + textId + '" class="small text-muted">准备中…</span>' +
+            '<button id="' + cancelId + '" class="btn btn-sm btn-outline-secondary">取消</button></div>'
+        );
+    } else {
+        statusEl.html(
+            '<div class="spinner-border spinner-border-sm text-primary" role="status"></div>' +
+            '<div class="progress mx-auto mt-2" style="max-width:320px;height:8px;">' +
+            '<div id="' + progId + '" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div></div>' +
+            '<div id="' + textId + '" class="small text-muted mt-1">准备中…</div>' +
+            '<button id="' + cancelId + '" class="btn btn-sm btn-outline-secondary mt-2">取消</button>'
+        );
+    }
+    $('#' + cancelId).on('click', function () {
+        $(this).prop('disabled', true).text('取消中…');
+        cancelAnalyze(opts);
+    });
+    return function updateProgress(done, total, text) {
+        if (done < 0) { $('#' + textId).text('正在取消…'); return; }
+        if (total > 0) $('#' + progId).css('width', Math.round(done / total * 100) + '%');
+        $('#' + textId).text(text || '准备中…');
+    };
+}
+
+function runSingleDimension(config) {
+    var dim = config.dim;
+    var btn = config.btn;
+    var status = config.status;
+    var origLabel = config.origLabel || btn.data('orig') || btn.text();
+    var runningLabel = config.runningLabel || '分析中…';
+    var doneLabel = config.doneLabel || origLabel;
+    var compact = Boolean(config.compactAlert);
+    var updateEmptyState = Boolean(config.updateEmptyState);
+
+    btn.prop('disabled', true).text(runningLabel);
+    if (updateEmptyState) setAnalysisEmptyState(dim, 'running');
+
+    var updateProgress = null;
+    function finishButton(label) {
+        btn.prop('disabled', false).text(label || origLabel);
+        if (config.onFinish) config.onFinish();
+    }
+
+    var opts = {
+        refresh: Boolean(config.refresh),
+        onProgress: function (done, total, detail) {
+            var text = config.formatProgress
+                ? config.formatProgress(done, total, detail)
+                : (total > 0
+                    ? ('已完成 ' + done + '/' + total + '（' + Math.round(done / total * 100) + '%）')
+                    : '准备中…');
+            if (updateProgress) updateProgress(done, total, text);
+        },
+        onDone: function (result, meta) {
+            if (meta && meta.partial) {
+                var partialMsg = config.onPartialResult
+                    ? config.onPartialResult(result, meta, false)
+                    : null;
+                _renderStatusAlert(
+                    status,
+                    'warning',
+                    partialMsg || '本次只处理了所选单元，未标记为完整维度结果；可重新预览并补齐。',
+                    compact
+                );
+                finishButton(origLabel);
+                return;
+            }
+            if (updateEmptyState) setAnalysisEmptyState(dim, 'ready');
+            var doneMsg = config.onFullDone ? config.onFullDone(result, meta) : null;
+            _renderStatusAlert(status, 'success', doneMsg || '分析完成', compact);
+            finishButton(doneLabel);
+        },
+        onError: function (msg, meta) {
+            var cancelled = _isAnalyzeCancelled(msg, meta);
+            var partial = meta && meta.partialResults && meta.partialResults[dim];
+            var hasPartial = Boolean(partial && (typeof partial !== 'object' || Object.keys(partial).length > 0));
+            if (hasPartial && config.onPartialResult) {
+                var partialErrorMsg = config.onPartialResult(partial, meta, true);
+                _renderStatusAlert(status, 'warning', partialErrorMsg || msg, compact);
+                finishButton(origLabel);
+                return;
+            }
+            if (updateEmptyState) {
+                setAnalysisEmptyState(dim, cancelled ? 'empty' : 'error', cancelled ? null : msg);
+            }
+            var retained = Object.keys((meta && meta.results) || {});
+            var suffix = retained.length ? '；任务响应中保留了这些维度的结果：' + retained.join('、') : '';
+            var level = cancelled ? 'secondary' : (retained.length ? 'warning' : 'danger');
+            _renderStatusAlert(status, level, (cancelled ? '分析已取消' : msg) + suffix, compact);
+            finishButton(origLabel);
+        }
+    };
+
+    updateProgress = _mountAnalyzeProgress(status, opts, config.progressIds);
+    startAnalyze(dim, opts);
+}
+
+function runBatchAnalyze(config) {
+    var btn = config.btn;
+    var status = config.status;
+    var idleLabel = config.idleLabel || '全量分析';
+    var runningLabel = config.runningLabel || '全量分析中…';
+    $('.btn-analyze, #btn-analyze-all').prop('disabled', true);
+    btn.text(runningLabel);
+
+    function restoreAllButtons() {
+        $('.btn-analyze').prop('disabled', false).each(function () {
+            var orig = $(this).data('orig');
+            if (orig) $(this).text(orig);
+        });
+        btn.prop('disabled', false).text(idleLabel);
+    }
+
+    var updateProgress = null;
+    var opts = {
+        refresh: Boolean(config.refresh),
+        onProgress: function (done, total, detail) {
+            var text = config.formatProgress
+                ? config.formatProgress(done, total, detail)
+                : (detail || (total > 0 ? ('已完成 ' + done + '/' + total + ' 个维度') : '准备中…'));
+            if (updateProgress) updateProgress(done, total, text);
+        },
+        onDone: function (summary, meta) {
+            var outcome = config.onDone ? config.onDone(summary, meta, restoreAllButtons) : null;
+            restoreAllButtons();
+            if (outcome && outcome.text) {
+                _renderStatusAlert(status, outcome.level || 'success', outcome.text, false);
+            }
+        },
+        onError: function (msg, meta) {
+            restoreAllButtons();
+            var cancelled = _isAnalyzeCancelled(msg, meta);
+            var retained = Object.keys((meta && meta.results) || {});
+            var suffix = retained.length ? '；任务响应中保留了这些维度的结果：' + retained.join('、') : '';
+            var level = (cancelled || retained.length) ? 'warning' : 'danger';
+            var text = (cancelled ? '全量分析已取消。' : msg) + suffix;
+            _renderStatusAlert(status, level, text, false);
+        }
+    };
+
+    updateProgress = _mountAnalyzeProgress(status, opts, config.progressIds);
+    startAnalyzeAll(opts);
+}
+
 // 私聊维度页「页内运行本维度分析」的五页共用接线（此前只能回仪表盘触发，群聊页早有页内按钮）。
 // 页面模板提供 #inPageAnalyze 按钮 / #inPageStatus 状态区 / #inPageRefresh 复选框；
 // 没有这些元素的页面调用它会直接返回，因此对仪表盘、群聊页等零影响。
@@ -368,60 +535,32 @@ function analyzeInPage(dim, renderFn) {
     var btn = $('#inPageAnalyze');
     if (!btn.length) return;
     btn.on('click', function () {
-        var status = $('#inPageStatus');
         var orig = btn.data('orig') || '运行本维度分析';
-        btn.prop('disabled', true).text('分析中…');
-        setAnalysisEmptyState(dim, 'running');
-        var opts = {
+        runSingleDimension({
+            dim: dim,
+            btn: btn,
+            status: $('#inPageStatus'),
             refresh: $('#inPageRefresh').length ? $('#inPageRefresh').is(':checked') : false,
-            onProgress: function (done, total) {
-                if (done < 0) { $('#ipText').text('正在取消…'); return; }
-                if (total > 0) {
-                    var pct = Math.round(done / total * 100);
-                    $('#ipProg').css('width', pct + '%');
-                    $('#ipText').text('已完成 ' + done + '/' + total + ' 个月');
-                }
+            origLabel: orig,
+            progressIds: { progId: 'ipProg', textId: 'ipText', cancelId: 'ipCancel', inline: true },
+            compactAlert: true,
+            updateEmptyState: true,
+            formatProgress: function (done, total) {
+                return total > 0 ? ('已完成 ' + done + '/' + total + ' 个月') : '准备中…';
             },
-            onDone: function (result, meta) {
-                if (meta && meta.partial) {
-                    setAnalysisEmptyState(dim, 'empty', '本次只分析了所选单元，尚未生成完整维度结果。');
-                    status.html('<div class="alert alert-warning py-1 mb-0 small">部分分析已显示，但未保存为完整结果；可重新预览并补齐。</div>');
-                    btn.prop('disabled', false).text(orig);
-                    if (renderFn) renderFn(result);
-                    return;
-                }
-                setAnalysisEmptyState(dim, 'ready');
-                status.html('<div class="alert alert-success py-1 mb-0 small">分析完成</div>');
-                btn.prop('disabled', false).text(orig);
+            onPartialResult: function (partialResult, _meta, isFromError) {
+                setAnalysisEmptyState(dim, 'empty', isFromError
+                    ? '本次分析未完整完成，当前显示已完成部分。'
+                    : '本次只分析了所选单元，尚未生成完整维度结果。');
+                if (renderFn) renderFn(partialResult);
+                return isFromError
+                    ? '分析未完整完成；已显示可用的部分结果，未保存为完整维度结果。'
+                    : '部分分析已显示，但未保存为完整结果；可重新预览并补齐。';
+            },
+            onFullDone: function (result) {
                 if (renderFn) renderFn(result);
-            },
-            onError: function (msg, meta) {
-                var cancelled = msg === '分析已取消';
-                var partialResult = meta && meta.partial && meta.partialResults
-                    && meta.partialResults[dim];
-                if (partialResult && typeof partialResult === 'object'
-                    && !Array.isArray(partialResult) && Object.keys(partialResult).length > 0) {
-                    setAnalysisEmptyState(dim, 'empty', '本次分析未完整完成，当前显示已完成部分。');
-                    status.html('<div class="alert alert-warning py-1 mb-0 small">分析未完整完成；已显示可用的部分结果，未保存为完整维度结果。</div>');
-                    btn.prop('disabled', false).text(orig);
-                    if (renderFn) renderFn(partialResult);
-                    return;
-                }
-                setAnalysisEmptyState(dim, cancelled ? 'empty' : 'error', cancelled ? null : msg);
-                status.html('<div class="alert alert-' + (cancelled ? 'secondary' : 'danger')
-                    + ' py-1 mb-0 small">' + esc(msg) + '</div>');
-                btn.prop('disabled', false).text(orig);
+                return '分析完成';
             }
-        };
-        status.html(
-            '<div class="d-flex align-items-center gap-2 flex-wrap">' +
-            '<div class="spinner-border spinner-border-sm text-primary" role="status"></div>' +
-            '<div class="progress" style="min-width:160px;height:8px;">' +
-            '<div id="ipProg" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div></div>' +
-            '<span id="ipText" class="small text-muted">准备中…</span>' +
-            '<button id="ipCancel" class="btn btn-sm btn-outline-secondary">取消</button></div>'
-        );
-        $('#ipCancel').on('click', function () { $(this).prop('disabled', true).text('取消中…'); cancelAnalyze(opts); });
-        startAnalyze(dim, opts);
+        });
     });
 }

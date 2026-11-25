@@ -1560,6 +1560,42 @@ class TestBrowserFlows(unittest.TestCase):
         self.page.evaluate("() => { $.get = window.__scopeOriginalGet; }")
         self.assertFalse(self.errors, self.errors)
 
+    def test_group_partial_error_renders_partial_result_without_js_error(self):
+        from playwright.sync_api import expect
+        from analyzer import group_client as gc
+        from analyzer.deepseek_client import QuotaExhaustedError
+        from result_fixtures import for_dimension
+
+        calls = [0]
+
+        def fail_on_second_member(*args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 1:
+                result = for_dimension("member_profiles")
+                result["verdict"] = "首名成员合成局部结论"
+                return result
+            raise QuotaExhaustedError("合成测试配额耗尽")
+
+        group = json.loads((Path(__file__).parent / "fixtures/group_5p.json").read_text(encoding="utf-8"))
+        group["chatInfo"]["name"] = "摸鱼群局部失败回归"
+        payload_bytes = json.dumps(group, ensure_ascii=False).encode("utf-8")
+
+        with mock.patch.object(gc, "_call_api", side_effect=fail_on_second_member):
+            self.upload(payload_bytes)
+            self.page.goto(self.base + "/profile")
+            trigger = self.page.locator('.btn-analyze[data-dim="member_profiles"]')
+            trigger.click()
+            self.confirm_plan()
+
+            status = self.page.locator("#analyzeStatus")
+            expect(status).to_contain_text("合成测试配额耗尽", timeout=20_000)
+            sec = self.page.locator("#sec-profiles")
+            expect(sec).to_contain_text("首名成员合成局部结论")
+            expect(sec).to_contain_text("未保存为完整维度结果")
+            expect(trigger).to_be_enabled()
+            expect(trigger).to_contain_text("分析成员画像")
+            self.assertFalse(self.errors, self.errors)
+
 
 if __name__ == "__main__":
     unittest.main()

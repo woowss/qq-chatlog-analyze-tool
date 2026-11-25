@@ -531,6 +531,32 @@ class TestFrontendRegressionGuards(unittest.TestCase):
         self.assertIn("中途失败", src)
         self.assertIn("服务端跳过", src)
 
+    def test_group_pages_share_analysis_panel_partial(self):
+        """五个群聊详情页应共用 _group_analysis_panel.html 与 _analysis_refresh_option.html"""
+        for name in (
+            "group_activity.html",
+            "group_relations.html",
+            "group_emotion.html",
+            "group_topics.html",
+            "group_profiles.html",
+        ):
+            src = (ROOT / "web" / "templates" / name).read_text(encoding="utf-8")
+            self.assertIn('_group_analysis_panel.html"', src, f"{name} 应复用公共分析面板 partial")
+        panel = (ROOT / "web" / "templates" / "_group_analysis_panel.html").read_text(encoding="utf-8")
+        self.assertIn('_analysis_refresh_option.html"', panel)
+        self.assertIn('_analysis_empty.html"', panel)
+
+    def test_static_js_files_parse_cleanly_when_node_available(self):
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("当前环境未安装 node")
+        for js in sorted((ROOT / "web" / "static" / "js").glob("*.js")):
+            proc = subprocess.run([node, "--check", str(js)], capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, f"{js.name} 语法检查失败: {proc.stderr}")
+
 
 class TestRouteSurfaceUnchanged(unittest.TestCase):
     """webapp 拆分是搬家不是改建：路由与端点名必须原样"""
