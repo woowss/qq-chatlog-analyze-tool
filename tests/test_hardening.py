@@ -1364,5 +1364,35 @@ class TestHealthEndpoint(unittest.TestCase):
         self.assertIn("health", BYPASS_ENDPOINTS)
 
 
+class TestWaitForStatsDoesNotJoinAnUnstartedThread(unittest.TestCase):
+    """`start_stats_job` 是"锁内登记、锁外 start"，窗口内 join 未启动线程会抛 RuntimeError。
+
+    症状是仪表盘 500（`cannot join thread before it is started`），而它的成因恰好是
+    本轮想消灭的"平白弹回首页"这条链上的另一环。修法是 start 移进锁内 + join 前查
+    `is_alive()`，这里钉住后者（前者无法从外部稳定复现那个纳秒级窗口）。
+    """
+
+    HASH = "statsrace000001"
+
+    def setUp(self):
+        self.addCleanup(storemod._STATS_THREADS.pop, self.HASH, None)
+
+    def test_wait_does_not_raise_on_registered_but_unstarted_thread(self):
+        t = threading.Thread(target=lambda: None, name="stats-not-started")
+        with storemod._STATS_LOCK:
+            storemod._STATS_THREADS[self.HASH] = t
+        try:
+            storemod.wait_for_stats(self.HASH, timeout=0.01)  # 不许抛
+        except RuntimeError as e:  # pragma: no cover - 失败路径
+            self.fail(f"join 了未启动的线程：{e}")
+        self.assertFalse(t.is_alive())
+
+    def test_reverse_verification_joining_directly_does_raise(self):
+        """反向验证：对未启动的线程直接 join 确实抛错，所以上面那道 `is_alive()` 是必需的。"""
+        t = threading.Thread(target=lambda: None)
+        with self.assertRaises(RuntimeError):
+            t.join(0.01)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

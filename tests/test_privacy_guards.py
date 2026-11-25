@@ -36,10 +36,21 @@ import io
 import json
 import os
 import re
+import shutil
 import tempfile
 import time
 import unittest
+import zipfile
 from unittest import mock
+
+from _bootstrap import bootstrap
+
+bootstrap()
+
+from analyzer import deepseek_client as dc  # noqa: E402
+from analyzer import month_cache as mc  # noqa: E402
+from analyzer import purge_marks  # noqa: E402
+from webapp import store  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -674,6 +685,307 @@ class TestNonLoopbackFailClosed(unittest.TestCase):
             503,
             "回环绑定下不设口令是既有的正常用法，不能被这条护栏误伤",
         )
+
+
+class _TempCacheDirs(unittest.TestCase):
+    """把缓存目录整体搬进临时目录：这些用例都靠"目录外有个诱饵文件"来判成败。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="r7-cache-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.ai = os.path.join(self.tmp, "ai_cache")
+        self.stats = os.path.join(self.tmp, "stats_cache")
+        os.makedirs(self.ai, exist_ok=True)
+        os.makedirs(self.stats, exist_ok=True)
+        for mod, attr, val in ((store, "AI_CACHE_DIR", self.ai), (store, "STATS_CACHE_DIR", self.stats)):
+            p = mock.patch.object(mod, attr, val)
+            p.start()
+            self.addCleanup(p.stop)
+        mc.configure_month_cache(self.ai)
+        self.addCleanup(mc.configure_month_cache, "")
+        # 把月份的"宽限期"归零：否则这些用例会因为"文件还年轻、本就不删"而**恒真**绿掉
+        # （写这组用例时第一版就踩了：诱饵只老了 10 小时 < 默认 24 小时，断言 0 次删除
+        # 看似"挡住了"，其实什么都没验——反向验证那一条当场把它抓了出来）。
+        grace = mock.patch.object(mc, "MONTH_CACHE_GRACE_SECONDS", 0)
+        grace.start()
+        self.addCleanup(grace.stop)
+        # 造出穿越路径的**中间目录**（键 "/../.." 拼出来的是 `month_/../../x.json`）。
+        # 为什么必须有：POSIX 的路径解析要求中间每一段都真实存在，而 Windows 是先做
+        # 词法归一、不需要。少了这一层，那两条"去掉闸门就该中招"的反向验证在 Linux 上
+        # 会因为"路径压根解析不通"而失败（CI 就是 Linux）——那验的就不是闸门了。
+        os.makedirs(os.path.join(self.ai, "month_"), exist_ok=True)
+        purge_marks.clear()
+        self.addCleanup(purge_marks.clear)
+
+    def _malicious_bundle(self, chat_hash: str, key: str, leaf: str | None = None) -> io.BytesIO:
+        buf = io.BytesIO()
+        name = leaf or f"manifest_{chat_hash}.json"
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("meta.json", json.dumps({"bundle": 1, "chat_hash": chat_hash}))
+            zf.writestr(f"ai_cache/{name}", json.dumps({"months": [key]}))
+        buf.seek(0)
+        return buf
+
+
+class TestMonthKeysAreNeverPaths(_TempCacheDirs):
+    """`months` 是**磁盘内容**（且可由导入包写进来），绝不许拼进路径。
+
+    这是本轮唯一的"能直接删/偷用户本机文件"的洞，所以用例分三层钉：
+    形状闸、两个消费点（删除 / 导出）、以及"去掉闸就会中招"的反向验证。
+    """
+
+    HASH = "deadbeefdeadbeef"
+
+    def _decoy(self) -> str:
+        """缓存目录**之外**的诱饵文件（模拟别人的缓存 / 配置 / 凭据 json）。"""
+        path = os.path.join(self.tmp, "decoy_target.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('{"secret": "must survive"}')
+        old = time.time() - 10 * 3600
+        os.utime(path, (old, old))  # 远早于任何宽限期（上面已把宽限期归零）
+        return path
+
+    #: `/../../decoy_target` → month_/../../decoy_target.json → 归一后逃出 ai_cache/
+    KEY = "/../../decoy_target"
+
+    def test_key_shape_gate_rejects_path_characters(self):
+        """闸门本身：分隔符 / 上跳 / 盘符 / 空 / 超长一律拒绝，正常 key 照常放行。"""
+        for bad in ("/../../x", "x/../../y", "..\\..\\z", "", "a" * 65, "a/b", None, 123, "c:d"):
+            self.assertFalse(mc.is_safe_month_key(bad), f"{bad!r} 不该被当成合法月份键")
+        for good in ("m1", "k1", "0" * 20, "abcDEF123_-"):
+            self.assertTrue(mc.is_safe_month_key(good), f"{good!r} 是既有数据里出现过的形状")
+
+    def test_month_cache_path_refuses_to_escape(self):
+        """唯一的路径构造点拒绝拼路径（返回空串），而不是拼出一个能逃出目录的路径。"""
+        self.assertEqual(mc.month_cache_path(self.KEY), "")
+        # 合法键的行为逐字节不变
+        self.assertTrue(mc.month_cache_path("m1").endswith(os.path.join("", "month_m1.json")))
+
+    def test_manifest_reader_filters_unsafe_keys(self):
+        """读 manifest 时按形状过滤：非法项当成不存在，绝不带到 os.path.join 上去。"""
+        with open(os.path.join(self.ai, f"manifest_{self.HASH}.json"), "w", encoding="utf-8") as f:
+            json.dump({"months": [self.KEY, "legit1", 7, None, "a/b"]}, f)
+        keys = mc._manifest_keys_locked(f"manifest_{self.HASH}.json")
+        self.assertEqual(keys, {"legit1"}, "只有形状合法的键能进引用集")
+
+    def test_purge_never_touches_files_outside_the_cache_dir(self):
+        """端到端：导入恶意 manifest → 级联清理 → 缓存目录外的诱饵必须还在。"""
+        decoy = self._decoy()
+        out = store.read_chat_bundle(self._malicious_bundle(self.HASH, self.KEY))
+        self.assertNotIn("error", out, "恶意 manifest 本身会被写进来（形状合法）")
+
+        removed = mc.purge_month_cache(self.HASH)
+        self.assertEqual(removed, 0, "非法键不该产生任何一次删除")
+        self.assertTrue(os.path.exists(decoy), "缓存目录之外的 .json 绝不许被删")
+
+    def test_decoy_would_be_deleted_without_the_guard(self):
+        """反向验证：把闸门拆掉，同一个攻击必须得手。
+
+        没有这一条，上面的用例可能只是"恰好没删掉"（例如键拼错了、宽限期没越过）。
+        这里显式 mock 掉形状判定，证明**正是它**挡住了删除。
+        """
+        decoy = self._decoy()
+        store.read_chat_bundle(self._malicious_bundle(self.HASH, self.KEY))
+        with mock.patch.object(mc, "is_safe_month_key", lambda _k: True):
+            removed = mc.purge_month_cache(self.HASH)
+        self.assertEqual(removed, 1, "去掉闸门时这一步确实会删掉诱饵")
+        self.assertFalse(os.path.exists(decoy), "反向验证：闸门就是唯一的拦截点")
+
+    def test_export_never_carries_files_outside_the_cache_dir(self):
+        """第二个消费点：导出按同一个键 zf.write，会把任意 .json 的内容打进分享包。"""
+        self._decoy()
+        store.read_chat_bundle(self._malicious_bundle(self.HASH, self.KEY))
+
+        entries = store.chat_bundle_files(self.HASH)["ai_cache"]
+        self.assertFalse(
+            [n for n in entries if "decoy" in n],
+            f"导出清单不许出现逃出缓存目录的条目：{entries}",
+        )
+
+        buf = io.BytesIO()
+        store.write_chat_bundle(self.HASH, buf)
+        buf.seek(0)
+        with zipfile.ZipFile(buf) as zf:
+            names = zf.namelist()
+        self.assertFalse([n for n in names if "decoy" in n], f"导出的包里不许夹带：{names}")
+
+    def test_export_would_leak_without_the_guard(self):
+        """反向验证（导出侧）：去掉闸门时，诱饵内容确实会被复制进结果包。"""
+        decoy = self._decoy()
+        store.read_chat_bundle(self._malicious_bundle(self.HASH, self.KEY))
+        with mock.patch.object(mc, "is_safe_month_key", lambda _k: True):
+            entries = store.chat_bundle_files(self.HASH)["ai_cache"]
+        self.assertTrue([n for n in entries if "decoy" in n], "反向验证：闸门是唯一的拦截点")
+        self.assertTrue(os.path.exists(decoy))
+
+    def test_legitimate_month_migration_still_works(self):
+        """不误伤：正常的月份文件仍要顺着 manifest 被收进包（增量迁移的依据）。"""
+        legit = os.path.join(self.ai, "month_legit1.json")
+        with open(legit, "w", encoding="utf-8") as f:
+            f.write('{"result": 1}')
+        out = store.read_chat_bundle(self._malicious_bundle(self.HASH, "legit1"))
+        self.assertNotIn("error", out)
+        self.assertIn("month_legit1.json", store.chat_bundle_files(self.HASH)["ai_cache"])
+
+
+class TestMaliciousManifestCannotPoisonTheManifestFile(_TempCacheDirs):
+    """写回 manifest 时也把非法键洗掉，别让"读旧 + 并新"把它继续留在盘上。"""
+
+    def test_record_month_usage_drops_unsafe_keys(self):
+        mc._record_month_usage("hashCleanup01", ["/../../evil", "good1"])
+        with open(mc._manifest_path("hashCleanup01"), encoding="utf-8") as f:
+            keys = json.load(f)["months"]
+        self.assertEqual(keys, ["good1"])
+
+    def test_preexisting_unsafe_keys_are_washed_on_rewrite(self):
+        """磁盘上已有一份被篡改的 manifest：下一次写入顺手洗干净。"""
+        path = mc._manifest_path("hashCleanup02")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"months": ["/../../evil", "keep1"]}, f)
+        mc._record_month_usage("hashCleanup02", ["keep2"])
+        with open(path, encoding="utf-8") as f:
+            keys = json.load(f)["months"]
+        self.assertEqual(keys, ["keep1", "keep2"], "非法项不留、合法项不丢")
+
+
+class TestSecretsAreScrubbedFromOutwardFacingText(unittest.TestCase):
+    """Key 走 Authorization 头、不进 URL，官方端点还会打码——但第三方网关常把它原样
+    写进错误正文，而这些文本会回到浏览器（用户会截图求助）与 logs/（README 承诺
+    日志可以整目录留存/贴给别人看）。
+
+    **不读环境里那个真实的 Key**（CI 上没有 `.env`，key 是空串，于是"应当有 key"这类
+    断言必挂、`assertNotIn("", detail)` 更是恒假——这正是 `_bootstrap.api_configured_patcher`
+    的说明里点名过的那类"本机绿、CI 红"的坑，本文件第一版就踩了）。一律用打桩的
+    合成 key，两个环境跑的是同一条用例。
+    """
+
+    #: 合成 key：**不是** _PLACEHOLDER_KEYS 里的占位符，所以会被当作真秘密处理
+    FAKE_KEY = "sk-qqchatlogfakekey0123456789"
+
+    def test_configured_key_is_replaced(self):
+        with mock.patch.object(dc, "DEEPSEEK_API_KEY", self.FAKE_KEY):
+            out = dc.scrub_secrets(f"upstream said: invalid key {self.FAKE_KEY} for model x")
+        self.assertNotIn(self.FAKE_KEY, out, "本机配置的那个 Key 必须被抹掉")
+        self.assertIn("<API_KEY>", out)
+        self.assertIn("invalid key", out, "除 Key 之外的排障信息必须保留")
+
+    def test_placeholder_key_is_not_a_secret(self):
+        """占位符（.env.example 里那种"你的API_Key"）不是秘密，不必抹也不用报。"""
+        with mock.patch.object(dc, "DEEPSEEK_API_KEY", "你的API_Key"):
+            out = dc.scrub_secrets("bad key 你的API_Key rejected")
+        self.assertIn("你的API_Key", out)
+
+    def test_key_shaped_strings_are_redacted(self):
+        token = "sk-abcdefghijklmnop1234"
+        out = dc.scrub_secrets(f"401 unauthorized: {token}")
+        self.assertNotIn(token, out)
+        self.assertIn("<redacted>", out)
+
+    def test_keyed_value_keeps_the_label(self):
+        out = dc.scrub_secrets("apikey=abcdef1234567890 rejected")
+        self.assertNotIn("abcdef1234567890", out)
+        self.assertIn("apikey=", out, "保留键名，只抹值（排障仍要看得懂是哪一项被拒）")
+
+    def test_ordinary_error_text_is_left_alone(self):
+        """不误伤：普通错误文本里的短标识、request-id、会话名不该被抹掉。"""
+        text = "Error code: 429 - rate limit; request-id: abc123; session_id: sess-42"
+        self.assertEqual(dc.scrub_secrets(text), text)
+
+    def test_test_connection_does_not_echo_the_key(self):
+        """`/api/status/test` 的响应会显示给用户：上游把 Key 回显进正文时不许带出去。"""
+        leaky = (
+            "Error code: 401 - {'error': {'message': 'bad key "
+            f"sk-abcdefghijklmnop1234 / {self.FAKE_KEY}'}}}}"
+        )
+
+        class _Boom:
+            class chat:  # noqa: N801
+                class completions:  # noqa: N801
+                    @staticmethod
+                    def create(**_kw):
+                        raise RuntimeError(leaky)
+
+        with (
+            mock.patch.object(dc, "DEEPSEEK_API_KEY", self.FAKE_KEY),
+            mock.patch.object(dc, "is_api_configured", lambda: True),
+            mock.patch.object(dc, "_get_client", lambda: _Boom()),
+        ):
+            ok, detail = dc.test_connection()
+        self.assertFalse(ok)
+        self.assertNotIn("sk-abcdefghijklmnop1234", detail, "长相像 Key 的字串必须被抹掉")
+        self.assertNotIn(self.FAKE_KEY, detail, "本机配置的 Key 本身必须被抹掉")
+        self.assertIn("401", detail, "错误码这类排障线索要保留")
+
+
+class _FakeSessionCache:
+    """最小会话后端替身：只实现 `has()`（真实后端是 cachelib.FileSystemCache）。"""
+
+    def __init__(self, alive):
+        self._alive = set(alive)
+        self.seen = []
+
+    def has(self, key):
+        self.seen.append(key)
+        return key in self._alive
+
+
+class TestGhostLiveRefsDoNotBlockExplicitDelete(unittest.TestCase):
+    """没点退出就关掉的会话会留下引用，把隐私清理挡住最长 24h，界面还说"仍被其它浏览器使用"。
+
+    显式删除路径因此额外核对会话后端；换文件路径保持原样——那里误判的代价是删掉别人
+    正在用的已付费结果，而内容寻址意味着闲置用户回头重传本该免费命中，两种代价不对称。
+    """
+
+    HASH = "ghosthash000001"
+
+    def setUp(self):
+        store.clear_live_chat_refs()
+        self.addCleanup(store.clear_live_chat_refs)
+
+    def test_dead_session_is_not_reported_as_still_using_the_chat(self):
+        import app as appmod
+
+        store.note_live_chat(self.HASH, "sid-ghost")
+        cache = _FakeSessionCache(alive=[])
+        with appmod.app.app_context(), mock.patch.dict(appmod.app.config, {"SESSION_CACHELIB": cache}):
+            self.assertEqual(
+                store.other_live_sessions(self.HASH, exclude_sid="me", require_live_session=True),
+                [],
+                "会话后端里已经没有这个 sid 了，它不该再挡住显式删除",
+            )
+            # 换文件路径保持原口径（保守：宁可少删）
+            self.assertEqual(
+                store.other_live_sessions(self.HASH, exclude_sid="me"),
+                ["sid-ghost"],
+                "换文件路径不看会话后端，行为逐字节不变",
+            )
+        self.assertIn("session:sid-ghost", cache.seen, "查的键必须带 flask-session 的前缀")
+
+    def test_real_session_still_blocks(self):
+        import app as appmod
+
+        store.note_live_chat(self.HASH, "sid-real")
+        cache = _FakeSessionCache(alive=["session:sid-real"])
+        with appmod.app.app_context(), mock.patch.dict(appmod.app.config, {"SESSION_CACHELIB": cache}):
+            self.assertEqual(
+                store.other_live_sessions(self.HASH, exclude_sid="me", require_live_session=True),
+                ["sid-real"],
+                "真正还活着的会话必须继续被尊重（否则就是删别人正在看的结果）",
+            )
+
+    def test_without_a_session_backend_it_stays_conservative(self):
+        """拿不到后端（无应用上下文等）时按"还活着"处理，绝不因为查不到就删。"""
+        import app as appmod
+
+        store.note_live_chat(self.HASH, "sid-unknown")
+        self.assertIsNone(store.live_session_exists("sid-unknown"), "无上下文时如实回答'判断不了'")
+        with appmod.app.app_context(), mock.patch.dict(appmod.app.config, {"SESSION_CACHELIB": None}):
+            self.assertIsNone(store.live_session_exists("sid-unknown"))
+            self.assertEqual(
+                store.other_live_sessions(self.HASH, exclude_sid="me", require_live_session=True),
+                ["sid-unknown"],
+                "判断不了就该保守留着",
+            )
 
 
 if __name__ == "__main__":

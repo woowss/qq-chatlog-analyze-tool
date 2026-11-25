@@ -31,6 +31,7 @@
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -44,7 +45,8 @@ from _bootstrap import bootstrap  # noqa: E402
 bootstrap()
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from analyzer import atomic_write, face_images, usage, vision  # noqa: E402
+from analyzer import atomic_write, face_images, purge_marks, usage, vision  # noqa: E402
+from analyzer import month_cache as mc  # noqa: E402
 from webapp import store as storemod  # noqa: E402
 
 
@@ -235,6 +237,95 @@ class TestSaveAndHashIntegrity(unittest.TestCase):
             with self.assertRaises(OSError):
                 storemod.save_and_hash(fs, dest)
             self.assertFalse(fs.save_called, "不可回退时不该再调 save() 写出半截文件")
+
+
+class TestMonthCacheTempNamesAndRestamp(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="r7-month-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        mc.configure_month_cache(self.tmp)
+        self.addCleanup(mc.configure_month_cache, "")
+        purge_marks.clear()
+        self.addCleanup(purge_marks.clear)
+
+    def test_tmp_sibling_is_unique_and_still_recognizable(self):
+        """固定 `{path}.tmp` 会被两个并发写者共踩；唯一名仍要被清理侧认得出来。"""
+        path = mc.month_cache_path("concurrent1")
+        names = {mc._tmp_sibling(path) for _ in range(50)}
+        self.assertEqual(len(names), 50, "每个写者必须拿到各自的临时文件名")
+        self.assertTrue(all(n.endswith(".tmp") for n in names))
+        # 级联清理靠这个正则把临时文件认成"属于该聊天"，认不出来就会漏删敏感残留
+        for n in names:
+            self.assertTrue(storemod._TMP_SUFFIX_RE.search(os.path.basename(n)), n)
+            self.assertTrue(storemod._cache_belongs_to(os.path.basename(n), "concurrent1"), n)
+
+    def test_concurrent_writers_do_not_share_a_tmp_file(self):
+        """两个线程写同一个键：最终文件必须是**完整的 JSON**（半截文件=丢掉一次付费结果）。"""
+        key = "racekey0001"
+        payloads = [{"result": {"n": i, "pad": "x" * 4000}} for i in range(2)]
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def worker(payload):
+            try:
+                barrier.wait(timeout=5)
+                mc._write_month_cache(key, payload)
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(p,)) for p in payloads]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(errors, [])
+        with open(mc.month_cache_path(key), encoding="utf-8") as f:
+            data = json.load(f)  # 半截文件会在这里抛 JSONDecodeError
+        self.assertIn("n", data["result"])
+        leftovers = [n for n in os.listdir(self.tmp) if n.endswith(".tmp")]
+        self.assertEqual(leftovers, [], "成功的写入不该留下临时文件")
+
+    def test_restamp_writes_thinking_mark_when_not_purged(self):
+        """基线：没被清理过的老文件，读到就补标记（否则模式切换会一直串）。"""
+        key = "legacy000001"
+        path = mc.month_cache_path(key)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"result": {"v": 1}}, f)  # 升级前的老文件：没有 _thinking
+
+        mc._read_month_cache(key, expect_thinking=True, chat_hash="hashFresh001")
+        with open(path, encoding="utf-8") as f:
+            self.assertTrue(json.load(f).get("_thinking"), "基线行为：应当补上标记")
+
+    def test_restamp_does_not_resurrect_a_purged_file(self):
+        """被清理过的聊天：读侧不许把刚删掉的月份文件（含聊天原句引用）写回去。
+
+        这是**读路径上的写**，只靠 `os.path.exists` 复查挡不住 TOCTOU；标记才是闸门。
+        """
+        key = "legacy000002"
+        path = mc.month_cache_path(key)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"result": {"v": 1}}, f)
+
+        purge_marks.mark("hashPurged02")
+        mc._read_month_cache(key, expect_thinking=True, chat_hash="hashPurged02")
+        with open(path, encoding="utf-8") as f:
+            self.assertIsNone(json.load(f).get("_thinking"), "被清理过就不许补标记（=不许写回）")
+
+        # 反向验证：同一份文件、不打标记时必须会写回，证明上一行不是因为别的原因恒真
+        purge_marks.unmark("hashPurged02")
+        mc._read_month_cache(key, expect_thinking=True, chat_hash="hashPurged02")
+        with open(path, encoding="utf-8") as f:
+            self.assertTrue(json.load(f).get("_thinking"), "反向验证：没标记时确实会写回")
+
+    def test_restamp_without_chat_hash_keeps_old_behaviour(self):
+        """没传 chat_hash 的老调用方退化为只做 exists 复查，行为与从前一致。"""
+        key = "legacy000003"
+        path = mc.month_cache_path(key)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"result": {"v": 1}}, f)
+        mc._read_month_cache(key, expect_thinking=True)
+        with open(path, encoding="utf-8") as f:
+            self.assertTrue(json.load(f).get("_thinking"))
 
 
 if __name__ == "__main__":

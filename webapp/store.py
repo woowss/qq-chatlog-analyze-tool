@@ -456,7 +456,7 @@ def _tmp_sibling(path: str) -> str:
     口径只有 `analyzer.atomic_write.tmp_sibling` 一份（唯一名的理由写在那个模块的文件
     说明里：固定名会让两个并发写者互相删半成品，并把半截文件发布成正式缓存）。
     这里保留同名函数，是因为清理侧与用例都把它当契约（见 _cache_belongs_to 与
-    tests/test_feature_round7.py 的临时名唯一性用例）。
+    tests/test_privacy_guards.py 的临时名唯一性用例）。
     """
     return tmp_sibling(path)
 

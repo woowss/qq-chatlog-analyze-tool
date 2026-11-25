@@ -32,9 +32,11 @@
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -50,9 +52,10 @@ os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import parser.qq_parser as qp  # noqa: E402
-from parser.qq_parser import load_chat  # noqa: E402
+from parser.qq_parser import CST, load_chat  # noqa: E402
 from parser.group_identity import is_placeholder_sender  # noqa: E402
 from analyzer import group_stats as gs  # noqa: E402
+from analyzer import local_stats as ls  # noqa: E402
 
 BASE_MS = 1740900000000  # 2025-03-02 12:00:00 CST 附近，用例不关心具体日期
 
@@ -573,6 +576,68 @@ class TestMatrixSchemaStability(BaseCase):
                 "mentions_received",
             },
         )
+
+
+_R7_BASE = 1704067200.0
+
+
+def _r7_write_chat(payload) -> str:
+    d = tempfile.mkdtemp(prefix="r7-parse-")
+    path = os.path.join(d, "chat.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    return path
+
+
+def _r7_msg(msg_id, uid, name, ts_s, el_type, el_data=None, text=""):
+    return {
+        "id": str(msg_id),
+        "timestamp": int(ts_s * 1000),
+        "time": datetime.fromtimestamp(ts_s, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        "sender": {"uid": uid, "name": name},
+        "type": "text",
+        "content": {
+            "text": text,
+            "elements": [{"type": el_type, "data": el_data if el_data is not None else {"text": text}}],
+        },
+    }
+
+
+class TestNameHistoryStripsDisplayNames(unittest.TestCase):
+    """带尾空格的昵称不许被拆成两个桶——那会显示一次从未发生的改名。"""
+
+    def _chat(self):
+        payload = {
+            "chatInfo": {"name": "对方", "selfUid": "uA", "selfName": "我"},
+            "statistics": {"senders": [{"uid": "uA", "name": "我"}, {"uid": "uB", "name": "小明"}]},
+            "messages": [
+                _r7_msg(1, "uA", "我", _R7_BASE, "text", text="早"),
+                _r7_msg(2, "uB", "小明", _R7_BASE + 60, "text", text="早"),
+                _r7_msg(3, "uB", "小明 ", _R7_BASE + 120, "text", text="在"),
+                _r7_msg(4, "uB", "   ", _R7_BASE + 180, "text", text="忙"),
+            ],
+        }
+        path = _r7_write_chat(payload)
+        try:
+            return load_chat(path)
+        finally:
+            shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+
+    def test_trailing_space_and_blank_names_collapse(self):
+        trends = ls.calc_trends(self._chat())
+        other = trends["name_history"]["other"]
+        names = [r["name"] for r in other]
+        self.assertEqual(names, ["小明"], f"同一个人的昵称必须合成一桶：{names}")
+        # 三条非空名里 "小明" ×2 与 "小明 " ×1 合并；"   " 那条不是名字（跳过），
+        # 所以计数是 2 而不是 3——它的**正文**照常进词频/句长，只是不产生第三个名字。
+        self.assertEqual(other[0]["count"], 2, "strip 后同一个名字的条数要合并")
+
+    def test_reverse_verification_unstripped_names_would_split(self):
+        """反向验证：不 strip 时同一个名字会裂成三桶（这就是被修掉的现象）。"""
+        chat = self._chat()
+        raw = {(m.sender_name or "") for m in chat.messages}
+        self.assertGreater(len(raw), 1, "原始昵称里确实存在'小明'/'小明 '/'   '三种写法")
+        self.assertNotIn("小明 ", [r["name"] for r in ls.calc_trends(chat)["name_history"]["other"]])
 
 
 if __name__ == "__main__":

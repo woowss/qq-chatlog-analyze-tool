@@ -108,7 +108,7 @@ def _tmp_sibling(path: str) -> str:
     """原子写入的临时文件名：**必须唯一**，不能用固定的 `f"{path}.tmp"`。
 
     口径只有 `analyzer.atomic_write.tmp_sibling` 一份（那里写着为什么）；保留这个函数名
-    是因为用例把它当契约（tests/test_review_round7.py 钉"临时名唯一且仍被清理侧认出"）。
+    是因为用例把它当契约（tests/test_atomic_write.py 钉"临时名唯一且仍被清理侧认出"）。
     """
     return tmp_sibling(path)
 

@@ -26,7 +26,9 @@
 
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -45,7 +47,7 @@ os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config  # noqa: E402
-from parser.qq_parser import ChatData, Message  # noqa: E402
+from parser.qq_parser import ChatData, Message, load_chat  # noqa: E402
 from analyzer import group_stats as gs  # noqa: E402
 from analyzer.local_stats import SESSION_GAP_MINUTES  # noqa: E402
 from webapp import store  # noqa: E402
@@ -487,6 +489,93 @@ class TestGroupStatsPerformance(unittest.TestCase):
         self.assertEqual(stats["overview"]["member_count"], 50)
         self.assertEqual(len(stats["interaction"]["members"]), config.GROUP_MATRIX_MEMBERS)
         self.assertTrue(stats["interaction"]["truncated"])
+
+
+_R7_BASE = 1704067200.0
+
+
+def _r7_write_chat(payload) -> str:
+    d = tempfile.mkdtemp(prefix="r7-parse-")
+    path = os.path.join(d, "chat.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    return path
+
+
+def _r7_msg(msg_id, uid, name, ts_s, el_type, el_data=None, text=""):
+    return {
+        "id": str(msg_id),
+        "timestamp": int(ts_s * 1000),
+        "time": datetime.fromtimestamp(ts_s, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        "sender": {"uid": uid, "name": name},
+        "type": "text",
+        "content": {
+            "text": text,
+            "elements": [{"type": el_type, "data": el_data if el_data is not None else {"text": text}}],
+        },
+    }
+
+
+class TestInteractionMatrixIsMemoisedPerEffectiveLimit(unittest.TestCase):
+    """Sparse interaction counts are primary; dense projections stay bounded."""
+
+    def _chat(self, n_members=4):
+        msgs = []
+        seq = 0
+        for i in range(n_members):
+            uid = f"u{i}"
+            for _ in range(n_members - i):
+                msgs.append(_r7_msg(seq, uid, uid, _R7_BASE + seq * 2, "text", text="话"))
+                seq += 1
+        payload = {
+            "chatInfo": {"name": "摸鱼群", "selfUid": "u0", "selfName": "u0", "type": "group"},
+            "statistics": {"senders": [{"uid": f"u{i}", "name": f"u{i}"} for i in range(n_members)]},
+            "messages": msgs,
+        }
+        path = _r7_write_chat(payload)
+        try:
+            return load_chat(path)
+        finally:
+            shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+
+    def test_same_limit_returns_the_cached_object(self):
+        chat = self._chat()
+        first = gs.calc_interaction_matrix(chat, top_k=0)
+        second = gs.calc_interaction_matrix(chat, top_k=0)
+        self.assertIs(first, second, "同一个生效上限必须命中缓存（否则成员画像里就是白算）")
+
+    def test_different_limits_are_cached_separately(self):
+        chat = self._chat()
+        full = gs.calc_interaction_matrix(chat, top_k=0)
+        capped = gs.calc_interaction_matrix(chat, top_k=2)
+        self.assertIsNot(full, capped)
+        self.assertEqual(len(full["members"]), 4)
+        self.assertEqual(len(capped["members"]), 2)
+        # 再取一次：两者都还在缓存里，互不覆盖
+        self.assertIs(gs.calc_interaction_matrix(chat, top_k=0), full)
+        self.assertIs(gs.calc_interaction_matrix(chat, top_k=2), capped)
+
+    def test_config_is_still_read_at_call_time(self):
+        """缓存键必须是**解析后的**上限：改配置后不许拿回旧上限的结果。"""
+        chat = self._chat()
+        with mock.patch("analyzer.group_stats.config.GROUP_MATRIX_MEMBERS", 2):
+            self.assertEqual(gs.calc_interaction_matrix(chat)["matrix_limit"], 2)
+        with mock.patch("analyzer.group_stats.config.GROUP_MATRIX_MEMBERS", 4):
+            self.assertEqual(gs.calc_interaction_matrix(chat)["matrix_limit"], 4)
+
+    def test_cache_is_per_chat_object(self):
+        """两份不同的聊天不许互相命中（缓存挂在 chat 对象上，不挂在模块上）。"""
+        a, b = self._chat(4), self._chat(3)
+        self.assertIsNot(gs.calc_interaction_matrix(a, top_k=0), gs.calc_interaction_matrix(b, top_k=0))
+
+    def test_dense_projection_cache_is_bounded(self):
+        chat = self._chat(8)
+        for limit in (1, 2, 3, 4, 5):
+            gs.calc_interaction_matrix(chat, top_k=limit)
+        self.assertEqual(len(chat._matrix_cache), 3)
+        self.assertEqual(set(chat._matrix_cache), {3, 4, 5})
+        last = gs.calc_interaction_matrix(chat, top_k=5)
+        self.assertIs(last, chat._matrix_cache[5])
 
 
 if __name__ == "__main__":

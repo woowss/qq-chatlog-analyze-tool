@@ -19,6 +19,7 @@
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -1527,6 +1528,114 @@ class TestMaxTokensConfigurable(unittest.TestCase):
             self.assertEqual(dc._max_tokens("profile", 49152), 49152, "非法值应回退默认")
         with mock.patch.dict(os.environ, {"LLM_MAX_TOKENS_PROFILE": "10"}):
             self.assertEqual(dc._max_tokens("profile", 49152), 49152, "越界值应回退默认")
+
+
+_R7_BASE = 1704067200.0
+
+
+def _r7_write_chat(payload) -> str:
+    d = tempfile.mkdtemp(prefix="r7-parse-")
+    path = os.path.join(d, "chat.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    return path
+
+
+def _r7_msg(msg_id, uid, name, ts_s, el_type, el_data=None, text=""):
+    return {
+        "id": str(msg_id),
+        "timestamp": int(ts_s * 1000),
+        "time": datetime.fromtimestamp(ts_s, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        "sender": {"uid": uid, "name": name},
+        "type": "text",
+        "content": {
+            "text": text,
+            "elements": [{"type": el_type, "data": el_data if el_data is not None else {"text": text}}],
+        },
+    }
+
+
+class TestParserToleratesNonStringTypeFields(unittest.TestCase):
+    """`type` 字段是 JSON 数字/对象时不许崩。
+
+    症状不是"少一条消息"而是"整份文件传不上去"：upload 视图把异常当"解析失败"，
+    **并删掉刚上传的文件**，界面上一句 `'int' object has no attribute 'strip'` 或
+    `unhashable type: 'dict'`，与"文件格式"毫无关系。四种形状都实测复现过。
+    """
+
+    def _load(self, payload):
+        path = _r7_write_chat(payload)
+        try:
+            return load_chat(path)
+        finally:
+            shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+
+    def test_message_type_as_object_or_array_does_not_crash(self):
+        for bad_type in ({"a": 1}, ["text"], 7, None):
+            with self.subTest(msg_type=bad_type):
+                payload = {
+                    "chatInfo": {"name": "对方", "selfUid": "uA", "selfName": "我"},
+                    "statistics": {"senders": [{"uid": "uA", "name": "我"}]},
+                    "messages": [
+                        {**_r7_msg(1, "uA", "我", _R7_BASE, "text", text="你好"), "type": bad_type},
+                        _r7_msg(2, "uB", "对方", _R7_BASE + 60, "text", text="在"),
+                    ],
+                }
+                chat = self._load(payload)
+                self.assertEqual(len(chat.messages), 2, "坏 type 不该让整份文件解析失败")
+
+    def test_element_type_as_object_does_not_crash(self):
+        """不可哈希的 el_type 会让 `el_type in MEDIA_KINDS` 抛 TypeError。"""
+        payload = {
+            "chatInfo": {"name": "对方", "selfUid": "uA", "selfName": "我"},
+            "statistics": {"senders": [{"uid": "uA", "name": "我"}]},
+            "messages": [
+                _r7_msg(1, "uA", "我", _R7_BASE, {"a": 1}, el_data={"text": "你好"}),
+                _r7_msg(2, "uB", "对方", _R7_BASE + 60, "text", text="在"),
+            ],
+        }
+        chat = self._load(payload)
+        self.assertEqual(len(chat.messages), 2)
+        self.assertTrue(chat.unknown_element_types, "认不出的元素要如实记账，而不是崩")
+
+    def test_chatinfo_type_as_number_does_not_crash(self):
+        payload = {
+            "chatInfo": {"name": "对方", "selfUid": "uA", "selfName": "我", "type": 1},
+            "statistics": {"senders": [{"uid": "uA", "name": "我"}]},
+            "messages": [_r7_msg(1, "uA", "我", _R7_BASE, "text", text="你好")],
+        }
+        chat = self._load(payload)
+        self.assertEqual(chat.chat_type, "1")
+
+    def test_non_object_top_level_is_rejected_as_a_format_error(self):
+        """顶层是 null / 数字 / 数组：要给"格式不对"的人话，而不是 TypeError。"""
+        for bad in (None, 123, [], "x"):
+            with self.subTest(payload=bad):
+                with self.assertRaises(ValueError) as ctx:
+                    self._load(bad)
+                self.assertIn("QQChatExporter", str(ctx.exception))
+
+    def test_senders_name_as_number_does_not_crash(self):
+        """`statistics.senders[].name` 是数字时，other_name 会带上 int 并让日志脱敏崩。
+
+        链路：other_name=int → views 里 mask_name(chat.other_name) → logger 的
+        `(name or "").strip()` → AttributeError → 上传被当成"解析失败"并删文件。
+
+        消息里**故意不带 sender.name**：只有走 statistics.senders 那条兜底取值时，
+        这个数字才会真的落到 other_name 上。消息自带名字的话，聚合名会先命中，
+        这条用例就变成恒真的了（第一版就是这么写的，校验不了任何东西）。
+        """
+        payload = {
+            "chatInfo": {"name": "对方", "selfUid": "uA", "selfName": "我"},
+            "statistics": {"senders": [{"uid": "uB", "name": 12345}]},
+            "messages": [_r7_msg(1, "uB", "", _R7_BASE, "text", text="在")],
+        }
+        chat = self._load(payload)
+        self.assertIsInstance(chat.other_name, str, "other_name 必须是字符串")
+        self.assertEqual(chat.other_name, "12345", "数字名归一成字符串，而不是留在 int 上")
+        from analyzer.logger import mask_name
+
+        mask_name(chat.other_name)  # 不该抛：这正是上传路径上的那一步
 
 
 if __name__ == "__main__":
