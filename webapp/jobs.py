@@ -418,6 +418,7 @@ def _run_analyze_all(
         dims = dimensions_for_mode(is_group)
         total = len(dims)
         summary: dict[str, str] = {}
+        partial_results: dict = {}
 
         def should_cancel() -> bool:
             return _stop_requested(job_id)
@@ -431,8 +432,10 @@ def _run_analyze_all(
                 if j:
                     j["detail"] = f"{idx}/{total} {dim_name}"
             cache_fp = store.analysis_cache_fingerprint(dim, chat)
-            if not refresh and store._read_cache(dim, chat_hash, fingerprint=cache_fp) is not None:
+            cached = None if refresh else store._read_cache(dim, chat_hash, fingerprint=cache_fp)
+            if cached is not None:
                 summary[dim] = "cached"
+                partial_results[dim] = cached
             else:
                 unit = dimension_unit(dim)
 
@@ -455,11 +458,20 @@ def _run_analyze_all(
                         validate_dimension_result(dim, result)
                         store._write_cache(dim, chat_hash, result, fingerprint=cache_fp)
                         summary[dim] = "done"
+                        partial_results[dim] = result
                     else:
                         summary[dim] = "empty"
                 except QuotaExhaustedError as e:
                     # 配额/限流致命：已完成的维度结果已落盘缓存，如实报告
                     summary[dim] = "aborted"
+                    if not store._is_recently_purged(chat_hash):
+                        with JOBS_LOCK:
+                            j = JOBS.get(job_id)
+                            if j:
+                                j["result"] = dict(summary)
+                                if partial_results:
+                                    j["partial_results"] = dict(partial_results)
+                                    j["partial"] = True
                     _fail_job(job_id, f"{e}（已完成维度：{len(summary)}，其结果已缓存）")
                     return
                 except ResultValidationError as e:
@@ -468,6 +480,9 @@ def _run_analyze_all(
                 except Exception as e:
                     logger.error("一键全量分析 %s 失败: %s", dim_name, scrub_secrets(e))
                     summary[dim] = "error"
+                    partial = _validated_partial_result(dim, e)
+                    if partial is not None and not store._is_recently_purged(chat_hash):
+                        partial_results[dim] = partial
             with JOBS_LOCK:
                 j = JOBS.get(job_id)
                 if j:
@@ -481,10 +496,31 @@ def _run_analyze_all(
             # j["cancel"] 现成可读，关闭标志则由无锁的 shutdown_requested() 给出；
             # 第三个停止条件（刚被清理）同理从手头直接判 —— 循环就是因此中断的，
             # 这里漏判会把"清理后整轮作废"如实发生的任务标成 done。
-            if j.get("cancel") or shutdown_requested() or purge_marks.is_marked(j.get("chat_hash", "")):
+            purged = purge_marks.is_marked(j.get("chat_hash", ""))
+            if j.get("cancel") or shutdown_requested() or purged:
                 j.update(status="cancelled", finished_at=time.time())
+                if purged:
+                    j.pop("partial_results", None)
+                    j.pop("partial", None)
             else:
-                j.update(status="done", result=summary, finished_at=time.time())
+                failed = [
+                    ALL_DIMENSION_NAMES.get(d, d)
+                    for d, st in summary.items()
+                    if st in ("error", "invalid", "aborted", "empty")
+                ]
+                if failed:
+                    update = {
+                        "status": "error",
+                        "error": f"部分维度未完成：{', '.join(failed)}（已完成结果已缓存）",
+                        "result": summary,
+                        "finished_at": time.time(),
+                    }
+                    if partial_results:
+                        update["partial_results"] = partial_results
+                        update["partial"] = True
+                    j.update(update)
+                else:
+                    j.update(status="done", result=summary, finished_at=time.time())
             hist = {
                 "t": j.get("finished_at"),
                 "dim": "all",

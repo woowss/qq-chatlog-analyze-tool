@@ -151,7 +151,8 @@ def _collect(result, dimension, chat):
             scope = dict(scope)
             if quote:
                 # A date outside the quote is a declared source constraint.
-                dates = _DATE.findall(value.replace(quote, ""))
+                stripped = " ".join(value.rsplit(quote, 1)) if quote in value else value
+                dates = _DATE.findall(stripped)
                 if len(set(dates)) == 1:
                     restrict_date(scope, dates[0])
             records.append({"path": path, "text": value, "quote": quote, "scope": scope})
@@ -176,10 +177,12 @@ def _input_lines(chat, dimension, unit, person_context_enabled=None):
         def resolve(uid):
             return names.get(uid, "未知发送者")
 
-        entries = [
-            (i, m.sender_uid or "__unknown__", m, _message_line(m, resolve(m.sender_uid)))
-            for i, m in enumerate(valid)
-        ]
+        entries = []
+        prev_uid = prev_ts = None
+        for i, m in enumerate(valid):
+            line = _message_line(m, resolve(m.sender_uid), prev_uid, prev_ts)
+            entries.append((i, m.sender_uid or "__unknown__", m, line))
+            prev_uid, prev_ts = m.sender_uid, m.timestamp
         selected, lines, _ = gc._fit_group_entries(
             entries, gc.GROUP_MAX_DIALOG_CHARS, lambda kept: gc._render_group_entries(kept, resolve)
         )

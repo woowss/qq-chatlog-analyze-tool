@@ -357,6 +357,7 @@ class Message:
     image_bytes: int = 0  # 只属于图片元素的字节
     image_count: int = 0  # 这条消息里有几个图片元素（一条消息连发 3 张图就是 3 张）
     image_ids: list[str] = field(default_factory=list)  # 各图片元素的 md5（去重口径用）
+    image_items: list[dict] = field(default_factory=list)  # 各图片元素的 path/md5/w/h 列表
 
 
 def is_statistical(m: "Message") -> bool:
@@ -609,6 +610,7 @@ def load_chat(filepath: str) -> ChatData:
         image_bytes = 0
         image_count = 0
         image_ids: list[str] = []
+        image_items: list[dict] = []
         media_kind = ""
         media_label = ""
         media_bytes = 0
@@ -616,6 +618,8 @@ def load_chat(filepath: str) -> ChatData:
         media_path = ""
         media_w = 0
         media_h = 0
+        non_image_id = ""
+        non_image_path = ""
         face_url = ""
         reply_to_id = ""
         mentions: list[str] = []
@@ -663,12 +667,16 @@ def load_chat(filepath: str) -> ChatData:
                 image_count += 1
                 media_bytes += img_size
                 img_md5 = str(el_data.get("md5") or "")
+                img_path = str(el_data.get("url") or el_data.get("localPath") or "")
+                img_w = _to_int(el_data.get("width"))
+                img_h = _to_int(el_data.get("height"))
                 if img_md5:
                     image_ids.append(img_md5)
+                image_items.append({"path": img_path, "id": img_md5, "w": img_w, "h": img_h})
                 media_id = media_id or img_md5
-                media_path = media_path or str(el_data.get("url") or el_data.get("localPath") or "")
-                media_w = media_w or _to_int(el_data.get("width"))
-                media_h = media_h or _to_int(el_data.get("height"))
+                media_path = media_path or img_path
+                media_w = media_w or img_w
+                media_h = media_h or img_h
             elif el_type == "reply":
                 is_reply = True
                 # 只给被回复消息的 id：发言人要在全量消息里回查（见下面的回填）
@@ -693,8 +701,8 @@ def load_chat(filepath: str) -> ChatData:
                 if not media_kind:
                     media_kind = el_type
                     media_label = _media_label(el_type, el_data, raw_text)
-                    media_id = media_id or str(el_data.get("md5") or "")
-                    media_path = media_path or str(el_data.get("url") or el_data.get("localPath") or "")
+                    non_image_id = str(el_data.get("md5") or "")
+                    non_image_path = str(el_data.get("url") or el_data.get("localPath") or "")
             else:
                 # 未知元素类型：不再静默吞掉（旧实现里 elif 链没有尾巴，导出器哪天
                 # 改名 "text"，正文会丢光而统计照常出数——谁都看不见事故发生了）。
@@ -715,6 +723,10 @@ def load_chat(filepath: str) -> ChatData:
             clean_text = raw_text.strip()
         elif not clean_text and not elements and raw_text:
             clean_text = raw_text.strip()
+
+        if not has_image:
+            media_id = media_id or non_image_id
+            media_path = media_path or non_image_path
 
         parsed = Message(
             # id 必须与 reply_to_id 同一个类型口径：下面 :618 那类取值处把
@@ -756,6 +768,7 @@ def load_chat(filepath: str) -> ChatData:
             reply_to_id=reply_to_id,
             mentions=mentions,
             mentions_all=mentions_all,
+            image_items=image_items,
         )
         chat.messages.append(parsed)
 
@@ -763,12 +776,32 @@ def load_chat(filepath: str) -> ChatData:
 
     # 回填"这条回复的是谁"：reply 元素只给被回复消息的 id，要在全量消息里查一次发言人。
     # 必须等所有消息都解析完再做——被引用消息可能排在引用它的消息之后（实测绝大多数都能回查到）。
-    # 查不到时 reply_to_uid 留空，由统计层如实计入"未解析回复"，不猜、不丢。
+    # 查不到或同一 id 对应多位不同发言人时 reply_to_uid 留空，由统计层如实计入"未解析回复"，不猜、不丢。
     if any(m.reply_to_id for m in chat.messages):
-        uid_by_id = {m.id: m.sender_uid for m in chat.messages if m.id}
+        _unset = object()
+        global_uid: dict[str, Optional[str]] = {}
+        for m in chat.messages:
+            if not m.id:
+                continue
+            prev = global_uid.get(m.id, _unset)
+            if prev is _unset:
+                global_uid[m.id] = m.sender_uid
+            elif prev != m.sender_uid:
+                global_uid[m.id] = None
+
+        seen_uid: dict[str, Optional[str]] = {}
         for m in chat.messages:
             if m.reply_to_id:
-                m.reply_to_uid = uid_by_id.get(m.reply_to_id, "")
+                resolved = seen_uid.get(m.reply_to_id, _unset)
+                if resolved is _unset:
+                    resolved = global_uid.get(m.reply_to_id, "")
+                m.reply_to_uid = resolved or ""
+            if m.id:
+                prev_seen = seen_uid.get(m.id, _unset)
+                if prev_seen is _unset:
+                    seen_uid[m.id] = m.sender_uid
+                elif prev_seen != m.sender_uid:
+                    seen_uid[m.id] = None
 
     # 多人（群聊）防线：本工具的历史口径是"我 vs 对方"两类。若导入群聊导出，
     # 除 self 外的所有人都会静默并进"对方"名下——条数、回复速度、锐评全部失真，
