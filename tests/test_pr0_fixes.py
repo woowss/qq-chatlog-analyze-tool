@@ -631,12 +631,16 @@ class TestFaceMemoAndFrontendGuards(unittest.TestCase):
         )
 
         group_charts = (ROOT / "web" / "static" / "js" / "group_charts.js").read_text(encoding="utf-8")
+        analyze_js = (ROOT / "web" / "static" / "js" / "analyze.js").read_text(encoding="utf-8")
         render_trend = group_charts.split("function renderGroupEmotionTrend")[1].split("\nfunction ")[0]
         self.assertLess(
             render_trend.index("classList.remove('d-none')"),
             render_trend.index("mountChart('emotionTrend')"),
         )
-        self.assertIn("meta.partialResults", group_charts)
+        self.assertIn("meta.partialResults", analyze_js)
+        self.assertIn("onPartialResult:", group_charts)
+        self.assertNotIn("onSuccess", group_charts)
+        self.assertNotIn("onSuccess", analyze_js)
 
         profile = (ROOT / "web" / "templates" / "profile.html").read_text(encoding="utf-8")
         self.assertIn('<div id="profileContent" class="row">', profile)
