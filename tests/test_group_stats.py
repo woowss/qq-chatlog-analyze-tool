@@ -26,7 +26,9 @@
 
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -45,7 +47,7 @@ os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config  # noqa: E402
-from parser.qq_parser import ChatData, Message  # noqa: E402
+from parser.qq_parser import ChatData, Message, load_chat  # noqa: E402
 from analyzer import group_stats as gs  # noqa: E402
 from analyzer.local_stats import SESSION_GAP_MINUTES  # noqa: E402
 from webapp import store  # noqa: E402
@@ -487,6 +489,399 @@ class TestGroupStatsPerformance(unittest.TestCase):
         self.assertEqual(stats["overview"]["member_count"], 50)
         self.assertEqual(len(stats["interaction"]["members"]), config.GROUP_MATRIX_MEMBERS)
         self.assertTrue(stats["interaction"]["truncated"])
+
+
+_R7_BASE = 1704067200.0
+
+
+def _r7_write_chat(payload) -> str:
+    d = tempfile.mkdtemp(prefix="r7-parse-")
+    path = os.path.join(d, "chat.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    return path
+
+
+def _r7_msg(msg_id, uid, name, ts_s, el_type, el_data=None, text=""):
+    return {
+        "id": str(msg_id),
+        "timestamp": int(ts_s * 1000),
+        "time": datetime.fromtimestamp(ts_s, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        "sender": {"uid": uid, "name": name},
+        "type": "text",
+        "content": {
+            "text": text,
+            "elements": [{"type": el_type, "data": el_data if el_data is not None else {"text": text}}],
+        },
+    }
+
+
+class TestInteractionMatrixIsMemoisedPerEffectiveLimit(unittest.TestCase):
+    """Sparse interaction counts are primary; dense projections stay bounded."""
+
+    def _chat(self, n_members=4):
+        msgs = []
+        seq = 0
+        for i in range(n_members):
+            uid = f"u{i}"
+            for _ in range(n_members - i):
+                msgs.append(_r7_msg(seq, uid, uid, _R7_BASE + seq * 2, "text", text="话"))
+                seq += 1
+        payload = {
+            "chatInfo": {"name": "摸鱼群", "selfUid": "u0", "selfName": "u0", "type": "group"},
+            "statistics": {"senders": [{"uid": f"u{i}", "name": f"u{i}"} for i in range(n_members)]},
+            "messages": msgs,
+        }
+        path = _r7_write_chat(payload)
+        try:
+            return load_chat(path)
+        finally:
+            shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+
+    def test_same_limit_returns_the_cached_object(self):
+        chat = self._chat()
+        first = gs.calc_interaction_matrix(chat, top_k=0)
+        second = gs.calc_interaction_matrix(chat, top_k=0)
+        self.assertIs(first, second, "同一个生效上限必须命中缓存（否则成员画像里就是白算）")
+
+    def test_different_limits_are_cached_separately(self):
+        chat = self._chat()
+        full = gs.calc_interaction_matrix(chat, top_k=0)
+        capped = gs.calc_interaction_matrix(chat, top_k=2)
+        self.assertIsNot(full, capped)
+        self.assertEqual(len(full["members"]), 4)
+        self.assertEqual(len(capped["members"]), 2)
+        # 再取一次：两者都还在缓存里，互不覆盖
+        self.assertIs(gs.calc_interaction_matrix(chat, top_k=0), full)
+        self.assertIs(gs.calc_interaction_matrix(chat, top_k=2), capped)
+
+    def test_config_is_still_read_at_call_time(self):
+        """缓存键必须是**解析后的**上限：改配置后不许拿回旧上限的结果。"""
+        chat = self._chat()
+        with mock.patch("analyzer.group_stats.config.GROUP_MATRIX_MEMBERS", 2):
+            self.assertEqual(gs.calc_interaction_matrix(chat)["matrix_limit"], 2)
+        with mock.patch("analyzer.group_stats.config.GROUP_MATRIX_MEMBERS", 4):
+            self.assertEqual(gs.calc_interaction_matrix(chat)["matrix_limit"], 4)
+
+    def test_cache_is_per_chat_object(self):
+        """两份不同的聊天不许互相命中（缓存挂在 chat 对象上，不挂在模块上）。"""
+        a, b = self._chat(4), self._chat(3)
+        self.assertIsNot(gs.calc_interaction_matrix(a, top_k=0), gs.calc_interaction_matrix(b, top_k=0))
+
+    def test_dense_projection_cache_is_bounded(self):
+        chat = self._chat(8)
+        for limit in (1, 2, 3, 4, 5):
+            gs.calc_interaction_matrix(chat, top_k=limit)
+        self.assertEqual(len(chat._matrix_cache), 3)
+        self.assertEqual(set(chat._matrix_cache), {3, 4, 5})
+        last = gs.calc_interaction_matrix(chat, top_k=5)
+        self.assertIs(last, chat._matrix_cache[5])
+
+
+_R6_BASE_MS = 1_700_000_000_000
+
+
+class TestStatsConventions(unittest.TestCase):
+    """断言 B3/B4/B5：媒体分家、中位数口径唯一、同名成员与自回复"""
+
+    @staticmethod
+    def _chat(items):
+        """items: [(uid, name, text, kwargs...)] 直接构造 Message，绕开解析器"""
+        from parser.qq_parser import ChatData, Message
+
+        msgs = []
+        for i, (uid, name, text, kw) in enumerate(items):
+            m = Message(
+                f"m{i}",
+                _R6_BASE_MS + i * 60000,
+                "2023-11-14 22:13:20",
+                name,
+                uid,
+                text,
+                text,
+                "text",
+                bool(kw.pop("has_image", False)),
+                False,
+                **kw,
+            )
+            msgs.append(m)
+        return ChatData("c", "我", "对方", "u_self", "u_other", messages=msgs, total_count=len(msgs))
+
+    def test_image_and_file_in_one_message_not_double_counted(self):
+        """一条消息同时有图片与文件：字节必须分家，不能两边各记一份合计
+
+        反向验证：把 calc_overview 里的 img_bytes/other_bytes 分家改回
+        `image_bytes += m.media_bytes` / `other_media_bytes += m.media_bytes`，本条变红
+        （仪表盘并排显示"图片 6144 · 文件/视频 6144"，而真实发送量只有 6144）。
+        """
+        from analyzer.local_stats import calc_overview
+
+        chat = self._chat(
+            [
+                (
+                    "u_self",
+                    "我",
+                    "看图说话",
+                    {
+                        "has_image": True,
+                        "media_bytes": 2048 + 4096,
+                        "media_kind": "file",
+                        "image_bytes": 2048,
+                        "image_count": 1,
+                        "image_ids": ["IMG"],
+                        "media_id": "IMG",
+                    },
+                ),
+            ]
+        )
+        ov = calc_overview(chat)
+        self.assertEqual(ov["image_bytes"], 2048, "图片体积只该算图片那一份")
+        self.assertEqual(ov["other_media_bytes"], 4096, "非图片媒体只算剩下的那一份")
+        self.assertEqual(ov["image_bytes"] + ov["other_media_bytes"], 6144, "合计不许重复计")
+
+    def test_images_counted_per_picture_not_per_message(self):
+        """一条消息发 3 张图 → "图片总数"该是 3（标签写的是张，此前按消息条数算）"""
+        from analyzer.local_stats import calc_overview
+
+        chat = self._chat(
+            [
+                (
+                    "u_self",
+                    "我",
+                    "三连",
+                    {
+                        "has_image": True,
+                        "media_bytes": 3000,
+                        "image_bytes": 3000,
+                        "image_count": 3,
+                        "image_ids": ["A", "B", "C"],
+                        "media_id": "A",
+                    },
+                ),
+            ]
+        )
+        ov = calc_overview(chat)
+        self.assertEqual(ov["total_images"], 3)
+        self.assertEqual(ov["unique_images"], 3, "去重也按张，一条消息里的三张不该塌成一张")
+
+    def test_legacy_message_without_image_split_still_counts(self):
+        """手工构造的旧式 Message（没有分家字段）退回旧口径，不许把图片算成 0"""
+        from analyzer.local_stats import calc_overview
+
+        chat = self._chat(
+            [("u_other", "对方", "图", {"has_image": True, "media_bytes": 100, "media_id": "x"})]
+        )
+        ov = calc_overview(chat)
+        self.assertEqual(ov["total_images"], 1)
+        self.assertEqual(ov["image_bytes"], 100)
+        self.assertEqual(ov["other_media_bytes"], 0)
+
+    def test_p50_survives_chronological_gaps(self):
+        """中位数必须先排序：arr 是按对话时间序 append 的，"取中间那条"不是中位数
+
+        反向验证：把 _stats 里的 _median(sorted(arr)) 改回 _median(arr)，本条变红——
+        间隔按时间序 [10,100,20,30]，真中位数 25.0，未排序会报 (100+20)/2=60.0，
+        等于把最长的一段对话当成"典型回复速度"，而 p50 恰恰是关系页的主展示指标。
+        （为什么非要 n≥3 且乱序：n=2 时取中间两数平均与顺序无关；离群值若排在
+        后半段，中间位置照样落进普通值——本轮两条 p50 用例都栽在这个盲区里。）
+        """
+        from analyzer.local_stats import calc_response_time
+        from parser.qq_parser import ChatData, Message
+
+        def m(i, uid, ts_s):
+            return Message(
+                f"m{i}",
+                _R6_BASE_MS + ts_s * 1000,
+                "2023-11-14 22:13:20",
+                "我" if uid == "u_self" else "对方",
+                uid,
+                "话",
+                "话",
+                "text",
+                False,
+                False,
+            )
+
+        # 时间序上交替发言；self 侧回复间隔依次是 10、100、20、30 秒（乱序）
+        timeline = [
+            ("u_other", 0),
+            ("u_self", 10),
+            ("u_other", 15),
+            ("u_self", 115),
+            ("u_other", 120),
+            ("u_self", 140),
+            ("u_other", 145),
+            ("u_self", 175),
+        ]
+        chat = ChatData(
+            "c",
+            "我",
+            "对方",
+            "u_self",
+            "u_other",
+            messages=[m(i, u, t) for i, (u, t) in enumerate(timeline)],
+            total_count=len(timeline),
+        )
+        rt = calc_response_time(chat)
+        self.assertEqual(rt["self"]["count"], 4, "self 侧应配对出 4 个间隔")
+        self.assertEqual(rt["self"]["p50"], 25.0, f"[10,100,20,30] 的中位数是 25.0，实际 {rt['self']['p50']}")
+        self.assertEqual(rt["self"]["avg"], 40.0)
+
+    def test_median_of_even_sample_is_not_the_upper_middle(self):
+        """句长中位数：偶数样本必须取中间两个的平均，而不是上中位
+
+        反向验证：把 _median 改回 s[n//2]，本条变红 —— 两句 [1,9] 会被报成
+        "中位句长 9"（真值 5.0），等于把最长的那句当成中位数。
+        """
+        from analyzer.local_stats import calc_message_length_stats
+
+        chat = self._chat(
+            [
+                ("u_self", "我", "x", {}),
+                ("u_self", "我", "y" * 9, {}),
+                ("u_other", "对方", "a", {}),
+                ("u_other", "对方", "b" * 100, {}),
+            ]
+        )
+        st = calc_message_length_stats(chat)
+        self.assertEqual(st["self"]["median"], 5.0, f"两句的中位数应是 5.0，实际 {st['self']['median']}")
+        self.assertEqual(st["other"]["median"], 50.5)
+
+    def test_p50_and_median_share_one_implementation(self):
+        """同一个模块里"中位数"只许有一种算法（口径唯一是本地统计的立身之本）
+
+        反向验证：让 p50 重新走 `_percentile(arr, 0.5)`（那是 int(round(0.5*(n-1)))，
+        偶数样本取**下**中位），第二组断言立刻与第一组矛盾。
+        """
+        from analyzer.local_stats import _median
+
+        self.assertEqual(_median([1, 9]), 5.0)
+        self.assertEqual(_median([1, 2, 9]), 2.0)
+        self.assertEqual(_median([]), 0.0)
+        self.assertEqual(_median([7]), 7.0)
+
+        # p50 走的就是它：造两个间隔 1s / 99s 的配对，仪表盘该报 50.0 而不是 1.0
+        from analyzer.local_stats import calc_response_time
+
+        msgs = [
+            Message("a", _R6_BASE_MS, "t", "我", "u_self", "在", "在", "text", False, False),
+            Message("b", _R6_BASE_MS + 1000, "t", "对方", "u_other", "嗯", "嗯", "text", False, False),
+            Message("c", _R6_BASE_MS + 61000, "t", "我", "u_self", "在", "在", "text", False, False),
+            Message("d", _R6_BASE_MS + 160000, "t", "对方", "u_other", "嗯", "嗯", "text", False, False),
+        ]
+        from parser.qq_parser import ChatData
+
+        got = calc_response_time(
+            ChatData("c", "我", "对方", "u_self", "u_other", messages=msgs, total_count=4)
+        )
+        self.assertEqual(got["other"]["p50"], 50.0, f"两次间隔的中位数应是 50s，实际 {got['other']['p50']}")
+
+    def test_same_second_reply_is_not_reported_as_zero_speed(self):
+        """秒级时间戳下同秒跨人配对不该算出"平均回复 0 秒"
+
+        反向验证：把 calc_response_time 的 `gap <= 0` 判断去掉，本条变红
+        （self: avg 0.0 / p50 0.0，界面显示的是一件物理上不可能的事）。
+        """
+        from analyzer.local_stats import calc_response_time
+
+        chat = self._chat(
+            [
+                ("u_self", "我", "甲", {}),
+                ("u_other", "对方", "乙", {}),
+            ]
+        )
+        # 人为制造同毫秒的跨人配对
+        chat.messages[0].timestamp = _R6_BASE_MS
+        chat.messages[1].timestamp = _R6_BASE_MS
+        got = calc_response_time(chat)
+        self.assertEqual(got["other"]["count"], 0, "0 间隔不该被当成一次响应")
+        self.assertEqual(got["other"]["avg"], 0.0)
+
+    def test_duplicate_names_with_numeric_uids_are_unique(self):
+        """真实 QQ 号前 4 位相同也必须消歧（此前 #uid4 会让两个"小明"合成一个人）
+
+        反向验证：把 unique_display_names 的后缀改回 uid[:4]，本条变红。
+        """
+        from parser.group_identity import Participant, unique_display_names
+
+        parts = [
+            Participant(uid="1000000001", name="小明"),
+            Participant(uid="1000000042", name="小明"),
+        ]
+        names = [p.name for p in unique_display_names(parts)]
+        self.assertEqual(len(set(names)), 2, f"显示名冲突：{names}")
+        self.assertTrue(all(n.startswith("小明#") for n in names), names)
+
+    def test_anonymous_members_are_distinguishable(self):
+        """两个匿名成员也不能撞名"""
+        from parser.group_identity import Participant, unique_display_names
+
+        parts = [Participant(uid="1000000001", name=""), Participant(uid="1000000042", name="")]
+        names = [p.name for p in unique_display_names(parts)]
+        self.assertEqual(len(set(names)), 2, f"匿名成员撞名：{names}")
+
+    def test_self_reply_not_doubled_in_undirected_matrix(self):
+        """自回复（引用自己发的消息）在无向矩阵对角上不该翻倍
+
+        反向验证：把 _symmetrize 的对角分支改成与 off-diagonal 同样的相加，本条变红
+        （3 次自回复报成 6 次，而矩阵与图例、总数从此对不上账）。
+        """
+        from analyzer.group_stats import calc_interaction_matrix
+        from parser.qq_parser import load_chat
+
+        msgs = []
+        for i in range(4):
+            msgs.append(
+                {
+                    "id": f"seed{i}",
+                    "timestamp": _R6_BASE_MS + i * 60000,
+                    "time": "2023-11-14 22:13:20",
+                    "sender": {"uid": "uA", "name": "甲"},
+                    "type": "text",
+                    "content": {"text": f"甲原话{i}"},
+                }
+            )
+        for i in range(3):
+            msgs.append(
+                {
+                    "id": f"sr{i}",
+                    "timestamp": _R6_BASE_MS + (400 + i) * 60000,
+                    "time": "2023-11-14 23:00:00",
+                    "sender": {"uid": "uA", "name": "甲"},
+                    "type": "text",
+                    "content": {
+                        "text": f"自回复{i}",
+                        "elements": [{"type": "reply", "data": {"referencedMessageId": f"seed{i}"}}],
+                    },
+                }
+            )
+        for i in range(3):
+            msgs.append(
+                {
+                    "id": f"b{i}",
+                    "timestamp": _R6_BASE_MS + (800 + i) * 60000,
+                    "time": "2023-11-14 23:30:00",
+                    "sender": {"uid": "uB", "name": "乙"},
+                    "type": "text",
+                    "content": {"text": f"乙{i}"},
+                }
+            )
+        payload = {
+            "chatInfo": {"name": "测试群", "selfUid": "uA", "selfName": "甲", "type": "group"},
+            "statistics": {"totalMessages": len(msgs), "senders": [{"uid": "uA", "name": "甲"}]},
+            "messages": msgs,
+        }
+        tmp = Path(tempfile.mkdtemp(prefix="r6-sr-")) / "selfreply.json"
+        try:
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            chat = load_chat(str(tmp))
+        finally:
+            shutil.rmtree(tmp.parent, ignore_errors=True)
+        inter = calc_interaction_matrix(chat)
+        idx = [m["uid"] for m in inter["members"]].index("uA")
+        self.assertEqual(inter["explicit_directed"][idx][idx], 3)
+        self.assertEqual(inter["explicit_undirected"][idx][idx], 3, "无向对角不该翻倍")
+        self.assertEqual(inter["self_replies"], 3, "自回复总数要能对账（关系图里没有自环）")
 
 
 if __name__ == "__main__":

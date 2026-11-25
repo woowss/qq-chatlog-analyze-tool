@@ -74,10 +74,7 @@ GROUP_DIM_NAMES = {
 GROUP_ANALYZE_FUNCS = {
     key: item.runner for key, item in analysis_catalog.ANALYSIS_CATALOG.items() if item.mode == "group"
 }
-# 「整体总括」（analyzer/recap_client.py）：私聊专用、单次调用、独立缓存族。
-# **刻意不进** ANALYZE_FUNCS——dimensions_for_mode 就是"一键全量"的清单，
-# README 对全量成本有实测承诺（约 ¥6），悄悄把新维度塞进去等于改了承诺；
-# recap 走独立按钮，成本（一次调用）在页面上写清。
+# 「整体总括」为私聊专用单次维度，不纳入一键全量清单，通过独立入口触发
 RECAP_ANALYZE_FUNCS = {
     key: item.runner for key, item in analysis_catalog.ANALYSIS_CATALOG.items() if item.private_only
 }
@@ -85,12 +82,7 @@ ALL_DIMENSION_NAMES = {key: item.label for key, item in analysis_catalog.ANALYSI
 
 
 def dimensions_for_mode(is_group: bool) -> list:
-    """该模式该跑哪些维度（顺序即"一键全量"的执行顺序）。
-
-    群聊把最贵的"成员画像"放在最后：用户先拿到便宜的群级结果，配额万一在中途耗尽，
-    也已经有可用产出。
-    私聊的全量清单不含 recap（理由见 RECAP_ANALYZE_FUNCS 上方注释）。
-    """
+    """返回指定模式下“一键全量”执行的维度顺序（群聊将成员画像置后，私聊不含 recap）。"""
     mode = "group" if is_group else "private"
     return [
         key
@@ -115,16 +107,7 @@ def is_group_dimension(dimension: str) -> bool:
 
 
 def is_private_only_dimension(dimension: str) -> bool:
-    """该维度是否"只适用于两人私聊"——群聊会话一律不许跑。
-
-    为什么不能直接用 `not is_group_dimension(dim)` 代替：recap 既不在 ANALYZE_FUNCS
-    也不在 GROUP_DIMENSIONS（它是第三套独立注册表 RECAP_DIMENSIONS），所以
-    `is_group_dimension("recap")` 是 False，`False != True` 就放行了群聊会话。
-    而 recap 与私聊五维吃的是**同一份**摘要，那份摘要是二人关系口径
-    （"参与者：我 与 对方"，每条非本人消息都标成 other_name；群聊文件里
-    other_name 是群名），拿它跑群聊就是"我 vs 全群"被讲成二人关系——与
-    _dimension_guard 存在的目的完全同类，且每跑一次就真花一次钱。
-    """
+    """判断维度是否仅适用于两人私聊（涵盖不属 ANALYZE_FUNCS/GROUP_DIMENSIONS 的 recap）。"""
     return analysis_catalog.is_private_only(dimension)
 
 
@@ -136,14 +119,8 @@ def dimension_unit(dimension: str) -> str:
 # 内存任务表：job_id -> 状态字典
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
-MAX_JOBS_KEPT = 256  # 表长上限：超限按完成时间先淘汰已结束的条目
-# running 条目的硬上限（兜底，**不参与 TTL 淘汰**）。
-# 曾经 running 也按 created 走 TTL，而 _prune_jobs 就在轮询端点入口调用
-# （webapp/api.py 的 api_analyze_job），于是一键全量分析（5 维度 × 多月 × 思考模式）
-# 跑过默认 15 分钟后，会在**自己的轮询请求**里把自己删掉，此后每次轮询都 404，
-# 用户看到的是"任务不存在（服务可能已重启）"——与实际不符（任务还在跑；结果因先落盘
-# 而不会重复付费，但状态直播断了）。所以 running 只受这个远大于任何合理单次运行的
-# 硬上限约束，用来兜住"线程异常死亡、没来得及写 finished_at"的滞留条目。
+MAX_JOBS_KEPT = 256
+# running 条目不走短 TTL，仅设长上限兜底异常滞留任务
 JOB_RUNNING_MAX_SECONDS = max(8 * JOB_TTL_SECONDS, 2 * 3600)
 
 
@@ -292,18 +269,7 @@ def _job_chat_hash(job_id: str) -> str:
 
 
 def _stop_requested(job_id: str) -> bool:
-    """是否该停止继续派发新任务：用户点了取消、进程正在关闭，或这个聊天刚被清掉。
-
-    三者必须分开看的地方在缓存写入：关闭时 _analyze_periods 会带着"已完成的部分
-    月份"返回，把它当正常结果写进**维度**缓存，用户之后重跑就直接命中这份残缺结果，
-    缺掉的月份再也不会补上。而用户主动取消是"我不要这次结果"，同样不该写。
-    已经完成调用的月份本身已经落在月份缓存里，重跑不会重复付费。
-
-    "刚被清掉"这一条原先是缺的：分析动辄跑几分钟，用户在中间换了一份聊天，级联清理
-    把派生数据全删了，而这一轮跑完照样把维度结果、月份文件、manifest 依次写回盘上——
-    清理报称"已删除"的敏感数据原地复活，且已无人引用。把它做成停止条件，一处就同时
-    管住三处：不再派发新月份、不写月份缓存、不写维度缓存（状态记为 cancelled）。
-    """
+    """检查任务是否应终止派发/写回（用户取消、服务关闭或聊天刚被清理）。"""
     return _job_cancelled(job_id) or shutdown_requested() or purge_marks.is_marked(_job_chat_hash(job_id))
 
 
@@ -317,13 +283,10 @@ def _run_job(
 ) -> None:
     """后台线程执行分析：更新进度、支持取消、成功后写磁盘缓存"""
     dim_name = DIMENSION_NAMES.get(dimension, dimension)
-    # 一次运行 = 这一个维度：把调用计数清零，让 LLM_MAX_CALLS_PER_RUN 从 0 起算。
-    # 命中缓存的月份不发请求、不计入，所以上限只约束真正花钱的部分。
+    # 每次独立任务重置按次调用计数，缓存命中的单元不计入消耗
     begin_run()
     try:
-        # 会话文件可能在"发起任务"与"后台线程开工"之间被 24 小时清理收走
-        # （uploads/ 按 mtime 回收）。不特判的话它只是一个 FileNotFoundError，
-        # 用户看到的是 "AI 分析失败: [Errno 2] No such file or directory: ..."。
+        # 排队到执行期间 uploads 可能已被 24 小时 TTL 清理，需明确提示而非抛 FileNotFoundError
         if not os.path.exists(filepath):
             logger.warning("%s 中止：会话文件已被清理（%s…）", dim_name, chat_hash[:8])
             _fail_job(job_id, "会话文件已被清理（上传文件只保留 24 小时），请重新上传聊天记录")

@@ -178,51 +178,15 @@ def _load_chat_cached(filepath: str):
 # 本地统计结果的磁盘缓存（内容寻址，与 AI 缓存同生命周期）
 # ---------------------------------------------------------------------------
 
-# 统计结果的结构版本：字段形状变了就 +1，老缓存会被判为过期并重算（避免模板 500）
-# v3：overview 增加 total_files / total_videos / total_forwards / total_other_media
-# v4：overview 增加 image_bytes / media_bytes / unique_images（媒体体积与去重）
-# v5：三个数字换了口径，老缓存里的值从此是错的，必须重算而不是继续显示：
-#     ① 句长 median 此前取上中位（两句 [1,9] 报成 9），② 一条消息里的图片与文件
-#     被同一份 media_bytes 双计进两个字段，③ 图片按"含图消息条数"数却标注为"张"。
-#     重算只花本地 CPU（数万条约 0.2~1s，词频仍是懒算），不产生任何 API 费用，
-#     所以这里宁可整族失效，也不让用户继续看错的数。
-# v6：① 修 total_other_media 的枚举漏计（json/av_record 被解析被计数却进不了汇总，
-#         界面"通话/卡片"恒为 0），改为差集口径；② 语音消息进入媒体口径（total_voices）；
-#     ③ 新增撤回计数与"未识别元素类型"漂移探测；④ 新增 trends 时间趋势族
-#         （逐月互发与句长、中断≥3天的重启与重启方、称呼变迁、首条消息原文）。
-#     均为加法字段 + 一处口径修复，老缓存里"其他=0"是错的，继续显示不如重算
-#     （只花本地 CPU，零 API 费用）。
-# v7：trends.name_history 的键改用 strip 过的显示名。带尾空格的昵称此前会被拆成两个
-#     桶（"小明" 与 "小明 "），仪表盘的「称呼变迁」于是显示一次从未发生的改名——而那张
-#     卡片的语义是关系信号，假信号比缺信号更糟。老缓存里这条是错的，重算只花 CPU。
-#     注意：calc_trends 同时进 recap/ask 的提示词指纹，所以这一改也让那两族缓存换代；
-#     该族尚未发布（CHANGELOG 已记账），没有用户为它付过钱。
+# 统计结果结构版本号：私聊与群聊各自独立，不共用版本号（避免互相误触发重算）
 STATS_SCHEMA_VERSION = 7
-# 群聊统计是**另一套形状**，因此用独立的版本号与 mode 字段，而不是把私聊的 v4 往上顶：
-# 顶版本号会让所有既有私聊统计缓存立刻失效（升级后第一次打开页面白等一次计算），
-# 而私聊缓存的形状其实一个字都没变。mode 是权威判别字段，_v 只在同 mode 内有意义。
-# g1 → g2：interaction 增加 explicit_/mention_ 矩阵与覆盖率计数（群聊轨尚未对外，无影响）
-# g2 → g3：① length_stats 的中位数改了口径（群统计复用同一个函数）；
-# ② interaction 的 explicit_undirected 对角不再把自回复翻倍，并新增 self_replies 字段。
-# 老缓存里的数字是错的，而重算只花本地 CPU（不产生任何 API 费用），所以宁可整族失效。
-# g3 → g4：群聊 overview 复用私聊 calc_overview，随私聊 v6 一起变
-# （total_other_media 差集口径、total_voices、撤回计数、未识别元素探测）。
 GROUP_STATS_SCHEMA_VERSION = 4
 
-# 统计计算挪出请求线程后的在跑任务：chat_hash -> Thread
 _STATS_THREADS: dict[str, threading.Thread] = {}
 _STATS_LOCK = threading.Lock()
-# 等待后台统计的最长时间（首屏可以稍微等一会儿，好过把"计算中"甩给用户）
 STATS_WAIT_SECONDS = 20.0
-# 统计失败的哈希 -> 失败原因：异步化之后错误不再有 HTTP 响应可承载，
-# 不记下来的话用户只会看到"上传成功但仪表盘又跳回首页"，无从排查。
 _STATS_ERRORS: dict[str, str] = {}
-# 最近被级联清理过的哈希：防止仍在跑的线程把结果"复活"成孤儿缓存。
-# 表本身住在 analyzer.purge_marks（分析层与持久层都要读，谁也不能 import 谁），
-# 这里只留同名包装，_STATS_ERRORS 的顺带清理仍在本模块的锁里做。
-# 上面两处由后台统计线程与请求线程共同读写：GIL 让简单操作"大多不会炸"，
-# 但 pop/迭代混在一起时并不可靠，统一挂到这把独立锁下（不复用 _STATS_LOCK，
-# 避免与"等线程结束"的 join 路径互相等待）
+# _STATS_ERRORS 与 purge_marks 读写用独立锁，避免与等待后台线程 join 时产生锁竞争
 _META_LOCK = threading.Lock()
 
 
@@ -258,25 +222,11 @@ def _is_recently_purged(chat_hash: str) -> bool:
     return purge_marks.is_marked(chat_hash)
 
 
-# ---------------------------------------------------------------------------
-# 存活会话对"某份聊天内容"的引用表
-# ---------------------------------------------------------------------------
-# 缓存是按**内容哈希**寻址的，而同一个内容可以被多个会话同时打开了好几份，
-# 每个会话自己传自己一份（各自的 filepath 不同，内容一样 → chat_hash 一样）。
-# 于是"会话 2 换文件"触发的级联清理会连带删掉会话 1 正在用的统计与**已付费**的 AI 结果：
-# 会话 1 的症状是"仪表盘平白弹回首页"，而他要恢复只能重新分析（真的再付一次钱）。
-# 实测过：20 个会话并发跑，7 个换文件，另外 3 个会话的页面请求就被打回首页。
-# 这里记一份"谁在用哪个哈希"，级联清理只删**已经没有别的会话在用**的那些。
-#
-# 口径：TTL 与 flask_session/ 本身的 24 小时回收一致（见 cleanup 的 86400）——
-# 会话只要还在被请求就会刷新时间戳，不再活动的会话自然过期，不会把缓存永久钉住。
+# 存活会话引用表：按内容哈希跟踪活跃会话，仅在无其它会话共用时才清理派生缓存（TTL 同会话 24h）
 _LIVE_CHAT_REFS: dict[str, dict[str, float]] = {}
 _LIVE_REFS_LOCK = threading.Lock()
 LIVE_CHAT_REF_TTL = 86400.0
-#: (哈希, 会话) 对的硬上限。修剪原先只发生在"该哈希又被读一次"的时候，而长期运行的
-#: 实例里每个上传过的哈希都只被写、之后未必再被读——(哈希, sid) 对会一直涨。
-#: 这张表只用来判断"还能不能删缓存"，超限时按时间戳淘汰最旧的：误判方向只是
-#: 提前删掉一份早已没人看的缓存，而不是把隐私清理永久挡住。
+#: 引用表条目硬上限；超限时按最久未活跃顺序淘汰，防止长期运行后内存无界增长
 LIVE_CHAT_REFS_MAX = 512
 
 
@@ -456,7 +406,7 @@ def _tmp_sibling(path: str) -> str:
     口径只有 `analyzer.atomic_write.tmp_sibling` 一份（唯一名的理由写在那个模块的文件
     说明里：固定名会让两个并发写者互相删半成品，并把半截文件发布成正式缓存）。
     这里保留同名函数，是因为清理侧与用例都把它当契约（见 _cache_belongs_to 与
-    tests/test_feature_round7.py 的临时名唯一性用例）。
+    tests/test_privacy_guards.py 的临时名唯一性用例）。
     """
     return tmp_sibling(path)
 
@@ -564,18 +514,10 @@ def compute_stats(chat) -> dict:
 
 
 def start_stats_job(chat, chat_hash: str) -> None:
-    """把统计计算放进后台线程：上传请求只做「保存 + 解析校验」，尽快返回。
-
-    50MB 记录的十项统计要 0.2~1s+，压在请求线程上纯属让浏览器干转圈；
-    结果是确定性的、又要落盘复用，天然适合异步。首个页面请求经
-    _current_stats() 短暂 join，用户几乎无感。
-    """
+    """后台异步计算本地十项统计并落盘；判重、登记与启动必须在同一把锁内完成。"""
     if not chat_hash:
         return
-    # 用户清掉后又重新上传同一份文件：这是新会话的正当计算，撤销旧的"已清理"标记
     _unmark_purged(chat_hash)
-    # 这里**故意不做**"已在跑就返回"的前置检查：判存在与登记必须一次加锁完成，
-    # 否则两个并发上传会双双通过检查、各起一个线程（真正的判定挪到函数末尾的注册处）。
 
     def _work():
         t0 = time.time()
@@ -584,8 +526,7 @@ def start_stats_job(chat, chat_hash: str) -> None:
             if _load_stats(chat_hash, expect_mode=mode) is not None:
                 return
             stats = compute_stats(chat)
-            # 守卫必须放在计算之后、落盘之前复查：计算期间用户可能已清理该聊天，
-            # 开算前查一次是不够的（那正是"晚到的线程复活孤儿缓存"的窗口）。
+            # 落盘前复查 purge mark，防止清理期间算完的后台线程复活孤儿统计
             if _is_recently_purged(chat_hash):
                 logger.info("该聊天的缓存已被清理，放弃写入后台统计结果（避免孤儿）")
                 return
@@ -593,37 +534,21 @@ def start_stats_job(chat, chat_hash: str) -> None:
             _clear_stats_error(chat_hash)
             logger.info("本地统计完成（%.0f ms，后台线程），已落盘复用", (time.time() - t0) * 1000)
         except Exception as e:
-            # 异步之后没有 HTTP 响应能承载这个错误：记在案，首页会提示用户
             _record_stats_error(chat_hash, f"{type(e).__name__}: {e}")
             logger.error("本地统计失败（该文件统计结果不可用）: %s", e)
         finally:
             with _STATS_LOCK:
-                # **只摘自己**：原先这里无条件 pop，于是"同一份内容被并发上传两次"时，
-                # 先结束的那个线程会把还在一起跑的第二个线程从表里抹掉。
-                # 后果不是脏数据而是用户可见的故障：_current_stats() 看到 busy=False
-                # 就不等 20 秒、直接拿到 None，_require_stats() 于是把人弹回首页——
-                # 正是本轮 _LIVE_CHAT_REFS 想消灭的"仪表盘平白弹回首页"，从另一条路复活。
-                # 比对身份（同一个 Thread 对象）才摘，别人的登记不许我替他们清。
+                # 仅摘除当前线程自身登记，避免并发上传时误删仍在跑的新线程
                 if _STATS_THREADS.get(chat_hash) is t:
                     _STATS_THREADS.pop(chat_hash, None)
 
     t = threading.Thread(target=_work, daemon=True, name=f"stats-{chat_hash[:8]}")
-    # 判"有没有人在算"与登记必须一次加锁完成：原先查完就放锁、再二次进锁登记，
-    # 中间那个窗口里两个并发上传会双双通过检查、各起一个线程，然后撞上
-    # 上面 finally 的无条件 pop（同一份内容被两个浏览器/两台设备打开是本项目
-    # 明确支持的场景，见 _LIVE_CHAT_REFS）。与登录限流那处是同一个教训。
+    # 在同一把锁内判重、登记并 start()，防止未启动线程窗口被 wait_for_stats join 抛 RuntimeError
     with _STATS_LOCK:
         existing = _STATS_THREADS.get(chat_hash)
         if existing is not None and existing.is_alive():
             return
-        # 已登记但线程早已结束（异常路径没清干净时的残骸）：覆盖掉，别永久卡死
         _STATS_THREADS[chat_hash] = t
-        # start() 必须在**同一把锁内**：它原先在锁外，于是"登记完、还没 start"的窗口里
-        # 另一个请求会看到 busy=True、进而 join 一个尚未启动的线程——CPython 对此抛
-        # `RuntimeError: cannot join thread before it is started`（实测复现），仪表盘直接
-        # 500；在不抛的版本上 join 立刻返回、调用方拿到 None，症状又变回"平白弹回首页"，
-        # 正是本轮 _LIVE_CHAT_REFS 要消灭的那个。start() 本身很便宜，而 _work 只在
-        # finally 里取这把锁，锁内启动不会与它自锁。
         t.start()
 
 
@@ -631,8 +556,6 @@ def wait_for_stats(chat_hash: str, timeout: float = STATS_WAIT_SECONDS) -> None:
     """等某个聊天的后台统计跑完（没有在跑就直接返回）"""
     with _STATS_LOCK:
         t = _STATS_THREADS.get(chat_hash)
-    # is_alive() 两道用：① 线程可能已经结束但还没被自己摘掉（见 _work 的 finally）；
-    # ② 兜住任何"已登记但尚未 start"的历史窗口——对未启动的线程 join 会抛 RuntimeError。
     if t is not None and t.is_alive():
         t.join(timeout)
 
@@ -805,13 +728,10 @@ def _purge_chat_caches(chat_hash: str) -> int:
             os.remove(path)
             removed += 1
         except FileNotFoundError:
-            pass  # 本来就没有，属正常情形，不必报
+            pass
         except OSError as e:
             logger.warning("统计缓存删除失败（可能仍残留敏感内容）: %s (%s)", path, e)
-    # 月份级缓存已在函数开头处理（顺序原因见那里的注释）：这里不再重复调用。
-    # 看图用的图片副本（uploads/media/<chat_hash>/）：源文件都换了/没了，
-    # 派生出来的图片本体必须一起走，否则它只受"24 小时 mtime 回收"约束，
-    # 而在那之前一直是盘上最敏感的一批数据。
+    # 清理图片摘要内存缓存与 uploads/media/<chat_hash>/ 图片副本
     try:
         from analyzer import vision  # 延迟导入，避免 store→vision 模块级依赖
 
@@ -822,21 +742,18 @@ def _purge_chat_caches(chat_hash: str) -> int:
             face_images.purge_collect_memo(chat_hash)
         except Exception:
             pass
-    except Exception as e:  # 回收失败不影响主流程，但必须继续清理磁盘副本
+    except Exception as e:
         logger.warning("进程内图片摘要回收失败: %s", e)
     try:
-        from analyzer import vision  # 延迟导入，避免 store→vision 模块级依赖
+        from analyzer import vision
 
         removed += vision.purge_session_media(chat_hash)
-    except Exception as e:  # 回收失败不影响主流程
+    except Exception as e:
         logger.warning("图片副本回收失败: %s", e)
-    # 任务历史账目（logs/job_history.jsonl）里那几行 chat_hash 前缀。
-    # 少了这一步，「删除本聊天」之后盘上仍然留着"某日分析过这份内容、跑了哪个维度、
-    # 几个月"这张账——而 chat_hash 在本项目里就是聊天的身份（缓存全按它寻址）。
-    # 它不含聊天内容，但属于"这份内容被分析过"的留存记录，不该在删除后独自留下。
+    # 清理 logs/job_history.jsonl 中归属该 chat_hash 的记录行
     try:
         removed += purge_job_history(chat_hash)
-    except Exception as e:  # 账目清不掉不影响隐私主路径，但要出声
+    except Exception as e:
         logger.warning("任务历史按聊天清理失败: %s", e)
     return removed
 
@@ -848,14 +765,11 @@ def _load_cache_file(path: str, *, touch: bool = True):
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
-    # 新格式带创建时间（供绝对上限清理用）；旧格式直接就是结果本身
     if isinstance(data, dict) and "_created" in data and "result" in data:
         data = data["result"]
-    # 命中即续期：清理任务按 mtime 判断过期，只读不写会让天天用的缓存
-    # 在 30 天后照样被删掉（然后重新花钱分析）
     if touch:
         try:
-            os.utime(path, None)
+            os.utime(path, None)  # 命中续期 mtime（30 天滑动窗口）
         except OSError:
             pass
     return data
@@ -868,15 +782,7 @@ def _read_cache(
     *,
     read_only: bool = False,
 ):
-    """读维度缓存；当前指纹下没有时，沿"历史代指纹链"逐代找并迁移到当前键。
-
-    指纹公式从"源码原文"改成 AST 归一之后，既有用户的缓存文件名仍是旧指纹。
-    不认那份的话，他们每一次分析都要重新付费——而这次公式变更与提示词、与对话
-    内容都毫无关系。读到旧文件就 os.replace 到当前键：既完成迁移，又不留重复的
-    敏感内容（这些缓存含聊天原文引用）。
-    链式（而非单值）：未来任何一次指纹换代都只需把"上一代的当前值"压进链头，
-    这里会挨代找到旧缓存并搬到新键——第三次、第四次换代的老用户同样不再付费。
-    """
+    """读取维度缓存；当前指纹未命中时沿历史指纹链迁移旧文件至当前键。"""
     current_fp = fingerprint or fingerprint_for_dimension(dimension)
     current_path = _cache_path(dimension, chat_hash, fingerprint=current_fp)
     data = _load_cache_file(current_path, touch=not read_only)

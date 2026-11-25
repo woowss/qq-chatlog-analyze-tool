@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from datetime import datetime
 from unittest import mock
@@ -6,14 +7,18 @@ from _bootstrap import bootstrap
 
 bootstrap()
 
+import app  # noqa: E402
 from analyzer import deepseek_client as dc  # noqa: E402
 from analyzer import group_client as gc  # noqa: E402
+from analyzer import local_stats  # noqa: E402
+from analyzer.recap_client import _recap_digest  # noqa: E402
+from flask import session as flask_session  # noqa: E402
 from parser.qq_parser import CST, ChatData, Message  # noqa: E402
-from webapp import evidence  # noqa: E402
+from result_fixtures import ask  # noqa: E402
 from result_fixtures import emotion  # noqa: E402
-from webapp import analysis_plan, api, jobs, store  # noqa: E402
-from webapp.message_index import index_for  # noqa: E402
+from webapp import analysis_plan, api, evidence, jobs, store, views  # noqa: E402
 from webapp.analysis_scope import apply_scope, normalize_scope, scope_identity  # noqa: E402
+from webapp.message_index import index_for  # noqa: E402
 
 
 def _message(message_id, uid, name, year, month, day, hour=9, minute=0, *, reply_to_id="", reply_to_uid=""):
@@ -439,6 +444,310 @@ class AnalysisScopeApiTests(unittest.TestCase):
         self.assertEqual([message.id for message in sent_chat.messages], ["feb-b", "feb-a"])
         self.assertEqual(answer.call_args.args[1], "范围里说了什么？")
         self.assertNotEqual(cache_read.call_args.args[1], "范围里说了什么？")
+
+
+def _plan_message(message_id, uid, name, month, day, text, *, has_image=False):
+    dt = datetime(2025, month, day, 9, 0, tzinfo=CST)
+    return Message(
+        id=message_id,
+        timestamp=int(dt.timestamp() * 1000),
+        time_str=dt.strftime("%Y-%m-%d %H:%M:%S"),
+        sender_name=name,
+        sender_uid=uid,
+        text=text,
+        raw_text=text,
+        msg_type="type_1",
+        has_image=has_image,
+        is_reply=False,
+    )
+
+
+def _plan_chat(*, with_image=False):
+    return ChatData(
+        chat_name="合成私聊",
+        self_name="甲",
+        other_name="乙",
+        self_uid="u_a",
+        other_uid="u_b",
+        messages=[
+            _plan_message("jan-a", "u_a", "甲", 1, 1, "合成的一月消息", has_image=with_image),
+            _plan_message("jan-b", "u_b", "乙", 1, 2, "合成的一月回复"),
+            _plan_message("feb-a", "u_a", "甲", 2, 1, "合成的二月消息"),
+        ],
+    )
+
+
+class AnalysisScopeDurationFollowupTests(unittest.TestCase):
+    def test_scoped_overview_and_recap_recompute_duration(self):
+        chat = _plan_chat()
+        chat.duration_days = 365
+        for scope in (
+            {"date_from": "2025-01-01", "date_to": "2025-01-02"},
+            {"message_positions": [0, 1]},
+            {"allowed_uids": ["u_a"]},
+        ):
+            with self.subTest(scope=scope):
+                scoped, _ = apply_scope(chat, scope)
+                expected = (
+                    max(message.time_str[:10] for message in scoped.messages),
+                    min(message.time_str[:10] for message in scoped.messages),
+                )
+                from datetime import date
+
+                days = (date.fromisoformat(expected[0]) - date.fromisoformat(expected[1])).days + 1
+                overview = local_stats.calc_overview(scoped)
+                self.assertEqual(overview["total_days"], days)
+                self.assertEqual(overview["days_basis"], "computed")
+                self.assertEqual(overview["avg_daily"], round(len(scoped.messages) / days, 1))
+                self.assertIn(f"日均 {overview['avg_daily']}", _recap_digest(scoped))
+        self.assertEqual(chat.duration_days, 365)
+        targeted, _ = apply_scope(chat, {"target_uids": ["u_a"]})
+        self.assertEqual(targeted.duration_days, 365)
+
+
+def _rep_message(message_id, uid, name, month, day, text):
+    dt = datetime(2025, month, day, 9, 0, tzinfo=CST)
+    return Message(
+        id=message_id,
+        timestamp=int(dt.timestamp() * 1000),
+        time_str=dt.strftime("%Y-%m-%d %H:%M:%S"),
+        sender_name=name,
+        sender_uid=uid,
+        text=text,
+        raw_text=text,
+        msg_type="type_1",
+        has_image=False,
+        is_reply=False,
+    )
+
+
+def _rep_chat(*, group=False):
+    return ChatData(
+        chat_name="合成审核对话",
+        self_name="合成甲",
+        other_name="合成乙",
+        self_uid="u_a",
+        other_uid="u_b",
+        messages=[
+            _rep_message("jan-a", "u_a", "合成甲", 1, 1, "合成一月甲消息"),
+            _rep_message("jan-b", "u_b", "合成乙", 1, 2, "合成一月乙消息"),
+            _rep_message("feb-a", "u_a", "合成甲", 2, 1, "合成二月甲消息"),
+        ],
+        is_group_chat=group,
+    )
+
+
+class BackendIdentityAndAskCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.client = app.app.test_client()
+        self.client.get("/")
+        with self.client.session_transaction() as session:
+            self.sid = session.sid
+            self.headers = {
+                "Origin": "http://localhost:5000",
+                "X-CSRF-Token": session["csrf_token"],
+            }
+            session.update(
+                chat_mode="private",
+                chat_hash="synthetic-backend-identity",
+                filepath="synthetic-chat.json",
+            )
+        self.chat = _rep_chat()
+        self._patchers = [
+            mock.patch.object(api, "_session_chat_file", return_value=("synthetic-chat.json", None)),
+            mock.patch.object(store, "_load_chat_cached", return_value=self.chat),
+        ]
+        for patcher in self._patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(jobs.JOBS.clear)
+
+    def _set_scope(self, scope):
+        response = self.client.post("/api/analysis-scope", json={"scope": scope}, headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body.get("chat_hash"), "synthetic-backend-identity")
+        return body
+
+    def test_scope_and_plan_endpoints_return_current_chat_identity(self):
+        scope_response = self.client.get("/api/analysis-scope").get_json()
+        self.assertEqual(scope_response.get("chat_hash"), "synthetic-backend-identity")
+        plan_response = self.client.get("/api/analysis-plan?dimensions=emotion").get_json()
+        self.assertEqual(plan_response.get("chat_hash"), "synthetic-backend-identity")
+        self.assertEqual(plan_response["scope_id"], scope_response["scope_id"])
+
+    def test_rendered_page_identity_uses_canonical_session_scope_without_chat_parse(self):
+        scoped = self._set_scope({"date_from": "2025-01-01", "date_to": "2025-01-31"})
+        with app.app.test_request_context("/"):
+            flask_session["chat_hash"] = "synthetic-backend-identity"
+            flask_session["analysis_scope"] = scoped["scope"]
+            with mock.patch.object(views, "is_api_configured", return_value=True):
+                identity = views.inject_stats_flag().get("analysis_page_identity")
+                self.assertEqual(
+                    identity,
+                    {"chat_hash": "synthetic-backend-identity", "scope_id": scoped["scope_id"]},
+                )
+
+                flask_session["overview"] = {}
+                compatibility_identity = views.inject_stats_flag().get("analysis_page_identity")
+                self.assertEqual(compatibility_identity, identity)
+
+                flask_session["analysis_scope"] = None
+                self.assertEqual(
+                    views.inject_stats_flag().get("analysis_page_identity"),
+                    {"chat_hash": "synthetic-backend-identity", "scope_id": ""},
+                )
+
+                flask_session["analysis_scope"] = {"date_from": "2025-01-01"}
+                self.assertEqual(
+                    views.inject_stats_flag().get("analysis_page_identity"),
+                    {
+                        "chat_hash": "synthetic-backend-identity",
+                        "scope_id": scope_identity(
+                            {
+                                "date_from": "2025-01-01",
+                                "date_to": "",
+                                "target_uids": None,
+                                "allowed_uids": None,
+                                "message_positions": None,
+                            }
+                        ),
+                    },
+                )
+
+                flask_session["analysis_scope"] = {
+                    **scoped["scope"],
+                    "date_from": "not-a-date",
+                }
+                self.assertIsNone(views.inject_stats_flag().get("analysis_page_identity"))
+
+    def test_plan_start_and_poll_keep_the_scope_identity_created_with_job(self):
+        scoped = self._set_scope({"date_from": "2025-01-01", "date_to": "2025-01-31"})
+        plan = self.client.get("/api/analysis-plan?dimensions=emotion").get_json()
+        selected = [unit["key"] for unit in plan["units"][:1]]
+        with (
+            mock.patch.object(api, "is_api_configured", return_value=True),
+            mock.patch.object(api.threading, "Thread"),
+        ):
+            started = self.client.post(
+                "/api/analyze-plan",
+                json={
+                    "plan_id": plan["plan_id"],
+                    "dimensions": ["emotion"],
+                    "selected_units": selected,
+                },
+                headers=self.headers,
+            )
+        self.assertEqual(started.status_code, 200)
+        start_body = started.get_json()
+        self.assertEqual(start_body.get("chat_hash"), "synthetic-backend-identity")
+        self.assertEqual(start_body.get("scope_id"), scoped["scope_id"])
+
+        new_scope = self._set_scope({"date_from": "2025-02-01", "date_to": "2025-02-28"})
+        polled = self.client.get(f"/api/analyze-job/{start_body['job']}").get_json()
+        self.assertEqual(polled["chat_hash"], "synthetic-backend-identity")
+        self.assertEqual(polled["scope_id"], scoped["scope_id"])
+        self.assertNotEqual(polled["scope_id"], new_scope["scope_id"])
+        job = jobs.JOBS[start_body["job"]]
+        for status in ("done", "error", "cancelled"):
+            job.update(
+                status=status,
+                result={"emotion": {}},
+                results={"emotion": {}},
+                summary={"emotion": status},
+                partial_results={},
+                error="synthetic job result",
+            )
+            polled = self.client.get(f"/api/analyze-job/{start_body['job']}").get_json()
+            self.assertEqual(polled["chat_hash"], "synthetic-backend-identity")
+            self.assertEqual(polled["scope_id"], scoped["scope_id"])
+
+    def test_cached_analysis_response_has_true_chat_and_scope_identity(self):
+        scoped = self._set_scope({"message_positions": [1]})
+        with mock.patch.object(store, "_read_cache", return_value={"2025-01": emotion()}):
+            response = self.client.get("/api/analysis/emotion")
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body.get("chat_hash"), "synthetic-backend-identity")
+        self.assertEqual(body.get("scope_id"), scoped["scope_id"])
+
+    def test_analysis_404_and_immediate_analyze_cache_hit_return_identity(self):
+        with mock.patch.object(store, "_read_cache", return_value=None):
+            missing = self.client.get("/api/analysis/emotion")
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.get_json().get("chat_hash"), "synthetic-backend-identity")
+        self.assertEqual(missing.get_json().get("scope_id"), "")
+
+        with (
+            mock.patch.object(api, "is_api_configured", return_value=True),
+            mock.patch.object(store, "_read_cache", return_value={"2025-01": emotion()}),
+        ):
+            immediate = self.client.post("/api/analyze/emotion", headers=self.headers)
+        self.assertEqual(immediate.status_code, 200)
+        self.assertTrue(immediate.get_json().get("cached"))
+        self.assertEqual(immediate.get_json().get("chat_hash"), "synthetic-backend-identity")
+        self.assertEqual(immediate.get_json().get("scope_id"), "")
+
+    def test_target_only_scope_reuses_full_chat_ask_cache(self):
+        question = "这段对话主要聊了什么？"
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(store, "AI_CACHE_DIR", directory):
+                store.ask_cache_write("synthetic-backend-identity", question, ask())
+                scoped = self._set_scope({"target_uids": ["u_b"]})
+                with (
+                    mock.patch.object(api, "is_api_configured", return_value=True),
+                    mock.patch(
+                        "analyzer.recap_client.answer_question",
+                        return_value={"answer": "合成答案", "confidence": "medium", "evidence": []},
+                    ) as answer,
+                ):
+                    response = self.client.post("/api/ask", json={"question": question}, headers=self.headers)
+                self.assertEqual(response.status_code, 200)
+                body = response.get_json()
+                self.assertTrue(body.get("cached", False))
+                self.assertEqual(body["chat_hash"], "synthetic-backend-identity")
+                self.assertEqual(body["scope_id"], scoped["scope_id"])
+                answer.assert_not_called()
+
+    def test_target_only_scope_shares_ask_inflight_identity_with_full_chat(self):
+        question = "这段对话主要聊了什么？"
+        full_chat, _ = apply_scope(self.chat, {})
+        target_chat, _ = apply_scope(self.chat, {"target_uids": ["u_b"]})
+        key_builder = getattr(api, "_ask_cache_question", None)
+        self.assertIsNotNone(key_builder)
+        full_key = key_builder(question, full_chat)
+        target_key = key_builder(question, target_chat)
+        self.assertEqual(full_key, target_key)
+
+        api._ASK_IN_FLIGHT.clear()
+        try:
+            with app.app.test_request_context("/"):
+                token, busy = api._ask_acquire("synthetic-backend-identity", full_key)
+                self.assertIsNone(busy)
+                duplicate_token, busy = api._ask_acquire("synthetic-backend-identity", target_key)
+                self.assertIsNone(duplicate_token)
+                self.assertIsNotNone(busy)
+                api._ask_release("synthetic-backend-identity", full_key, token)
+        finally:
+            api._ASK_IN_FLIGHT.clear()
+
+    def test_range_ask_does_not_hit_old_duration_semantics_cache(self):
+        question = "这段对话主要聊了什么？"
+        scoped = self._set_scope({"date_from": "2025-02-01", "date_to": "2025-02-28"})
+        old_cache_question = f"{question}\0{scoped['scope_id']}"
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(store, "AI_CACHE_DIR", directory):
+                store.ask_cache_write("synthetic-backend-identity", old_cache_question, ask())
+                with (
+                    mock.patch.object(api, "is_api_configured", return_value=True),
+                    mock.patch("analyzer.recap_client.answer_question", return_value=ask()) as answer,
+                ):
+                    response = self.client.post("/api/ask", json={"question": question}, headers=self.headers)
+                self.assertEqual(response.status_code, 200)
+                self.assertFalse(response.get_json().get("cached", False))
+                self.assertEqual(response.get_json()["chat_hash"], "synthetic-backend-identity")
+                self.assertEqual(response.get_json()["scope_id"], scoped["scope_id"])
+                answer.assert_called_once()
 
 
 if __name__ == "__main__":

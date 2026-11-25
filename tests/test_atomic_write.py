@@ -28,8 +28,10 @@
    钉成"仍被引用"。
 """
 
+import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -38,12 +40,15 @@ from pathlib import Path
 from unittest import mock
 
 # 测试隔离 + 网络护栏：见 tests/_bootstrap.py（必须在 import 项目模块之前完成）
+from datetime import datetime, timedelta, timezone
 from _bootstrap import bootstrap  # noqa: E402
 
 bootstrap()
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from analyzer import atomic_write, face_images, usage, vision  # noqa: E402
+from analyzer import atomic_write, face_images, purge_marks, usage, vision  # noqa: E402
+from analyzer import month_cache as mc  # noqa: E402
+from webapp import store as storemod  # noqa: E402
 
 
 class TmpNameSurface(unittest.TestCase):
@@ -170,6 +175,241 @@ class TmpNameUniqueness(unittest.TestCase):
         for t in threads:
             t.join(timeout=30)
         self.assertEqual(len(set(found)), 300, "并发线程之间也不该撞名")
+
+
+class TestSaveAndHashIntegrity(unittest.TestCase):
+    """上传流落盘：要么给出完整文件的哈希，要么报错——绝不返回半截结果"""
+
+    class _GoodFS:
+        def __init__(self, data: bytes):
+            self.stream = io.BytesIO(data)
+
+    class _ExplodingStream:
+        """先吐一部分数据再抛 OSError，且不可 seek（模拟不可回退的失败流）"""
+
+        def __init__(self, data: bytes):
+            self._data = data
+            self._sent = False
+
+        def seek(self, *args):
+            raise OSError("not seekable")
+
+        def read(self, n=-1):
+            if not self._sent:
+                self._sent = True
+                return self._data[: max(1, n // 2)]
+            raise OSError("source vanished")
+
+    class _ExplodingFS:
+        def __init__(self, data: bytes):
+            self.stream = TestSaveAndHashIntegrity._ExplodingStream(data)
+            self.save_called = False
+
+        def save(self, path):
+            self.save_called = True
+            with open(path, "wb") as f:
+                f.write(b"PARTIAL")
+
+    def test_fast_path_hash_matches_full_reread(self):
+        data = json.dumps({"hello": "世界" * 500}).encode("utf-8")
+        with tempfile.TemporaryDirectory(prefix="qqchatlog-savehash-") as tmp:
+            dest = os.path.join(tmp, "a.json")
+            size, digest = storemod.save_and_hash(self._GoodFS(data), dest)
+            self.assertEqual(size, len(data))
+            self.assertEqual(digest, storemod._chat_hash(dest))
+
+    def test_empty_stream_yields_empty_file_hash(self):
+        with tempfile.TemporaryDirectory(prefix="qqchatlog-savehash-") as tmp:
+            dest = os.path.join(tmp, "empty.json")
+            size, digest = storemod.save_and_hash(self._GoodFS(b""), dest)
+            self.assertEqual(size, 0)
+            self.assertEqual(digest, storemod._chat_hash(dest))
+
+    def test_unrewindable_failed_stream_raises_instead_of_truncating(self):
+        """核心回归：拷贝中途失败且流不可回退时，必须报错。
+
+        旧实现会在 seek 失败后照常调用 save()，而 save() 从"流当前的位置"拷贝——
+        于是落下一份从中间开始的半截 JSON，还被当成上传成功返回。
+        """
+        data = json.dumps({"hello": "世界" * 500}).encode("utf-8")
+        with tempfile.TemporaryDirectory(prefix="qqchatlog-savehash-") as tmp:
+            dest = os.path.join(tmp, "b.json")
+            fs = self._ExplodingFS(data)
+            with self.assertRaises(OSError):
+                storemod.save_and_hash(fs, dest)
+            self.assertFalse(fs.save_called, "不可回退时不该再调 save() 写出半截文件")
+
+
+class TestMonthCacheTempNamesAndRestamp(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="r7-month-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        mc.configure_month_cache(self.tmp)
+        self.addCleanup(mc.configure_month_cache, "")
+        purge_marks.clear()
+        self.addCleanup(purge_marks.clear)
+
+    def test_tmp_sibling_is_unique_and_still_recognizable(self):
+        """固定 `{path}.tmp` 会被两个并发写者共踩；唯一名仍要被清理侧认得出来。"""
+        path = mc.month_cache_path("concurrent1")
+        names = {mc._tmp_sibling(path) for _ in range(50)}
+        self.assertEqual(len(names), 50, "每个写者必须拿到各自的临时文件名")
+        self.assertTrue(all(n.endswith(".tmp") for n in names))
+        # 级联清理靠这个正则把临时文件认成"属于该聊天"，认不出来就会漏删敏感残留
+        for n in names:
+            self.assertTrue(storemod._TMP_SUFFIX_RE.search(os.path.basename(n)), n)
+            self.assertTrue(storemod._cache_belongs_to(os.path.basename(n), "concurrent1"), n)
+
+    def test_concurrent_writers_do_not_share_a_tmp_file(self):
+        """两个线程写同一个键：最终文件必须是**完整的 JSON**（半截文件=丢掉一次付费结果）。"""
+        key = "racekey0001"
+        payloads = [{"result": {"n": i, "pad": "x" * 4000}} for i in range(2)]
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def worker(payload):
+            try:
+                barrier.wait(timeout=5)
+                mc._write_month_cache(key, payload)
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(p,)) for p in payloads]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(errors, [])
+        with open(mc.month_cache_path(key), encoding="utf-8") as f:
+            data = json.load(f)  # 半截文件会在这里抛 JSONDecodeError
+        self.assertIn("n", data["result"])
+        leftovers = [n for n in os.listdir(self.tmp) if n.endswith(".tmp")]
+        self.assertEqual(leftovers, [], "成功的写入不该留下临时文件")
+
+    def test_restamp_writes_thinking_mark_when_not_purged(self):
+        """基线：没被清理过的老文件，读到就补标记（否则模式切换会一直串）。"""
+        key = "legacy000001"
+        path = mc.month_cache_path(key)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"result": {"v": 1}}, f)  # 升级前的老文件：没有 _thinking
+
+        mc._read_month_cache(key, expect_thinking=True, chat_hash="hashFresh001")
+        with open(path, encoding="utf-8") as f:
+            self.assertTrue(json.load(f).get("_thinking"), "基线行为：应当补上标记")
+
+    def test_restamp_does_not_resurrect_a_purged_file(self):
+        """被清理过的聊天：读侧不许把刚删掉的月份文件（含聊天原句引用）写回去。
+
+        这是**读路径上的写**，只靠 `os.path.exists` 复查挡不住 TOCTOU；标记才是闸门。
+        """
+        key = "legacy000002"
+        path = mc.month_cache_path(key)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"result": {"v": 1}}, f)
+
+        purge_marks.mark("hashPurged02")
+        mc._read_month_cache(key, expect_thinking=True, chat_hash="hashPurged02")
+        with open(path, encoding="utf-8") as f:
+            self.assertIsNone(json.load(f).get("_thinking"), "被清理过就不许补标记（=不许写回）")
+
+        # 反向验证：同一份文件、不打标记时必须会写回，证明上一行不是因为别的原因恒真
+        purge_marks.unmark("hashPurged02")
+        mc._read_month_cache(key, expect_thinking=True, chat_hash="hashPurged02")
+        with open(path, encoding="utf-8") as f:
+            self.assertTrue(json.load(f).get("_thinking"), "反向验证：没标记时确实会写回")
+
+    def test_restamp_without_chat_hash_keeps_old_behaviour(self):
+        """没传 chat_hash 的老调用方退化为只做 exists 复查，行为与从前一致。"""
+        key = "legacy000003"
+        path = mc.month_cache_path(key)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"result": {"v": 1}}, f)
+        mc._read_month_cache(key, expect_thinking=True)
+        with open(path, encoding="utf-8") as f:
+            self.assertTrue(json.load(f).get("_thinking"))
+
+
+_FIX_CST = timezone(timedelta(hours=8))
+
+
+def _fix_chat_payload(uids_to_msgs):
+    msgs = []
+    base = int(datetime(2025, 3, 1, 20, 0, tzinfo=_FIX_CST).timestamp() * 1000)
+    i = 0
+    for uid, texts in uids_to_msgs.items():
+        for t in texts:
+            msgs.append(
+                {
+                    "id": str(i),
+                    "timestamp": base + i * 60000,
+                    "time": "2025-03-01 20:%02d:00" % (i % 60),
+                    "sender": {"uid": uid, "name": "人" + uid[-1]},
+                    "content": t,
+                }
+            )
+            i += 1
+    return _fix_wrap(msgs, {k: "人" + k[-1] for k in uids_to_msgs})
+
+
+def _fix_wrap(msgs, senders, self_uid="uA"):
+    """按导出格式包装（msgs 为完整消息字典，便于构造 system/type_23 等特殊条目）"""
+    return json.dumps(
+        {
+            "chatInfo": {
+                "name": senders.get("uB", "对方"),
+                "selfUid": self_uid,
+                "selfName": senders.get(self_uid, "我"),
+            },
+            "statistics": {
+                "senders": [{"uid": uid, "name": name} for uid, name in senders.items()],
+                "totalMessages": len(msgs),
+            },
+            "messages": msgs,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+class TestSaveAndHash(unittest.TestCase):
+    """保存即哈希：与落盘后重读的结果一致"""
+
+    def test_hash_equals_reread(self):
+        from webapp import store as storemod
+
+        class FS:
+            def __init__(self, data):
+                self.stream = io.BytesIO(data)
+
+        data = json.dumps({"hello": "世界" * 500}).encode("utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "f.json")
+            fs = FS(data)
+            size, h = storemod.save_and_hash(fs, dest)
+            self.assertEqual(size, len(data))
+            self.assertEqual(h, storemod._chat_hash(dest))
+
+    def test_upload_records_hash_from_stream(self):
+        import app as appmod
+
+        payload = _fix_chat_payload({"uA": ["在吗"], "uB": ["在的"]})
+        client = appmod.app.test_client()
+        client.get("/")
+        with client.session_transaction() as sess:
+            token = sess["csrf_token"]
+        r = client.post(
+            "/upload",
+            data={"file": (io.BytesIO(payload), "h.json")},
+            headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token},
+        )
+        self.assertEqual(r.status_code, 302)
+        with client.session_transaction() as sess:
+            path, h = sess["filepath"], sess["chat_hash"]
+        try:
+            self.assertEqual(h, storemod._chat_hash(path))
+        finally:
+            storemod._purge_chat_caches(h)
+            if path and os.path.exists(path):
+                os.remove(path)
 
 
 if __name__ == "__main__":

@@ -32,9 +32,11 @@
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -50,9 +52,11 @@ os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import parser.qq_parser as qp  # noqa: E402
-from parser.qq_parser import load_chat  # noqa: E402
+from parser.qq_parser import CST, load_chat  # noqa: E402
 from parser.group_identity import is_placeholder_sender  # noqa: E402
 from analyzer import group_stats as gs  # noqa: E402
+from analyzer import local_stats as ls  # noqa: E402
+from analyzer.dialog import _message_line  # noqa: E402
 
 BASE_MS = 1740900000000  # 2025-03-02 12:00:00 CST 附近，用例不关心具体日期
 
@@ -573,6 +577,438 @@ class TestMatrixSchemaStability(BaseCase):
                 "mentions_received",
             },
         )
+
+
+_R7_BASE = 1704067200.0
+
+
+def _r7_write_chat(payload) -> str:
+    d = tempfile.mkdtemp(prefix="r7-parse-")
+    path = os.path.join(d, "chat.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    return path
+
+
+def _r7_msg(msg_id, uid, name, ts_s, el_type, el_data=None, text=""):
+    return {
+        "id": str(msg_id),
+        "timestamp": int(ts_s * 1000),
+        "time": datetime.fromtimestamp(ts_s, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        "sender": {"uid": uid, "name": name},
+        "type": "text",
+        "content": {
+            "text": text,
+            "elements": [{"type": el_type, "data": el_data if el_data is not None else {"text": text}}],
+        },
+    }
+
+
+class TestNameHistoryStripsDisplayNames(unittest.TestCase):
+    """带尾空格的昵称不许被拆成两个桶——那会显示一次从未发生的改名。"""
+
+    def _chat(self):
+        payload = {
+            "chatInfo": {"name": "对方", "selfUid": "uA", "selfName": "我"},
+            "statistics": {"senders": [{"uid": "uA", "name": "我"}, {"uid": "uB", "name": "小明"}]},
+            "messages": [
+                _r7_msg(1, "uA", "我", _R7_BASE, "text", text="早"),
+                _r7_msg(2, "uB", "小明", _R7_BASE + 60, "text", text="早"),
+                _r7_msg(3, "uB", "小明 ", _R7_BASE + 120, "text", text="在"),
+                _r7_msg(4, "uB", "   ", _R7_BASE + 180, "text", text="忙"),
+            ],
+        }
+        path = _r7_write_chat(payload)
+        try:
+            return load_chat(path)
+        finally:
+            shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+
+    def test_trailing_space_and_blank_names_collapse(self):
+        trends = ls.calc_trends(self._chat())
+        other = trends["name_history"]["other"]
+        names = [r["name"] for r in other]
+        self.assertEqual(names, ["小明"], f"同一个人的昵称必须合成一桶：{names}")
+        # 三条非空名里 "小明" ×2 与 "小明 " ×1 合并；"   " 那条不是名字（跳过），
+        # 所以计数是 2 而不是 3——它的**正文**照常进词频/句长，只是不产生第三个名字。
+        self.assertEqual(other[0]["count"], 2, "strip 后同一个名字的条数要合并")
+
+    def test_reverse_verification_unstripped_names_would_split(self):
+        """反向验证：不 strip 时同一个名字会裂成三桶（这就是被修掉的现象）。"""
+        chat = self._chat()
+        raw = {(m.sender_name or "") for m in chat.messages}
+        self.assertGreater(len(raw), 1, "原始昵称里确实存在'小明'/'小明 '/'   '三种写法")
+        self.assertNotIn("小明 ", [r["name"] for r in ls.calc_trends(chat)["name_history"]["other"]])
+
+
+_F7_BASE = int(datetime(2025, 3, 1, 20, 0, tzinfo=CST).timestamp())
+
+
+def _f7_el(msg_id, uid, name, ts_s, el_type, data, text=""):
+    """构造一条"带结构化元素"的消息（新版导出器形态）"""
+    return {
+        "id": str(msg_id),
+        "timestamp": int(ts_s * 1000),
+        "time": datetime.fromtimestamp(ts_s, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        "sender": {"uid": uid, "name": name},
+        "type": el_type,
+        "content": {"text": text, "elements": [{"type": el_type, "data": data}]},
+    }
+
+
+def _f7_text(msg_id, uid, name, ts_s, text):
+    return {
+        "id": str(msg_id),
+        "timestamp": int(ts_s * 1000),
+        "time": datetime.fromtimestamp(ts_s, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        "sender": {"uid": uid, "name": name},
+        "type": "text",
+        "content": {"text": text, "elements": [{"type": "text", "data": {"text": text}}]},
+    }
+
+
+def _f7_load(msgs, self_uid="uA"):
+    payload = json.dumps(
+        {
+            "chatInfo": {"name": "对方", "selfUid": self_uid, "selfName": "我"},
+            "statistics": {
+                "senders": [{"uid": "uA", "name": "我"}, {"uid": "uB", "name": "对方"}],
+                "totalMessages": len(msgs),
+            },
+            "messages": msgs,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        f.write(payload)
+        path = f.name
+    try:
+        return load_chat(path)
+    finally:
+        os.remove(path)
+
+
+class TestVoiceMedia(unittest.TestCase):
+    """语音消息本体此前不在任何分派分支：以零正文混进计数、模型完全看不见。"""
+
+    def test_voice_gets_kind_and_label(self):
+        chat = _f7_load([_f7_el(1, "uB", "对方", _F7_BASE, "voice", {"duration": 12})])
+        m = chat.messages[0]
+        self.assertEqual(m.media_kind, "voice", "语音必须进媒体口径（kind 非空才不被当空正文）")
+        self.assertIn("12", m.media_label)
+        self.assertEqual(m.text, "", "占位符不进正文，避免污染词频与句长")
+
+    def test_voice_dialog_line_has_mark(self):
+        chat = _f7_load([_f7_el(1, "uB", "对方", _F7_BASE, "voice", {"duration": 5})])
+        m = chat.messages[0]
+        line = _message_line(m, "对方")
+        self.assertIn("语音", line, "喂模型的对话行要标注语音，否则模型看不见它发生过")
+
+    def test_voice_without_duration_still_labeled(self):
+        chat = _f7_load([_f7_el(1, "uB", "对方", _F7_BASE, "voice", {"summary": ""})])
+        self.assertEqual(chat.messages[0].media_kind, "voice")
+
+
+class TestUnknownElements(unittest.TestCase):
+    """未知元素类型不再被静默吞掉：计数、上报，且绝不静默把正文判死。"""
+
+    def test_unknown_type_is_counted(self):
+        chat = _f7_load(
+            [
+                _f7_text(1, "uA", "我", _F7_BASE, "早"),
+                _f7_el(2, "uB", "对方", _F7_BASE + 60, "brand_new_thing", {"x": 1}),
+            ]
+        )
+        self.assertEqual(chat.unknown_element_types.get("brand_new_thing"), 1)
+        ov = ls.calc_overview(chat)
+        self.assertEqual(ov["unknown_element_types"].get("brand_new_thing"), 1, "overview 要能拿到漂移信号")
+
+    def test_all_unknown_message_falls_back_to_raw_text(self):
+        # 导出器把 "text" 改名成新类型：结构化侧给不出正文，但原始文本在——不能丢。
+        m = {
+            "id": "1",
+            "timestamp": _F7_BASE * 1000,
+            "time": "2025-03-01 20:00:00",
+            "sender": {"uid": "uB", "name": "对方"},
+            "type": "renamed_text",
+            "content": {"text": "记得吃饭", "elements": [{"type": "renamed_text", "data": {}}]},
+        }
+        chat = _f7_load([m])
+        self.assertEqual(chat.messages[0].text, "记得吃饭", "全未知元素时回落原始文本，正文不丢")
+
+    def test_image_only_message_does_not_fall_back(self):
+        # 有已识别元素（image）的消息不回落，以免把 "[图片]" 当成正文（旧口径钉住）。
+        chat = _f7_load([_f7_el(1, "uB", "对方", _F7_BASE, "image", {"url": "x.jpg"}, text="[图片]")])
+        self.assertEqual(chat.messages[0].text, "")
+
+
+class TestRecallCounts(unittest.TestCase):
+    """撤回标记已解析却零消费——补上按人计数（recalled 内容仍不进正文统计，那是正确的）。"""
+
+    def test_recall_counted_per_party(self):
+        msgs = [
+            _f7_text(1, "uA", "我", _F7_BASE, "在吗"),
+            _f7_text(2, "uB", "对方", _F7_BASE + 60, "在的"),
+        ]
+        msgs[1]["recalled"] = True
+        msgs.append({**_f7_text(3, "uA", "我", _F7_BASE + 120, "算了"), "recalled": True})
+        ov = ls.calc_overview(_f7_load(msgs))
+        self.assertEqual(ov["total_recalls"], 2)
+        self.assertEqual(ov["self_recalls"], 1)
+        self.assertEqual(ov["other_recalls"], 1)
+
+    def test_recalled_not_in_body_stats(self):
+        # 反向锚点：撤回的那条不该进 total_messages（正文口径），只进撤回计数。
+        msgs = [
+            _f7_text(1, "uA", "我", _F7_BASE, "你好"),
+            {**_f7_text(2, "uB", "对方", _F7_BASE + 60, "撤回我"), "recalled": True},
+        ]
+        ov = ls.calc_overview(_f7_load(msgs))
+        self.assertEqual(ov["total_messages"], 1)
+        self.assertEqual(ov["total_recalls"], 1)
+
+
+class TestOtherMediaFix(unittest.TestCase):
+    """total_other_media 此前写死枚举三类，卡片/通话被解析被计数却漏进汇总（界面恒显示 0）。"""
+
+    def test_card_and_call_now_included(self):
+        chat = _f7_load(
+            [
+                _f7_el(1, "uB", "对方", _F7_BASE, "json", {"summary": "分享了一个链接"}),
+                _f7_el(2, "uB", "对方", _F7_BASE + 60, "av_record", {"summary": "通话 - 未接听"}),
+            ]
+        )
+        ov = ls.calc_overview(chat)
+        self.assertEqual(ov["total_other_media"], 2, "卡片+通话都要进「其他」，旧枚举口径是 0")
+
+    def test_no_double_count_with_voice(self):
+        chat = _f7_load(
+            [
+                _f7_el(1, "uB", "对方", _F7_BASE, "voice", {"duration": 3}),
+                _f7_el(2, "uB", "对方", _F7_BASE + 60, "wallet", {"summary": "恭喜发财"}),
+            ]
+        )
+        ov = ls.calc_overview(chat)
+        self.assertEqual(ov["total_voices"], 1)
+        # 语音单独成项，不重复计入 other；other 只剩红包
+        self.assertEqual(ov["total_other_media"], 1)
+
+
+def _fix_wrap(msgs, senders, self_uid="uA"):
+    """按导出格式包装（msgs 为完整消息字典，便于构造 system/type_23 等特殊条目）"""
+    return json.dumps(
+        {
+            "chatInfo": {
+                "name": senders.get("uB", "对方"),
+                "selfUid": self_uid,
+                "selfName": senders.get(self_uid, "我"),
+            },
+            "statistics": {
+                "senders": [{"uid": uid, "name": name} for uid, name in senders.items()],
+                "totalMessages": len(msgs),
+            },
+            "messages": msgs,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _fix_write_tmp(payload):
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        f.write(payload)
+        return f.name
+
+
+class TestMediaParticipation(unittest.TestCase):
+    """文件/视频/转发/卡片/通话/商城表情都要参与统计与分析（真实导出里的形态）"""
+
+    @staticmethod
+    def _msg_with(el_type, data, msg_type=None, text="", **kw):
+        m = {
+            "id": "1",
+            "timestamp": 1704067200000,
+            "time": "2024-01-01T00:00:00.000Z",
+            "sender": {"uid": "uA", "name": "我"},
+            "type": msg_type or el_type,
+            "content": {"text": text, "elements": [{"type": el_type, "data": data}]},
+        }
+        m.update(kw)
+        return m
+
+    def _load(self, msgs):
+        path = _fix_write_tmp(_fix_wrap(msgs, {"uA": "我", "uB": "对方"}))
+        try:
+            from parser.qq_parser import load_chat
+
+            return load_chat(path)
+        finally:
+            os.remove(path)
+
+    def test_file_and_video_carry_labels_but_not_body_text(self):
+        chat = self._load(
+            [
+                self._msg_with(
+                    "file", {"filename": "example.zip", "size": "12345"}, text="[文件:example.zip]"
+                ),
+                self._msg_with("video", {"filename": "clip.mp4", "size": "999"}, text="[视频:clip.mp4]"),
+            ]
+        )
+        f, v = chat.messages
+        self.assertEqual((f.media_kind, f.media_label), ("file", "example.zip"))
+        self.assertEqual((v.media_kind, v.media_label), ("video", "clip.mp4"))
+        # 正文保持干净：文件名不能灌进词频/句长口径
+        self.assertEqual(f.text, "")
+        self.assertEqual(v.text, "")
+
+    def test_forward_card_gets_title_and_count(self):
+        chat = self._load(
+            [
+                self._msg_with(
+                    "forward",
+                    {"title": "小明和小红的聊天记录", "messageCount": "25"},
+                    msg_type="json",
+                    text="[转发消息: 25条]",
+                )
+            ]
+        )
+        m = chat.messages[0]
+        self.assertEqual(m.media_kind, "forward")
+        self.assertIn("25条", m.media_label)
+        self.assertIn("聊天记录", m.media_label)
+
+    def test_call_record_and_json_card_and_wallet(self):
+        chat = self._load(
+            [
+                self._msg_with("av_record", {}, msg_type="type_19", text="通话 - 未接听，点击回拨"),
+                self._msg_with("json", {}, msg_type="json", text="[JSON消息]"),
+                self._msg_with(
+                    "wallet", {"summary": "红包/钱包消息"}, msg_type="type_10", text="红包/钱包消息"
+                ),
+            ]
+        )
+        kinds = [m.media_kind for m in chat.messages]
+        self.assertEqual(kinds, ["av_record", "json", "wallet"])
+        self.assertIn("未接听", chat.messages[0].media_label)
+
+    def test_market_face_counts_as_face_and_is_not_skipped(self):
+        """type_17（商城大表情）此前被整个跳过，是 277 条白白丢掉的信号"""
+        chat = self._load(
+            [self._msg_with("market_face", {"name": "[[叉腰]]"}, msg_type="type_17", text="[[叉腰]]")]
+        )
+        m = chat.messages[0]
+        self.assertEqual(m.face_names, ["叉腰"])
+        from parser.qq_parser import is_statistical
+
+        self.assertTrue(is_statistical(m), "商城表情不该被当成不可分析的卡片")
+        from analyzer.local_stats import calc_face_stats, calc_overview
+
+        self.assertEqual(calc_overview(chat)["total_faces"], 1)
+        self.assertEqual(calc_face_stats(chat)["self"], {"叉腰": 1})
+
+    def test_media_messages_enter_ai_dialog_with_markers(self):
+        import analyzer.deepseek_client as dc
+
+        chat = self._load(
+            [
+                self._msg_with("file", {"filename": "示例表.xlsx"}, text="[文件:示例表.xlsx]"),
+                self._msg_with(
+                    "forward",
+                    {"title": "小明和小红的聊天记录", "messageCount": "4"},
+                    msg_type="json",
+                    text="[转发消息: 4条]",
+                ),
+                self._msg_with("av_record", {}, msg_type="type_19", text="通话 - 未接听"),
+            ]
+        )
+        for m in chat.messages:
+            self.assertTrue(dc._has_content(m), "媒体消息必须能进 AI 对话")
+        lines = [dc._message_line(m, "我") for m in chat.messages]
+        self.assertIn("[文件:示例表.xlsx]", lines[0])
+        self.assertIn("转发:", lines[1])
+        self.assertIn("通话:", lines[2])
+
+    def test_media_does_not_pollute_length_or_word_stats(self):
+        from analyzer.local_stats import calc_message_length_stats
+
+        long_name = "a" * 80 + ".zip"
+        chat = self._load([self._msg_with("file", {"filename": long_name}, text=f"[文件:{long_name}]")])
+        stats = calc_message_length_stats(chat)
+        self.assertEqual(stats["self"]["max"], 0, "文件名不该计入发言长度")
+
+    def test_overview_counts_media_by_kind(self):
+        from analyzer.local_stats import calc_overview
+
+        chat = self._load(
+            [
+                self._msg_with("file", {"filename": "a.zip"}),
+                self._msg_with("file", {"filename": "b.zip"}),
+                self._msg_with("video", {"filename": "c.mp4"}),
+                self._msg_with("forward", {"title": "t", "messageCount": "3"}, msg_type="json"),
+                self._msg_with("wallet", {"summary": "红包"}),
+            ]
+        )
+        ov = calc_overview(chat)
+        self.assertEqual(ov["total_files"], 2)
+        self.assertEqual(ov["total_videos"], 1)
+        self.assertEqual(ov["total_forwards"], 1)
+        self.assertEqual(ov["total_other_media"], 1)
+
+    def test_media_volume_and_dedup(self):
+        """导出器给到的 size/md5 用于体积与去重统计（同一张图反复发只算一张）"""
+        from analyzer.local_stats import calc_overview
+
+        img = {"filename": "a.jpg", "size": "2048", "md5": "AAA"}
+        chat = self._load(
+            [
+                self._msg_with("image", img),
+                self._msg_with("image", img),  # 同一张图重复发送
+                self._msg_with("image", {"filename": "b.jpg", "size": "1024", "md5": "BBB"}),
+                self._msg_with("file", {"filename": "c.zip", "size": "4096", "md5": "CCC"}),
+            ]
+        )
+        ov = calc_overview(chat)
+        self.assertEqual(ov["total_images"], 3)
+        self.assertEqual(ov["image_bytes"], 2048 * 2 + 1024)
+        self.assertEqual(ov["unique_images"], 2)
+        self.assertEqual(ov["other_media_bytes"], 4096, "文件体积计入非图片媒体，不计入图片体积")
+
+    def test_media_size_dirty_values_do_not_crash(self):
+        from analyzer.local_stats import calc_overview
+
+        chat = self._load([self._msg_with("image", {"filename": "x.jpg", "size": "未知", "md5": None})])
+        ov = calc_overview(chat)
+        self.assertEqual(ov["image_bytes"], 0)
+        self.assertIsNone(ov["unique_images"], "没有 md5 时应给 None 而不是假装 0")
+
+
+class TestTimeNormalization(unittest.TestCase):
+    """时间字符串必须与统计口径一致（新版导出器写的是 UTC ISO 时间）"""
+
+    def test_iso_utc_time_is_converted_to_cst(self):
+        from parser.qq_parser import load_chat
+
+        msgs = [
+            {
+                "id": "1",
+                "timestamp": 1704067200000,
+                "time": "2024-01-01T00:00:00.000Z",
+                "sender": {"uid": "uA", "name": "我"},
+                "content": {"text": "在吗", "elements": [{"type": "text", "data": {"text": "在吗"}}]},
+            }
+        ]
+        path = _fix_write_tmp(_fix_wrap(msgs, {"uA": "我", "uB": "对方"}))
+        try:
+            chat = load_chat(path)
+        finally:
+            os.remove(path)
+        self.assertEqual(chat.messages[0].time_str, "2024-01-01 08:00:00")
+
+    def test_iso_fallback_when_timestamp_missing(self):
+        from parser.qq_parser import _parse_timestamp
+
+        ts = _parse_timestamp(None, "2024-01-01T00:00:00.000Z")
+        self.assertIsNotNone(ts, "缺 timestamp 时应能从 ISO 字符串回退解析")
+        self.assertEqual(ts, 1704067200000)
 
 
 if __name__ == "__main__":

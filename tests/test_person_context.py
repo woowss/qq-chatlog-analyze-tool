@@ -1,7 +1,8 @@
-import unittest
-from datetime import datetime
+import hashlib
 import json
 import tempfile
+import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -16,6 +17,8 @@ from analyzer.dialog import _message_line  # noqa: E402
 from parser.group_identity import Participant  # noqa: E402
 from parser.qq_parser import CST, ChatData, Message  # noqa: E402
 from result_fixtures import profile as valid_profile  # noqa: E402
+from webapp import store  # noqa: E402
+from webapp.analysis_scope import apply_scope  # noqa: E402
 from webapp.evidence import _input_lines  # noqa: E402
 
 
@@ -309,6 +312,105 @@ class LegacyPersonContextCacheTests(unittest.TestCase):
                         ),
                         {"old": True},
                     )
+
+
+def _multi_month_chat():
+    def _plan_msg(message_id, uid, name, month, day, text):
+        dt = datetime(2025, month, day, 9, 0, tzinfo=CST)
+        return Message(
+            id=message_id,
+            timestamp=int(dt.timestamp() * 1000),
+            time_str=dt.strftime("%Y-%m-%d %H:%M:%S"),
+            sender_name=name,
+            sender_uid=uid,
+            text=text,
+            raw_text=text,
+            msg_type="type_1",
+            has_image=False,
+            is_reply=False,
+        )
+
+    return ChatData(
+        chat_name="合成私聊",
+        self_name="甲",
+        other_name="乙",
+        self_uid="u_a",
+        other_uid="u_b",
+        messages=[
+            _plan_msg("jan-a", "u_a", "甲", 1, 1, "合成的一月消息"),
+            _plan_msg("jan-b", "u_b", "乙", 1, 2, "合成的一月回复"),
+            _plan_msg("feb-a", "u_a", "甲", 2, 1, "合成的二月消息"),
+        ],
+    )
+
+
+class PersonContextDigestFollowupTests(unittest.TestCase):
+    def test_fixed_prompt_inputs_do_not_reuse_incorrect_cached_results(self):
+        chat = _multi_month_chat()
+        scoped, _ = apply_scope(chat, {"date_from": "2025-01-01", "date_to": "2025-01-02"})
+        old_recap_key = dc.scope_cache_fingerprint(scoped, dc.fingerprint_for_dimension("recap"))
+        self.assertNotEqual(store.analysis_cache_fingerprint("recap", scoped), old_recap_key)
+        self.assertEqual(
+            store.analysis_cache_fingerprint("recap", chat), dc.fingerprint_for_dimension("recap")
+        )
+        with mock.patch.object(person_context, "PERSON_CONTEXT_ENABLED", True):
+            for dimension, base in (
+                ("profile", dc.fingerprint_for_dimension("profile")),
+                ("member_profiles", gc.GROUP_PROMPT_FINGERPRINT),
+            ):
+                old_key = hashlib.sha256(f"{base}:{dimension}:person-context-v2".encode()).hexdigest()[:12]
+                self.assertNotEqual(store.analysis_cache_fingerprint(dimension, chat), old_key)
+
+    def test_private_person_digest_does_not_attribute_neighbor_images(self):
+        target = _message("u_a", "甲", 1, "我来整理", message_id="target")
+        neighbor = _message("u_b", "乙", 2, "乙的图片", message_id="neighbor")
+        neighbor.has_image = True
+        target.has_image = True
+        with (
+            mock.patch.object(person_context, "PERSON_CONTEXT_ENABLED", True),
+            mock.patch.object(dc, "_vision_digest", return_value="目标图片摘要") as digest,
+        ):
+            request = dc._prepare_person_request(
+                "system",
+                10,
+                [target],
+                "甲",
+                "{display_name}\n{dialog}",
+                tag="profile",
+                context_messages=[target, neighbor],
+                speaker_name_of=lambda message: message.sender_name,
+            )
+        self.assertEqual([m.id for m in digest.call_args.args[0]], ["target"])
+        self.assertIn("乙的图片", request["user_content"])
+        self.assertIn("仅供上下文", request["user_content"])
+
+    def test_member_digest_does_not_attribute_neighbor_images(self):
+        chat = ChatData(
+            "合成群",
+            "甲",
+            "",
+            "u_a",
+            "",
+            [
+                _message("u_a", "甲", 1, "我来整理", message_id="target"),
+                _message("u_b", "乙", 2, "乙的图片", message_id="neighbor"),
+            ],
+            is_group_chat=True,
+            mode="group",
+        )
+        for message in chat.messages:
+            message.has_image = True
+        member = next(person for person in chat.participants() if person.uid == "u_a")
+        with (
+            mock.patch.object(person_context, "PERSON_CONTEXT_ENABLED", True),
+            mock.patch.object(gc, "_vision_digest", return_value="目标图片摘要") as digest,
+        ):
+            request = gc._prepare_member_request(
+                chat, member, gc._member_prompt_template(), "member_profiles"
+            )
+        self.assertTrue(digest.call_args.args[0])
+        self.assertEqual({m.sender_uid for m in digest.call_args.args[0]}, {member.uid})
+        self.assertIn("仅供上下文", request["prompt"])
 
 
 if __name__ == "__main__":

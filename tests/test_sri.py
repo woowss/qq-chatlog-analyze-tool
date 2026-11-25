@@ -28,6 +28,7 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+import re
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -107,6 +108,56 @@ class TestReportSriConstants(unittest.TestCase):
             2,
             "两处换 CDN 都要走 vendorName()，否则带 ?v= 的路径匹配不上映射表",
         )
+
+
+class TestLocalizedAssets(unittest.TestCase):
+    """前端资源本地化：页面不再伸手向 CDN；导出仍换回 CDN"""
+
+    def test_vendor_files_present_and_nonempty(self):
+        vendor = ROOT / "web" / "static" / "vendor"
+        for name, min_size in (
+            ("bootstrap.min.css", 100_000),
+            ("bootstrap.bundle.min.js", 50_000),
+            ("jquery.min.js", 50_000),
+            ("echarts.min.js", 500_000),
+            ("echarts-wordcloud.min.js", 10_000),
+        ):
+            p = vendor / name
+            self.assertTrue(p.exists(), f"缺少本地化资源 {name}")
+            self.assertGreater(p.stat().st_size, min_size, f"{name} 体积异常，疑似下载失败")
+
+    def test_page_templates_have_no_runtime_cdn(self):
+        for name in ("base.html", "login.html"):
+            src = (ROOT / "web" / "templates" / name).read_text(encoding="utf-8")
+            self.assertNotIn("cdn.jsdelivr", src, f"{name} 仍在运行时拉 CDN")
+
+    def test_exported_report_rewrites_vendor_to_cdn(self):
+        src = (ROOT / "web" / "templates" / "_report_assets.html").read_text(encoding="utf-8")
+        self.assertIn("VENDOR_CDN", src, "导出必须把 vendor 路径换回 CDN，否则分享出去的报告没了样式")
+        for name in ("bootstrap.min.css", "jquery.min.js", "echarts.min.js"):
+            self.assertIn(name, src)
+
+    def test_theme_toggle_has_view_transition(self):
+        css = (ROOT / "web" / "static" / "css" / "style.css").read_text(encoding="utf-8")
+        self.assertIn("@view-transition", css, "主题切换 reload 应带跨文档过渡，缓解整页闪跳")
+
+    def test_report_cdn_map_covers_every_vendor_file(self):
+        """base.html 引用的本地 vendor 资源必须都在导出映射表里。
+
+        漏一个的后果很隐蔽：应用内一切正常，只有"下载 HTML 发给别人"时
+        那份报告掉了样式/图表，而导出是纯前端拼接，没人会立刻发现。
+        """
+
+        base = (ROOT / "web" / "templates" / "base.html").read_text(encoding="utf-8")
+        report = (ROOT / "web" / "templates" / "_report_assets.html").read_text(encoding="utf-8")
+        refs = set(re.findall(r"filename='vendor/([\w.-]+)'", base))
+        self.assertTrue(refs, "base.html 应引用本地化的 vendor 资源")
+        for name in sorted(refs):
+            self.assertIn(
+                "'%s'" % name,
+                report,
+                f"{name} 不在 _report_assets.html 的 VENDOR_CDN 映射里，导出的报告会 404",
+            )
 
 
 if __name__ == "__main__":

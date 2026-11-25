@@ -579,6 +579,7 @@ class TestBrowserFlows(unittest.TestCase):
         self.page.locator("#msgList .msg-scope-check").first.check()
         self.page.locator("#useSelectedMessages").click()
         self.page.wait_for_url("**/dashboard")
+        self.page.wait_for_load_state("networkidle")
 
         self.page.goto(self.base + "/emotion")
         expect(self.page.locator('[data-analysis-empty][data-state="empty"]')).to_be_visible()
