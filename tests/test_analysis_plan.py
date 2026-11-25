@@ -11,7 +11,9 @@ from _bootstrap import bootstrap
 
 bootstrap()
 
+import app  # noqa: E402
 from analyzer import deepseek_client as dc  # noqa: E402
+from analyzer import group_client as gc  # noqa: E402
 from analyzer import month_cache as mc  # noqa: E402
 from analyzer import vision  # noqa: E402
 from parser.qq_parser import CST, ChatData, Message  # noqa: E402
@@ -577,6 +579,172 @@ class PartialPlanExecutionTests(unittest.TestCase):
         self.assertEqual(job["results"]["emotion"], {"2025-01": emotion()})
         self.assertEqual(job["partial_results"]["emotion"], {"2025-01": emotion()})
         self.assertEqual(job["summary"]["habits"], "cancelled")
+
+
+class ReviewApiTests(unittest.TestCase):
+    def setUp(self):
+        self.client = app.app.test_client()
+        self.client.get("/")
+        with self.client.session_transaction() as session:
+            self.sid = session.sid
+            self.headers = {"Origin": "http://localhost:5000", "X-CSRF-Token": session["csrf_token"]}
+            session.update(chat_mode="private", chat_hash="synthetic-review-chat", filepath="virtual.json")
+        self.chat = _chat()
+        self.patchers = [
+            mock.patch.object(api, "_session_chat_file", return_value=("virtual.json", None)),
+            mock.patch.object(store, "_load_chat_cached", return_value=self.chat),
+        ]
+        for patcher in self.patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(jobs.JOBS.clear)
+
+    def completed_job(self, status="done"):
+        job_id, _, _ = jobs._get_or_create_job(self.sid, "profile", "synthetic-review-chat", 1)
+        jobs.JOBS[job_id].update(
+            status=status, result={"self": {"verdict": "synthetic saved result"}}, finished_at=time.time()
+        )
+        return job_id
+
+    def test_delete_with_shared_cache_revokes_old_job_access_and_clears_scope(self):
+        job_id = self.completed_job()
+        with self.client.session_transaction() as session:
+            session["analysis_scope"] = {"message_positions": [0], "target_uids": ["u_a"]}
+        other_client = app.app.test_client()
+        other_client.get("/")
+        with other_client.session_transaction() as session:
+            other_sid = session.sid
+            session.update(chat_hash="synthetic-review-chat", filepath="another.json")
+        other_job, _, _ = jobs._get_or_create_job(other_sid, "profile", "synthetic-review-chat", 1)
+        jobs.JOBS[other_job].update(
+            status="done", result={"paid": "another session"}, finished_at=time.time()
+        )
+        with (
+            mock.patch.object(store, "other_live_sessions", return_value={other_sid}),
+            mock.patch.object(store, "_purge_chat_caches") as purge,
+            mock.patch.object(store, "_is_recently_purged", return_value=False),
+        ):
+            deleted = self.client.post("/api/chat/delete", headers=self.headers)
+            self.assertEqual(deleted.status_code, 200)
+            self.assertTrue(deleted.get_json()["kept_for_other_sessions"])
+            purge.assert_not_called()
+            denied = self.client.get("/api/analyze-job/" + job_id)
+            self.assertEqual(denied.status_code, 404)
+            self.assertNotIn("synthetic saved result", denied.get_data(as_text=True))
+            self.assertEqual(other_client.get("/api/analyze-job/" + other_job).status_code, 200)
+        with self.client.session_transaction() as session:
+            self.assertNotIn("analysis_scope", session)
+
+    def test_switching_chat_denies_old_job(self):
+        job_id = self.completed_job()
+        with self.client.session_transaction() as session:
+            session["chat_hash"] = "synthetic-different-chat"
+        self.assertEqual(self.client.get("/api/analyze-job/" + job_id).status_code, 404)
+
+    def test_delete_clears_scope_even_when_chat_cache_is_purged(self):
+        with self.client.session_transaction() as session:
+            session["analysis_scope"] = {"date_from": "2025-01-01"}
+        with (
+            mock.patch.object(store, "other_live_sessions", return_value=set()),
+            mock.patch.object(store, "_purge_chat_caches", return_value=0),
+        ):
+            self.assertEqual(self.client.post("/api/chat/delete", headers=self.headers).status_code, 200)
+        with self.client.session_transaction() as session:
+            self.assertNotIn("analysis_scope", session)
+
+    def test_thread_start_failure_is_terminal_and_retry_creates_a_new_job(self):
+        preview = self.client.get("/api/analysis-plan?dimensions=profile").get_json()
+        payload = {
+            "plan_id": preview["plan_id"],
+            "dimensions": ["profile"],
+            "selected_units": [unit["key"] for unit in preview["units"]],
+        }
+        with (
+            mock.patch.object(api, "is_api_configured", return_value=True),
+            mock.patch.object(api.threading, "Thread") as thread,
+        ):
+            thread.return_value.start.side_effect = RuntimeError("synthetic thread failure")
+            failed = self.client.post("/api/analyze-plan", json=payload, headers=self.headers)
+            self.assertEqual(failed.status_code, 503)
+            job_id = next(iter(jobs.JOBS))
+            self.assertEqual(jobs.JOBS[job_id]["status"], "error")
+            self.assertIn("finished_at", jobs.JOBS[job_id])
+            thread.return_value.start.side_effect = None
+            retry = self.client.post("/api/analyze-plan", json=payload, headers=self.headers)
+            self.assertEqual(retry.status_code, 200)
+            self.assertNotEqual(retry.get_json()["job"], job_id)
+            self.assertFalse(retry.get_json().get("reused", False))
+
+    def test_read_failures_are_json_errors_for_new_apis(self):
+        endpoints = [
+            ("get", "/api/analysis-plan?dimensions=profile", None),
+            ("post", "/api/analyze-plan", {"dimensions": ["profile"]}),
+            ("get", "/api/analysis-scope", None),
+            ("post", "/api/analysis-scope", {"scope": {}}),
+            ("get", "/api/messages/timeline?q=合成", None),
+            ("post", "/api/stats/compare", {"a": {}, "b": {}}),
+            ("post", "/api/report/share", {"options": {}}),
+            ("get", "/api/analysis/profile", None),
+            ("get", "/api/evidence/profile", None),
+        ]
+        for error, expected in (
+            (FileNotFoundError("synthetic-path"), 410),
+            (ValueError("invalid"), 400),
+            (OSError("unreadable"), 400),
+            (KeyError("malformed"), 400),
+        ):
+            for method, url, payload in endpoints:
+                with self.subTest(error=type(error).__name__, url=url):
+                    with mock.patch.object(store, "_load_chat_cached", side_effect=error):
+                        kwargs = {"json": payload} if payload is not None else {}
+                        response = getattr(self.client, method)(url, headers=self.headers, **kwargs)
+                    self.assertEqual(response.status_code, expected)
+                    self.assertTrue(response.is_json)
+                    self.assertIn("error", response.get_json())
+                    self.assertNotIn("synthetic-path", response.get_data(as_text=True))
+
+
+class ReviewPlanTests(unittest.TestCase):
+    def test_empty_person_results_fail_the_plan_and_never_enter_dimension_cache(self):
+        for dimension in ("profile", "member_profiles"):
+            for selected_all in (True, False):
+                with self.subTest(dimension=dimension, selected_all=selected_all):
+                    chat = _chat()
+                    if dimension == "member_profiles":
+                        chat.is_group_chat = True
+                    plan = analysis_plan.build_analysis_plan(chat, "synthetic-empty-review", [dimension])
+                    selected = [unit["key"] for unit in plan["units"]]
+                    if not selected_all:
+                        selected = selected[:1]
+                    jid, _, _ = jobs._get_or_create_job(
+                        "synthetic-empty-sid", "plan", "synthetic-empty-review", len(selected)
+                    )
+                    with (
+                        mock.patch.object(jobs.os.path, "exists", return_value=True),
+                        mock.patch.object(store, "_load_chat_cached", return_value=chat),
+                        mock.patch.object(store, "_read_cache", return_value=None),
+                        mock.patch.object(jobs, "analyze_func_for", return_value=lambda *a, **k: {}),
+                        mock.patch.object(dc, "_analyze_person", return_value=None),
+                        mock.patch.object(gc, "_analyze_member", return_value=None),
+                        mock.patch.object(store, "_write_cache") as write,
+                        mock.patch.object(store, "append_job_history"),
+                    ):
+                        jobs._run_selected_plan(
+                            jid, "virtual.json", "synthetic-empty-review", False, plan, selected
+                        )
+                    job = jobs.JOBS.pop(jid)
+                    expected_summary = (
+                        "error" if dimension == "member_profiles" and not selected_all else "empty"
+                    )
+                    self.assertEqual(job["summary"][dimension], expected_summary)
+                    self.assertEqual(job["status"], "error")
+                    self.assertTrue(job["partial"])
+                    self.assertNotIn(dimension, job.get("results", {}))
+                    if expected_summary == "error":
+                        self.assertIn("成员画像分析未取得", job["error"])
+                    else:
+                        self.assertIn("未返回分析结果", job["error"])
+                    write.assert_not_called()
 
 
 if __name__ == "__main__":

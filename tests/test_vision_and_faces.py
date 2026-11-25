@@ -1,3 +1,12 @@
+# Copyright (C) 2026 woowss
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+"""Regression tests for Vision cache identity, LRU memoization, and face images."""
+
 import hashlib
 import os
 import tempfile
@@ -11,6 +20,55 @@ from _bootstrap import bootstrap
 bootstrap()
 
 from analyzer import vision  # noqa: E402
+
+
+class TestVisionMemoLRU(unittest.TestCase):
+    """进程内摘要缓存：每条背后都是一次付费视觉调用，淘汰只能淘汰最久未用的"""
+
+    def test_overflow_evicts_oldest_only(self):
+        with mock.patch.object(vision, "_MEMO", {}), mock.patch.object(vision, "_MEMO_MAX", 3):
+            for k in "abc":
+                vision._memo_put(k, k.upper())
+            self.assertEqual(sorted(vision._MEMO), ["a", "b", "c"])
+            vision._memo_put("d", "D")
+            self.assertEqual(sorted(vision._MEMO), ["b", "c", "d"], "只该淘汰最久未用的 a")
+            self.assertEqual(vision._MEMO["b"], "B", "旧条目内容不能被清掉")
+
+    def test_recently_read_key_survives_eviction(self):
+        with mock.patch.object(vision, "_MEMO", {}), mock.patch.object(vision, "_MEMO_MAX", 3):
+            for k in "abc":
+                vision._memo_put(k, k.upper())
+            self.assertEqual(vision._memo_get("a"), "A")  # a 变成最近使用
+            vision._memo_put("d", "D")  # 该淘汰 b
+            self.assertIn("a", vision._MEMO)
+            self.assertNotIn("b", vision._MEMO)
+
+    def test_miss_returns_none(self):
+        with mock.patch.object(vision, "_MEMO", {}):
+            self.assertIsNone(vision._memo_get("没有这个键"))
+
+    def test_disk_hit_path_also_respects_bound(self):
+        """命中磁盘缓存那条路径原本没做容量检查，条目数可以越过上限"""
+        keys = iter(f"k{i}" for i in range(6))
+        with (
+            mock.patch.object(vision, "_MEMO", {}),
+            mock.patch.object(vision, "_MEMO_MAX", 2),
+            mock.patch.object(vision, "available", return_value=True),
+            mock.patch.object(vision, "pick_images", return_value=[{"path": "x", "key": "fp"}]),
+            mock.patch.object(vision, "_images_key", side_effect=lambda _imgs: next(keys)),
+            mock.patch.object(vision, "_read_cache", return_value="磁盘里的摘要"),
+        ):
+            for _ in range(6):
+                self.assertEqual(vision.digest([], chat_hash="h"), "磁盘里的摘要")
+            self.assertLessEqual(len(vision._MEMO), 2, "走磁盘缓存也必须受 _MEMO_MAX 约束")
+
+    def test_plain_dict_still_works(self):
+        """现有用例用 mock.patch.object(vision, "_MEMO", {}) 注入普通 dict，别把它换掉"""
+        with mock.patch.object(vision, "_MEMO", {}):
+            vision._memo_put("k", "v")
+            self.assertEqual(vision._memo_get("k"), "v")
+            vision._MEMO.clear()  # 用例里也这么清
+            self.assertIsNone(vision._memo_get("k"))
 
 
 class VisionCacheIdentityTests(unittest.TestCase):

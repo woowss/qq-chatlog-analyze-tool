@@ -14,6 +14,8 @@ from result_fixtures import emotion  # noqa: E402
 from webapp import analysis_plan, api, jobs, store  # noqa: E402
 from webapp.message_index import index_for  # noqa: E402
 from webapp.analysis_scope import apply_scope, normalize_scope, scope_identity  # noqa: E402
+from analyzer import local_stats  # noqa: E402
+from analyzer.recap_client import _recap_digest  # noqa: E402
 
 
 def _message(message_id, uid, name, year, month, day, hour=9, minute=0, *, reply_to_id="", reply_to_uid=""):
@@ -439,6 +441,65 @@ class AnalysisScopeApiTests(unittest.TestCase):
         self.assertEqual([message.id for message in sent_chat.messages], ["feb-b", "feb-a"])
         self.assertEqual(answer.call_args.args[1], "范围里说了什么？")
         self.assertNotEqual(cache_read.call_args.args[1], "范围里说了什么？")
+
+
+def _plan_message(message_id, uid, name, month, day, text, *, has_image=False):
+    dt = datetime(2025, month, day, 9, 0, tzinfo=CST)
+    return Message(
+        id=message_id,
+        timestamp=int(dt.timestamp() * 1000),
+        time_str=dt.strftime("%Y-%m-%d %H:%M:%S"),
+        sender_name=name,
+        sender_uid=uid,
+        text=text,
+        raw_text=text,
+        msg_type="type_1",
+        has_image=has_image,
+        is_reply=False,
+    )
+
+
+def _plan_chat(*, with_image=False):
+    return ChatData(
+        chat_name="合成私聊",
+        self_name="甲",
+        other_name="乙",
+        self_uid="u_a",
+        other_uid="u_b",
+        messages=[
+            _plan_message("jan-a", "u_a", "甲", 1, 1, "合成的一月消息", has_image=with_image),
+            _plan_message("jan-b", "u_b", "乙", 1, 2, "合成的一月回复"),
+            _plan_message("feb-a", "u_a", "甲", 2, 1, "合成的二月消息"),
+        ],
+    )
+
+
+class AnalysisScopeDurationFollowupTests(unittest.TestCase):
+    def test_scoped_overview_and_recap_recompute_duration(self):
+        chat = _plan_chat()
+        chat.duration_days = 365
+        for scope in (
+            {"date_from": "2025-01-01", "date_to": "2025-01-02"},
+            {"message_positions": [0, 1]},
+            {"allowed_uids": ["u_a"]},
+        ):
+            with self.subTest(scope=scope):
+                scoped, _ = apply_scope(chat, scope)
+                expected = (
+                    max(message.time_str[:10] for message in scoped.messages),
+                    min(message.time_str[:10] for message in scoped.messages),
+                )
+                from datetime import date
+
+                days = (date.fromisoformat(expected[0]) - date.fromisoformat(expected[1])).days + 1
+                overview = local_stats.calc_overview(scoped)
+                self.assertEqual(overview["total_days"], days)
+                self.assertEqual(overview["days_basis"], "computed")
+                self.assertEqual(overview["avg_daily"], round(len(scoped.messages) / days, 1))
+                self.assertIn(f"日均 {overview['avg_daily']}", _recap_digest(scoped))
+        self.assertEqual(chat.duration_days, 365)
+        targeted, _ = apply_scope(chat, {"target_uids": ["u_a"]})
+        self.assertEqual(targeted.duration_days, 365)
 
 
 if __name__ == "__main__":

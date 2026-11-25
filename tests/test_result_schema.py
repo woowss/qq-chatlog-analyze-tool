@@ -618,5 +618,69 @@ class TestCacheValidationBoundary(unittest.TestCase):
         self.assertEqual([], [name for name in os.listdir(self.cache_dir) if name.startswith("month_")])
 
 
+def _topics(*weights) -> dict:
+    return {"topics": [{"name": f"话题{i}", "weight": w} for i, w in enumerate(weights)]}
+
+
+def _weights(obj) -> list:
+    return [t["weight"] for t in obj["topics"]]
+
+
+class TestTopicWeightNormalization(unittest.TestCase):
+    """归一化后总和必须恰好是 1.0：前端按 weight*100 直接显示百分比"""
+
+    def test_rounding_drift_is_absorbed(self):
+        """0.333/0.333/0.334 各自 round 到 2 位是 0.99，必须补回 1.0"""
+        obj = _topics(0.333, 0.333, 0.334)
+        dc._normalize_topic_weights(obj)
+        self.assertEqual(round(sum(_weights(obj)), 2), 1.0)
+        self.assertEqual(_weights(obj), [0.33, 0.33, 0.34], "误差应补给占比最大的那个话题")
+
+    def test_sum_is_exactly_one_over_many_shapes(self):
+        cases = [
+            (1.0,),
+            (0.5, 0.5),
+            (1, 1, 1),
+            (0.1, 0.2, 0.3, 0.4),
+            (2.5, 2.5),
+            (0.005,) * 7,
+            tuple(range(1, 11)),  # 1..10，10 个话题
+        ]
+        for case in cases:
+            with self.subTest(case=case):
+                obj = _topics(*case)
+                dc._normalize_topic_weights(obj)
+                self.assertEqual(round(sum(_weights(obj)), 2), 1.0)
+
+    def test_tiny_last_topic_never_goes_negative(self):
+        """把误差补给"最后一个"话题时，10 个话题 + 末位极小会算出负权重"""
+        obj = _topics(0.111, 0.111, 0.111, 0.111, 0.111, 0.111, 0.111, 0.111, 0.111, 0.001)
+        dc._normalize_topic_weights(obj)
+        self.assertEqual(round(sum(_weights(obj)), 2), 1.0)
+        self.assertTrue(all(w >= 0 for w in _weights(obj)), f"出现负权重: {_weights(obj)}")
+
+    def test_order_is_preserved(self):
+        obj = _topics(0.05, 0.9, 0.05)
+        dc._normalize_topic_weights(obj)
+        got = _weights(obj)
+        self.assertEqual(got, [0.05, 0.9, 0.05])
+        self.assertEqual(got.index(max(got)), 1, "最大项不能被误差补给顶下去")
+
+    def test_non_numeric_weight_is_zeroed_and_sum_kept(self):
+        obj = {"topics": [{"name": "a", "weight": "0.5"}, {"name": "b", "weight": "坏值"}, {"name": "c"}]}
+        dc._normalize_topic_weights(obj)
+        self.assertEqual(obj["topics"][1]["weight"], 0.0)
+        self.assertEqual(round(sum(_weights(obj)), 2), 1.0)
+
+    def test_non_dict_entries_and_bad_input_do_not_crash(self):
+        obj = {"topics": [{"name": "a", "weight": 1.0}, "字符串", None, 42]}
+        dc._normalize_topic_weights(obj)
+        self.assertEqual(obj["topics"][0]["weight"], 1.0)
+        for bad in ("topics", "weight"):
+            dc._normalize_topic_weights({})  # 缺字段
+            dc._normalize_topic_weights({"topics": bad})  # 类型不对
+        self.assertEqual(_weights(_topics(0.0, 0.0)), [0.0, 0.0], "总权重为 0 时原样保留，不除零")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

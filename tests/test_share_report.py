@@ -204,5 +204,52 @@ class ShareReportTests(unittest.TestCase):
             self.assertNotIn("_created", loaded)
 
 
+def _ctx_message(uid, name, minute, text, *, message_id, reply_to_id=""):
+    from parser.qq_parser import CST, Message
+
+    timestamp = int(datetime(2025, 1, 1, 9, minute, tzinfo=CST).timestamp() * 1000)
+    return Message(
+        id=message_id,
+        timestamp=timestamp,
+        time_str=datetime.fromtimestamp(timestamp / 1000, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        sender_name=name,
+        sender_uid=uid,
+        text=text,
+        raw_text=text,
+        msg_type="text",
+        has_image=False,
+        is_reply=bool(reply_to_id),
+        reply_to_id=reply_to_id,
+        reply_to_uid="u_other" if reply_to_id else "",
+    )
+
+
+class ShareReportRedactionFollowupTests(unittest.TestCase):
+    def test_nameless_uid_is_redacted_in_group_statistics_and_originals(self):
+        anonymous = _ctx_message("", "合成匿名昵称", 1, "合成匿名昵称你好", message_id="anonymous")
+        chat = ChatData("合成群", "本人", "", "u_self", "", [anonymous], is_group_chat=True)
+        stats = {
+            "member_activity": [{"uid": "", "name": anonymous.sender_name}],
+            "interaction": {"members": [{"uid": "", "name": anonymous.sender_name}]},
+        }
+        options = {"hide_statistics": False, "hide_original_text": False}
+        model, _, _ = build_share_model(chat, stats, options)
+        self.assertNotIn(anonymous.sender_name, json.dumps(model, ensure_ascii=False))
+        self.assertTrue(model["members"][0]["name"].startswith("成员 "))
+        self.assertEqual(model["members"][0]["name"], model["original_messages"][0]["sender"])
+        model, _, _ = build_share_model(chat, stats, dict(options, hide_nicknames=False))
+        self.assertEqual(model["original_messages"][0]["sender"], anonymous.sender_name)
+
+    def test_private_overview_without_uid_hides_names_and_mentions(self):
+        message = _ctx_message("", "合成本人", 1, "合成本人叫合成对方", message_id="private-anonymous")
+        chat = ChatData("合成对话", "合成本人", "合成对方", "", "", [message])
+        model, _, _ = build_share_model(
+            chat, {"overview": {}}, {"hide_statistics": False, "hide_original_text": False}
+        )
+        serialized = json.dumps(model, ensure_ascii=False)
+        self.assertNotIn("合成本人", serialized)
+        self.assertNotIn("合成对方", serialized)
+
+
 if __name__ == "__main__":
     unittest.main()
