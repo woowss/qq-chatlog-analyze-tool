@@ -355,5 +355,121 @@ class TestNetworkInterruptionRecovery(unittest.TestCase):
         self.assertIn("xhr.status === 404", src)
 
 
+class TestFrontendGuards(unittest.TestCase):
+    """断言 C1/C2/C3：前端三处用静态断言守住（与 test_review_fixes 的同类手法一致）"""
+
+    ROOT = Path(__file__).resolve().parent.parent
+    CHARTS = ROOT / "web" / "static" / "js" / "group_charts.js"
+    EMOTION = ROOT / "web" / "templates" / "group_emotion.html"
+    TOPICS = ROOT / "web" / "templates" / "group_topics.html"
+    ASSETS = ROOT / "web" / "templates" / "_report_assets.html"
+    GROUP_REPORT = ROOT / "web" / "templates" / "group_report.html"
+
+    @staticmethod
+    def _code_of(text):
+        """只留代码行：注释里会引用旧写法作为反面教材，混进来会把断言变成永真"""
+        return "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith("//"))
+
+    def _heatmap_body(self):
+        src = self._code_of(self.CHARTS.read_text(encoding="utf-8"))
+        return src.split("function renderInteractionHeatmap")[1].split("\nfunction ")[0]
+
+    def test_heatmap_tooltip_matches_axis_convention(self):
+        """tooltip 的「谁先说 / 谁接话」必须与坐标轴、数据三方一致
+
+        服务端是 directed[先说者][接话者]，图里压成 [列, 行, 值] → x=列=接话者、
+        y=行=先说者。写反之后卡片标题与两条坐标轴都是对的，只有鼠标气泡说反，
+        而用户信的是气泡。
+        反向验证：把「说完」那一方从 value[1] 改回 value[0]，本条变红。
+        """
+        body = self._heatmap_body()
+        # 绑定与使用要一起看：气泡里的「说完」必须取自 value[1]（行 = 先说的人）。
+        # 只匹配一整句字符串的话，改个变量名就能骗过这条用例。
+        self.assertRegex(
+            body, r"var\s+row\s*=\s*esc\(names\[p\.value\[1\]\]\)", "row 必须绑定到 value[1]（行）"
+        )
+        self.assertRegex(
+            body, r"var\s+col\s*=\s*esc\(names\[p\.value\[0\]\]\)", "col 必须绑定到 value[0]（列）"
+        )
+        self.assertRegex(body, r"row\s*\+\s*' 说完", "「说完」的一方必须是 row")
+        self.assertNotIn("col + ' 说完", body, "把 col 说成「先开口的人」就是本轮修的那个反义 bug")
+        self.assertIn("接了", body, "接话次数仍要在气泡里报出来")
+
+    def test_mention_matrix_uses_its_own_wording(self):
+        """@点名矩阵复用同一张热力图时，文案与行列语义都要换一套
+
+        反向验证：删掉 mention 分支（回到只会说「说完/接了」），本条变红。
+        """
+        body = self._heatmap_body()
+        self.assertIn("mention", body, "函数需要区分接话矩阵与 @ 矩阵")
+        self.assertIn("@了", body, "@矩阵要说 @，不能沿用「说完/接了」")
+        self.assertIn("mode: 'mention'", self.TOPICS.read_text(encoding="utf-8"), "调用点要显式声明模式")
+
+    def test_emotion_page_guards_missing_container(self):
+        """未配 Key 时 #sec-emotion 不渲染，但回调仍会拿到旧结果 —— 必须判空
+
+        反向验证：去掉模板里的 `if (box)`、恢复直接把 getElementById 传进渲染函数，
+        本条变红。那不只丢 AI 小节：同一个回调里排在后面的 mountChart('emotionTrend')
+        会被一个 TypeError 一起带走，本地统计的走势图同样空掉。
+        """
+        src = self._code_of(self.EMOTION.read_text(encoding="utf-8"))
+        self.assertNotIn(
+            "renderGroupEmotion(document.getElementById(",
+            src,
+            "容器判空前不要直接把 getElementById 传进渲染函数",
+        )
+        self.assertIn("if (box)", src, "AI 小节要判空后再渲染")
+        self.assertLess(
+            src.index("if (box)"),
+            src.index("mountChart('emotionTrend')"),
+            "判空要在走势图之前，否则一个 null 把本地图也带走",
+        )
+
+    def test_report_snapshot_freezes_charts_before_stripping_scripts(self):
+        """导出快照必须先把 canvas 冻结成图片，再剥脚本
+
+        canvas 的像素不参与 outerHTML 序列化，而画图的代码又被剥掉了 —— 顺序反了
+        或根本没冻结，分享出去的群报告就是四个全白的图表区域。
+        反向验证：删掉 `freezeCharts(clone)` 这一行，本条变红。
+        """
+        code = self._code_of(self.ASSETS.read_text(encoding="utf-8"))
+        self.assertIn("function freezeCharts", code, "导出快照要有图表冻结步骤")
+        self.assertIn("getInstanceByDom", code, "要用活实例取快照")
+        self.assertIn("getDataURL", code)
+        # 断言必须落在**调用点**上。第一版写的是 index("freezeCharts(clone)")，
+        # 而这串字符同样出现在 `function freezeCharts(clone) {` 那一行里 —— 删掉调用
+        # 也照样"绿"，是一条没有鉴别力的假守卫（反向验证脚本把它抓出来了）。
+        self.assertRegex(code, r"\n\s*freezeCharts\(clone\);", "buildReportSnapshot 里要真的调用冻结")
+        call = code.index("freezeCharts(clone);")
+        self.assertGreater(call, code.index("cloneNode(true)"), "冻结要作用在克隆体上")
+        self.assertLess(call, code.index("/static/js/"), "必须先冻结再剥脚本（脚本没了就画不出来了）")
+
+    def test_report_snapshot_drops_live_render_scripts_but_keeps_theme(self):
+        """分享版剥掉「活渲染块」与导出机制，但必须留住首屏的主题初始化
+
+        反向验证：把内联脚本整体保留（旧行为只删 CSRF 那一块），收件人打开导出件
+        会在第一行 ReferenceError；而误删主题初始化会让分享件打开时先闪一下浅色。
+        """
+        code = self._code_of(self.ASSETS.read_text(encoding="utf-8"))
+        self.assertIn("window\\.CSRF_TOKEN", code, "含 token 的脚本仍要按内容精确剔除")
+        self.assertIn("data-theme", code, "主题初始化必须留在分享版里")
+        self.assertIn("{ s.remove(); return; }", code, "非主题的脚本要整体摘掉，而不是留一份跑不动的")
+
+    def test_report_snapshot_strips_csrf_input_and_uses_surface_bg(self):
+        """剥了脚本不许漏剥表单里的 hidden csrf_token；冻结底色取卡片底而不是页面底
+
+        反向验证：①删掉摘 input[name=csrf_token]/form.nav-logout 的那一行，第一段变红
+        （登出表单在 base.html 里带 hidden token，与 window.CSRF_TOKEN 同值，README
+        承诺"导出剥掉 CSRF token"就落空）；②把 freezeCharts 的取色改回 --bs-body-bg，
+        第二段变红（图表都在 .card 里，暗色主题下按页面底填色，每张导出图自带一块
+        比卡片更深的矩形）。
+        """
+        code = self._code_of(self.ASSETS.read_text(encoding="utf-8"))
+        self.assertIn('input[name="csrf_token"]', code, "hidden csrf_token 要整体摘掉")
+        self.assertIn("form.nav-logout", code, "登出表单连壳一起摘，别只留个空 form")
+        self.assertIn("--surface", code, "冻结底色取卡片底")
+        self.assertNotIn("--bs-body-bg", code, "页面底不是图表的容身色")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

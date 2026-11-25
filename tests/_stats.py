@@ -22,7 +22,7 @@
 整类用例一起红（CI 负载高时必现，本机几乎撞不上）。
 
 所以这里的做法是：等一次，等不到就**当场同步补算**。本组用例考的是页面渲染，
-统计管线本身由 test_optimizations / test_review_round* 里那些专门用例钉住，
+统计管线本身由 test_optimizations / test_cache_lifecycle 里那些专门用例钉住，
 不该让它们互相污染。
 """
 
