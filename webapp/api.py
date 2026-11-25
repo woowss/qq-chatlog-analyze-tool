@@ -1147,12 +1147,7 @@ def api_job_history():
     return jsonify({"history": store.read_job_history()})
 
 
-#: 同题互斥：(chat_hash, 问题哈希) -> 持有该问题的 sid。
-#: 提问的缓存是**调用返回之后**才写的（见 api_ask 结尾），所以两个并发相同问题
-#: 都会读不到缓存、都去发一次真实调用 —— 用户点两下就是两次付费，正是本文件
-#: _get_or_create_job 那条规则（"拒绝而不是另起一个任务，否则同一维度被分析两遍、
-#: 双倍计费"）要防的事。提问走同步路径、进不了任务表，所以在这里补一道同口径的锁。
-#: 带 TTL 兜底：持有者被硬杀时不许把这个问题永久锁死。
+#: 同题互斥：(chat_hash, 问题哈希) -> (token, timestamp, sid)，防并发重复提问双倍计费（带陈旧超时）
 _ASK_IN_FLIGHT: dict = {}
 _ASK_LOCK = threading.Lock()
 _ASK_STALE_SECONDS = 600.0
@@ -1199,35 +1194,20 @@ def _ask_release(chat_hash: str, question: str, token) -> None:
     key = (chat_hash, _ask_key_fingerprint(question))
     with _ASK_LOCK:
         holder = _ASK_IN_FLIGHT.get(key)
-        # 只解自己占的那把：超时被别人接管后，迟到的持有者不许把别人的锁放掉
+        # 仅释放与持有 token 一致的锁，防止超时接管后误放他人锁
         if holder and holder[0] == token:
             _ASK_IN_FLIGHT.pop(key, None)
 
 
 def _private_only_guard(label: str):
-    """recap / ask 是私聊专用：群聊会话直接拒。
-
-    这两族吃的同一份摘要（recap_client._recap_digest）结构性地是二人关系口径：
-    头行写"参与者：{self_name}（我）与 {other_name}"，抽样对话里每一条非本人消息
-    都被标成 other_name，而群聊文件里 other_name 是**群名**（parser 的兜底取值）。
-    于是 N 个成员的话被合并成一个人格、"我 vs 大家"被讲成二人关系——正是
-    _dimension_guard 文档里说的"产出看着像结论、其实口径错位"。
-    /recap 页面早就按这个口径把群聊会话重定向走了（views.recap），ask 之前漏了，
-    而且每漏一次就真花一次钱（约 15 万字符的输入）。
-    """
+    """recap / ask 仅限私聊，拒绝群聊会话以免口径错位并产生无效开销。"""
     if session.get("chat_mode") == "group":
         return jsonify({"error": f"「{label}」不适用于当前记录（这是群聊记录）"}), 400
     return None
 
 
 def api_ask():
-    """自定义提问：一次同步调用 + 问题级缓存（重问同一题免费）。
-
-    与维度不同，它是"一问一答"的即席请求：单次调用没有多月份进度要直播，
-    同步返回比塞进任务表更诚实（前端转圈等待，超过一分钟属正常）。
-    缓存文件名含问题哈希、落在同一 ai_cache/ 目录——级联清理、结果导出、
-    保留期回收全部自动覆盖，不给"提问"单造一套生命周期。
-    """
+    """自定义提问：同步调用并使用同问题缓存（受同生命周期清理管理）。"""
     guard = _guard_post()
     if guard:
         return jsonify({"error": guard[0]}), guard[1]
@@ -1325,12 +1305,7 @@ def api_ask():
             }
         )
     except QuotaExhaustedError as e:
-        # 这条路径原先没有 except：而 _call_api 在 402/余额不足、401/403 配额、TPM 耗尽时
-        # 是**故意抛** QuotaExhaustedError 的，异常于是穿透视图，用户拿到一页 Flask 的
-        # 500 HTML，而那句专门写给人的"额度耗尽，请充值"被丢掉了——前端只显示
-        # "提问失败（HTTP 500）"，完全无从下手。is_api_configured() 只查 Key 是否存在，
-        # 所以"Key 有效但余额为 0"的第一次提问必定撞在这里。其它 LLM 入口都由 _run_job
-        # 统一兜住这类异常，只有 ask 漏了。
+        # 额度/限流异常返回 429 JSON，保留可读提示而非落入 500 HTML
         logger.warning("提问因配额/限流中止: %s", e)
         return jsonify(
             {

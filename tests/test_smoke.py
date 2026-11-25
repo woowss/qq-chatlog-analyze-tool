@@ -356,7 +356,7 @@ class TestNetworkInterruptionRecovery(unittest.TestCase):
 
 
 class TestFrontendGuards(unittest.TestCase):
-    """断言 C1/C2/C3：前端三处用静态断言守住（与 test_review_fixes 的同类手法一致）"""
+    """前端模板与图表静态回归护栏"""
 
     ROOT = Path(__file__).resolve().parent.parent
     CHARTS = ROOT / "web" / "static" / "js" / "group_charts.js"

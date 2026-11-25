@@ -14,26 +14,10 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 #
-"""群聊 AI 分析：对话构建、成员感知抽样、4 个维度的执行体
+"""群聊 AI 分析：成员感知抽样、互动事实上下文与 4 维度执行。
 
-与私聊的分工（**不要越界**）：
-- 复用 deepseek_client 的既有零件：_analyze_periods（逐月并发/取消/月份缓存）、
-  _call_api（限流/配额/思考模式）、_message_line（对话行格式）、_fit_lines（兜底截断）、
-  _vision_digest（图片摘要）。这些都是纯函数或参数化的执行器，复用它们才不会出现
-  "私聊一套节奏、群聊另一套节奏"。
-- **不改**私聊提示词、不改 _build_dialog / _message_line 等进私聊指纹的函数源码：
-  群聊自己的对话构建与抽样写在这里，并只进 group_prompt_fingerprint。
-- 群聊的月份缓存与维度缓存都走群聊自己的指纹（见 group_prompt_fingerprint），
-  因此新增/修改群聊提示词**不会**让任何私聊缓存失效。
-
-群聊特有的两处设计（都是被真实数据逼出来的）：
-1. **成员感知抽样**：等间隔抽样在 50 人以上的群里会把低频成员整段丢掉，模型于是把
-   他们读成"缺席/潜水"——恰好污染 lurker_ratio 这类结论。这里先给每位成员保底条数，
-   再按发言占比分配预算，最后在原时间顺序上还原。
-2. **成员画像必须带群上下文**：只喂一个人自己的发言，模型无法判断他是"捧哏王"还是
-   "话题主导者"（两者的定义都依赖看到别人）。所以每个成员的样本前会附上本地精确算出的
-   互动数字（被回复/被@/回复了谁/主要互动对象），并明确区分"事实"与"推断"。
-"""
+复用 `deepseek_client` 传输/并发骨架，提示词与对话格式化函数单独哈希进
+`GROUP_PROMPT_FINGERPRINT`，与私聊缓存完全隔离。"""
 
 import hashlib
 import inspect
@@ -1074,23 +1058,7 @@ def _group_cache_salt(salt: "str | None") -> str:
 
 
 def group_prompt_fingerprint(salt: "str | None" = None, normalize: bool = True) -> str:
-    """群聊提示词与格式的指纹，参与群聊的月份缓存键与维度缓存文件名。
-
-    与私聊指纹**完全独立**：私聊那份按名单哈希 analyzer/prompts.py 的常量，
-    这里哈希 analyzer/group_prompts.py 的全部常量 + 群聊自己的格式化函数源码 + 群聊常量。
-    两边互不影响，因此新增/修改群聊提示词不会作废任何私聊缓存（那会让用户重新付费）。
-
-    normalize 的含义与私聊那份一致（见 deepseek_client._hashed_source）：
-    True = 源码归一到 AST（注释/空白/格式重排不再换键），False = 复现旧的原文公式，
-    只用于算 GROUP_PROMPT_FINGERPRINT_LEGACY 以读取旧缓存。
-
-    源码不可读时（frozen/打包）降级为函数名占位，并提示用 PROMPT_CACHE_SALT 手动换键。
-
-    群聊独立盐 QQCHAT_GROUP_CACHE_SALT：PROMPT_CACHE_SALT 是一颗盐同时换私聊/群聊
-    两族键——想只重刷群聊缓存做不到。新增的这颗盐**只在非空时**并入群聊指纹，
-    默认（空）时群聊指纹与升级前逐字节一致，不影响任何既有缓存；
-    PROMPT_CACHE_SALT 对群聊继续生效（既有测试与用户配置都依赖它）。
-    """
+    """计算群聊提示词与格式化函数指纹（与私聊独立；支持 PROMPT_CACHE_SALT / QQCHAT_GROUP_CACHE_SALT）。"""
     salt = _group_cache_salt(salt)
     current = _group_fingerprint_inputs()
     if normalize:
@@ -1136,12 +1104,5 @@ def group_sampled_prompt_fingerprint(salt: "str | None" = None) -> str:
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
-#: 旧公式（按 getsource 原文哈希）的取值：只为读取 AST 归一之前写下的群聊缓存。
-#: **必须是字面量，不能改回 group_prompt_fingerprint(normalize=False)**：旧公式哈希的是
-#: 当前源码原文，任何一次对进指纹函数（build_group_dialog / _fit_group_lines /
-#: _interaction_digest / _member_facts / _member_context）的改动都会让现算值漂移，
-#: 而它是"读旧群聊缓存并免费迁移"的唯一凭据——漂掉之后那批用户的旧缓存再也读不到，
-#: 本该免费的迁移静默退化成重新付费。理由与私聊那条完全一致，
-#: 详见 deepseek_client.PROMPT_FINGERPRINT_LEGACY 上方的说明。
-#: 取值由 tests/test_group_foundation.py::PINNED_LEGACY_GROUP_FINGERPRINT 钉住。
+#: AST 归一前旧公式的冻结指纹字面量，仅用于迁移旧群聊缓存（不可改为实时计算）
 GROUP_PROMPT_FINGERPRINT_LEGACY = "5f1f7bb3c0ce"
