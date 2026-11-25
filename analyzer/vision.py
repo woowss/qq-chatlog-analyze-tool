@@ -203,7 +203,7 @@ def resolve(media_path: str, chat_hash: str = ""):
         candidates.append(os.path.join(MEDIA_ROOT, "resources", rel))
     for cand in candidates:
         if os.path.isfile(cand) and _within(MEDIA_ROOT, cand):
-            return cand
+            return os.path.normpath(cand)
     return None
 
 

@@ -355,7 +355,7 @@ class TestMixedMediaAndMultiImageVision(unittest.TestCase):
                 picked = vision.pick_images(chat.messages, limit=5)
             self.assertEqual(wanted, ["resources/images/screen.png"])
             self.assertEqual(len(picked), 1)
-            self.assertEqual(picked[0]["path"], str(shot))
+            self.assertEqual(Path(picked[0]["path"]), shot)
 
     def test_duplicate_message_id_reply_backfill_avoids_guessing(self):
         with tempfile.TemporaryDirectory() as tmp:
