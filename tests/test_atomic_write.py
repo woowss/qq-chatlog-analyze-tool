@@ -28,6 +28,7 @@
    钉成"仍被引用"。
 """
 
+import io
 import json
 import os
 import sys
@@ -44,6 +45,7 @@ bootstrap()
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from analyzer import atomic_write, face_images, usage, vision  # noqa: E402
+from webapp import store as storemod  # noqa: E402
 
 
 class TmpNameSurface(unittest.TestCase):
@@ -170,6 +172,69 @@ class TmpNameUniqueness(unittest.TestCase):
         for t in threads:
             t.join(timeout=30)
         self.assertEqual(len(set(found)), 300, "并发线程之间也不该撞名")
+
+
+class TestSaveAndHashIntegrity(unittest.TestCase):
+    """上传流落盘：要么给出完整文件的哈希，要么报错——绝不返回半截结果"""
+
+    class _GoodFS:
+        def __init__(self, data: bytes):
+            self.stream = io.BytesIO(data)
+
+    class _ExplodingStream:
+        """先吐一部分数据再抛 OSError，且不可 seek（模拟不可回退的失败流）"""
+
+        def __init__(self, data: bytes):
+            self._data = data
+            self._sent = False
+
+        def seek(self, *args):
+            raise OSError("not seekable")
+
+        def read(self, n=-1):
+            if not self._sent:
+                self._sent = True
+                return self._data[: max(1, n // 2)]
+            raise OSError("source vanished")
+
+    class _ExplodingFS:
+        def __init__(self, data: bytes):
+            self.stream = TestSaveAndHashIntegrity._ExplodingStream(data)
+            self.save_called = False
+
+        def save(self, path):
+            self.save_called = True
+            with open(path, "wb") as f:
+                f.write(b"PARTIAL")
+
+    def test_fast_path_hash_matches_full_reread(self):
+        data = json.dumps({"hello": "世界" * 500}).encode("utf-8")
+        with tempfile.TemporaryDirectory(prefix="qqchatlog-savehash-") as tmp:
+            dest = os.path.join(tmp, "a.json")
+            size, digest = storemod.save_and_hash(self._GoodFS(data), dest)
+            self.assertEqual(size, len(data))
+            self.assertEqual(digest, storemod._chat_hash(dest))
+
+    def test_empty_stream_yields_empty_file_hash(self):
+        with tempfile.TemporaryDirectory(prefix="qqchatlog-savehash-") as tmp:
+            dest = os.path.join(tmp, "empty.json")
+            size, digest = storemod.save_and_hash(self._GoodFS(b""), dest)
+            self.assertEqual(size, 0)
+            self.assertEqual(digest, storemod._chat_hash(dest))
+
+    def test_unrewindable_failed_stream_raises_instead_of_truncating(self):
+        """核心回归：拷贝中途失败且流不可回退时，必须报错。
+
+        旧实现会在 seek 失败后照常调用 save()，而 save() 从"流当前的位置"拷贝——
+        于是落下一份从中间开始的半截 JSON，还被当成上传成功返回。
+        """
+        data = json.dumps({"hello": "世界" * 500}).encode("utf-8")
+        with tempfile.TemporaryDirectory(prefix="qqchatlog-savehash-") as tmp:
+            dest = os.path.join(tmp, "b.json")
+            fs = self._ExplodingFS(data)
+            with self.assertRaises(OSError):
+                storemod.save_and_hash(fs, dest)
+            self.assertFalse(fs.save_called, "不可回退时不该再调 save() 写出半截文件")
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@
 缓存原子写与续期、登录限流、会话 Cookie、日志 handler 唯一性。
 """
 
+import importlib
 import io
 import json
 import os
@@ -30,6 +31,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -48,11 +50,16 @@ os.environ.setdefault("QQCHAT_MONTH_CACHE", "0")
 
 # 别名与项目模块的导入都必须排在环境准备之后：提前导入 webapp.* 会连带导入 config，
 # 于是 QQCHAT_MONTH_CACHE / QQCHAT_DATA_DIR 被读成默认值（月份缓存意外开启）
+import app as appmod  # noqa: E402
+import config  # noqa: E402
+from analyzer import deepseek_client as dc  # noqa: E402
+from analyzer import shutdown as sd  # noqa: E402
+from analyzer import usage as usage_mod  # noqa: E402
+from analyzer.local_stats import calc_overview  # noqa: E402
+from parser.qq_parser import CST, ChatData, Message, load_chat, split_by_month  # noqa: E402
 from webapp import jobs as jobsmod  # noqa: E402
 from webapp import security as securitymod  # noqa: E402
 from webapp import store as storemod  # noqa: E402
-from parser.qq_parser import Message, load_chat, split_by_month  # noqa: E402
-from analyzer.local_stats import calc_overview  # noqa: E402
 
 
 def _write_chat(data: dict) -> str:
@@ -924,6 +931,437 @@ class TestFrontendEscaping(unittest.TestCase):
         body = src.split("function esc(s)")[1].split("\n}")[0]
         for entity in ("&amp;", "&lt;", "&gt;", "&quot;", "&#39;"):
             self.assertIn(entity, body, f"esc() 缺少 {entity} 转义")
+
+
+def _r4_msg(uid: str, ts: int, text: str = "在吗", has_image: bool = False, **kw) -> Message:
+    return Message(
+        id=str(ts),
+        timestamp=ts,
+        time_str=datetime.fromtimestamp(ts / 1000, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        sender_name=uid,
+        sender_uid=uid,
+        text=text,
+        raw_text=text,
+        msg_type="type_1",
+        has_image=has_image,
+        is_reply=False,
+        **kw,
+    )
+
+
+def _r4_chat(msgs) -> ChatData:
+    return ChatData(chat_name="", self_name="A", other_name="B", self_uid="u1", other_uid="u2", messages=msgs)
+
+
+def _r4_months_chat(n_months: int, pairs_per_month: int = 6) -> ChatData:
+    """跨 n 个月的聊天（每月内容互不相同）"""
+    msgs = []
+    for m in range(n_months):
+        year, month = 2025 + m // 12, (m % 12) + 1
+        for i in range(pairs_per_month):
+            t = datetime(year, month, 5, 20, 0, tzinfo=CST) + timedelta(minutes=17 * i)
+            text = f"{year}-{month:02d} 第{i}条消息"
+            msgs.append(_r4_msg("u1" if i % 2 else "u2", int(t.timestamp() * 1000), text=text))
+    return _r4_chat(msgs)
+
+
+class TestOpenRedirect(unittest.TestCase):
+    """登录后的 next= 跳转不能把用户带出站外"""
+
+    def setUp(self):
+        self.client = appmod.app.test_client()
+        self.client.get("/")
+
+    def _login(self, nxt):
+        with mock.patch.object(securitymod, "ACCESS_PASSWORD", "s3cret"):
+            return self.client.post(f"/login?next={nxt}", data={"password": "s3cret"})
+
+    def test_backslash_protocol_relative_is_rejected(self):
+        r = self._login("/\\evil.example.com")
+        self.assertEqual(r.status_code, 302)
+        self.assertNotIn(
+            "evil.example.com", r.headers["Location"], "浏览器把 /\\host 当协议相对地址，必须拦住"
+        )
+        self.assertEqual(r.headers["Location"], "/")
+
+    def test_double_slash_is_rejected(self):
+        self.assertEqual(self._login("//evil.example.com").headers["Location"], "/")
+
+    def test_absolute_url_is_rejected(self):
+        self.assertEqual(self._login("http://evil.example.com/x").headers["Location"], "/")
+
+    def test_local_path_is_kept(self):
+        self.assertEqual(self._login("/dashboard").headers["Location"], "/dashboard")
+
+
+class TestSecurityHeaders(unittest.TestCase):
+    """统一安全响应头：即便将来某处漏了转义，注入也拿不到跨站资源"""
+
+    def test_headers_present_on_pages(self):
+        client = appmod.app.test_client()
+        r = client.get("/")
+        self.assertEqual(r.headers.get("X-Content-Type-Options"), "nosniff")
+        self.assertEqual(r.headers.get("X-Frame-Options"), "SAMEORIGIN")
+        self.assertEqual(r.headers.get("Referrer-Policy"), "same-origin")
+        csp = r.headers.get("Content-Security-Policy", "")
+        self.assertIn("default-src 'self'", csp)
+        self.assertIn("frame-ancestors 'self'", csp)
+
+
+class TestUploadLimitIsConfigurable(unittest.TestCase):
+    """超长聊天的 JSON 会逼近 50MB：上限要能调，且默认值不变"""
+
+    def test_default_is_50mb(self):
+        self.assertEqual(config.MAX_CONTENT_LENGTH, 50 * 1024 * 1024)
+        self.assertEqual(
+            appmod.app.config["MAX_CONTENT_LENGTH"], config.MAX_CONTENT_LENGTH, "配置要真的接到 Flask 上"
+        )
+
+    def test_env_override(self):
+        with mock.patch.dict(os.environ, {"QQCHAT_MAX_UPLOAD_MB": "120"}):
+            reloaded = importlib.reload(config)
+            try:
+                self.assertEqual(reloaded.MAX_CONTENT_LENGTH, 120 * 1024 * 1024)
+            finally:
+                os.environ.pop("QQCHAT_MAX_UPLOAD_MB", None)
+                importlib.reload(config)
+        self.assertEqual(config.MAX_CONTENT_LENGTH, 50 * 1024 * 1024)
+
+    def test_413_returns_actionable_chinese_hint(self):
+        """超过上限时不能只回 Werkzeug 的英文页：用户得知道限制是多少、怎么调"""
+        client = appmod.app.test_client()
+        client.get("/")
+        with client.session_transaction() as sess:
+            token = sess["csrf_token"]
+        headers = {"Origin": "http://localhost:5000", "X-CSRF-Token": token}
+        payload = b"x" * 4096
+        # 把上限压到 1KB，避免测试真的上传 50MB
+        original = appmod.app.config["MAX_CONTENT_LENGTH"]
+        appmod.app.config["MAX_CONTENT_LENGTH"] = 1024
+        try:
+            # AJAX 上传（首页拖拽）：应拿到 JSON 形式的可读错误
+            r = client.post(
+                "/upload",
+                data={"file": (io.BytesIO(payload), "big.json")},
+                headers={**headers, "X-Requested-With": "fetch"},
+            )
+            self.assertEqual(r.status_code, 413)
+            self.assertIn("QQCHAT_MAX_UPLOAD_MB", r.get_json().get("error", ""))
+
+            # 普通表单提交：也应看到中文提示而不是英文模板
+            r2 = client.post("/upload", data={"file": (io.BytesIO(payload), "big.json")}, headers=headers)
+            self.assertEqual(r2.status_code, 413)
+            body = r2.get_data(as_text=True)
+            self.assertIn("上限", body)
+            self.assertNotIn("Request Entity Too Large", body)
+        finally:
+            appmod.app.config["MAX_CONTENT_LENGTH"] = original
+
+
+class TestInsecureBaseUrlDetection(unittest.TestCase):
+    """明文 http 的非本机端点会让 Key 与聊天内容裸奔，启动时就该提醒"""
+
+    def test_detection(self):
+        with mock.patch.object(dc, "DEEPSEEK_BASE_URL", "http://api.example.com/v1"):
+            self.assertTrue(dc.is_insecure_base_url())
+        with mock.patch.object(dc, "DEEPSEEK_BASE_URL", "http://127.0.0.1:11434/v1"):
+            self.assertFalse(dc.is_insecure_base_url(), "本机明文端点不算裸奔")
+        with mock.patch.object(dc, "DEEPSEEK_BASE_URL", "https://api.example.com/v1"):
+            self.assertFalse(dc.is_insecure_base_url())
+
+
+class TestChatCachePurge(unittest.TestCase):
+    """删聊天时进程内的 ChatData 也要丢：它带着上一条聊天的全部消息内容"""
+
+    def test_purge_drops_in_memory_chat(self):
+        payload = {
+            "chatInfo": {"name": "对方", "selfName": "我", "selfUid": "uA"},
+            "statistics": {"senders": [{"uid": "uA", "name": "我"}, {"uid": "uB", "name": "对方"}]},
+            "messages": [
+                {
+                    "id": "1",
+                    "timestamp": 1704067191000,
+                    "sender": {"uid": "uA", "name": "我"},
+                    "content": {
+                        "text": "在吗",
+                        "elements": [{"type": "text", "data": {"text": "在吗"}}],
+                    },
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory(prefix="qqchatlog-chatcache-") as tmp:
+            src = os.path.join(tmp, "c.json")
+            with open(src, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            with storemod._CHAT_CACHE_LOCK:
+                storemod._CHAT_CACHE.clear()
+            self.addCleanup(storemod._CHAT_CACHE.clear)
+
+            storemod._load_chat_cached(src)
+            self.assertEqual(len(storemod._CHAT_CACHE), 1)
+            storemod._purge_chat_caches("some-other-hash")
+            self.assertEqual(len(storemod._CHAT_CACHE), 0, "清理后进程内不该还留着已解析的聊天内容")
+
+
+class TestJobSurvivesFileCleanup(unittest.TestCase):
+    """后台任务开工时会话文件可能已被 24 小时清理收走：要给可读提示，不能是 Errno 2"""
+
+    def _register(self, job_id: str) -> None:
+        jobsmod.JOBS[job_id] = {
+            "status": "running",
+            "dim": "emotion",
+            "done": 0,
+            "total": 0,
+            "cancel": False,
+            "chat_hash": "deadbeefcafe0000",
+            "sid": "sess",
+            "created": 0.0,
+        }
+        self.addCleanup(jobsmod.JOBS.pop, job_id, None)
+
+    def test_run_job_reports_cleanup_not_filenotfound(self):
+        job_id = "job-missing-file"
+        self._register(job_id)
+        missing = os.path.join(tempfile.gettempdir(), "definitely-not-here.json")
+        jobsmod._run_job(job_id, "emotion", missing, "deadbeefcafe0000")
+
+        job = jobsmod.JOBS[job_id]
+        self.assertEqual(job["status"], "error")
+        self.assertIn("已被清理", job["error"])
+        self.assertNotIn("No such file", job["error"])
+        self.assertNotIn("Errno", job["error"])
+
+    def test_run_analyze_all_reports_cleanup(self):
+        job_id = "job-all-missing-file"
+        self._register(job_id)
+        missing = os.path.join(tempfile.gettempdir(), "definitely-not-here-either.json")
+        jobsmod._run_analyze_all(job_id, missing, "deadbeefcafe0000", False)
+
+        job = jobsmod.JOBS[job_id]
+        self.assertEqual(job["status"], "error")
+        self.assertIn("已被清理", job["error"])
+
+    def test_run_boundary_is_released_on_every_exit_path(self):
+        """begin_run/end_run 必须成对：漏掉的后果是 LLM_MAX_CALLS_PER_RUN 变成
+        「进程启动以来的累计」，之后每次 begin_run 都不再清零，正常分析也会被掐断。
+
+        反向验证：删掉 _run_job（或 _run_analyze_all）finally 里的 end_run()，
+        本条立刻变红。这里刻意走「文件已被清理」这条**提前 return** 的出口——
+        它是 finally 最容易被漏掉的那一类路径。
+
+        断言用"相对进入前"的口径而不是绝对值：这个计数器是进程级的，别的用例可能
+        已经把它留在某个状态上，绝对断言会变成顺序相关的假失败。
+        """
+        from analyzer import deepseek_client as dc
+
+        depth_before = dc._run_depth
+        active_before = dc._run_active
+        missing = os.path.join(tempfile.gettempdir(), "definitely-not-here-boundary.json")
+
+        job_id = "job-boundary-single"
+        self._register(job_id)
+        jobsmod._run_job(job_id, "emotion", missing, "deadbeefcafe0001")
+        self.assertEqual(dc._run_depth, depth_before, "_run_job 退出时必须释放自己占用的运行边界")
+        self.assertEqual(dc._run_active, active_before, "_run_job 不该把「运行中」粘住")
+
+        job_id = "job-boundary-all"
+        self._register(job_id)
+        jobsmod._run_analyze_all(job_id, missing, "deadbeefcafe0002", False)
+        self.assertEqual(dc._run_depth, depth_before, "_run_analyze_all 退出时必须释放运行边界")
+        self.assertEqual(dc._run_active, active_before, "_run_analyze_all 不该把「运行中」粘住")
+
+
+class TestSharedRetrySkeleton(unittest.TestCase):
+    """_call_api 与 _call_vision 共用 _request_with_retry，错误分类必须一致"""
+
+    def setUp(self):
+        self._orig_interval = dc.CALL_MIN_INTERVAL
+        dc.CALL_MIN_INTERVAL = 0.0
+        self.addCleanup(lambda: setattr(dc, "CALL_MIN_INTERVAL", self._orig_interval))
+
+    @staticmethod
+    def _ok():
+        resp = mock.Mock()
+        resp.choices = [mock.Mock(finish_reason="stop", message=mock.Mock(content='{"a": 1}'))]
+        resp.usage = None
+        return resp
+
+    @staticmethod
+    def _err(status: int, message: str) -> Exception:
+        err = Exception(message)
+        err.status_code = status
+        return err
+
+    def test_both_entry_points_use_the_shared_skeleton(self):
+        client = mock.Mock()
+        client.chat.completions.create.return_value = self._ok()
+        with (
+            mock.patch.object(dc, "_get_client", return_value=client),
+            mock.patch.object(dc, "_request_with_retry", wraps=dc._request_with_retry) as shared,
+        ):
+            self.assertEqual(dc._call_api("s", "u"), {"a": 1})
+            self.assertEqual(shared.call_count, 1)
+
+        vision_client = mock.Mock()
+        vision_client.chat.completions.create.return_value = self._ok()
+        with (
+            mock.patch.object(dc, "_get_client", return_value=vision_client),
+            mock.patch.object(dc, "_request_with_retry", wraps=dc._request_with_retry) as shared,
+            mock.patch("analyzer.vision.load_image_b64", return_value="data:image/png;base64,xx"),
+        ):
+            dc._call_vision("s", "看图", [{"path": "p.png", "mime": "image/png"}])
+            self.assertEqual(shared.call_count, 1, "看图调用同样要走公共骨架")
+
+    def test_vision_degrades_where_text_analysis_raises(self):
+        """同一类失败：文本分析抛错中止，看图返回空串继续——这是两者的既定分工"""
+        fake = mock.Mock()
+        fake.chat.completions.create.side_effect = self._err(429, "Allocated quota exceeded")
+        with (
+            mock.patch.object(dc, "_get_client", return_value=fake),
+            mock.patch.object(dc, "TPM_WAIT_SECONDS", 0.01),
+            mock.patch("analyzer.vision.load_image_b64", return_value="data:image/png;base64,xx"),
+        ):
+            with self.assertRaises(dc.QuotaExhaustedError):
+                dc._call_api("s", "u", tpm_wait=0.01)
+            self.assertEqual(
+                dc._call_vision("s", "看图", [{"path": "p.png", "mime": "image/png"}]),
+                "",
+                "看图失败不该拖垮文本分析",
+            )
+
+    def test_generic_errors_keep_the_old_retry_count(self):
+        fake = mock.Mock()
+        fake.chat.completions.create.side_effect = OSError("connection reset")
+        with (
+            mock.patch.object(dc, "_get_client", return_value=fake),
+            mock.patch.object(dc.time, "sleep"),
+        ):
+            with self.assertRaises(OSError):
+                dc._call_api("s", "u", retry=2)
+        self.assertEqual(fake.chat.completions.create.call_count, 3, "retry=2 → 共 3 次尝试")
+
+
+class TestGracefulShutdown(unittest.TestCase):
+    """Ctrl+C 之后不该再发起新的付费调用，也不该把残缺结果写进维度缓存"""
+
+    def setUp(self):
+        sd.reset_shutdown()
+        self.addCleanup(sd.reset_shutdown)
+
+    def test_no_new_months_after_shutdown(self):
+        chat = _r4_months_chat(3)
+        calls = []
+
+        def fake_api(*a, **kw):
+            calls.append(1)
+            return valid_emotion()
+
+        def on_progress(done, total):
+            sd.request_shutdown()  # 第一个月一完成就"按下 Ctrl+C"
+
+        with (
+            mock.patch.object(dc, "_call_api", side_effect=fake_api),
+            mock.patch.object(dc, "CALL_MIN_INTERVAL", 0.0),
+            mock.patch.object(dc, "CONCURRENCY", 1),
+        ):
+            out = dc.analyze_emotion(chat, on_progress=on_progress, chat_hash="")
+        self.assertEqual(len(calls), 1, "关闭后不得再启动新的月份")
+        self.assertEqual(len(out), 1, "已完成的那一个月仍要返回")
+
+    def test_shutdown_flag_is_one_way_until_reset(self):
+        self.assertFalse(sd.shutdown_requested())
+        self.assertTrue(sd.request_shutdown(), "第一次请求返回 True（调用方据此打日志）")
+        self.assertTrue(sd.shutdown_requested())
+        self.assertFalse(sd.request_shutdown(), "重复请求返回 False")
+        sd.reset_shutdown()
+        self.assertFalse(sd.shutdown_requested())
+
+    def test_partial_dimension_result_is_not_cached_on_shutdown(self):
+        filepath = os.path.join(tempfile.gettempdir(), "shutdown-chat.json")
+        Path(filepath).write_text("{}", encoding="utf-8")
+        self.addCleanup(lambda: os.path.exists(filepath) and os.remove(filepath))
+        jobsmod.JOBS["jobSD"] = {"status": "running", "cancel": False}
+        self.addCleanup(lambda: jobsmod.JOBS.pop("jobSD", None))
+        written = []
+
+        def fake_dim(chat, on_progress=None, should_cancel=None, chat_hash=""):
+            sd.request_shutdown()  # 维度跑完一个月就遇到关闭
+            return {"2024-01": {"self_emotion": "平静"}}
+
+        with (
+            mock.patch.dict(jobsmod.ANALYZE_FUNCS, {"emotion": fake_dim}),
+            mock.patch.object(jobsmod.store, "_load_chat_cached", return_value=_r4_months_chat(1)),
+            mock.patch.object(jobsmod.store, "_write_cache", side_effect=lambda *a: written.append(a)),
+        ):
+            jobsmod._run_job("jobSD", "emotion", filepath, "hashSD")
+
+        self.assertEqual(written, [], "残缺的维度结果一旦落盘，重跑会命中它、缺的月份再也补不回来")
+        self.assertEqual(jobsmod.JOBS["jobSD"]["status"], "cancelled")
+
+    def test_usage_flush_is_wired_into_the_signal_handler(self):
+        """信号处理器必须落盘 token 用量（它按天累计在内存里，硬杀进程就丢了）"""
+        import signal
+
+        import app as appmod
+
+        self.assertTrue(hasattr(appmod, "_install_shutdown_handler"), "app.py 应提供优雅关闭的安装函数")
+        grace_before = appmod.SHUTDOWN_GRACE_SECONDS
+        self.addCleanup(setattr, appmod, "SHUTDOWN_GRACE_SECONDS", grace_before)
+        self.addCleanup(signal.signal, signal.SIGINT, signal.default_int_handler)
+
+        with mock.patch.object(appmod, "flush_usage") as flush:
+            appmod.SHUTDOWN_GRACE_SECONDS = 0
+            appmod._install_shutdown_handler()
+            handler = signal.getsignal(signal.SIGINT)
+            self.assertTrue(callable(handler))
+            with self.assertRaises(KeyboardInterrupt):
+                handler(signal.SIGINT, None)
+            flush.assert_called_once()
+            self.assertTrue(sd.shutdown_requested())
+
+    def test_usage_module_exposes_flush(self):
+        self.assertTrue(callable(usage_mod.flush))
+
+
+class TestHealthEndpoint(unittest.TestCase):
+    """存活探针：不登录、不建会话、不写日志"""
+
+    @classmethod
+    def setUpClass(cls):
+        import app as appmod
+
+        cls.appmod = appmod
+        cls.client = appmod.app.test_client()
+
+    def test_returns_ok(self):
+        r = self.client.get("/health")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_data(as_text=True), "ok")
+
+    def test_bypasses_login(self):
+        from webapp import security
+
+        with mock.patch.object(security, "ACCESS_PASSWORD", "s3cret"):
+            r = self.client.get("/health")
+        self.assertEqual(r.status_code, 200, "设了口令后探针不能被 302 到登录页")
+
+    def test_does_not_create_a_session(self):
+        fresh = self.appmod.app.test_client()
+        r = fresh.get("/health")
+        self.assertIsNone(r.headers.get("Set-Cookie"), "探针不该建会话（高频调用会堆满磁盘）")
+
+    def test_is_not_logged(self):
+        """探针可能每秒一次，逐条记日志会把真正有用的日志刷爆"""
+        from webapp import views
+
+        with mock.patch.object(views.logger, "info") as info:
+            self.client.get("/health")
+        info.assert_not_called()
+
+    def test_endpoint_is_in_bypass_list(self):
+        from webapp.security import BYPASS_ENDPOINTS
+
+        self.assertIn("health", BYPASS_ENDPOINTS)
 
 
 if __name__ == "__main__":

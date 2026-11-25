@@ -241,5 +241,119 @@ class TestPageSmoke(unittest.TestCase):
             self.assertNotIn("Traceback", body)
 
 
+ROOT = Path(__file__).resolve().parent.parent
+
+
+class TestFrontendRecoversAfterRestart(unittest.TestCase):
+    """任务记录只在内存（TTL/重启会丢），但已完成的维度结果已落盘：
+
+    轮询到 404 时应回读磁盘缓存，而不是把已经付过费的分析显示成失败。
+    """
+
+    def test_poll_falls_back_to_disk_cache_on_404(self):
+        src = (ROOT / "web" / "static" / "js" / "analyze.js").read_text(encoding="utf-8")
+        self.assertIn("xhr.status === 404", src)
+        self.assertIn("loadAnalysis(opts.dim", src, "404 时应回读磁盘结果")
+        self.assertIn("opts.dim = dim", src, "startAnalyze 要把维度名传下去")
+
+    def test_polling_backs_off_and_pauses_when_hidden(self):
+        """固定 1.5s 的 setInterval 会让一次全量分析发出几百次请求"""
+        src = (ROOT / "web" / "static" / "js" / "analyze.js").read_text(encoding="utf-8")
+        self.assertNotIn("setInterval(", src, "轮询不该再用固定间隔")
+        self.assertIn("POLL_MAX_DELAY_MS", src, "应有退避上限")
+        self.assertIn("visibilitychange", src, "后台标签页应降频、回到前台立刻补查")
+
+    def test_charts_share_one_resize_listener(self):
+        """每个图表各挂一个 resize 监听且从不移除：同一页面重绘 N 次就留下 N 个监听"""
+        src = (ROOT / "web" / "static" / "js" / "charts.js").read_text(encoding="utf-8")
+        self.assertEqual(src.count("addEventListener('resize'"), 1, "resize 监听只应保留全局那一个")
+        self.assertNotIn("window.addEventListener('resize', function() { chart.resize(); });", src)
+        self.assertIn("function mountChart(", src)
+        self.assertEqual(
+            src.count("echarts.init("), 1, "只允许 mountChart 内部建实例（重绘要先 dispose 旧的）"
+        )
+        self.assertIn("dispose()", src)
+
+
+class TestAssetCacheBusting(unittest.TestCase):
+    """自有 JS/CSS 必须带版本参数，否则用户会长期跑到旧脚本"""
+
+    @classmethod
+    def setUpClass(cls):
+        import app as appmod
+
+        cls.client = appmod.app.test_client()
+
+    def test_own_assets_carry_version(self):
+        """自有 JS/CSS 必须带 ?v= 破缓存，否则用户会长期跑到旧脚本。
+
+        首页**不再加载图表脚本**（上传页没有图表，见 test_smoke 的逐页断言），
+        所以这里分两处看：渲染出的首页验证 CSS，base.html 源码验证那两个图表脚本
+        仍然挂着版本参数——少一个 `?v=`，改了前端却还在跑旧 JS，页面会直接不可用。
+        """
+        index = self.client.get("/").get_data(as_text=True)
+        self.assertRegex(index, r"css/style\.css\?v=\d+")
+
+        base = (ROOT / "web" / "templates" / "base.html").read_text(encoding="utf-8")
+        self.assertRegex(base, r"js/charts\.js'\) \}\}\?v=\{\{ asset_v \}\}")
+        self.assertRegex(base, r"js/analyze\.js'\) \}\}\?v=\{\{ asset_v \}\}")
+
+    def test_vendor_assets_keep_their_own_filenames(self):
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn("vendor/jquery.min.js", body)
+        self.assertNotIn("vendor/jquery.min.js?v=", body, "vendor 文件名自带版本，不必再挂参数")
+
+    def test_version_is_numeric(self):
+        from web import ASSET_VERSION
+
+        self.assertRegex(ASSET_VERSION, r"^\d+$")
+
+
+class TestApiOkInjectedGlobally(unittest.TestCase):
+    """api_ok 由 context processor 统一注入；视图不再各传一份"""
+
+    def test_pages_get_api_ok_from_context_processor(self):
+        import app as appmod
+        from flask import template_rendered
+
+        captured = {}
+
+        def record(_sender, **extra):
+            # blinker 1.9 起接收者只能收 sender + 关键字参数，位置参数会直接 TypeError
+            captured.update(extra.get("context") or {})
+
+        template_rendered.connect(record, appmod.app)
+        self.addCleanup(template_rendered.disconnect, record, appmod.app)
+
+        with mock.patch.object(appmod.views, "is_api_configured", return_value=False):
+            body = appmod.app.test_client().get("/").get_data(as_text=True)
+        self.assertIn("api_ok", captured, "模板上下文里必须有 api_ok")
+        self.assertFalse(captured["api_ok"])
+        self.assertIn("未配置 API Key", body, "页面要如实显示未配置状态")
+
+    def test_views_no_longer_pass_it_manually(self):
+        src = (ROOT / "webapp" / "views.py").read_text(encoding="utf-8")
+        self.assertEqual(
+            src.count("api_ok=is_api_configured()"),
+            0,
+            "视图里不该再逐个传 api_ok（由 context processor 注入）",
+        )
+
+
+class TestNetworkInterruptionRecovery(unittest.TestCase):
+    """服务重启/断网时前端要回读缓存，而不是报"分析失败"诱导用户重跑"""
+
+    def test_analyze_js_handles_status_zero(self):
+        src = (ROOT / "web" / "static" / "js" / "analyze.js").read_text(encoding="utf-8")
+        self.assertIn("xhr.status === 0", src, "网络层失败要有单独分支")
+        branch = src.split("xhr.status === 0")[1].split("opts.onError((xhr.responseJSON")[0]
+        self.assertIn("loadAnalysis", branch, "网络中断时要尝试回读磁盘缓存")
+        self.assertIn("不会重复付费", branch, "提示要说清「结果已保存」")
+
+    def test_analyze_js_still_handles_404(self):
+        src = (ROOT / "web" / "static" / "js" / "analyze.js").read_text(encoding="utf-8")
+        self.assertIn("xhr.status === 404", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

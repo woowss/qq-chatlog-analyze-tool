@@ -8,8 +8,11 @@
 """Regression tests for Vision cache identity, LRU memoization, and face images."""
 
 import hashlib
+import json
 import os
+import shutil as _shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +22,11 @@ from _bootstrap import bootstrap
 
 bootstrap()
 
+from analyzer import deepseek_client as dc  # noqa: E402
+from analyzer import face_images as fi  # noqa: E402
 from analyzer import vision  # noqa: E402
+from webapp import cleanup as cleanupmod  # noqa: E402
+from webapp import store as storemod  # noqa: E402
 
 
 class TestVisionMemoLRU(unittest.TestCase):
@@ -171,8 +178,6 @@ class VisionCacheIdentityTests(unittest.TestCase):
         self.assertEqual(call.call_count, 2)
 
     def test_untrusted_path_legacy_cache_is_not_migrated(self):
-        from analyzer import deepseek_client as dc
-
         self._write_media("chat-a", b"synthetic current file")
         message = self._message()
         with (
@@ -192,8 +197,6 @@ class VisionCacheIdentityTests(unittest.TestCase):
         self.assertTrue(os.path.exists(old_path))
 
     def test_verified_md5_migrates_both_historical_fingerprint_keys(self):
-        from analyzer import deepseek_client as dc
-
         content = b"synthetic image with matching exported md5"
         md5 = hashlib.md5(content, usedforsecurity=False).hexdigest()
         self._write_media("chat-a", content)
@@ -223,8 +226,6 @@ class VisionCacheIdentityTests(unittest.TestCase):
             self.assertEqual(call.call_count, 0)
 
     def test_legacy_cache_read_during_purge_does_not_migrate_or_repopulate_memo(self):
-        from analyzer import deepseek_client as dc
-
         content = b"synthetic image with matching exported md5"
         md5 = hashlib.md5(content, usedforsecurity=False).hexdigest()
         self._write_media("chat-a", content)
@@ -340,8 +341,6 @@ class VisionCacheIdentityTests(unittest.TestCase):
 
     @staticmethod
     def _raw_key(images, prompt_fingerprint):
-        from analyzer import deepseek_client as dc
-
         digest = hashlib.sha256()
         for part in (dc.DEEPSEEK_MODEL, prompt_fingerprint, vision.VISION_SYSTEM, vision.VISION_DETAIL):
             digest.update(str(part).encode("utf-8"))
@@ -350,6 +349,177 @@ class VisionCacheIdentityTests(unittest.TestCase):
             digest.update(str(image.get("legacy_key", image["key"])).encode("utf-8"))
             digest.update(b"\x00")
         return digest.hexdigest()[:20]
+
+
+class TestMediaCopyLifecycle(unittest.TestCase):
+    """图片副本是盘上最敏感的一批派生数据：既要有 24 小时回收，也要随聊天级联删除"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="qqchatlog-media-lifecycle-")
+        self.addCleanup(_shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _patched_dirs(self):
+        """把清理涉及的目录全部指向临时目录，避免碰到真实数据"""
+        return [
+            mock.patch.object(cleanupmod, "UPLOAD_FOLDER", self.tmp),
+            mock.patch.object(cleanupmod, "SESSION_FILE_DIR", os.path.join(self.tmp, "session")),
+            mock.patch.object(cleanupmod, "AI_CACHE_DIR", os.path.join(self.tmp, "ai")),
+            mock.patch.object(cleanupmod, "STATS_CACHE_DIR", os.path.join(self.tmp, "stats")),
+            mock.patch.object(cleanupmod, "LOG_DIR", os.path.join(self.tmp, "logs")),
+            mock.patch.object(vision, "UPLOAD_FOLDER", self.tmp),
+        ]
+
+    def test_expired_media_copy_is_reclaimed_recursively(self):
+        """uploads/media/<哈希>/ 里的图片副本必须被回收，空目录也要清掉。
+
+        原先 _purge_dir 只看目录下的普通文件（os.path.isfile），整个 media 子树
+        被跳过——图片副本永远留在盘上，与 README 的 24 小时承诺不符。
+        """
+        media_dir = os.path.join(self.tmp, "media", "abc123")
+        os.makedirs(media_dir, exist_ok=True)
+        old_file = os.path.join(media_dir, "old.jpg")
+        new_file = os.path.join(media_dir, "new.jpg")
+        for path in (old_file, new_file):
+            with open(path, "wb") as f:
+                f.write(b"\xff\xd8\xff" + b"x" * 16)
+        ancient = time.time() - 48 * 3600
+        os.utime(old_file, (ancient, ancient))
+
+        for patcher in self._patched_dirs():
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        removed = cleanupmod.cleanup_old_files()
+
+        self.assertGreaterEqual(removed, 1)
+        self.assertFalse(os.path.exists(old_file), "过期图片副本应被删除")
+        self.assertTrue(os.path.exists(new_file), "未过期的副本不该被误删")
+
+        # 再跑一次：这次全部过期 → 文件与空目录一起清掉，不留空壳目录
+        os.utime(new_file, (ancient, ancient))
+        cleanupmod.cleanup_old_files()
+        self.assertFalse(os.path.isdir(media_dir), "回收干净后应删掉空的哈希目录")
+        self.assertFalse(os.path.isdir(os.path.join(self.tmp, "media")), "空的 media 目录也不该留着")
+
+    def test_purge_chat_caches_removes_media_copy(self):
+        """删聊天（换文件/清理）时必须连带删掉图片副本目录"""
+        chat_hash = "deadbeefcafe0001"
+        media_dir = os.path.join(self.tmp, "media", chat_hash)
+        os.makedirs(media_dir, exist_ok=True)
+        for name in ("a.jpg", "b.png"):
+            with open(os.path.join(media_dir, name), "wb") as f:
+                f.write(b"x" * 8)
+
+        with mock.patch.object(vision, "UPLOAD_FOLDER", self.tmp):
+            removed = storemod._purge_chat_caches(chat_hash)
+
+        self.assertGreaterEqual(removed, 2, "回收计数应包含图片副本")
+        self.assertFalse(os.path.exists(media_dir), "图片副本目录应被整目录删除")
+
+    def test_purge_session_media_is_idempotent(self):
+        """没有副本目录时不该报错（旧聊天、没开图片理解都要走这条路径）"""
+        with mock.patch.object(vision, "UPLOAD_FOLDER", self.tmp):
+            self.assertEqual(vision.purge_session_media("nonexistent"), 0)
+
+
+class TestVisionCallIsNonThinking(unittest.TestCase):
+    """摘要的 max_tokens 只有 512：开思考模式必然被思维链吃满并截断"""
+
+    def test_call_vision_sends_thinking_disabled(self):
+        captured = {}
+
+        class _FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                msg = mock.Mock()
+                msg.content = "- 一张图"
+                choice = mock.Mock()
+                choice.message = msg
+                choice.finish_reason = "stop"
+                resp = mock.Mock()
+                resp.choices = [choice]
+                resp.usage = None
+                return resp
+
+        fake_client = mock.Mock()
+        fake_client.chat.completions = _FakeCompletions()
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + b"x" * 16)
+            img_path = f.name
+        self.addCleanup(os.remove, img_path)
+
+        with (
+            mock.patch.object(dc, "_get_client", return_value=fake_client),
+            mock.patch.object(dc, "_SEND_THINKING_PARAM", True),
+            mock.patch.object(dc, "THINKING_DEFAULT", True),
+            mock.patch.object(dc, "CALL_MIN_INTERVAL", 0.0),
+        ):
+            text = dc._call_vision("sys", "看图", [{"path": img_path, "mime": "image/png", "key": "k1"}])
+
+        self.assertEqual(text, "- 一张图")
+        self.assertEqual(
+            captured.get("extra_body"), {"thinking": {"type": "disabled"}}, "图片摘要必须显式关闭思考模式"
+        )
+        self.assertEqual(captured.get("max_tokens"), 512)
+
+
+class TestFaceFetchBudget(unittest.TestCase):
+    """表情图抓取是同步请求：必须有单次时长预算，抓不完就下次继续"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="qqchatlog-face-budget-")
+        self.addCleanup(_shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_budget_stops_network_loop(self):
+        faces = {
+            "可怜": {"key": fi.key_for("可怜"), "market_url": None},
+            "流泪": {"key": fi.key_for("流泪"), "market_url": None},
+        }
+        calls = []
+        with (
+            mock.patch.object(fi, "FACE_IMAGES_ENABLED", True),
+            mock.patch.object(fi, "FACE_CACHE_DIR", self.tmp),
+            mock.patch.object(fi, "_download", side_effect=lambda url: calls.append(url)),
+        ):
+            # 极小预算：第一轮就该判定超时并收工
+            fi.ensure(faces, allow_network=True, max_seconds=1e-9)
+        self.assertEqual(calls, [], "预算用尽后不应再发起下载")
+
+    def test_no_budget_means_no_limit(self):
+        faces = {"可怜": {"key": fi.key_for("可怜"), "market_url": None}}
+        calls = []
+        with (
+            mock.patch.object(fi, "FACE_IMAGES_ENABLED", True),
+            mock.patch.object(fi, "FACE_CACHE_DIR", self.tmp),
+            mock.patch.object(fi, "_download", side_effect=lambda url: calls.append(url)),
+        ):
+            fi.ensure(faces, allow_network=True)  # 默认 0 = 不限时长
+        self.assertEqual(len(calls), 1, "默认行为不变：没有预算就一直抓到上限/抓完")
+
+
+class TestVisionCacheHasCreatedStamp(unittest.TestCase):
+    """含图片描述的缓存必须有创建时间，否则绝对 90 天上限对它永远不生效"""
+
+    def test_write_includes_created_and_reads_legacy(self):
+        path = os.path.join(os.environ["QQCHAT_DATA_DIR"], "vision_probe.json")
+        try:
+            vision._write_cache(path, "- 一张截图")
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            self.assertIsInstance(payload.get("_created"), float, "要写 _created 供硬上限回收")
+            self.assertEqual(payload.get("digest"), "- 一张截图")
+            self.assertEqual(vision._read_cache(path), "- 一张截图")
+            self.assertGreater(
+                cleanupmod._cache_created_at(path), time.time() - 60, "清理任务能读到刚写入的创建时间"
+            )
+
+            # 旧格式（没有 _created）仍要能读，避免升级后缓存集体失效、重复调用视觉模型
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"digest": "- 旧格式"}, f)
+            self.assertEqual(vision._read_cache(path), "- 旧格式")
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
 
 
 if __name__ == "__main__":

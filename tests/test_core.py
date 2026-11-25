@@ -57,6 +57,8 @@ from analyzer.deepseek_client import (  # noqa: E402
     _fit_lines,
 )
 from analyzer.local_stats import calc_milestones, calc_overview, calc_response_time  # noqa: E402
+from analyzer import deepseek_client as dc  # noqa: E402
+from analyzer import local_stats as ls  # noqa: E402
 
 
 def _write_chat(data: dict) -> str:
@@ -1401,6 +1403,130 @@ class TestReuploadCacheLifecycle(unittest.TestCase):
         finally:
             if path_b and os.path.exists(path_b):
                 os.remove(path_b)
+
+
+def _r3_msg(uid: str, ts: int, text: str) -> Message:
+    return Message(
+        id=f"{uid}-{ts}",
+        timestamp=ts,
+        time_str=datetime.fromtimestamp(ts / 1000, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        sender_name=uid,
+        sender_uid=uid,
+        text=text,
+        raw_text=text,
+        msg_type="type_1",
+        has_image=False,
+        is_reply=False,
+    )
+
+
+class TestSessionBoundarySingleSource(unittest.TestCase):
+    """对话段口径只有一份实现：本地统计与 prompt 统计头必须完全一致"""
+
+    def _chat(self, gaps_minutes):
+        from parser.qq_parser import ChatData, Message
+
+        base = 1704067200000
+        ts = base
+        msgs = []
+        for i, gap in enumerate(gaps_minutes):
+            ts += gap * 60000
+            msgs.append(
+                Message(
+                    id=str(i),
+                    timestamp=ts,
+                    time_str="",
+                    sender_name="我" if i % 2 else "对方",
+                    sender_uid="u_self" if i % 2 else "u_other",
+                    text="在吗",
+                    raw_text="在吗",
+                    msg_type="type_1",
+                    has_image=False,
+                    is_reply=False,
+                )
+            )
+        chat = ChatData(
+            chat_name="c",
+            self_name="我",
+            other_name="对方",
+            self_uid="u_self",
+            other_uid="u_other",
+            messages=msgs,
+        )
+        return chat
+
+    def test_predicate_boundary(self):
+        self.assertTrue(ls.is_session_start(None, 1000), "首条必然是新段")
+        self.assertFalse(
+            ls.is_session_start(1000, 1000 + ls.SESSION_GAP_MS), "刚好等于阈值不算新段（与原口径一致）"
+        )
+        self.assertTrue(ls.is_session_start(1000, 1000 + ls.SESSION_GAP_MS + 1))
+
+    def test_local_and_prompt_agree_on_session_count(self):
+        chat = self._chat([0, 1, 31, 1, 40, 1])
+        local_sessions = len(ls.calc_conversation_sessions(chat))
+        stats = dc._conversation_stats(chat.messages, chat.self_uid)
+        self.assertEqual(
+            stats["sessions"], local_sessions, "prompt 统计头与本地统计的段数必须一致（同一份口径）"
+        )
+        self.assertEqual(stats["sessions"], 3)
+
+
+class TestMessageLineFormatCompatibility(unittest.TestCase):
+    """对话行压缩的三种形态：重构后必须逐字保持原样（缓存键含这两个函数的源码）"""
+
+    def setUp(self):
+        self.t0 = int(datetime(2024, 1, 1, 8, 0, tzinfo=CST).timestamp() * 1000)
+        self.m = {
+            i: _r3_msg(uid, self.t0 + off, f"消息{i}")
+            for i, (uid, off) in enumerate(
+                [("u2", 0), ("u1", 3 * 60000), ("u2", 6 * 60000), ("u2", 7 * 60000), ("u1", 207 * 60000)]
+            )
+        }
+
+    def test_first_line_has_absolute_time_and_name(self):
+        self.assertEqual(dc._message_line(self.m[0], "B"), "[01-01 08:00] B: 消息0")
+
+    def test_same_speaker_continuation_drops_everything(self):
+        line = dc._message_line(self.m[3], "B", prev_uid="u2", prev_ts=self.m[2].timestamp)
+        self.assertEqual(line, "消息3")
+
+    def test_speaker_change_keeps_name_and_relative_mark(self):
+        line = dc._message_line(self.m[1], "A", prev_uid="u2", prev_ts=self.m[0].timestamp)
+        self.assertEqual(line, "A(+3m): 消息1")
+
+    def test_large_gap_prints_absolute_time(self):
+        line = dc._message_line(self.m[4], "A", prev_uid="u2", prev_ts=self.m[3].timestamp)
+        self.assertTrue(line.startswith("["), line)
+        self.assertIn("A:", line)
+
+    def test_same_speaker_within_section_keeps_gap_mark(self):
+        """段内同人连发但间隔够大（≥2 分钟且 <30 分钟）：只留 (+Nm)，不重复昵称"""
+        gap_msg = _r3_msg("u2", self.m[0].timestamp + 10 * 60000, "消息X")
+        line = dc._message_line(gap_msg, "B", prev_uid="u2", prev_ts=self.m[0].timestamp)
+        self.assertEqual(line, "(+10m): 消息X")
+
+    def test_gap_at_threshold_switches_to_absolute_time(self):
+        """恰好 30 分钟就翻到"新的一段"：打印绝对时间（口径边界不能漂）"""
+        gap_msg = _r3_msg("u2", self.m[0].timestamp + 30 * 60000, "消息X")
+        line = dc._message_line(gap_msg, "B", prev_uid="u2", prev_ts=self.m[0].timestamp)
+        self.assertEqual(line, "[01-01 08:30] B: 消息X")
+
+
+class TestMaxTokensConfigurable(unittest.TestCase):
+    """输出预算要能通过 .env 调整，而不是让用户去改源码"""
+
+    def test_defaults_match_legacy_values(self):
+        self.assertEqual(dc.MAX_TOKENS_BY_DIM["emotion"], 32768)
+        self.assertEqual(dc.MAX_TOKENS_BY_DIM["profile"], 49152)
+
+    def test_env_override_and_invalid_value(self):
+        with mock.patch.dict(os.environ, {"LLM_MAX_TOKENS_PROFILE": "65536"}):
+            self.assertEqual(dc._max_tokens("profile", 49152), 65536)
+        with mock.patch.dict(os.environ, {"LLM_MAX_TOKENS_PROFILE": "abc"}):
+            self.assertEqual(dc._max_tokens("profile", 49152), 49152, "非法值应回退默认")
+        with mock.patch.dict(os.environ, {"LLM_MAX_TOKENS_PROFILE": "10"}):
+            self.assertEqual(dc._max_tokens("profile", 49152), 49152, "越界值应回退默认")
 
 
 if __name__ == "__main__":
