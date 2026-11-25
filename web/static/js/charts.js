@@ -669,7 +669,7 @@ function renderEmotionCharts(data) {
             '</div>' +
             (d.month_vibe ? '<div class="mt-1 small">' + esc(d.month_vibe) + '</div>' : '') +
             (d.turning_point ? '<div class="mt-1 small text-warning">' + esc(d.turning_point) + '</div>' : '') +
-            '</div></div></div>';
+            '</div></div>';
     });
     $('#emotionDetails').html(html);
 }

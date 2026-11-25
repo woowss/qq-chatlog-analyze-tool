@@ -115,6 +115,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <p class="text-muted small mt-4">报告生成时间：<span id="reportGenTime"></span></p>
 
 {% set report_download_name = 'QQ聊天分析报告_' ~ overview.other_name ~ '.html' %}{% include "_report_assets.html" %}
+<script>
 
 $(function() {
     // 模型偶尔会把该给数组的字段写成字符串：统一兜底，别让一处 TypeError

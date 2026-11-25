@@ -120,6 +120,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 {% block scripts %}
 {% set report_download_name = 'QQ群聊分析报告_' ~ overview.group_name ~ '.html' %}{% include "_report_assets.html" %}
+<script>
 $(function() {
     $('#reportGenTime').text(new Date().toLocaleString('zh-CN'));
 
