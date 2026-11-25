@@ -51,6 +51,7 @@ from analyzer import local_stats as ls  # noqa: E402
 import config  # noqa: E402
 from analyzer import usage as usage_mod  # noqa: E402
 from parser.qq_parser import split_by_month  # noqa: E402
+from parser.qq_parser import load_chat  # noqa: E402
 
 
 def _msg(uid: str, ts: int, text: str = "在吗") -> Message:
@@ -1069,6 +1070,305 @@ class TestCleanupClosureBinding(unittest.TestCase):
             ):
                 cleanupmod.cleanup_old_files(max_age_seconds=86400)
             self.assertFalse(os.path.exists(stale), "过期的上传文件应被清理")
+
+
+_F7_BASE = int(datetime(2025, 3, 1, 20, 0, tzinfo=CST).timestamp())
+
+
+def _f7_text(msg_id, uid, name, ts_s, text):
+    return {
+        "id": str(msg_id),
+        "timestamp": int(ts_s * 1000),
+        "time": datetime.fromtimestamp(ts_s, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        "sender": {"uid": uid, "name": name},
+        "type": "text",
+        "content": {"text": text, "elements": [{"type": "text", "data": {"text": text}}]},
+    }
+
+
+def _f7_load(msgs, self_uid="uA"):
+    payload = json.dumps(
+        {
+            "chatInfo": {"name": "对方", "selfUid": self_uid, "selfName": "我"},
+            "statistics": {
+                "senders": [{"uid": "uA", "name": "我"}, {"uid": "uB", "name": "对方"}],
+                "totalMessages": len(msgs),
+            },
+            "messages": msgs,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        f.write(payload)
+        path = f.name
+    try:
+        return load_chat(path)
+    finally:
+        os.remove(path)
+
+
+def _f7_touch_cache(name: str, content: str = '{"_created": 1}', age_days: int = 0) -> str:
+    path = os.path.join(storemod.AI_CACHE_DIR, name)
+    os.makedirs(storemod.AI_CACHE_DIR, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    if age_days:
+        old = time.time() - age_days * 86400
+        os.utime(path, (old, old))
+    return path
+
+
+class TestStatsVersionPin(unittest.TestCase):
+    def test_bumped(self):
+
+        # 旧缓存里"其他=0"是错的，必须失效重算（只花本地 CPU，零 API 费用）。
+        self.assertGreaterEqual(storemod.STATS_SCHEMA_VERSION, 6)
+        self.assertGreaterEqual(storemod.GROUP_STATS_SCHEMA_VERSION, 4)
+
+
+class TestRetentionSwitch(unittest.TestCase):
+    """QQCHAT_CACHE_SLIDE_DAYS / QQCHAT_CACHE_MAX_DAYS 决定派生缓存的命运；0 = 不过期。"""
+
+    def _aged(self, name: str, days: int):
+        return _f7_touch_cache(name, json.dumps({"_created": time.time() - days * 86400}), age_days=days)
+
+    def test_default_still_collects(self):
+        p = self._aged("emotion_hash_x.json", 40)
+        from webapp import cleanup as cm
+
+        with mock.patch.object(cm, "CACHE_SLIDE_DAYS", 30), mock.patch.object(cm, "CACHE_MAX_DAYS", 90):
+            cm.cleanup_old_files(max_age_seconds=86400)
+        self.assertFalse(os.path.exists(p))
+
+    def test_zero_means_never_expire(self):
+        p = self._aged("emotion_hash_y.json", 400)
+        from webapp import cleanup as cm
+
+        with mock.patch.object(cm, "CACHE_SLIDE_DAYS", 0), mock.patch.object(cm, "CACHE_MAX_DAYS", 0):
+            cm.cleanup_old_files(max_age_seconds=86400)
+        self.assertTrue(os.path.exists(p), "两条规则都关掉后，再老也不许删（用户显式要永久保留）")
+        os.remove(p)
+
+    def test_slide_off_hard_still_applies(self):
+        p = self._aged("emotion_hash_z.json", 100)
+        from webapp import cleanup as cm
+
+        with mock.patch.object(cm, "CACHE_SLIDE_DAYS", 0), mock.patch.object(cm, "CACHE_MAX_DAYS", 90):
+            cm.cleanup_old_files(max_age_seconds=86400)
+        self.assertFalse(os.path.exists(p), "关掉滑动不关掉绝对上限")
+
+
+class TestStopwordsExternal(unittest.TestCase):
+    """停用词外部化（评审遗留 #18）：内置词表永在，文件只做加法；改了文件词云要重算。"""
+
+    def _freq(self, words):
+        from datetime import timedelta
+
+        msgs = []
+        t = _F7_BASE
+        for w in words:
+            msgs.append(_f7_text(len(msgs) + 1, "uA", "我", t, w))
+            t += int(timedelta(minutes=1).total_seconds())
+        return ls.calc_word_freq(_f7_load(msgs))
+
+    def test_builtin_never_disappears(self):
+        out = self._freq(["因为 因为"])
+        self.assertNotIn("因为", {x["word"] for x in out["self"]}, "内置停用词永远生效")
+
+    def test_external_file_is_additive_and_roundtrips(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "stop.txt")
+            base_fp = ls.stopwords_fingerprint()
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("# 我们的口头禅，从词云里摘掉\n加班\n")
+            ls._STOP_CACHE.update(stamp="force-reload", words=frozenset(), text="")
+            with mock.patch.dict(os.environ, {"QQCHAT_STOPWORD_FILE": path}):
+                fp2 = ls.stopwords_fingerprint()
+                self.assertNotEqual(fp2, base_fp, "文件改了，指纹必须变（词云才会重算）")
+                out = self._freq(["加班 加班", "加班"])
+                self.assertNotIn("加班", {x["word"] for x in out["self"]})
+                self.assertEqual(out["stop_fp"], fp2)
+            ls._STOP_CACHE.update(stamp="force-reload", words=frozenset(), text="")
+            self.assertEqual(ls.stopwords_fingerprint(), base_fp, "撤掉文件回到内置口径")
+
+    def test_freq_result_carries_fingerprint(self):
+        self.assertIn("stop_fp", self._freq(["你好"]), "词频要带停用词指纹，懒算缓存靠它判新旧")
+
+    def test_lazy_cache_recomputes_on_fingerprint_mismatch(self):
+        """旧词频带着过期 stop_fp → _stats_with_word_freq 必须重算并盖上新指纹。"""
+        import app as appmod
+        from flask import session as flask_session
+        from webapp import store as storemod
+
+        stale = {
+            "overview": {"total_messages": 1},
+            "word_freq": {"self": [], "other": [], "stop_fp": "STALE00000"},
+        }
+        with appmod.app.test_request_context("/habits"):
+            flask_session["filepath"] = __file__
+            flask_session["chat_hash"] = "hashStop"
+            with (
+                mock.patch.object(
+                    storemod,
+                    "_load_chat_cached",
+                    return_value=_f7_load([_f7_text(1, "uA", "我", _F7_BASE, "你好")]),
+                ),
+                mock.patch.object(storemod, "_save_stats"),
+            ):
+                out = storemod._stats_with_word_freq(dict(stale), "hashStop")
+        self.assertNotEqual(out["word_freq"]["stop_fp"], "STALE00000")
+
+    def test_lazy_cache_hit_when_fresh(self):
+        """指纹一致：命中缓存、绝不再分词（外部化不能把懒算的省钱效果打回去）。"""
+        import app as appmod
+        from flask import session as flask_session
+        from webapp import store as storemod
+
+        fresh_fp = ls.stopwords_fingerprint()
+        stats = {
+            "overview": {"total_messages": 1},
+            "word_freq": {"self": [{"word": "你好", "count": 1}], "other": [], "stop_fp": fresh_fp},
+        }
+        with appmod.app.test_request_context("/habits"):
+            flask_session["filepath"] = __file__  # 路径真实存在，唯一能短路的就是 stop_fp 命中
+            with mock.patch.object(storemod, "_load_chat_cached", side_effect=AssertionError("不该重算")):
+                out = storemod._stats_with_word_freq(dict(stats), "hashStop")
+        self.assertEqual(out["word_freq"]["self"], [{"word": "你好", "count": 1}])
+
+
+class TestFingerprintMigrationChain(unittest.TestCase):
+    """7-E 迁移链扩展：单代 if → 有序链 + 读侧循环。现值零变化，未来换代不再断层。"""
+
+    def test_current_values_untouched(self):
+        """链式机制：群聊/recap 仍各只有一代旧键；私聊已有两代（中位数换代）。
+
+        私聊那条从"单代"变成两代是有意的：_conversation_stats 的 median_gap 改用
+        local_stats._median（上中位 → 真中位），改变了喂给模型的那行文本，
+        所以必须换键；换出去的那一代压进链头，让沿链迁移继续读得到它。
+        这正好反过来验证了链式改造的价值：第三次换代不再断层。
+        """
+        from analyzer import deepseek_client as dc
+        from analyzer import group_client as gc
+        from analyzer import recap_client as rc
+
+        self.assertEqual(
+            dc.legacy_fingerprints_for_dimension("emotion"),
+            (*dc.PRIVATE_FINGERPRINT_GENERATIONS, dc.PROMPT_FINGERPRINT_LEGACY),
+        )
+        self.assertEqual(len(dc.legacy_fingerprints_for_dimension("emotion")), 2, "私聊应为两代")
+        self.assertEqual(
+            dc.legacy_fingerprints_for_dimension("group_dynamics"), (gc.GROUP_PROMPT_FINGERPRINT_LEGACY,)
+        )
+        self.assertEqual(dc.legacy_fingerprints_for_dimension("recap"), (rc.RECAP_PROMPT_FINGERPRINT_LEGACY,))
+        # 链头是"上一代的当前键"（AST 归一时代写的），链尾是更早的原文公式
+        self.assertEqual(dc.legacy_fingerprints_for_dimension("emotion")[0], "f4bd6aa06d52")
+        self.assertEqual(dc.legacy_fingerprints_for_dimension("emotion")[-1], dc.PROMPT_FINGERPRINT_LEGACY)
+        # 单值入口取链头（老调用点语义保持："先试最近的那一代"）
+        self.assertEqual(
+            dc.legacy_fingerprint_for_dimension("emotion"), dc.PRIVATE_FINGERPRINT_GENERATIONS[0]
+        )
+        self.assertEqual(
+            dc.legacy_fingerprint_for_dimension("group_dynamics"), gc.GROUP_PROMPT_FINGERPRINT_LEGACY
+        )
+        # 链里不许混进当前键自己：那等于白读一次自己，还会把"命中"误报成"迁移成功"
+        for dim in ("emotion", "profile", "group_dynamics", "recap"):
+            self.assertNotIn(dc.fingerprint_for_dimension(dim), dc.legacy_fingerprints_for_dimension(dim))
+
+    def test_median_now_matches_local_stats_algorithm(self):
+        """给模型看的"回复间隔中位数"与界面卡用的是同一个算法（口径唯一）。
+
+        就地 `s[n//2]` 在偶数样本上取的是**上中位**：[10,20,30,40] 会报成 30（真值 25），
+        两句长度 [1,9] 报成 9（真值 5）。local_stats 为同一个毛病专门顶过
+        STATS_SCHEMA_VERSION，而模型侧这句漏了——同一个词在两处算出两个数。
+        """
+        from analyzer import local_stats as ls
+        from analyzer.dialog import _conversation_stats
+        from parser.qq_parser import Message
+
+        def mk(i, uid, ts):
+            return Message(
+                id=str(i),
+                timestamp=ts,
+                time_str="x",
+                sender_uid=uid,
+                sender_name=uid,
+                text="t",
+                raw_text="t",
+                msg_type="text",
+                has_image=False,
+                is_reply=False,
+                media_kind="",
+                media_label="",
+                media_bytes=0,
+                media_id="",
+                media_path="",
+                media_w=0,
+                media_h=0,
+                face_url="",
+                face_ids=[],
+                face_names=[],
+                image_bytes=0,
+                image_count=0,
+                image_ids=[],
+                recalled=False,
+                system=False,
+                reply_to_id="",
+                reply_to_uid="",
+                mentions=[],
+                mentions_all=False,
+            )
+
+        # 换人且都在同一段内 → gaps = [10, 20, 30, 40]，偶数样本
+        msgs = [
+            mk(0, "uA", 1_700_000_000_000),
+            mk(1, "uB", 1_700_000_010_000),
+            mk(2, "uA", 1_700_000_030_000),
+            mk(3, "uB", 1_700_000_060_000),
+            mk(4, "uA", 1_700_000_100_000),
+        ]
+        got = _conversation_stats(msgs, "uA")["median_gap"]
+        self.assertEqual(got, 25.0, f"偶数样本必须取中间两数平均，实际 {got}（30 = 上中位，就是原来的错法）")
+        self.assertEqual(got, ls._median(sorted([10.0, 20.0, 30.0, 40.0])), "与 local_stats 同口径")
+        # 奇数样本两种取法本来就一致，顺手钉住别把它改坏
+        odd = _conversation_stats(msgs[:4], "uA")["median_gap"]
+        self.assertEqual(odd, ls._median(sorted([10.0, 20.0, 30.0])))
+
+    def test_read_cache_walks_multi_generation_chain(self):
+        """链里放**两代**假旧键，_read_cache 必须挨代找到并搬到当前键。
+
+        反向验证：旧实现只认一代——写在中止于第一代，第二代永远读不到，本条变红。
+        """
+        from analyzer import deepseek_client as dc
+        from webapp import store as storemod
+
+        chat_hash = "chash-chain-001"
+        dim = "emotion"
+        gen1 = "ffffffffffff"
+        gen0 = "eeeeeeeeeeee"
+        # 旧键文件名必须复刻 _cache_path 的真实口径（思考模式开启时带 _think 后缀）
+        suffix = "_think" if dc.thinking_enabled(dim) else ""
+        legacy_payload = {"_created": time.time(), "result": {"self_emotion": "旧代产出"}}
+        path0 = os.path.join(
+            storemod.AI_CACHE_DIR, f"{dim}_{chat_hash}_{storemod.DEEPSEEK_MODEL}_{gen0}{suffix}.json"
+        )
+        try:
+            os.makedirs(storemod.AI_CACHE_DIR, exist_ok=True)
+            with open(path0, "w", encoding="utf-8") as f:
+                json.dump(legacy_payload, f)
+            # 打桩在**消费侧**的绑定名上（store 是 import 期绑定的，patch 源模块不影响它——
+            # 这正是本项目 _bootstrap.api_configured_patcher 文档里写过的同一课）
+            with mock.patch.object(storemod, "legacy_fingerprints_for_dimension", return_value=(gen1, gen0)):
+                got = storemod._read_cache(dim, chat_hash)
+            self.assertIsNotNone(got, "链上的每一代都要被尝试")
+            self.assertEqual(got["self_emotion"], "旧代产出")
+            self.assertFalse(os.path.exists(path0), "迁移是改名不是复制（敏感内容不留两份）")
+            self.assertTrue(os.path.exists(storemod._cache_path(dim, chat_hash)))
+        finally:
+            for p in (storemod._cache_path(dim, chat_hash), path0):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":

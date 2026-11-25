@@ -56,6 +56,7 @@ from parser.qq_parser import CST, load_chat  # noqa: E402
 from parser.group_identity import is_placeholder_sender  # noqa: E402
 from analyzer import group_stats as gs  # noqa: E402
 from analyzer import local_stats as ls  # noqa: E402
+from analyzer.dialog import _message_line  # noqa: E402
 
 BASE_MS = 1740900000000  # 2025-03-02 12:00:00 CST 附近，用例不关心具体日期
 
@@ -638,6 +639,159 @@ class TestNameHistoryStripsDisplayNames(unittest.TestCase):
         raw = {(m.sender_name or "") for m in chat.messages}
         self.assertGreater(len(raw), 1, "原始昵称里确实存在'小明'/'小明 '/'   '三种写法")
         self.assertNotIn("小明 ", [r["name"] for r in ls.calc_trends(chat)["name_history"]["other"]])
+
+
+_F7_BASE = int(datetime(2025, 3, 1, 20, 0, tzinfo=CST).timestamp())
+
+
+def _f7_el(msg_id, uid, name, ts_s, el_type, data, text=""):
+    """构造一条"带结构化元素"的消息（新版导出器形态）"""
+    return {
+        "id": str(msg_id),
+        "timestamp": int(ts_s * 1000),
+        "time": datetime.fromtimestamp(ts_s, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        "sender": {"uid": uid, "name": name},
+        "type": el_type,
+        "content": {"text": text, "elements": [{"type": el_type, "data": data}]},
+    }
+
+
+def _f7_text(msg_id, uid, name, ts_s, text):
+    return {
+        "id": str(msg_id),
+        "timestamp": int(ts_s * 1000),
+        "time": datetime.fromtimestamp(ts_s, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        "sender": {"uid": uid, "name": name},
+        "type": "text",
+        "content": {"text": text, "elements": [{"type": "text", "data": {"text": text}}]},
+    }
+
+
+def _f7_load(msgs, self_uid="uA"):
+    payload = json.dumps(
+        {
+            "chatInfo": {"name": "对方", "selfUid": self_uid, "selfName": "我"},
+            "statistics": {
+                "senders": [{"uid": "uA", "name": "我"}, {"uid": "uB", "name": "对方"}],
+                "totalMessages": len(msgs),
+            },
+            "messages": msgs,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        f.write(payload)
+        path = f.name
+    try:
+        return load_chat(path)
+    finally:
+        os.remove(path)
+
+
+class TestVoiceMedia(unittest.TestCase):
+    """语音消息本体此前不在任何分派分支：以零正文混进计数、模型完全看不见。"""
+
+    def test_voice_gets_kind_and_label(self):
+        chat = _f7_load([_f7_el(1, "uB", "对方", _F7_BASE, "voice", {"duration": 12})])
+        m = chat.messages[0]
+        self.assertEqual(m.media_kind, "voice", "语音必须进媒体口径（kind 非空才不被当空正文）")
+        self.assertIn("12", m.media_label)
+        self.assertEqual(m.text, "", "占位符不进正文，避免污染词频与句长")
+
+    def test_voice_dialog_line_has_mark(self):
+        chat = _f7_load([_f7_el(1, "uB", "对方", _F7_BASE, "voice", {"duration": 5})])
+        m = chat.messages[0]
+        line = _message_line(m, "对方")
+        self.assertIn("语音", line, "喂模型的对话行要标注语音，否则模型看不见它发生过")
+
+    def test_voice_without_duration_still_labeled(self):
+        chat = _f7_load([_f7_el(1, "uB", "对方", _F7_BASE, "voice", {"summary": ""})])
+        self.assertEqual(chat.messages[0].media_kind, "voice")
+
+
+class TestUnknownElements(unittest.TestCase):
+    """未知元素类型不再被静默吞掉：计数、上报，且绝不静默把正文判死。"""
+
+    def test_unknown_type_is_counted(self):
+        chat = _f7_load(
+            [
+                _f7_text(1, "uA", "我", _F7_BASE, "早"),
+                _f7_el(2, "uB", "对方", _F7_BASE + 60, "brand_new_thing", {"x": 1}),
+            ]
+        )
+        self.assertEqual(chat.unknown_element_types.get("brand_new_thing"), 1)
+        ov = ls.calc_overview(chat)
+        self.assertEqual(ov["unknown_element_types"].get("brand_new_thing"), 1, "overview 要能拿到漂移信号")
+
+    def test_all_unknown_message_falls_back_to_raw_text(self):
+        # 导出器把 "text" 改名成新类型：结构化侧给不出正文，但原始文本在——不能丢。
+        m = {
+            "id": "1",
+            "timestamp": _F7_BASE * 1000,
+            "time": "2025-03-01 20:00:00",
+            "sender": {"uid": "uB", "name": "对方"},
+            "type": "renamed_text",
+            "content": {"text": "记得吃饭", "elements": [{"type": "renamed_text", "data": {}}]},
+        }
+        chat = _f7_load([m])
+        self.assertEqual(chat.messages[0].text, "记得吃饭", "全未知元素时回落原始文本，正文不丢")
+
+    def test_image_only_message_does_not_fall_back(self):
+        # 有已识别元素（image）的消息不回落，以免把 "[图片]" 当成正文（旧口径钉住）。
+        chat = _f7_load([_f7_el(1, "uB", "对方", _F7_BASE, "image", {"url": "x.jpg"}, text="[图片]")])
+        self.assertEqual(chat.messages[0].text, "")
+
+
+class TestRecallCounts(unittest.TestCase):
+    """撤回标记已解析却零消费——补上按人计数（recalled 内容仍不进正文统计，那是正确的）。"""
+
+    def test_recall_counted_per_party(self):
+        msgs = [
+            _f7_text(1, "uA", "我", _F7_BASE, "在吗"),
+            _f7_text(2, "uB", "对方", _F7_BASE + 60, "在的"),
+        ]
+        msgs[1]["recalled"] = True
+        msgs.append({**_f7_text(3, "uA", "我", _F7_BASE + 120, "算了"), "recalled": True})
+        ov = ls.calc_overview(_f7_load(msgs))
+        self.assertEqual(ov["total_recalls"], 2)
+        self.assertEqual(ov["self_recalls"], 1)
+        self.assertEqual(ov["other_recalls"], 1)
+
+    def test_recalled_not_in_body_stats(self):
+        # 反向锚点：撤回的那条不该进 total_messages（正文口径），只进撤回计数。
+        msgs = [
+            _f7_text(1, "uA", "我", _F7_BASE, "你好"),
+            {**_f7_text(2, "uB", "对方", _F7_BASE + 60, "撤回我"), "recalled": True},
+        ]
+        ov = ls.calc_overview(_f7_load(msgs))
+        self.assertEqual(ov["total_messages"], 1)
+        self.assertEqual(ov["total_recalls"], 1)
+
+
+class TestOtherMediaFix(unittest.TestCase):
+    """total_other_media 此前写死枚举三类，卡片/通话被解析被计数却漏进汇总（界面恒显示 0）。"""
+
+    def test_card_and_call_now_included(self):
+        chat = _f7_load(
+            [
+                _f7_el(1, "uB", "对方", _F7_BASE, "json", {"summary": "分享了一个链接"}),
+                _f7_el(2, "uB", "对方", _F7_BASE + 60, "av_record", {"summary": "通话 - 未接听"}),
+            ]
+        )
+        ov = ls.calc_overview(chat)
+        self.assertEqual(ov["total_other_media"], 2, "卡片+通话都要进「其他」，旧枚举口径是 0")
+
+    def test_no_double_count_with_voice(self):
+        chat = _f7_load(
+            [
+                _f7_el(1, "uB", "对方", _F7_BASE, "voice", {"duration": 3}),
+                _f7_el(2, "uB", "对方", _F7_BASE + 60, "wallet", {"summary": "恭喜发财"}),
+            ]
+        )
+        ov = ls.calc_overview(chat)
+        self.assertEqual(ov["total_voices"], 1)
+        # 语音单独成项，不重复计入 other；other 只剩红包
+        self.assertEqual(ov["total_other_media"], 1)
 
 
 if __name__ == "__main__":

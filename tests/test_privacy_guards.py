@@ -988,5 +988,272 @@ class TestGhostLiveRefsDoNotBlockExplicitDelete(unittest.TestCase):
             )
 
 
+def _f7_touch_cache(name: str, content: str = '{"_created": 1}', age_days: int = 0) -> str:
+    path = os.path.join(store.AI_CACHE_DIR, name)
+    os.makedirs(store.AI_CACHE_DIR, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    if age_days:
+        old = time.time() - age_days * 86400
+        os.utime(path, (old, old))
+    return path
+
+
+class TestBundleRoundTrip(unittest.TestCase):
+    """导出→清空→导入：已付费结果必须原样回来（跨机器不重复付费的闭环）。"""
+
+    HASH = "aaaa1111bbbb2222"
+
+    def setUp(self):
+        self.files = [
+            _f7_touch_cache(f"emotion_{self.HASH}_model_fp123.json"),
+            _f7_touch_cache(f"vision_{self.HASH}_deadbeef.json"),
+            _f7_touch_cache(f"manifest_{self.HASH}.json", json.dumps({"months": ["mkey1", "mkey2"]})),
+            _f7_touch_cache("month_mkey1.json"),
+            _f7_touch_cache("month_mkey2.json"),
+        ]
+        sp = store._stats_path(self.HASH)
+        os.makedirs(os.path.dirname(sp), exist_ok=True)
+        with open(sp, "w", encoding="utf-8") as f:
+            f.write('{"overview": {}}')
+        self.files.append(sp)
+
+    def tearDown(self):
+        for p in self.files:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    def test_export_contains_month_files_via_manifest(self):
+        names = store.chat_bundle_files(self.HASH)
+        self.assertIn(f"emotion_{self.HASH}_model_fp123.json", names["ai_cache"])
+        # 月份文件名字里没有 chat_hash——必须顺着 manifest 收，否则迁移后退化成整月重付费
+        self.assertIn("month_mkey1.json", names["ai_cache"])
+        self.assertIn("month_mkey2.json", names["ai_cache"])
+        self.assertTrue(names["stats_cache"])
+
+    def test_export_import_roundtrip(self):
+        buf = io.BytesIO()
+        count = store.write_chat_bundle(self.HASH, buf)
+        self.assertGreaterEqual(count, 6)
+        for p in self.files:
+            os.remove(p)
+        self.assertFalse(os.path.exists(self.files[0]))
+        buf.seek(0)
+        out = store.read_chat_bundle(buf)
+        self.assertNotIn("error", out)
+        self.assertGreaterEqual(out["written"], 6)
+        for p in self.files:
+            self.assertTrue(os.path.exists(p), f"{p} 应被导入恢复")
+
+    def test_import_rejects_unsafe_entries(self):
+        """两道判定分开钉：① 路径成分（叶子名 + 目录前缀）② 归属（声明哈希的段）。
+
+        上一版这里断言"ai_cache/good.json 与 stats_hash.json 会被写入"——那正是问题
+        所在：只校验名字的**形状**，等于允许往这两个目录里写任意键，而其中的内容会被
+        当作已付费结果直接渲染。现在归属也要过：叶子必须内嵌 meta 声明的那份哈希。
+        """
+        declared = "abcd1234abcd1234"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("meta.json", json.dumps({"bundle": 1, "chat_hash": declared}))
+            zf.writestr("../evil.json", "{}")  # 路径穿越
+            zf.writestr("etc/passwd", "{}")  # 未知目录
+            zf.writestr("ai_cache/../../x.json", "{}")  # 藏在合法目录里的穿越
+            zf.writestr("ai_cache/good.json", '{"_created": 1}')  # 形状合法但不属于该聊天
+            zf.writestr("stats_cache/stats_hash.json", "{}")  # 同上
+            zf.writestr(f"ai_cache/emotion_{declared}_model_fp.json", '{"result": 1}')  # 该写的
+        buf.seek(0)
+        out = store.read_chat_bundle(buf)
+        self.assertEqual(out["written"], 1, "只有既在允许目录、又属于声明那份聊天的条目能落盘")
+        self.assertGreaterEqual(out["skipped"], 5)
+        self.assertFalse(os.path.exists(os.path.join(store.AI_CACHE_DIR, "..", "evil.json")))
+        self.assertFalse(os.path.exists(os.path.join(store.STATS_CACHE_DIR, "..", "x.json")))
+        self.assertFalse(os.path.exists(os.path.join(store.AI_CACHE_DIR, "good.json")))
+
+
+class TestBundleImportBinding(unittest.TestCase):
+    """导入结果包必须绑定到它自己声明的那份聊天；坏条目不许把请求打成 500。
+
+    这些文件是被当作**已付费的可信结果**读的：`_load_cache_file` 拿到 dict 就直接
+    渲染成页面。所以 zip 若能任意挑键写入，一个不含任何聊天数据的包就能把
+    `stats_<你当前聊天>.json` 换成任意内容，导入后冒充成用户的真实统计与
+    "已付费 AI 结论"——本工具"AI 结论可回溯到本地事实"这条立论当场被打穿。
+    路径穿越那一半上一轮已经挡住了（见上一条用例），这一半管的是**归属**。
+    """
+
+    H = "1111111111111111"
+    OTHER = "2222222222222222"
+
+    def setUp(self):
+        # 这一族的用例都会真的往缓存目录里写文件（H / OTHER 是**合成**哈希，
+        # 不是真聊天的键）。不留清理就会串味：前一条"确认后放行"的用例落了盘，
+        # 后一条断言"坏条目不许发布"的用例就看到文件在那儿——看起来像校验失效，
+        # 其实是上一条的残留。合成键可以安全直删，不必走级联清理。
+        self._written = []
+
+    def tearDown(self):
+        for name, base in self._written:
+            try:
+                os.remove(os.path.join(base, name))
+            except OSError:
+                pass
+        self._written.clear()
+
+    def _bundle(self, entries: dict, declared: str) -> io.BytesIO:
+        """造一个结果包，并把其中**可能被落盘**的条目登记进本用例的清理表。
+
+        登记放在造夹具的地方而不是每条用例里：条目清单本来就在这儿，逐条再写一遍
+        既啰嗦又漏得掉。
+        """
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("meta.json", json.dumps({"bundle": 1, "chat_hash": declared}))
+            for name, blob in entries.items():
+                zf.writestr(name, blob)
+                head, _, leaf = name.rpartition("/")
+                if head in ("ai_cache", "stats_cache"):
+                    self._written.append(
+                        (leaf, store.AI_CACHE_DIR if head == "ai_cache" else store.STATS_CACHE_DIR)
+                    )
+        buf.seek(0)
+        return buf
+
+    def _stats_blob(self, total: int = 999999) -> bytes:
+        return json.dumps({"_created": 1.0, "overview": {"total_messages": total}}).encode()
+
+    def test_entry_for_another_chat_is_refused(self):
+        out = store.read_chat_bundle(
+            self._bundle({f"stats_cache/stats_{self.OTHER}.json": self._stats_blob()}, self.H)
+        )
+        self.assertEqual(out["written"], 0, "声明了一份聊天，就不许写别人的键")
+        self.assertGreaterEqual(out["skipped"], 1)
+        self.assertFalse(
+            os.path.exists(os.path.join(store.STATS_CACHE_DIR, f"stats_{self.OTHER}.json")),
+            "被拒的条目不许留下文件",
+        )
+
+    def test_own_chat_entries_all_land_including_content_addressed_months(self):
+        good = json.dumps({"_created": 1.0, "result": {"a": 1}}).encode()
+        out = store.read_chat_bundle(
+            self._bundle(
+                {
+                    f"ai_cache/emotion_{self.H}_deepseek-flash_deadbeef1234.json": good,
+                    f"ai_cache/manifest_{self.H}.json": json.dumps(
+                        {"_created": 1.0, "months": ["k1"]}
+                    ).encode(),
+                    "ai_cache/month_k1.json": good,  # 内容寻址：增量迁移必须跟包走
+                    f"stats_cache/stats_{self.H}.json": self._stats_blob(3),
+                    f"ai_cache/emotion_{self.OTHER}_deepseek-flash_deadbeef1234.json": good,
+                },
+                self.H,
+            )
+        )
+        self.assertEqual(out["written"], 4, f"自己那份聊天的条目应全部落盘：{out}")
+        self.assertEqual(out["skipped"], 1, "另一份聊天的维度缓存必须被拒")
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(store.AI_CACHE_DIR, f"emotion_{self.OTHER}_deepseek-flash_deadbeef1234.json")
+            )
+        )
+
+    def test_unparsable_payload_is_skipped_not_published(self):
+        """校验只管"能不能被读"，不管属于哪一族。
+
+        逐族列 schema 一定会误拒合法导出（月份缓存是裸的 {期间: 结果} 映射、图片摘要
+        顶层是 digest、统计顶层是 mode/_v/overview……），那比原漏洞更糟。所以这里
+        只钉"非 JSON 不许发布"，并钉住"形状陌生但可解析"的内容照常导入。
+        """
+        out = store.read_chat_bundle(
+            self._bundle(
+                {
+                    f"stats_cache/stats_{self.H}.json": b"not json at all",
+                    f"ai_cache/emotion_{self.H}_m_fp.json": b"[1,2,3]",  # 不是 dict
+                    f"ai_cache/weird_{self.H}_m_fp.json": b'{"brand_new": true}',
+                },
+                self.H,
+            )
+        )
+        self.assertEqual(out["written"], 1, "只有可解析的 dict 条目该落盘")
+        self.assertGreaterEqual(out["skipped"], 2)
+        self.assertFalse(os.path.exists(os.path.join(store.STATS_CACHE_DIR, f"stats_{self.H}.json")))
+
+    def _expect_written(self, head: str, leaf: str) -> str:
+        """登记"这个条目会真的落盘"，交给 tearDown 清掉（手搭夹具的用例走这条）。"""
+        self._written.append((leaf, store.AI_CACHE_DIR if head == "ai_cache" else store.STATS_CACHE_DIR))
+        return leaf
+
+    def test_missing_or_illegal_meta_chat_hash_refuses_the_whole_bundle(self):
+        self._expect_written("stats_cache", f"stats_{self.H}.json")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr(f"stats_cache/stats_{self.H}.json", self._stats_blob())
+        buf.seek(0)
+        self.assertIn("error", store.read_chat_bundle(buf), "没有 meta 就无从绑定，必须整体拒绝")
+        for bad in ("", "../x", "deadbeef", "DEADBEEFDEADBEEF", self.H + ".json"):
+            with self.subTest(declared=bad):
+                res = store.read_chat_bundle(
+                    self._bundle({f"stats_cache/stats_{self.H}.json": self._stats_blob()}, bad)
+                )
+                self.assertIn("error", res, f"非法 chat_hash {bad!r} 竟被接受")
+
+    def test_corrupt_member_is_skipped_instead_of_raising(self):
+        """坏 CRC 单条目失败要跳过，不许穿成 HTTP 500。
+
+        `ZipExtFile` 校验 CRC 抛的是 `BadZipFile`，不是 OSError 的子类，原先的
+        `except OSError` 接不住：整个请求变成一页 500，而前面已经 os.replace 掉的
+        条目留下半包状态——用户既不知道导入了什么，也不知道失败了。
+        """
+        payload = self._stats_blob(1)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+            zf.writestr("meta.json", json.dumps({"bundle": 1, "chat_hash": self.H}))
+            zf.writestr(f"stats_cache/stats_{self.H}.json", payload)
+        raw = bytearray(buf.getvalue())
+        at = raw.find(payload)
+        self.assertGreater(at, 0, "夹具没在包里找到明文条目，本用例自身失效")
+        raw[at + 5] = ord("9")  # 改一个字节 -> CRC 与内容对不上
+        out = store.read_chat_bundle(io.BytesIO(bytes(raw)))  # 不得抛
+        self.assertEqual(out.get("written", 0), 0, "CRC 坏了的内容不许发布成正式缓存")
+
+    def test_overwriting_the_live_chat_requires_confirmation(self):
+        """包声明的正是当前打开的聊天时先要一次确认，确认后放行。
+
+        换机器恢复是合法用法（不能禁），但"随手导入一个来路不明的 zip 就把当前的
+        结论换掉"必须被拦住——所以是二次确认而不是拒绝。
+        """
+        blob = self._bundle({f"stats_cache/stats_{self.H}.json": self._stats_blob(7)}, self.H)
+        first = store.read_chat_bundle(io.BytesIO(blob.getvalue()), live_hash=self.H)
+        self.assertTrue(first.get("need_confirm"), "覆盖用户正在看的聊天要先确认一次")
+        self.assertNotIn("written", first)
+        blob.seek(0)
+        second = store.read_chat_bundle(blob, live_hash=self.H, confirm_overwrite=True)
+        self.assertEqual(second.get("written"), 1, "确认后应放行（迁移的正常路径）")
+
+    def test_other_chat_still_imports_without_a_confirm_prompt(self):
+        blob = self._bundle({f"stats_cache/stats_{self.H}.json": self._stats_blob(7)}, self.H)
+        out = store.read_chat_bundle(io.BytesIO(blob.getvalue()), live_hash=self.OTHER)
+        self.assertFalse(out.get("need_confirm"), "不是当前聊天就不该多问一句")
+        self.assertEqual(out.get("written"), 1)
+
+    def test_unique_temp_names_are_still_matched_by_the_privacy_purge(self):
+        """临时名唯一化之后，级联清理必须仍然认得它。
+
+        改成 `.json.{pid}.{tid}.{rand}.tmp` 是为了不让两个并发写者互相删对方的半成品
+        （多浏览器共用一份聊天是本项目明确支持的）。但 `_cache_belongs_to` 若还只剥
+        一个死的 `.tmp`，哈希段就成了 `{hash}.json.1234…`，整段匹配判假 → 清理报称
+        "已删"而那份含派生内容的残片留在盘上——上一轮刚修过的漏洞会随新命名原地复活。
+        """
+        a = store._tmp_sibling(f"stats_{self.H}.json")
+        b = store._tmp_sibling(f"stats_{self.H}.json")
+        self.assertNotEqual(a, f"stats_{self.H}.json.tmp", "临时名必须唯一")
+        self.assertNotEqual(a, b, "两次调用不得给出同一个名字")
+        self.assertTrue(store._cache_belongs_to(a, self.H), "新临时名必须仍被隐私清理认出")
+        self.assertTrue(store._cache_belongs_to(f"stats_{self.H}.json.tmp", self.H), "旧格式要继续认")
+        self.assertTrue(store._cache_belongs_to(f"emotion_{self.H}_m_fp.json.1.2.abcd.tmp", self.H))
+        self.assertFalse(store._cache_belongs_to(a.replace(self.H, "0" * 16), self.H))
+
+
 if __name__ == "__main__":
     unittest.main()

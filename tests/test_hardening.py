@@ -1394,5 +1394,62 @@ class TestWaitForStatsDoesNotJoinAnUnstartedThread(unittest.TestCase):
             t.join(0.01)
 
 
+class TestConnectionPing(unittest.TestCase):
+    def test_unconfigured_says_so(self):
+        from analyzer import deepseek_client as dc
+
+        with mock.patch.object(dc, "DEEPSEEK_API_KEY", ""):
+            ok, detail = dc.test_connection()
+        self.assertFalse(ok)
+        self.assertIn("API Key 未配置", detail)
+
+    def test_error_detail_is_honest_and_bounded(self):
+        from analyzer import deepseek_client as dc
+
+        class _Completions:
+            @staticmethod
+            def create(**kw):
+                raise RuntimeError("Error code: 401 - " + "x" * 500)
+
+        class _Chat:
+            completions = _Completions()
+
+        class _Client:
+            chat = _Chat()
+
+        with (
+            mock.patch.object(dc, "DEEPSEEK_API_KEY", "sk-secret-not-logged"),
+            mock.patch.object(dc, "_get_client", return_value=_Client()),
+        ):
+            ok, detail = dc.test_connection()
+        self.assertFalse(ok)
+        self.assertIn("RuntimeError", detail, "错误类型与文本就是排障线索，必须原样带回")
+        self.assertLessEqual(len(detail), 260, "错误截断在预算内")
+        self.assertNotIn("sk-secret", detail, "Key 绝不能出现在回显里")
+
+    def test_success_reports_model_and_latency(self):
+        from analyzer import deepseek_client as dc
+
+        class _Completions:
+            @staticmethod
+            def create(**kw):
+                assert kw["max_tokens"] == 1, "自检必须是最小请求，不能顺手烧一次真实分析的钱"
+                return object()
+
+        class _Chat:
+            completions = _Completions()
+
+        class _Client:
+            chat = _Chat()
+
+        with (
+            mock.patch.object(dc, "DEEPSEEK_API_KEY", "sk-test"),
+            mock.patch.object(dc, "_get_client", return_value=_Client()),
+        ):
+            ok, detail = dc.test_connection()
+        self.assertTrue(ok)
+        self.assertIn("延迟", detail)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

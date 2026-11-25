@@ -954,5 +954,28 @@ class TestFingerprintIsStableAcrossPythonVersions(unittest.TestCase):
         self.assertEqual(dc._canonical_ast(a), dc._canonical_ast(b))
 
 
+class TestGroupSaltSplit(unittest.TestCase):
+    """QQCHAT_GROUP_CACHE_SALT：非空才并入群聊指纹；私聊指纹对它完全免疫。"""
+
+    def test_empty_keeps_fingerprint_identical(self):
+        from analyzer import group_client as gc
+
+        base = gc.group_prompt_fingerprint()
+        with mock.patch.dict(os.environ, {"QQCHAT_GROUP_CACHE_SALT": ""}):
+            self.assertEqual(gc.group_prompt_fingerprint(), base, "默认（空盐）时指纹逐字节不变")
+
+    def test_group_salt_rotates_group_only(self):
+        from analyzer import deepseek_client as dc
+        from analyzer import group_client as gc
+
+        base_g, base_p = gc.group_prompt_fingerprint(), dc.PROMPT_FINGERPRINT
+        with mock.patch.dict(os.environ, {"QQCHAT_GROUP_CACHE_SALT": "redo-group"}):
+            self.assertNotEqual(gc.group_prompt_fingerprint(), base_g, "群盐应参与群聊指纹")
+        from analyzer.deepseek_client import _prompt_fingerprint
+
+        with mock.patch.dict(os.environ, {"QQCHAT_GROUP_CACHE_SALT": "redo-group"}):
+            self.assertEqual(_prompt_fingerprint(), base_p, "群盐绝不能动私聊指纹（那会让私聊用户重新付费）")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
