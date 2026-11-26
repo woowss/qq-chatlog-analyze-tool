@@ -917,7 +917,9 @@ class TestFrontendEscaping(unittest.TestCase):
     而这两个字段受聊天内容影响，等于给"聊天记录 → 页面 XSS"留了通道。
     """
 
-    CHARTS = Path(__file__).resolve().parent.parent / "web" / "static" / "js" / "charts.js"
+    WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
+    CHARTS = WEB_ROOT / "static" / "js" / "charts.js"
+    UTILS = WEB_ROOT / "static" / "js" / "utils.js"
 
     def test_emotion_tooltip_escapes_model_output(self):
         src = self.CHARTS.read_text(encoding="utf-8")
@@ -926,11 +928,27 @@ class TestFrontendEscaping(unittest.TestCase):
         self.assertNotIn("+ selfEmotions[idx] +", src)
         self.assertNotIn("+ otherEmotions[idx]", src)
 
-    def test_esc_covers_html_metacharacters(self):
-        src = self.CHARTS.read_text(encoding="utf-8")
+    def test_esc_covers_html_metacharacters_and_is_deduplicated(self):
+        src = self.UTILS.read_text(encoding="utf-8")
+        self.assertIn("window.esc = esc", src)
         body = src.split("function esc(s)")[1].split("\n}")[0]
         for entity in ("&amp;", "&lt;", "&gt;", "&quot;", "&#39;"):
             self.assertIn(entity, body, f"esc() 缺少 {entity} 转义")
+
+        base_html = (self.WEB_ROOT / "templates" / "base.html").read_text(encoding="utf-8")
+        self.assertIn("js/utils.js", base_html)
+
+        for rel in (
+            "static/js/charts.js",
+            "static/js/period_compare.js",
+            "templates/messages.html",
+            "templates/recap.html",
+        ):
+            content = (self.WEB_ROOT / rel).read_text(encoding="utf-8")
+            self.assertNotIn("function esc(", content, f"{rel} 不应重复定义 esc()")
+
+        assets = (self.WEB_ROOT / "templates" / "_report_assets.html").read_text(encoding="utf-8")
+        self.assertIn("function esc(s)", assets, "离线导出报告必须保留自包含 esc()")
 
 
 def _r4_msg(uid: str, ts: int, text: str = "在吗", has_image: bool = False, **kw) -> Message:
@@ -1131,11 +1149,17 @@ class TestJobSurvivesFileCleanup(unittest.TestCase):
         self.assertNotIn("No such file", job["error"])
         self.assertNotIn("Errno", job["error"])
 
-    def test_run_analyze_all_reports_cleanup(self):
+    def test_run_selected_plan_reports_cleanup(self):
         job_id = "job-all-missing-file"
         self._register(job_id)
         missing = os.path.join(tempfile.gettempdir(), "definitely-not-here-either.json")
-        jobsmod._run_analyze_all(job_id, missing, "deadbeefcafe0000", False)
+        plan = {
+            "dimensions": ["emotion"],
+            "units": [{"key": "emotion:month:2024-01", "dimension": "emotion", "status": "待调用"}],
+        }
+        jobsmod._run_selected_plan(
+            job_id, missing, "deadbeefcafe0000", False, plan, ["emotion:month:2024-01"]
+        )
 
         job = jobsmod.JOBS[job_id]
         self.assertEqual(job["status"], "error")
@@ -1145,7 +1169,7 @@ class TestJobSurvivesFileCleanup(unittest.TestCase):
         """begin_run/end_run 必须成对：漏掉的后果是 LLM_MAX_CALLS_PER_RUN 变成
         「进程启动以来的累计」，之后每次 begin_run 都不再清零，正常分析也会被掐断。
 
-        反向验证：删掉 _run_job（或 _run_analyze_all）finally 里的 end_run()，
+        反向验证：删掉 _run_job（或 _run_selected_plan）finally 里的 end_run()，
         本条立刻变红。这里刻意走「文件已被清理」这条**提前 return** 的出口——
         它是 finally 最容易被漏掉的那一类路径。
 
@@ -1166,9 +1190,15 @@ class TestJobSurvivesFileCleanup(unittest.TestCase):
 
         job_id = "job-boundary-all"
         self._register(job_id)
-        jobsmod._run_analyze_all(job_id, missing, "deadbeefcafe0002", False)
-        self.assertEqual(dc._run_depth, depth_before, "_run_analyze_all 退出时必须释放运行边界")
-        self.assertEqual(dc._run_active, active_before, "_run_analyze_all 不该把「运行中」粘住")
+        plan = {
+            "dimensions": ["emotion"],
+            "units": [{"key": "emotion:month:2024-01", "dimension": "emotion", "status": "待调用"}],
+        }
+        jobsmod._run_selected_plan(
+            job_id, missing, "deadbeefcafe0002", False, plan, ["emotion:month:2024-01"]
+        )
+        self.assertEqual(dc._run_depth, depth_before, "_run_selected_plan 退出时必须释放运行边界")
+        self.assertEqual(dc._run_active, active_before, "_run_selected_plan 不该把「运行中」粘住")
 
 
 class TestSharedRetrySkeleton(unittest.TestCase):

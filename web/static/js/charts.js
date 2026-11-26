@@ -17,15 +17,7 @@
 // QQ 聊天记录分析 — ECharts 图表渲染
 // ====================================
 
-// HTML 转义：AI 分析结果 / 聊天内容可能包含 HTML，插入 DOM 前必须转义，防止 XSS
-function esc(s) {
-    return String(s == null ? '' : s)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
-}
+// HTML 转义 window.esc 由 base.html 加载的 js/utils.js 全局提供
 
 // ---------------------------------------------------------------- 主题
 // AList 同款设计语言：主色与深浅变化由 CSS 主题变量提供。

@@ -27,10 +27,13 @@ import hashlib
 import os
 from typing import Any, Callable, Optional
 
+from analyzer import llm_runtime
 from analyzer import llm_stream
 from analyzer import recap_prompts as rp
+from analyzer.dialog import _has_content
 from analyzer.logger import get_logger
 from analyzer.recap_prompts import SYSTEM_PROMPT_ASK, SYSTEM_PROMPT_RECAP
+from analyzer.shutdown import shutdown_requested
 
 logger = get_logger("app")
 
@@ -119,14 +122,8 @@ def _recap_digest(chat) -> str:
 
 
 def _recap_max_tokens() -> int:
-    """recap 的输出预算：从 API 层统一表取（LLM_MAX_TOKENS_RECAP 可覆盖）。
-
-    延迟导入 deepseek_client 避免模块级环（那一层反过来 import 不到我们，但指纹
-    分派在它内部完成，形成运行时互相引用，函数内 import 是既定手法）。
-    """
-    from analyzer import deepseek_client as dc
-
-    return dc.MAX_TOKENS_BY_DIM.get(RECAP_DIMENSION, 16384)
+    """recap 的输出预算：从统一表取（LLM_MAX_TOKENS_RECAP 可覆盖）。"""
+    return llm_runtime.MAX_TOKENS_BY_DIM.get(RECAP_DIMENSION, 16384)
 
 
 def _recap_consts_part() -> str:
@@ -164,14 +161,12 @@ def analyze_recap(
     与单次调用维度（habits/profile）同形：不发月份并发、不写月份缓存；
     取消/关闭在派发前检查（一次调用没有"剩余月份"，检查点只有派发前这一处）。
     """
-    from analyzer import deepseek_client as dc
-
     if on_progress:
         on_progress(0, 1)
-    if dc.shutdown_requested() or (should_cancel and should_cancel()):
+    if shutdown_requested() or (should_cancel and should_cancel()):
         logger.info("recap：已请求停止，跳过本次调用")
         return None
-    if not any(dc._has_content(m) for m in chat.statistical()):
+    if not any(_has_content(m) for m in chat.statistical()):
         return None
     digest = _recap_digest(chat)
     if not digest.strip():
@@ -179,7 +174,7 @@ def analyze_recap(
     with llm_stream.stream_context(unit=RECAP_DIMENSION, label="整体总括", fresh_state=True):
         llm_stream.emit_event("stage", "开始生成整体总括（跨月趋势与关键节点）")
         try:
-            result = dc._call_api(
+            result = llm_runtime._call_api(
                 SYSTEM_PROMPT_RECAP,
                 digest,
                 max_tokens=_recap_max_tokens(),
@@ -225,15 +220,13 @@ def build_ask_user(question: str, digest: str) -> str:
 
 def ask_fingerprint(salt: Optional[str] = None) -> str:
     """ask 独立指纹：版本号 + system prompt + 抽样预算常量 + 输出预算 + 盐。"""
-    from analyzer import deepseek_client as dc
-
     if salt is None:
         salt = (os.getenv("PROMPT_CACHE_SALT", "") or "").strip()
     parts = [
         f"version:{ASK_CACHE_VERSION}",
         rp.SYSTEM_PROMPT_ASK,
         SYSTEM_PROMPT_ASK,
-        f"budget:{dc.MAX_TOKENS_BY_DIM.get(ASK_DIMENSION, 8192)}",
+        f"budget:{llm_runtime.MAX_TOKENS_BY_DIM.get(ASK_DIMENSION, 8192)}",
         _recap_consts_part(),
     ]
     if salt:
@@ -251,9 +244,7 @@ def answer_question(chat, question: str, chat_hash: str = "") -> Optional[dict]:
     不进 begin_run/end_run 的"运行"配额记账：一次提问本身就是一次调用，
     "一次点击不因为配错参数而花超"由 LLM_MAX_CALLS_PER_RUN 在分析任务那侧兜住。
     """
-    from analyzer import deepseek_client as dc
-
-    if dc.shutdown_requested():
+    if shutdown_requested():
         return None
     digest = _recap_digest(chat)
     if not digest.strip():
@@ -261,10 +252,10 @@ def answer_question(chat, question: str, chat_hash: str = "") -> Optional[dict]:
     with llm_stream.stream_context(unit=ASK_DIMENSION, label="自定义提问", fresh_state=True):
         llm_stream.emit_event("stage", "开始思考自定义提问")
         try:
-            result = dc._call_api(
+            result = llm_runtime._call_api(
                 SYSTEM_PROMPT_ASK,
                 build_ask_user(question, digest),
-                max_tokens=dc.MAX_TOKENS_BY_DIM.get(ASK_DIMENSION, 8192),
+                max_tokens=llm_runtime.MAX_TOKENS_BY_DIM.get(ASK_DIMENSION, 8192),
                 tag=ASK_DIMENSION,
                 dim=ASK_DIMENSION,
             )

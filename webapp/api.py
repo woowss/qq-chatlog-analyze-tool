@@ -26,7 +26,7 @@ from datetime import date
 
 from flask import jsonify, request, send_file, session
 
-from analyzer.deepseek_client import QuotaExhaustedError, is_api_configured, test_connection
+from analyzer.llm_runtime import QuotaExhaustedError, is_api_configured, test_connection
 from analyzer.logger import get_logger
 from analyzer.result_schema import ResultValidationError, validate_result
 from analyzer.usage import get_usage
@@ -52,7 +52,6 @@ from webapp.jobs import (
     _get_or_create_job,
     _fail_job,
     _prune_jobs,
-    _run_analyze_all,
     _run_selected_plan,
     _run_job,
     _session_chat_file,
@@ -628,7 +627,7 @@ def api_analysis_result(dimension: str):
 
 
 def api_analyze_all():
-    """一键全量分析：五个维度顺序跑完，进度按维度汇报"""
+    """一键全量分析：基于分析计划全选可分析单元并派发统一执行器"""
     guard = _guard_post()
     if guard:
         return jsonify({"error": guard[0]}), guard[1]
@@ -647,16 +646,27 @@ def api_analyze_all():
     if load_err:
         return jsonify({"error": load_err[0]}), load_err[1]
     try:
-        _scoped_chat, scope = apply_scope(raw_chat, session.get("analysis_scope"))
+        chat, scope = apply_scope(raw_chat, session.get("analysis_scope"))
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+
+    from webapp.analysis_plan import build_analysis_plan
+
+    plan = build_analysis_plan(chat, chat_hash, dimensions_for_mode(is_group), refresh=refresh)
+    plan["scope"] = scope
+    plan["scope_summary"] = scope_summary(scope, participant_labels(raw_chat))
+    plan["chat_hash"] = chat_hash
+    plan["scope_id"] = scope_identity(scope)
+    selected = [unit["key"] for unit in plan["units"] if unit["status"] != "无可分析消息"]
+    if not selected:
+        return jsonify({"error": "当前范围内没有可分析的对话内容"}), 400
 
     _prune_jobs()
     job_id, reused, conflict = _get_or_create_job(
         session.sid,
         "all",
         chat_hash,
-        total=len(dimensions_for_mode(is_group)),
+        total=len(selected),
         conflict_dimension="*",
         refresh=refresh,
         identity=scope_identity(scope),
@@ -678,8 +688,15 @@ def api_analyze_all():
             }
         ), 409
 
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job:
+            job.update(plan=plan, selected_units=selected)
     return _start_analysis_thread(
-        job_id, _run_analyze_all, (job_id, filepath, chat_hash, refresh, is_group), scope=scope
+        job_id,
+        _run_selected_plan,
+        (job_id, filepath, chat_hash, refresh, plan, selected),
+        scope=scope,
     )
 
 
