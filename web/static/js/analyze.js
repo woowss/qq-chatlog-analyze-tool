@@ -836,6 +836,15 @@ var AiOutputFeed = (function () {
         card.notes.appendChild(note);
     }
 
+    function resetUnitOutput(card) {
+        if (!card) return;
+        card.thinkPre.textContent = '';
+        card.thinkBox.classList.add('d-none');
+        card.contentPre.textContent = '';
+        card.contentLabel.textContent = '生成内容';
+        card.contentBox.classList.add('d-none');
+    }
+
     function appendEvents(events, meta) {
         if (meta) {
             if (typeof meta.done === 'number') latestDone = meta.done;
@@ -878,6 +887,15 @@ var AiOutputFeed = (function () {
             }
             var card = getOrCreateUnitCard(unit, label);
             if (label && !card.titleEl.textContent) card.titleEl.textContent = label;
+            var shouldReset = Boolean(ev.data && ev.data.reset);
+            if (kind === 'reset') {
+                resetUnitOutput(card);
+                if (text) appendUnitNote(card, 'warn', text);
+                return;
+            }
+            if (shouldReset) {
+                resetUnitOutput(card);
+            }
             if (kind === 'thinking') {
                 card.thinkBox.classList.remove('d-none');
                 card.thinkPre.appendChild(document.createTextNode(text));
@@ -962,17 +980,41 @@ function _unlockRestoredButtons() {
 function _applyRestoredCompletion(dim, result, meta) {
     var refreshers = window._analysisPageRefreshers || {};
     var isBatch = !dim || dim === 'all' || dim === 'plan';
+    var summary = (meta && meta.summary) || {};
     if (!isBatch && refreshers[dim]) {
-        if (result) refreshers[dim](result);
-        else loadAnalysis(dim, function (data) { if (data) refreshers[dim](data); });
-    } else {
-        Object.keys(refreshers).forEach(function (d) {
-            var direct = meta && ((meta.results && meta.results[d]) || (meta.partialResults && meta.partialResults[d]));
-            if (direct) refreshers[d](direct);
-            else loadAnalysis(d, function (data) { if (data) refreshers[d](data); });
-        });
+        var singleInfo = {
+            partial: Boolean(meta && meta.partial),
+            fromError: Boolean(meta && meta.status && meta.status !== 'done')
+        };
+        if (result) refreshers[dim](result, singleInfo);
+        else loadAnalysis(dim, function (data) { if (data) refreshers[dim](data, { partial: false, fromError: false }); });
+        if (window.updateEvidence && !(meta && meta.partial)) window.updateEvidence(dim);
+        return;
     }
-    if (window.updateEvidence && dim && !isBatch) window.updateEvidence(dim);
+    Object.keys(refreshers).forEach(function (d) {
+        var direct = meta && ((meta.results && meta.results[d]) || (meta.partialResults && meta.partialResults[d]));
+        var dimState = summary[d];
+        if (direct) {
+            var fromError = Boolean(
+                (meta && meta.status && meta.status !== 'done')
+                || dimState === 'error'
+                || dimState === 'aborted'
+                || dimState === 'cancelled'
+                || (meta && meta.partialResults && meta.partialResults[d] && dimState !== 'partial')
+            );
+            var isPartial = Boolean(
+                fromError
+                || dimState === 'partial'
+                || (meta && meta.partial && dimState !== 'done' && dimState !== 'cached')
+            );
+            refreshers[d](direct, { partial: isPartial, fromError: fromError });
+            if (window.updateEvidence && !isPartial) window.updateEvidence(d);
+        } else {
+            loadAnalysis(d, function (data) {
+                if (data) refreshers[d](data, { partial: false, fromError: false });
+            });
+        }
+    });
 }
 
 function restoreLatestAnalysisJob() {
@@ -1009,7 +1051,7 @@ function restoreLatestAnalysisJob() {
             },
             onDone: function (result, meta) {
                 _unlockRestoredButtons();
-                clearStaleStrategyWarning();
+                if (!(meta && meta.partial)) clearStaleStrategyWarning();
                 if (statusEl.length) {
                     _renderStatusAlert(
                         statusEl,
@@ -1051,7 +1093,18 @@ window.restoreLatestAnalysisJob = restoreLatestAnalysisJob;
 // 没有这些元素的页面调用它会直接返回，因此对仪表盘、群聊页等零影响。
 // 进度、取消、完成回调与仪表盘完全同一套（都走 startAnalyze → pollAnalyzeJob）。
 function analyzeInPage(dim, renderFn) {
-    if (renderFn) registerAnalysisRefresher(dim, renderFn);
+    if (renderFn) {
+        registerAnalysisRefresher(dim, function (data, info) {
+            if (info && info.partial) {
+                setAnalysisEmptyState(dim, 'empty', info.fromError
+                    ? '本次分析未完整完成，当前显示已完成部分。'
+                    : '本次只分析了所选单元，尚未生成完整维度结果。');
+            } else {
+                setAnalysisEmptyState(dim, 'ready');
+            }
+            renderFn(data);
+        });
+    }
     var btn = $('#inPageAnalyze');
     if (!btn.length) return;
     btn.on('click', function () {

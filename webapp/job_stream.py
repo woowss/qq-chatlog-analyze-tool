@@ -102,25 +102,136 @@ def _atomic_write_json(path: str, payload: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def _coalesce_for_disk(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """落盘时合并相邻同单元流式 delta，保持磁盘日志紧凑。"""
-    out: list[dict[str, Any]] = []
+def _is_reset_event(ev: dict[str, Any]) -> bool:
+    if ev.get("kind") == "reset":
+        return True
+    data = ev.get("data")
+    return isinstance(data, dict) and bool(data.get("reset"))
+
+
+def _can_coalesce_pair(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    kind = second.get("kind") or "stage"
+    if kind not in _COALESCE_KINDS or first.get("kind") != kind:
+        return False
+    if (first.get("unit") or "") != (second.get("unit") or ""):
+        return False
+    if _is_reset_event(first) or _is_reset_event(second):
+        return False
+    return len(first.get("text") or "") + len(second.get("text") or "") <= _MAX_TEXT_PER_EVENT
+
+
+def _merge_events(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(first)
+    merged["text"] = f"{first.get('text') or ''}{second.get('text') or ''}"
+    merged["ts"] = second.get("ts") or first.get("ts") or 0.0
+    if "seq" in second and second["seq"] is not None:
+        merged["seq"] = second["seq"]
+    return merged
+
+
+def _compact_events_locked(events: list[dict[str, Any]], max_events: int) -> None:
+    """超过上限时从最老记录开始合并同类型流式 delta，并保证列表长度严格受控。"""
+    if max_events <= 0:
+        events.clear()
+        return
+    if max_events >= 64:
+        target = max_events - max(1, min(256, max_events // 16))
+    else:
+        target = max(0, max_events - 1)
+    if len(events) <= target:
+        return
+
+    # 1) 优先合并最老的相邻同 (kind, unit) delta，保留顺序与最新尾部。
+    to_free = len(events) - target
+    compacted: list[dict[str, Any]] = []
     for ev in events:
+        if to_free > 0 and compacted and _can_coalesce_pair(compacted[-1], ev):
+            compacted[-1] = _merge_events(compacted[-1], ev)
+            to_free -= 1
+        else:
+            compacted.append(ev)
+
+    # 2) 多单元并发交错导致相邻无法合并时，跨单元合并同 (kind, unit) 最老分段，
+    # 并将文本并入较新的分段以维持 seq 单调递增且不跨越 reset/error/result 边界。
+    if len(compacted) > target:
+        to_free = len(compacted) - target
+        slots: list[Optional[dict[str, Any]]] = []
+        open_pos: dict[tuple[str, str], int] = {}
+        for ev in compacted:
+            kind = ev.get("kind") or "stage"
+            unit = ev.get("unit") or ""
+            if kind not in _COALESCE_KINDS or _is_reset_event(ev):
+                if kind in ("error", "result", "reset") or _is_reset_event(ev):
+                    for k in [key for key in open_pos if key[1] == unit]:
+                        open_pos.pop(k, None)
+                slots.append(ev)
+                continue
+            key = (kind, unit)
+            prev_idx = open_pos.get(key)
+            if (
+                to_free > 0
+                and prev_idx is not None
+                and slots[prev_idx] is not None
+                and _can_coalesce_pair(slots[prev_idx], ev)  # type: ignore[arg-type]
+            ):
+                merged = _merge_events(slots[prev_idx], ev)  # type: ignore[arg-type]
+                slots[prev_idx] = None
+                slots.append(merged)
+                open_pos[key] = len(slots) - 1
+                to_free -= 1
+            else:
+                slots.append(ev)
+                open_pos[key] = len(slots) - 1
+        compacted = [ev for ev in slots if ev is not None]
+
+    # 3) 极端体量兜底：先丢最老 delta，再丢最老非关键事件，确保内存硬上限。
+    if len(compacted) > target:
+        drop_need = len(compacted) - target
+        kept: list[dict[str, Any]] = []
+        for ev in compacted:
+            if drop_need > 0 and (ev.get("kind") or "stage") in _COALESCE_KINDS:
+                drop_need -= 1
+                continue
+            kept.append(ev)
+        compacted = kept
+    if len(compacted) > target:
+        drop_need = len(compacted) - target
+        kept = []
+        for ev in compacted:
+            if drop_need > 0 and (ev.get("kind") or "stage") not in ("error", "result"):
+                drop_need -= 1
+                continue
+            kept.append(ev)
+        compacted = kept
+    if len(compacted) > target:
+        compacted = compacted[-target:] if target > 0 else []
+
+    events[:] = compacted
+
+
+def _coalesce_for_disk(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """落盘时合并相邻同单元流式 delta，保留原始尾部 seq 以维持轮询断点连续。"""
+    out: list[dict[str, Any]] = []
+    for idx, ev in enumerate(events):
         kind = ev.get("kind") or "stage"
         unit = ev.get("unit") or ""
         text = ev.get("text") or ""
+        ev_seq = int(ev["seq"]) if "seq" in ev and ev["seq"] is not None else idx
         if (
             out
             and kind in _COALESCE_KINDS
+            and not _is_reset_event(ev)
+            and not _is_reset_event(out[-1])
             and out[-1].get("kind") == kind
             and out[-1].get("unit") == unit
             and len(out[-1].get("text") or "") + len(text) <= _MAX_TEXT_PER_EVENT
         ):
             out[-1]["text"] = f"{out[-1].get('text') or ''}{text}"
             out[-1]["ts"] = ev.get("ts") or out[-1].get("ts")
+            out[-1]["seq"] = ev_seq
             continue
         item = {
-            "seq": len(out),
+            "seq": ev_seq,
             "ts": ev.get("ts") or 0.0,
             "kind": kind,
             "unit": unit,
@@ -156,20 +267,47 @@ def _snapshot_for_disk(rec: dict[str, Any], *, compact: bool) -> Optional[dict[s
         "detail": rec["detail"],
         "error": rec["error"],
         "updated_at": rec["updated_at"],
+        "next_seq": rec["next_seq"],
         "events": events,
     }
 
 
-def _write_snapshot(chat_hash: str, job_id: str, payload: Optional[dict[str, Any]]) -> None:
-    if payload is None or _is_purged(chat_hash):
+def _prepare_flush_locked(
+    rec: dict[str, Any], *, compact: bool
+) -> Optional[tuple[str, str, dict[str, Any], threading.Lock, dict[str, Any], int]]:
+    payload = _snapshot_for_disk(rec, compact=compact)
+    if payload is None:
+        return None
+    rec["flush_gen"] += 1
+    return (
+        rec["chat_hash"],
+        rec["job_id"],
+        payload,
+        rec["write_lock"],
+        rec["flush_state"],
+        rec["flush_gen"],
+    )
+
+
+def _write_snapshot(
+    flush_job: Optional[tuple[str, str, dict[str, Any], threading.Lock, dict[str, Any], int]],
+) -> None:
+    if flush_job is None:
         return
-    path = _log_path(chat_hash, job_id)
-    if not path:
-        return
-    try:
-        _atomic_write_json(path, payload)
-    except OSError as e:
-        logger.warning("写入任务实时日志失败: %s", e)
+    chat_hash, job_id, payload, write_lock, flush_state, gen = flush_job
+    with write_lock:
+        if flush_state.get("purged") or _is_purged(chat_hash):
+            return
+        if gen <= flush_state["gen"]:
+            return
+        path = _log_path(chat_hash, job_id)
+        if not path:
+            return
+        try:
+            _atomic_write_json(path, payload)
+            flush_state["gen"] = gen
+        except OSError as e:
+            logger.warning("写入任务实时日志失败: %s", e)
 
 
 def _evict_finished_locked() -> None:
@@ -216,16 +354,19 @@ def init_job(
         "last_flush": time.monotonic(),
         "last_flushed_kind": "",
         "next_seq": 0,
+        "flush_gen": 0,
+        "write_lock": threading.Lock(),
+        "flush_state": {"gen": 0, "purged": False},
         "events": [],
     }
-    payload: Optional[dict[str, Any]] = None
+    flush_job = None
     with _STREAM_LOCK:
         if _is_purged(rec["chat_hash"]):
             return
         _STREAMS[job_id] = rec
         _evict_finished_locked()
-        payload = _snapshot_for_disk(rec, compact=False)
-    _write_snapshot(rec["chat_hash"], job_id, payload)
+        flush_job = _prepare_flush_locked(rec, compact=False)
+    _write_snapshot(flush_job)
 
 
 def update_job_meta(
@@ -239,14 +380,14 @@ def update_job_meta(
     force_flush: bool = False,
 ) -> None:
     """更新任务进度/状态元数据并在必要时落盘。"""
-    payload: Optional[dict[str, Any]] = None
-    chat_hash = ""
+    flush_job = None
     with _STREAM_LOCK:
         rec = _STREAMS.get(job_id)
         if rec is None:
             return
         chat_hash = rec["chat_hash"]
         if _is_purged(chat_hash):
+            rec["flush_state"]["purged"] = True
             _STREAMS.pop(job_id, None)
             return
         if status is not None:
@@ -264,14 +405,13 @@ def update_job_meta(
         terminal = rec["status"] != "running"
         if force_flush or terminal or (now_mono - rec["last_flush"] >= _FLUSH_INTERVAL_SEC):
             rec["last_flush"] = now_mono
-            payload = _snapshot_for_disk(rec, compact=terminal)
-    _write_snapshot(chat_hash, job_id, payload)
+            flush_job = _prepare_flush_locked(rec, compact=terminal)
+    _write_snapshot(flush_job)
 
 
 def append_event(job_id: str, event: dict[str, Any]) -> None:
     """向指定任务追加一条实时输出事件，按节奏异步安全落盘。"""
-    payload: Optional[dict[str, Any]] = None
-    chat_hash = ""
+    flush_job = None
     kind = str(event.get("kind") or "stage")
     text = str(event.get("text") or "")
     if len(text) > _MAX_TEXT_PER_EVENT:
@@ -286,18 +426,12 @@ def append_event(job_id: str, event: dict[str, Any]) -> None:
             return
         chat_hash = rec["chat_hash"]
         if _is_purged(chat_hash):
+            rec["flush_state"]["purged"] = True
             _STREAMS.pop(job_id, None)
             return
         events = rec["events"]
         if len(events) >= _MAX_EVENTS_PER_JOB:
-            # 超过软上限时压缩最老一段同类型流式 delta，保留 stage/error/result 关键事件
-            if (
-                kind in _COALESCE_KINDS
-                and events
-                and events[-1].get("kind") == kind
-                and events[-1].get("unit") == unit
-            ):
-                return
+            _compact_events_locked(events, _MAX_EVENTS_PER_JOB)
         seq = rec["next_seq"]
         rec["next_seq"] = seq + 1
         now = time.time()
@@ -322,8 +456,8 @@ def append_event(job_id: str, event: dict[str, Any]) -> None:
         if should_flush:
             rec["last_flush"] = now_mono
             rec["last_flushed_kind"] = kind
-            payload = _snapshot_for_disk(rec, compact=False)
-    _write_snapshot(chat_hash, job_id, payload)
+            flush_job = _prepare_flush_locked(rec, compact=False)
+    _write_snapshot(flush_job)
 
 
 def make_sink(job_id: str) -> Callable[[dict[str, Any]], None]:
@@ -373,7 +507,7 @@ def _format_snapshot(
         status = "error"
         if not error:
             error = _INTERRUPTED_MSG
-        next_idx = (int(events[-1]["seq"]) + 1) if events else 0
+        next_idx = max((int(events[-1]["seq"]) + 1) if events else 0, int(data.get("next_seq") or 0))
         if not (events and events[-1].get("text") == _INTERRUPTED_MSG):
             events.append(
                 {
@@ -416,6 +550,24 @@ def _read_disk_record(path: str) -> Optional[dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+def _copy_mem_snapshot_locked(rec: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": rec["job_id"],
+        "dim": rec["dim"],
+        "dim_label": rec["dim_label"],
+        "status": rec["status"],
+        "done": rec["done"],
+        "total": rec["total"],
+        "detail": rec["detail"],
+        "error": rec["error"],
+        "scope_id": rec["scope_id"],
+        "created_at": rec["created_at"],
+        "updated_at": rec["updated_at"],
+        "next_seq": rec["next_seq"],
+        "events": list(rec["events"]),
+    }
+
+
 def get_job_snapshot(
     job_id: str,
     *,
@@ -432,31 +584,20 @@ def get_job_snapshot(
     want_sid = sid_digest(sid)
     after_val = max(0, int(after or 0))
 
+    snap_src: Optional[dict[str, Any]] = None
     with _STREAM_LOCK:
         rec = _STREAMS.get(job_id)
         if rec is not None:
             if rec.get("chat_hash") != chat_hash or rec.get("sid_hash") != want_sid:
                 return None
-            snap_src = {
-                "job_id": rec["job_id"],
-                "dim": rec["dim"],
-                "dim_label": rec["dim_label"],
-                "status": rec["status"],
-                "done": rec["done"],
-                "total": rec["total"],
-                "detail": rec["detail"],
-                "error": rec["error"],
-                "scope_id": rec["scope_id"],
-                "created_at": rec["created_at"],
-                "updated_at": rec["updated_at"],
-                "next_seq": rec["next_seq"],
-                "events": list(rec["events"]),
-            }
-            return _format_snapshot(
-                snap_src,
-                after=after_val,
-                live_check=live_check or (lambda _jid: True),
-            )
+            snap_src = _copy_mem_snapshot_locked(rec)
+
+    if snap_src is not None:
+        return _format_snapshot(
+            snap_src,
+            after=after_val,
+            live_check=live_check or (lambda _jid: True),
+        )
 
     path = _log_path(chat_hash, job_id)
     if not path:
@@ -487,39 +628,20 @@ def find_latest_job(
     best_running: Optional[dict[str, Any]] = None
     best_finished: Optional[dict[str, Any]] = None
     seen_ids: set[str] = set()
+    mem_sources: list[dict[str, Any]] = []
 
     with _STREAM_LOCK:
-        mem_records = list(_STREAMS.values())
-
-    for rec in mem_records:
-        if rec.get("chat_hash") != chat_hash or rec.get("sid_hash") != want_sid:
-            continue
-        if str(rec.get("scope_id") or "") != want_scope:
-            continue
-        seen_ids.add(rec["job_id"])
-        with _STREAM_LOCK:
-            cur = _STREAMS.get(rec["job_id"])
-            if cur is None:
+        for rec in _STREAMS.values():
+            if rec.get("chat_hash") != chat_hash or rec.get("sid_hash") != want_sid:
                 continue
-            snap = _format_snapshot(
-                {
-                    "job_id": cur["job_id"],
-                    "dim": cur["dim"],
-                    "dim_label": cur["dim_label"],
-                    "status": cur["status"],
-                    "done": cur["done"],
-                    "total": cur["total"],
-                    "detail": cur["detail"],
-                    "error": cur["error"],
-                    "scope_id": cur["scope_id"],
-                    "created_at": cur["created_at"],
-                    "updated_at": cur["updated_at"],
-                    "next_seq": cur["next_seq"],
-                    "events": list(cur["events"]),
-                },
-                after=after_val,
-                live_check=live_check or (lambda _jid: True),
-            )
+            if str(rec.get("scope_id") or "") != want_scope:
+                continue
+            seen_ids.add(rec["job_id"])
+            mem_sources.append(_copy_mem_snapshot_locked(rec))
+
+    mem_live_check = live_check or (lambda _jid: True)
+    for src in mem_sources:
+        snap = _format_snapshot(src, after=after_val, live_check=mem_live_check)
         if snap["status"] == "running":
             if best_running is None or snap["updated_at"] > best_running["updated_at"]:
                 best_running = snap
@@ -566,11 +688,18 @@ def purge_chat(chat_hash: str) -> int:
     if not chat_hash:
         return 0
     removed = 0
+    dropped_locks: list[threading.Lock] = []
     with _STREAM_LOCK:
         to_drop = [jid for jid, rec in _STREAMS.items() if rec.get("chat_hash") == chat_hash]
         for jid in to_drop:
-            _STREAMS.pop(jid, None)
-            removed += 1
+            rec = _STREAMS.pop(jid, None)
+            if rec is not None:
+                rec["flush_state"]["purged"] = True
+                dropped_locks.append(rec["write_lock"])
+                removed += 1
+    for wlock in dropped_locks:
+        with wlock:
+            pass
     return removed
 
 
@@ -580,6 +709,7 @@ def purge_session(sid: str, chat_hash: str) -> int:
         return 0
     want_sid = sid_digest(sid)
     removed = 0
+    dropped_locks: list[threading.Lock] = []
     with _STREAM_LOCK:
         to_drop = [
             jid
@@ -587,8 +717,14 @@ def purge_session(sid: str, chat_hash: str) -> int:
             if rec.get("chat_hash") == chat_hash and rec.get("sid_hash") == want_sid
         ]
         for jid in to_drop:
-            _STREAMS.pop(jid, None)
-            removed += 1
+            rec = _STREAMS.pop(jid, None)
+            if rec is not None:
+                rec["flush_state"]["purged"] = True
+                dropped_locks.append(rec["write_lock"])
+                removed += 1
+    for wlock in dropped_locks:
+        with wlock:
+            pass
     cache_dir = _ai_cache_dir()
     if cache_dir:
         prefix = f"joblog_{chat_hash}_"

@@ -980,8 +980,15 @@ function wireGroupAnalyzeButtons(members) {
             renderer = function (el, data) { return renderMemberProfiles(el, data, members); };
         }
         if (window.registerAnalysisRefresher && dim && target && renderer) {
-            window.registerAnalysisRefresher(dim, function (data) {
-                renderGroupTarget(target, renderer, data, null);
+            window.registerAnalysisRefresher(dim, function (data, info) {
+                var partialMsg = null;
+                if (info && info.partial) {
+                    partialMsg = info.fromError
+                        ? '本次分析未完整完成，以下为已完成部分（未保存为完整维度结果）。'
+                        : '本次只处理了所选单元，未标记为完整维度结果。';
+                }
+                setAnalysisEmptyState(dim, 'ready');
+                renderGroupTarget(target, renderer, data, partialMsg);
             });
         }
     });

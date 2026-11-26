@@ -168,10 +168,10 @@ def purge_session_media(chat_hash: str) -> int:
 
 
 def _within(root: str, path: str) -> bool:
-    """路径是否确实位于 root 之内（防止 ../ 逃逸）"""
+    """路径是否确实位于 root 之内（防止 ../ 与符号链接逃逸）"""
     try:
-        root_abs = os.path.abspath(root)
-        return os.path.commonpath([root_abs, os.path.abspath(path)]) == root_abs
+        root_real = os.path.realpath(root)
+        return os.path.commonpath([root_real, os.path.realpath(path)]) == root_real
     except ValueError:  # 不同盘符等
         return False
 
@@ -191,9 +191,10 @@ def resolve(media_path: str, chat_hash: str = ""):
     rel = str(media_path).replace("\\", "/").lstrip("/")
     base = os.path.basename(rel)
     if chat_hash and base:
-        candidate = os.path.join(session_media_dir(chat_hash), base)
-        if os.path.isfile(candidate):
-            return candidate
+        session_root = session_media_dir(chat_hash)
+        candidate = os.path.join(session_root, base)
+        if os.path.isfile(candidate) and _within(session_root, candidate):
+            return os.path.normpath(candidate)
     if not MEDIA_ROOT:
         return None
     candidates = [os.path.join(MEDIA_ROOT, rel)]

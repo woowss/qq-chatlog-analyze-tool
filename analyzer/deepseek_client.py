@@ -875,7 +875,12 @@ def _call_api(
                 "可稍后再试，或在 .env 中调低 LLM_CONCURRENCY / LLM_CALL_MIN_INTERVAL，"
                 "也可到服务商控制台提升该模型的 TPM 限额。"
             )
-        choice = resp.choices[0]
+        choices = getattr(resp, "choices", None)
+        if not choices:
+            logger.error("模型返回空 choices，放弃本次结果（不重试）")
+            llm_stream.emit_event("error", "模型返回空 choices，放弃本次结果")
+            return None
+        choice = choices[0]
         if choice.finish_reason == "length":
             # 思考模式下思维链也占 max_tokens：大月份偶发被吃满。
             # 结果被截断=该月白跑，所以先降级为"关思考"重试一次——宁可精度略降，
@@ -887,6 +892,7 @@ def _call_api(
                 llm_stream.emit_event(
                     "warn",
                     f"输出被 max_tokens={max_tokens} 截断，改用非思考模式重试一次",
+                    data={"reset": True} if llm_stream.current_delta_emitted() else None,
                 )
                 think = False
                 continue
@@ -966,7 +972,11 @@ def _call_vision(system_prompt: str, user_text: str, images: list) -> str:
     if resp is None:
         logger.warning("图片摘要因限流放弃（文本分析继续）")
         return ""
-    choice = resp.choices[0]
+    choices = getattr(resp, "choices", None)
+    if not choices:
+        logger.warning("图片摘要返回空 choices（文本分析继续）")
+        return ""
+    choice = choices[0]
     if choice.finish_reason == "length":
         logger.warning("图片摘要被 max_tokens 截断，已按截断内容使用")
     return (choice.message.content or "").strip()

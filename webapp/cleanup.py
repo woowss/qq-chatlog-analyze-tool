@@ -29,6 +29,7 @@
 """
 
 import os
+import threading
 import time
 from typing import Optional
 
@@ -211,24 +212,33 @@ def cleanup_old_files(
 
 
 _last_cleanup = [0.0]
+_CLEANUP_LOCK = threading.Lock()
+_CLEANUP_RUN_LOCK = threading.Lock()
 
 
 def maybe_cleanup(interval_seconds: int = 3600) -> None:
     """长跑进程也要清理：按间隔去抖，避免每个请求都全目录扫描"""
-    now = time.time()
-    if now - _last_cleanup[0] < interval_seconds:
+    with _CLEANUP_LOCK:
+        now = time.time()
+        if now - _last_cleanup[0] < interval_seconds:
+            return
+        _last_cleanup[0] = now
+    if not _CLEANUP_RUN_LOCK.acquire(blocking=False):
         return
-    _last_cleanup[0] = now
     try:
         cleanup_old_files(max_age_seconds=86400)
     except Exception as e:  # 清理失败不能影响请求
         logger.warning("定期清理失败: %s", e)
+    finally:
+        _CLEANUP_RUN_LOCK.release()
 
 
 def startup_cleanup() -> None:
     """应用组装时跑一次全量回收，并把去抖计时归零"""
-    cleanup_old_files(max_age_seconds=86400)
-    _last_cleanup[0] = time.time()
+    with _CLEANUP_RUN_LOCK:
+        cleanup_old_files(max_age_seconds=86400)
+        with _CLEANUP_LOCK:
+            _last_cleanup[0] = time.time()
 
 
 def cleanup_hook():

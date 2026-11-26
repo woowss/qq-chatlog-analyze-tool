@@ -40,6 +40,7 @@ import os
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from config import (
@@ -167,7 +168,7 @@ CLASSIC_NAMES = {
 NAME_TO_CLASSIC = {name: fid for fid, name in CLASSIC_NAMES.items()}
 
 _IMAGE_EXT = (".gif", ".png", ".jpg", ".jpeg", ".webp")
-_MAGIC = (b"GIF8", b"\x89PNG", b"\xff\xd8\xff", b"RIFF")
+_MAGIC = (b"GIF8", b"\x89PNG", b"\xff\xd8\xff")
 
 #: 单次点击"获取原始表情图"的联网抓取时长上限（秒）：请求是同步的，
 #: 宁可少抓几张下次接着抓，也不要把页面挂住十几分钟。
@@ -229,7 +230,14 @@ def key_for(name: str, market_url: str = "") -> str:
 
 
 def _url_allowed(url: str) -> bool:
-    return any(url.startswith(f"https://{h}/") for h in ALLOWED_HOSTS)
+    if not isinstance(url, str):
+        return False
+    parsed = urllib.parse.urlsplit(url)
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc in ALLOWED_HOSTS
+        and any(url.startswith(f"https://{h}/") for h in ALLOWED_HOSTS)
+    )
 
 
 def url_for(name: str, market_url: str = ""):
@@ -268,23 +276,38 @@ def local_pack_path(key: str, name: str = "", local_dir: str = ""):
     fid = NAME_TO_CLASSIC.get(clean)
     if fid is not None:
         candidates += [str(fid), f"e{fid + 100}"]
-    root_abs = os.path.abspath(root)
+    root_real = os.path.realpath(root)
     for base in candidates:
         for ext in _IMAGE_EXT:
-            path = os.path.join(root_abs, base + ext)
+            path = os.path.join(root_real, base + ext)
             if not os.path.isfile(path):
                 continue
-            # 表情名来自导出文件（可被构造），确认没被 ../ 带出表情包目录
+            # 表情名来自导出文件（可被构造），确认没被 ../ 或符号链接带出表情包目录
             try:
-                if os.path.commonpath([root_abs, os.path.abspath(path)]) == root_abs:
-                    return path
+                path_real = os.path.realpath(path)
+                if os.path.commonpath([root_real, path_real]) == root_real:
+                    return path_real
             except ValueError:
                 continue
     return None
 
 
+def _is_webp(data: bytes) -> bool:
+    return len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+
+
 def _looks_like_image(data: bytes) -> bool:
-    return any(data.startswith(sig) for sig in _MAGIC)
+    return any(data.startswith(sig) for sig in _MAGIC) or _is_webp(data)
+
+
+class _AllowedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _url_allowed(newurl):
+            raise urllib.error.URLError(f"redirect target not allowed: {newurl[:60]}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_FACE_OPENER = urllib.request.build_opener(_AllowedRedirectHandler)
 
 
 def _download(url: str):
@@ -294,7 +317,11 @@ def _download(url: str):
         return None
     req = urllib.request.Request(url, headers={"User-Agent": "qqchatlog/1.0"})
     try:
-        with urllib.request.urlopen(req, timeout=FACE_FETCH_TIMEOUT) as resp:
+        with _FACE_OPENER.open(req, timeout=FACE_FETCH_TIMEOUT) as resp:
+            final_url = resp.geturl() if hasattr(resp, "geturl") else url
+            if final_url and not _url_allowed(final_url):
+                logger.info("跳过重定向至非白名单地址的表情图: %s", str(final_url)[:60])
+                return None
             data = resp.read(512 * 1024)
     except (urllib.error.URLError, OSError, ValueError) as e:
         logger.info("表情图下载失败（跳过）: %s (%s)", url[:60], type(e).__name__)
@@ -310,7 +337,7 @@ def _store(key: str, data: bytes) -> str:
         ext = ".png"
     elif data.startswith(b"\xff\xd8\xff"):
         ext = ".jpg"
-    elif data.startswith(b"RIFF"):
+    elif _is_webp(data):
         ext = ".webp"
     path = os.path.join(cache_dir(), key + ext)
     write_bytes_atomic(path, data)
