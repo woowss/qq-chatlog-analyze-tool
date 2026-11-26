@@ -1396,6 +1396,32 @@ class TestCleanupTriggeredWithoutUpload(unittest.TestCase):
             cleanupmod.maybe_cleanup(3600)
             self.assertFalse(co.called, "一小时内重复请求不该反复扫描目录")
 
+    def test_concurrent_maybe_cleanup_runs_once(self):
+        import threading
+        from webapp import cleanup as cleanupmod
+
+        barrier = threading.Barrier(8)
+        calls = []
+
+        def slow_cleanup(**_kw):
+            calls.append(1)
+            time.sleep(0.05)
+            return 0
+
+        with (
+            mock.patch.object(cleanupmod, "_last_cleanup", [0.0]),
+            mock.patch.object(cleanupmod, "cleanup_old_files", side_effect=slow_cleanup),
+        ):
+            threads = [
+                threading.Thread(target=lambda: (barrier.wait(timeout=5), cleanupmod.maybe_cleanup(3600)))
+                for _ in range(8)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+        self.assertEqual(len(calls), 1, "并发请求超过清理窗口时只应由一个线程执行清理")
+
 
 class TestFingerprintRobustness(unittest.TestCase):
     """源码不可读时指纹降级不崩；PROMPT_CACHE_SALT 可手动换键"""

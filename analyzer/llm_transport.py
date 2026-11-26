@@ -20,6 +20,10 @@ from typing import Any, Callable, Optional
 from . import llm_stream
 
 
+class EmptyChoicesError(RuntimeError):
+    """模型响应缺少有效 choices（可能触发内容审核或上游网关异常）。"""
+
+
 def _is_stream_param_rejected(exc: Exception) -> bool:
     """判断错误是否由服务端或桩函数不支持 stream / stream_options 参数引起。"""
     if isinstance(exc, TypeError):
@@ -65,6 +69,17 @@ def _call_completions(client, build_params: Callable[[], dict]):
     return llm_stream.consume_response_stream(raw)
 
 
+def _emit_retry_warn(message: str) -> None:
+    should_reset = llm_stream.has_active_stream() and llm_stream.current_delta_emitted()
+    llm_stream.emit_event(
+        "warn",
+        message,
+        data={"reset": True} if should_reset else None,
+    )
+    if should_reset:
+        llm_stream.reset_delta_emitted()
+
+
 def request_with_retry(
     client,
     build_params: Callable[[], dict],
@@ -101,7 +116,10 @@ def request_with_retry(
             if llm_stream.is_cancelled():
                 raise llm_stream.StreamCancelledError("分析任务已取消")
             resp = _call_completions(client, build_params)
-            choice = resp.choices[0]
+            choices = getattr(resp, "choices", None)
+            if not choices:
+                raise EmptyChoicesError("模型返回空 choices（可能触发内容审核或上游网关异常）")
+            choice = choices[0]
             if resp.usage:
                 logger.info(
                     "token 用量[%s]: prompt=%s completion=%s finish=%s",
@@ -125,7 +143,7 @@ def request_with_retry(
                         },
                     )
             return resp, None
-        except llm_stream.StreamCancelledError:
+        except (llm_stream.StreamCancelledError, EmptyChoicesError):
             raise
         except Exception as e:
             if is_plan_exhausted(e):
@@ -140,9 +158,8 @@ def request_with_retry(
                         tpm_hits,
                         tpm_max_attempts,
                     )
-                    llm_stream.emit_event(
-                        "warn",
-                        f"触发每分钟限流，全局冷却 {tpm_wait:.0f}s 后重试（{tpm_hits}/{tpm_max_attempts}）",
+                    _emit_retry_warn(
+                        f"触发每分钟限流，全局冷却 {tpm_wait:.0f}s 后重试（{tpm_hits}/{tpm_max_attempts}）"
                     )
                     set_cooldown(tpm_wait)
                     sleep(tpm_wait)
@@ -158,9 +175,8 @@ def request_with_retry(
                     delay,
                     scrub_secrets(e),
                 )
-                llm_stream.emit_event(
-                    "warn",
-                    f"API 调用失败（第 {generic_failures} 次，{delay}s 后重试）：{scrub_secrets(e)}",
+                _emit_retry_warn(
+                    f"API 调用失败（第 {generic_failures} 次，{delay}s 后重试）：{scrub_secrets(e)}"
                 )
                 sleep(delay)
                 continue

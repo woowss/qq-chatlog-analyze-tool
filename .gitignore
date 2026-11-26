@@ -54,3 +54,6 @@ _audit/
 
 # Synthetic browser traces, screenshots and downloaded reports
 output/playwright/
+
+# Local agent memory metadata
+.codex-memory/

@@ -1732,6 +1732,168 @@ class TestBrowserFlows(unittest.TestCase):
             self.page.wait_for_load_state("networkidle")
             self.assertFalse(self.errors, self.errors)
 
+    def test_live_ai_output_retry_resets_stale_unit_output(self):
+        from types import SimpleNamespace
+        from playwright.sync_api import expect
+        from analyzer import deepseek_client as dc
+        from result_fixtures import for_dimension
+        from test_p1 import payload
+
+        valid_emotion = for_dimension("emotion")
+        valid_json = json.dumps(valid_emotion, ensure_ascii=False)
+
+        def chunk(reasoning=None, content=None, finish_reason=None, usage=None):
+            delta = SimpleNamespace(reasoning_content=reasoning, content=content)
+            choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
+            return SimpleNamespace(
+                choices=[choice] if (reasoning or content or finish_reason) else [],
+                usage=usage,
+            )
+
+        attempts = [0]
+
+        def fake_create(**_kwargs):
+            attempts[0] += 1
+            if attempts[0] == 1:
+                return iter(
+                    [
+                        chunk(reasoning="旧思考残留：" + ("截断前推理。" * 12)),
+                        chunk(content='{"BROKEN_TRUNCATED_PREFIX": ', finish_reason="length"),
+                        chunk(usage=SimpleNamespace(prompt_tokens=100, completion_tokens=50)),
+                    ]
+                )
+            return iter(
+                [
+                    chunk(content=valid_json, finish_reason="stop"),
+                    chunk(usage=SimpleNamespace(prompt_tokens=90, completion_tokens=40)),
+                ]
+            )
+
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)))
+        doc = json.loads(payload().decode("utf-8"))
+        doc["chatInfo"]["name"] = "合成流式重试重置"
+        raw = json.dumps(doc, ensure_ascii=False).encode("utf-8")
+
+        with (
+            mock.patch.object(dc, "_call_api", self._real_dc_call_api),
+            mock.patch.object(dc, "_get_client", return_value=fake_client),
+            mock.patch.object(dc, "thinking_enabled", return_value=True),
+        ):
+            self.upload(raw)
+            self.page.goto(self.base + "/emotion")
+            self.page.wait_for_load_state("networkidle")
+            self.page.locator("details:has(#inPageRefresh) summary").click()
+            self.page.locator("#inPageRefresh").check()
+            self.page.locator("#inPageAnalyze").click()
+            self.confirm_plan()
+
+            expect(self.page.locator("#aiOutputStatus")).to_have_text("已完成", timeout=20_000)
+            panel = self.page.locator("#aiOutputPanel")
+            expect(panel).to_contain_text("改用非思考模式重试一次")
+            expect(panel).to_contain_text(valid_emotion["month_vibe"])
+            expect(panel).not_to_contain_text("BROKEN_TRUNCATED_PREFIX")
+            expect(panel).not_to_contain_text("旧思考残留")
+            self.assertFalse(self.errors, self.errors)
+
+    def test_reload_restores_partial_group_plan_with_notice_and_ready_empty_state(self):
+        from playwright.sync_api import expect
+        from analyzer import group_client as gc
+        from analyzer.deepseek_client import QuotaExhaustedError
+        from result_fixtures import for_dimension
+
+        first_done = threading.Event()
+        release_second = threading.Event()
+        self.addCleanup(release_second.set)
+        calls = [0]
+
+        def slow_then_fail(*args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 1:
+                result = for_dimension("member_profiles")
+                result["verdict"] = "重载后局部保留结论"
+                first_done.set()
+                return result
+            release_second.wait(timeout=15)
+            raise QuotaExhaustedError("重载后配额耗尽")
+
+        group = json.loads((Path(__file__).parent / "fixtures/group_5p.json").read_text(encoding="utf-8"))
+        group["chatInfo"]["name"] = "群聊重载局部恢复"
+        payload_bytes = json.dumps(group, ensure_ascii=False).encode("utf-8")
+
+        with mock.patch.object(gc, "_call_api", side_effect=slow_then_fail):
+            self.upload(payload_bytes)
+            self.page.goto(self.base + "/profile")
+            self.page.locator('.btn-analyze[data-dim="member_profiles"]').click()
+            self.confirm_plan()
+            self.assertTrue(first_done.wait(timeout=10), "first member did not finish in time")
+            expect(self.page.locator("#aiOutputStatus")).to_have_text("进行中", timeout=10_000)
+
+            self.page.reload()
+            expect(self.page.locator("#aiOutputStatus")).to_have_text("进行中", timeout=10_000)
+            release_second.set()
+
+            expect(self.page.locator("#analyzeStatus")).to_contain_text("重载后配额耗尽", timeout=20_000)
+            sec = self.page.locator("#sec-profiles")
+            expect(sec).to_contain_text("重载后局部保留结论")
+            expect(sec).to_contain_text("未保存为完整维度结果")
+            expect(self.page.locator('[data-analysis-empty="member_profiles"]')).to_have_count(0)
+            self.errors = [e for e in self.errors if not ("ERR_ABORTED" in e and "/api/analyze-job/" in e)]
+            self.assertFalse(self.errors, self.errors)
+
+    def test_reload_partial_private_plan_preserves_stale_strategy_warning(self):
+        from playwright.sync_api import expect
+        from analyzer import deepseek_client as dc
+        from result_fixtures import for_dimension
+        from test_p1 import payload
+        from webapp import store
+
+        started = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def slow_profile(*args, **kwargs):
+            started.set()
+            release.wait(timeout=15)
+            return for_dimension("profile")
+
+        doc = json.loads(payload().decode("utf-8"))
+        doc["chatInfo"]["name"] = "私聊部分重载告警保留"
+        raw = json.dumps(doc, ensure_ascii=False).encode("utf-8")
+        self.upload(raw)
+        chat_hash = self.page.evaluate("window.ANALYSIS_PAGE_IDENTITY.chat_hash")
+        legacy_fp = dc.legacy_person_context_fingerprint("profile")
+        store._write_cache(
+            "profile",
+            chat_hash,
+            {"self": for_dimension("profile"), "other": for_dimension("profile")},
+            fingerprint=legacy_fp,
+        )
+        self.addCleanup(lambda: store._purge_chat_caches(chat_hash))
+
+        with mock.patch.object(dc, "_call_api", side_effect=slow_profile):
+            self.page.goto(self.base + "/profile")
+            warning = self.page.locator("#loadWarnBox[data-stale-strategy='true']")
+            expect(warning).to_contain_text("旧版人物画像结果")
+
+            self.page.locator("#inPageAnalyze").click()
+            dialog = self.page.locator("#analysisPlanDialog")
+            expect(dialog).to_be_visible()
+            # Keep only 1 person selected so the plan job ends with meta.partial === true
+            dialog.locator(".analysis-plan-table tbody input[type='checkbox']").last.uncheck()
+            dialog.locator(".analysis-plan-footer .btn-primary").click()
+
+            self.assertTrue(started.wait(timeout=10))
+            expect(self.page.locator("#aiOutputStatus")).to_have_text("进行中", timeout=10_000)
+            self.page.reload()
+            expect(warning).to_contain_text("旧版人物画像结果", timeout=10_000)
+            expect(self.page.locator("#aiOutputStatus")).to_have_text("进行中", timeout=10_000)
+            release.set()
+
+            expect(self.page.locator("#inPageStatus")).to_contain_text("部分分析已完成", timeout=20_000)
+            expect(warning).to_contain_text("旧版人物画像结果")
+            self.errors = [e for e in self.errors if not ("ERR_ABORTED" in e and "/api/analyze-job/" in e)]
+            self.assertFalse(self.errors, self.errors)
+
 
 if __name__ == "__main__":
     unittest.main()

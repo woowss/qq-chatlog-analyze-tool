@@ -301,7 +301,7 @@ def api_analyze_job(job_id: str):
             sid=sid,
             chat_hash=sess_chat_hash,
             after=after,
-            live_check=_job_is_live,
+            live_check=_job_is_live if resp.get("status") == "running" else (lambda _jid: True),
         )
         if snap is not None:
             resp["stream_seq"] = snap["stream_seq"]

@@ -37,9 +37,12 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 import unittest
+import urllib.error
+import urllib.request
 import zipfile
 from unittest import mock
 
@@ -1368,6 +1371,62 @@ class TestPathContainment(unittest.TestCase):
             token = s["csrf_token"]
         r = client.post("/upload", data={"csrf_token": token}, headers={"Origin": "http://evil.example.com"})
         self.assertEqual(r.status_code, 403, "非白名单来源仍必须被拦下")
+
+    def test_vision_and_face_pack_refuse_symlinks_escaping_root(self):
+        from analyzer import face_images as fi
+        from analyzer import vision
+
+        base = tempfile.mkdtemp(prefix="qqchatlog-symlink-")
+        media_root = os.path.join(base, "media")
+        pack_root = os.path.join(base, "faces")
+        os.makedirs(media_root, exist_ok=True)
+        os.makedirs(pack_root, exist_ok=True)
+        outside_img = os.path.join(base, "secret.png")
+        outside_gif = os.path.join(base, "secret.gif")
+        with open(outside_img, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + b"a" * 16)
+        with open(outside_gif, "wb") as f:
+            f.write(b"GIF89a" + b"b" * 16)
+        try:
+            try:
+                os.symlink(outside_img, os.path.join(media_root, "escape.png"))
+                os.symlink(outside_gif, os.path.join(pack_root, "escape.gif"))
+            except (OSError, NotImplementedError):
+                self.skipTest("当前环境不支持创建符号链接")
+            with mock.patch.object(vision, "MEDIA_ROOT", media_root):
+                self.assertIsNone(vision.resolve("escape.png"), "指向 MEDIA_ROOT 之外的符号链接必须拒绝")
+            self.assertIsNone(
+                fi.local_pack_path("n1", "escape", local_dir=pack_root),
+                "指向 QQCHAT_FACE_DIR 之外的符号链接必须拒绝",
+            )
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_face_download_blocks_foreign_redirects_and_non_webp_riff(self):
+        from analyzer import face_images as fi
+
+        handler = fi._AllowedRedirectHandler()
+        req = urllib.request.Request("https://qzonestyle.gtimg.cn/qzone/em/e100.gif")
+        with self.assertRaises(urllib.error.URLError):
+            handler.redirect_request(req, None, 302, "Found", {}, "https://evil.example.com/steal.gif")
+        with self.assertRaises(urllib.error.URLError):
+            handler.redirect_request(req, None, 302, "Found", {}, "http://qzonestyle.gtimg.cn/downgrade.gif")
+
+        self.assertFalse(fi._looks_like_image(b"RIFF\x00\x00\x00\x00AVI "))
+        self.assertTrue(fi._looks_like_image(b"RIFF\x00\x00\x00\x00WEBP"))
+
+    def test_codex_memory_is_not_tracked_by_git(self):
+        if not os.path.isdir(os.path.join(ROOT, ".git")):
+            self.skipTest("非 git 检出环境")
+        out = subprocess.run(
+            ["git", "ls-files", ".codex-memory"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(out.returncode, 0)
+        self.assertEqual(out.stdout.strip(), "", ".codex-memory 不应纳入版本库")
 
 
 if __name__ == "__main__":

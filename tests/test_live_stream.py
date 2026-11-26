@@ -10,6 +10,7 @@
 import json
 import os
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -487,6 +488,269 @@ class TestJobStreamPersistenceAndApi(unittest.TestCase):
         for path in ("/", "/messages", "/report"):
             body = client.get(path).get_data(as_text=True)
             self.assertNotIn('id="aiOutputPanel"', body, path)
+
+    def test_snapshot_and_latest_do_not_hold_stream_lock_during_live_check(self):
+        job_id = "joblock001"
+        job_stream.init_job(
+            job_id,
+            sid="sid-lock",
+            chat_hash="lockhash01",
+            dim="emotion",
+            total=1,
+        )
+        self.addCleanup(lambda: job_stream.purge_chat("lockhash01"))
+        observed_locked = []
+
+        def check_live(_jid):
+            observed_locked.append(job_stream._STREAM_LOCK.locked())
+            return True
+
+        snap = job_stream.get_job_snapshot(
+            job_id, sid="sid-lock", chat_hash="lockhash01", live_check=check_live
+        )
+        latest = job_stream.find_latest_job(sid="sid-lock", chat_hash="lockhash01", live_check=check_live)
+        self.assertIsNotNone(snap)
+        self.assertIsNotNone(latest)
+        self.assertEqual(observed_locked, [False, False])
+
+    def test_stale_running_write_cannot_overwrite_finalized_done_disk_snapshot(self):
+        chat_hash = "racehash01"
+        job_id = "jobrace001"
+        job_stream.init_job(job_id, sid="sid-r", chat_hash=chat_hash, dim="emotion", total=1)
+        self.addCleanup(lambda: store._purge_chat_caches(chat_hash))
+
+        real_atomic = job_stream._atomic_write_json
+        stale_started = threading.Event()
+        release_stale = threading.Event()
+        self.addCleanup(release_stale.set)
+
+        def delayed_write(path, payload):
+            if payload.get("status") == "running" and not stale_started.is_set():
+                stale_started.set()
+                release_stale.wait(timeout=5)
+            return real_atomic(path, payload)
+
+        with job_stream._STREAM_LOCK:
+            rec = job_stream._STREAMS[job_id]
+            rec["last_flush"] = 0.0
+            inflight_flush = job_stream._prepare_flush_locked(rec, compact=False)
+            stale_flush = job_stream._prepare_flush_locked(rec, compact=False)
+
+        with mock.patch.object(job_stream, "_atomic_write_json", side_effect=delayed_write):
+            t_inflight = threading.Thread(target=job_stream._write_snapshot, args=(inflight_flush,))
+            t_inflight.start()
+            self.assertTrue(stale_started.wait(timeout=5))
+
+            t_final = threading.Thread(
+                target=lambda: job_stream.finalize_job(job_id, status="done", done=1, total=1)
+            )
+            t_final.start()
+            time.sleep(0.05)
+            release_stale.set()
+            t_inflight.join(timeout=5)
+            t_final.join(timeout=5)
+
+            # Even if an even older snapshot arrives after finalize_job completed, it is skipped.
+            job_stream._write_snapshot(stale_flush)
+
+        path = Path(store.AI_CACHE_DIR) / f"joblog_{chat_hash}_{job_id}.json"
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["status"], "done")
+
+    def test_event_cap_compacts_oldest_without_losing_latest_or_crossing_reset(self):
+        chat_hash = "caphash01"
+        job_id = "jobcap001"
+        job_stream.init_job(job_id, sid="sid-c", chat_hash=chat_hash, dim="emotion", total=2)
+        self.addCleanup(lambda: store._purge_chat_caches(chat_hash))
+
+        with mock.patch.object(job_stream, "_MAX_EVENTS_PER_JOB", 6):
+            for idx in range(5):
+                unit = f"emotion:2025-0{(idx % 2) + 1}"
+                job_stream.append_event(
+                    job_id, {"kind": "thinking", "unit": unit, "label": unit, "text": f"T{idx}|"}
+                )
+            job_stream.append_event(
+                job_id,
+                {
+                    "kind": "warn",
+                    "unit": "emotion:2025-01",
+                    "label": "emotion:2025-01",
+                    "text": "截断重试",
+                    "data": {"reset": True},
+                },
+            )
+            for idx in range(5, 10):
+                unit = f"emotion:2025-0{(idx % 2) + 1}"
+                job_stream.append_event(
+                    job_id, {"kind": "content", "unit": unit, "label": unit, "text": f"C{idx}|"}
+                )
+
+        snap = job_stream.get_job_snapshot(job_id, sid="sid-c", chat_hash=chat_hash, after=0)
+        self.assertIsNotNone(snap)
+        self.assertLessEqual(len(snap["events"]), 6)
+        self.assertEqual(snap["stream_seq"], 11)
+        joined = "".join(e["text"] for e in snap["events"])
+        self.assertIn("截断重试", joined)
+        self.assertIn("C9|", joined)
+
+    def test_finalized_disk_coalesce_preserves_tail_seq_and_next_seq(self):
+        chat_hash = "seqhash01"
+        job_id = "jobseq001"
+        job_stream.init_job(job_id, sid="sid-s", chat_hash=chat_hash, dim="emotion", total=1)
+        self.addCleanup(lambda: store._purge_chat_caches(chat_hash))
+
+        for i in range(4):
+            job_stream.append_event(
+                job_id, {"kind": "thinking", "unit": "emotion:2025-01", "label": "2025-01", "text": f"t{i}"}
+            )
+        job_stream.append_event(
+            job_id, {"kind": "content", "unit": "emotion:2025-01", "label": "2025-01", "text": '{"ok":1}'}
+        )
+        job_stream.append_event(
+            job_id,
+            {
+                "kind": "usage",
+                "unit": "emotion:2025-01",
+                "label": "2025-01",
+                "text": "tok",
+                "data": {"prompt_tokens": 10, "completion_tokens": 5},
+            },
+        )
+        job_stream.finalize_job(job_id, status="done", done=1, total=1)
+
+        # Simulate memory eviction / server restart before poller reads trailing events after=4
+        with job_stream._STREAM_LOCK:
+            job_stream._STREAMS.clear()
+
+        snap = job_stream.get_job_snapshot(job_id, sid="sid-s", chat_hash=chat_hash, after=4)
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap["status"], "done")
+        self.assertEqual(snap["stream_seq"], 6)
+        self.assertEqual([e["kind"] for e in snap["events"]], ["content", "usage"])
+        self.assertEqual(snap["events"][0]["seq"], 4)
+        self.assertEqual(snap["events"][1]["seq"], 5)
+
+    def test_retry_after_partial_stream_and_length_fallback_emit_reset_marker(self):
+        events = []
+        attempts = [0]
+
+        class FlakyStream:
+            def __iter__(self):
+                yield _make_chunk(reasoning="错误前思考" * 10)
+                yield _make_chunk(content='{"broken":')
+                raise RuntimeError("mid-stream disconnect")
+
+        def create_stream_then_ok(**_kwargs):
+            attempts[0] += 1
+            if attempts[0] == 1:
+                return FlakyStream()
+            return iter(
+                [
+                    _make_chunk(reasoning="新思考"),
+                    _make_chunk(content='{"ok": true}', finish_reason="stop"),
+                ]
+            )
+
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create_stream_then_ok))
+        )
+        with llm_stream.stream_context(sink=events.append, unit="emotion:2025-01", fresh_state=True):
+            resp, err = llm_transport.request_with_retry(
+                client,
+                lambda: {"model": "m", "messages": []},
+                tag="emotion",
+                max_attempts=3,
+                generic_retries=1,
+                tpm_wait=0.0,
+                fatal_message="quota",
+                count_call=lambda: None,
+                pace=lambda: None,
+                is_plan_exhausted=lambda _e: False,
+                is_tpm_throttle=lambda _e: False,
+                set_cooldown=lambda _s: None,
+                tpm_max_attempts=2,
+                logger=dc.logger,
+                record_call=lambda *args: None,
+                model="m",
+                scrub_secrets=str,
+                quota_exhausted_error=RuntimeError,
+                sleep=lambda _s: None,
+            )
+        self.assertIsNone(err)
+        self.assertEqual(resp.choices[0].message.content, '{"ok": true}')
+        warns = [e for e in events if e["kind"] == "warn"]
+        self.assertEqual(len(warns), 1)
+        self.assertTrue(warns[0]["data"]["reset"])
+
+        # Length-truncated thinking fallback in _call_api also emits reset=True
+        length_events = []
+        call_no = [0]
+
+        def length_then_ok(**_kwargs):
+            call_no[0] += 1
+            if call_no[0] == 1:
+                return iter(
+                    [
+                        _make_chunk(reasoning="超长思考" * 30),
+                        _make_chunk(content='{"half":', finish_reason="length"),
+                    ]
+                )
+            return iter([_make_chunk(content='{"month_vibe":"平稳"}', finish_reason="stop")])
+
+        client2 = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=length_then_ok)))
+        with (
+            mock.patch.object(dc, "_get_client", return_value=client2),
+            mock.patch.object(dc, "thinking_enabled", return_value=True),
+            mock.patch.object(dc, "_count_call"),
+            mock.patch.object(dc, "_pace"),
+            llm_stream.stream_context(sink=length_events.append, unit="emotion:2025-01", fresh_state=True),
+        ):
+            parsed = dc._call_api("sys", "user", max_tokens=4096, tag="emotion", dim="emotion")
+        self.assertEqual(parsed, {"month_vibe": "平稳"})
+        len_warns = [e for e in length_events if e["kind"] == "warn"]
+        self.assertTrue(any(w.get("data", {}).get("reset") for w in len_warns))
+
+    def test_empty_choices_raises_immediately_without_retrying_and_guards_callers(self):
+        attempts = [0]
+
+        def empty_create(**_kwargs):
+            attempts[0] += 1
+            return SimpleNamespace(choices=[], usage=None)
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=empty_create)))
+        with self.assertRaises(llm_transport.EmptyChoicesError):
+            llm_transport.request_with_retry(
+                client,
+                lambda: {"model": "m", "messages": []},
+                tag="emotion",
+                max_attempts=4,
+                generic_retries=3,
+                tpm_wait=0.0,
+                fatal_message="quota",
+                count_call=lambda: None,
+                pace=lambda: None,
+                is_plan_exhausted=lambda _e: False,
+                is_tpm_throttle=lambda _e: False,
+                set_cooldown=lambda _s: None,
+                tpm_max_attempts=2,
+                logger=dc.logger,
+                record_call=lambda *args: None,
+                model="m",
+                scrub_secrets=str,
+                quota_exhausted_error=RuntimeError,
+                sleep=lambda _s: None,
+            )
+        self.assertEqual(attempts[0], 1)
+
+        with (
+            mock.patch.object(dc, "_get_client", return_value=client),
+            mock.patch.object(dc, "_request_with_retry", return_value=(SimpleNamespace(choices=[]), None)),
+        ):
+            self.assertIsNone(dc._call_api("sys", "user", tag="emotion", dim="emotion"))
+            self.assertEqual(
+                dc._call_vision("sys", "user", [{"path": __file__, "mime": "image/png"}]),
+                "",
+            )
 
 
 if __name__ == "__main__":
