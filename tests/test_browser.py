@@ -1192,6 +1192,7 @@ class TestBrowserFlows(unittest.TestCase):
                         "/api/jobs/history",
                         "/api/usage",
                         "/api/analysis-scope",
+                        "/api/analyze-jobs/latest",
                     )
                 )
             )
@@ -1334,7 +1335,16 @@ class TestBrowserFlows(unittest.TestCase):
         self.assertIsNone(self.page.evaluate("key => sessionStorage.getItem(key)", foreign_key))
         self.page.unroute("**/api/analysis/emotion")
         self.errors = [
-            error for error in self.errors if not ("/api/analysis-scope" in error and "ERR_ABORTED" in error)
+            error
+            for error in self.errors
+            if not (
+                "ERR_ABORTED" in error
+                and (
+                    "/api/analysis-scope" in error
+                    or "/api/analyze-jobs/latest" in error
+                    or "/api/analysis/emotion" in error
+                )
+            )
         ]
         self.assertFalse(self.errors, self.errors)
 
@@ -1509,7 +1519,16 @@ class TestBrowserFlows(unittest.TestCase):
         self.assertGreaterEqual(len(navigations), 2)
         self.assertEqual(self.page.evaluate("window.ANALYSIS_PAGE_IDENTITY"), page_identity)
         self.errors = [
-            error for error in self.errors if not ("/api/analysis-scope" in error and "ERR_ABORTED" in error)
+            error
+            for error in self.errors
+            if not (
+                "ERR_ABORTED" in error
+                and (
+                    "/api/analysis-scope" in error
+                    or "/api/analyze-jobs/latest" in error
+                    or "/api/analysis/emotion" in error
+                )
+            )
         ]
         self.assertFalse(self.errors, self.errors)
 
