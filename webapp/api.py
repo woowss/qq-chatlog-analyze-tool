@@ -31,6 +31,7 @@ from analyzer.logger import get_logger
 from analyzer.result_schema import ResultValidationError, validate_result
 from analyzer.usage import get_usage
 from config import UPLOAD_FOLDER
+from webapp import job_stream
 from webapp import store
 from webapp.analysis_scope import (
     apply_scope,
@@ -190,77 +191,186 @@ def api_analyze(dimension: str):
     )
 
 
+def _job_is_live(job_id: str) -> bool:
+    with JOBS_LOCK:
+        j = JOBS.get(job_id)
+        return bool(j and j.get("status") == "running")
+
+
+def _dim_label_for(dimension: str) -> str:
+    if dimension == "all":
+        return "一键全量"
+    if dimension == "plan":
+        return "自选计划分析"
+    return ALL_DIMENSION_NAMES.get(dimension, dimension)
+
+
 def api_analyze_job(job_id: str):
-    """查询后台任务进度；完成时附带结果"""
+    """查询后台任务进度；附带实时输出流增量，完成时附带结果"""
     # 轮询是最高频的 API 入口，顺手在这里修剪过期任务：
     # 只在新任务启动时修剪的话，"跑完就不再发起分析"的进程会把结果一直挂在内存里
     _prune_jobs()
+    sid = session.sid
+    sess_chat_hash = session.get("chat_hash") or ""
+    try:
+        after = max(0, int(request.args.get("after", "0") or "0"))
+    except (TypeError, ValueError):
+        after = 0
+
+    purged_chat = ""
+    found_in_jobs = False
+    resp = None
     with JOBS_LOCK:
         j = JOBS.get(job_id)
-        if not j or j.get("sid") != session.sid:
-            return jsonify({"error": "任务不存在"}), 404
-        if not session.get("chat_hash") or j.get("chat_hash") != session.get("chat_hash"):
-            return jsonify({"error": "任务不存在"}), 404
-        resp = {
-            "status": j["status"],
-            "done": j["done"],
-            "total": j["total"],
-            "chat_hash": j.get("chat_hash", ""),
-            "scope_id": j.get("scope_id", ""),
-        }
-        if j.get("detail"):
-            resp["detail"] = j["detail"]
-        is_plan = j.get("dim") == "plan" or j.get("summary") is not None
-        if j.get("chat_hash") and store._is_recently_purged(j["chat_hash"]):
-            # A completed job may outlive deletion of its chat in JOBS. Do not make
-            # its in-memory model output retrievable after the cleanup boundary.
-            # This applies to legacy single-dimension and all-dimension jobs too.
-            j.update(
-                status="cancelled",
-                result={},
-                results={},
-                summary={},
-                partial_results={},
-                partial=True,
-                error="聊天已清理，分析结果已丢弃",
-            )
-            resp.update(
-                status="cancelled",
-                result={},
-                results={},
-                summary={},
-                partial_results={},
-                partial=True,
-                error=j["error"],
-            )
-            return jsonify(resp)
-        if j["status"] == "done":
-            resp["result"] = j["result"]
-            if j.get("summary") is not None:
-                resp["summary"] = j["summary"]
-            if is_plan:
-                resp["partial"] = bool(j.get("partial"))
-                resp["partial_results"] = j.get("partial_results", {})
-                resp["results"] = j.get("results", {})
-            elif j.get("partial"):
-                resp["partial"] = True
-                resp["partial_results"] = j.get("partial_results", {})
-        elif is_plan and j["status"] in {"error", "cancelled"}:
-            for key in ("result", "summary", "partial_results", "results"):
-                if key in j:
-                    resp[key] = j[key]
-            resp["partial"] = bool(j.get("partial", True))
+        if j:
+            if j.get("sid") != sid or not sess_chat_hash or j.get("chat_hash") != sess_chat_hash:
+                return jsonify({"error": "任务不存在"}), 404
+            found_in_jobs = True
+            dim_val = j.get("dim", "")
+            resp = {
+                "job_id": job_id,
+                "dim": dim_val,
+                "dim_label": j.get("dim_label") or _dim_label_for(dim_val),
+                "status": j["status"],
+                "done": j["done"],
+                "total": j["total"],
+                "chat_hash": j.get("chat_hash", ""),
+                "scope_id": j.get("scope_id", ""),
+            }
+            if j.get("detail"):
+                resp["detail"] = j["detail"]
+            is_plan = dim_val == "plan" or j.get("summary") is not None
+            if j.get("chat_hash") and store._is_recently_purged(j["chat_hash"]):
+                # A completed job may outlive deletion of its chat in JOBS. Do not make
+                # its in-memory model output retrievable after the cleanup boundary.
+                # This applies to legacy single-dimension and all-dimension jobs too.
+                purged_chat = j["chat_hash"]
+                j.update(
+                    status="cancelled",
+                    result={},
+                    results={},
+                    summary={},
+                    partial_results={},
+                    partial=True,
+                    error="聊天已清理，分析结果已丢弃",
+                )
+                resp.update(
+                    status="cancelled",
+                    result={},
+                    results={},
+                    summary={},
+                    partial_results={},
+                    partial=True,
+                    error=j["error"],
+                    stream_seq=0,
+                    events=[],
+                )
+            elif j["status"] == "done":
+                resp["result"] = j["result"]
+                if j.get("summary") is not None:
+                    resp["summary"] = j["summary"]
+                if is_plan:
+                    resp["partial"] = bool(j.get("partial"))
+                    resp["partial_results"] = j.get("partial_results", {})
+                    resp["results"] = j.get("results", {})
+                elif j.get("partial"):
+                    resp["partial"] = True
+                    resp["partial_results"] = j.get("partial_results", {})
+            elif is_plan and j["status"] in {"error", "cancelled"}:
+                for key in ("result", "summary", "partial_results", "results"):
+                    if key in j:
+                        resp[key] = j[key]
+                resp["partial"] = bool(j.get("partial", True))
+                if j.get("error"):
+                    resp["error"] = j["error"]
+                elif j["status"] == "cancelled":
+                    resp["error"] = "分析已取消"
+            elif j["status"] == "error":
+                resp["error"] = j.get("error", "未知错误")
+                if j.get("partial"):
+                    resp["partial"] = True
+                    resp["result"] = j.get("result", {})
+                    resp["partial_results"] = j.get("partial_results", {})
+    if purged_chat:
+        job_stream.purge_chat(purged_chat)
+        return jsonify(resp)
+
+    if found_in_jobs and resp is not None:
+        snap = job_stream.get_job_snapshot(
+            job_id,
+            sid=sid,
+            chat_hash=sess_chat_hash,
+            after=after,
+            live_check=_job_is_live,
+        )
+        if snap is not None:
+            resp["stream_seq"] = snap["stream_seq"]
+            resp["events"] = snap["events"]
+            if snap.get("dim_label"):
+                resp["dim_label"] = snap["dim_label"]
+        else:
+            resp["stream_seq"] = after
+            resp["events"] = []
+        return jsonify(resp)
+
+    if sess_chat_hash:
+        snap = job_stream.get_job_snapshot(
+            job_id,
+            sid=sid,
+            chat_hash=sess_chat_hash,
+            after=after,
+            live_check=_job_is_live,
+        )
+        if snap is not None:
+            return jsonify(snap)
+    return jsonify({"error": "任务不存在"}), 404
+
+
+def api_analyze_job_latest():
+    """返回当前会话、聊天与分析范围下最近一次分析任务及其实时输出流（供 UI 重载恢复）。"""
+    _prune_jobs()
+    chat_hash = session.get("chat_hash") or ""
+    if not chat_hash or store._is_recently_purged(chat_hash):
+        return jsonify({"found": False, "events": [], "stream_seq": 0})
+    try:
+        after = max(0, int(request.args.get("after", "0") or "0"))
+    except (TypeError, ValueError):
+        after = 0
+    cur_scope_id = scope_identity(session.get("analysis_scope"))
+    req_scope_id = (request.args.get("scope_id") or "").strip()
+    if req_scope_id and req_scope_id != cur_scope_id:
+        return jsonify(
+            {"found": False, "chat_hash": chat_hash, "scope_id": cur_scope_id, "events": [], "stream_seq": 0}
+        )
+    snap = job_stream.find_latest_job(
+        sid=session.sid,
+        chat_hash=chat_hash,
+        scope_id=cur_scope_id,
+        after=after,
+        live_check=_job_is_live,
+    )
+    if snap is None:
+        return jsonify(
+            {"found": False, "chat_hash": chat_hash, "scope_id": cur_scope_id, "events": [], "stream_seq": 0}
+        )
+    with JOBS_LOCK:
+        j = JOBS.get(snap["job_id"])
+        if j and j.get("sid") == session.sid and j.get("chat_hash") == chat_hash:
+            snap["status"] = j.get("status", snap["status"])
+            snap["done"] = int(j.get("done", snap["done"]))
+            snap["total"] = int(j.get("total", snap["total"]))
+            if j.get("detail"):
+                snap["detail"] = j["detail"]
             if j.get("error"):
-                resp["error"] = j["error"]
-            elif j["status"] == "cancelled":
-                resp["error"] = "分析已取消"
-        elif j["status"] == "error":
-            resp["error"] = j.get("error", "未知错误")
-            if j.get("partial"):
-                resp["partial"] = True
-                resp["result"] = j.get("result", {})
-                resp["partial_results"] = j.get("partial_results", {})
-    return jsonify(resp)
+                snap["error"] = j["error"]
+            if j.get("dim") == "plan" or j.get("summary") is not None:
+                snap["is_plan"] = True
+                if j.get("summary") is not None:
+                    snap["summary"] = j["summary"]
+            if snap["status"] == "done" and "result" in j:
+                snap["result"] = j["result"]
+    snap["found"] = True
+    return jsonify(snap)
 
 
 def _requested_plan_dimensions(values, is_group):
@@ -435,6 +545,11 @@ def api_analyze_plan():
         (current["plan_id"] + "\n" + "\n".join(sorted(selected))).encode("utf-8")
     ).hexdigest()
     _prune_jobs()
+    plan_label = (
+        ALL_DIMENSION_NAMES.get(dimensions[0], dimensions[0])
+        if len(dimensions) == 1
+        else ("一键全量" if not raw_dimensions else "自选计划分析")
+    )
     job_id, reused, conflict = _get_or_create_job(
         session.sid,
         "plan",
@@ -444,6 +559,7 @@ def api_analyze_plan():
         refresh=refresh,
         identity=identity,
         scope_id=current["scope_id"],
+        dim_label=plan_label,
     )
     if conflict:
         return jsonify({"error": "已有分析任务正在运行，请等它完成或先取消（避免重复调用 API）"}), 409
@@ -725,6 +841,7 @@ def api_chat_delete():
         except OSError as e:
             logger.warning("上传副本删除失败（可能仍残留敏感内容）: %s", e)
     store.forget_live_chat(chat_hash, sid)
+    removed += job_stream.purge_session(sid, chat_hash)
     # 显式删除：额外核对会话后端，别让"没点退出就关掉的浏览器"留下幽灵引用把清理挡住
     shared = store.other_live_sessions(chat_hash, exclude_sid=sid, require_live_session=True)
     if shared:
@@ -1323,6 +1440,7 @@ def register(app):
     """API 路由注册（端点名与旧 app.py 一致）"""
     app.add_url_rule("/api/analyze/<dimension>", "api_analyze", api_analyze, methods=["POST"])
     app.add_url_rule("/api/analyze-job/<job_id>", "api_analyze_job", api_analyze_job)
+    app.add_url_rule("/api/analyze-jobs/latest", "api_analyze_job_latest", api_analyze_job_latest)
     app.add_url_rule(
         "/api/analyze-job/<job_id>/cancel", "api_analyze_cancel", api_analyze_cancel, methods=["POST"]
     )

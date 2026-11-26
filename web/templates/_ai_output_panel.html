@@ -1,0 +1,26 @@
+{# Copyright (C) 2026 woowss
+
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+#}
+<section id="aiOutputPanel" class="card mb-4 d-none no-print ai-output-panel" aria-label="AI 实时分析输出" aria-live="polite">
+    <div class="card-header ai-output-header">
+        <div class="ai-output-title-wrap">
+            <span class="ai-output-title" id="aiOutputTitle">AI 实时输出</span>
+            <span class="badge bg-primary ai-output-status" id="aiOutputStatus">准备中</span>
+            <span class="small text-muted ai-output-meta" id="aiOutputMeta"></span>
+        </div>
+        <div class="ai-output-controls">
+            <button type="button" class="btn btn-sm btn-outline-secondary active" id="aiOutputThinkingBtn" aria-pressed="true" title="显示或隐藏模型思考过程">思考过程</button>
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="aiOutputToggleBtn" aria-expanded="true" aria-controls="aiOutputCollapseBody">收起</button>
+        </div>
+    </div>
+    <div class="card-body ai-output-collapse-body" id="aiOutputCollapseBody">
+        <div class="ai-output-body" id="aiOutputBody"></div>
+        <div class="ai-output-jump d-none" id="aiOutputJumpWrap">
+            <button type="button" class="btn btn-sm btn-primary" id="aiOutputJumpBtn">跳到最新</button>
+        </div>
+    </div>
+</section>

@@ -40,6 +40,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         <div id="recapStatus" class="flex-grow-1" role="status" aria-live="polite"></div>
     </div>
 </div>
+<div data-ai-output-slot></div>
 
 {% if not api_ok %}<div class="alert alert-info small" role="status">本地统计已可用；配置 API Key 后，可以生成跨月总括和提问角回答。</div>{% endif %}
 
@@ -138,6 +139,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
     // 已有结果先读盘（跨标签页/重启仍有效），没配 Key 也照常展示已生成的结果
     loadAnalysis('recap', function(cached) { if (cached) render(cached); });
+    if (window.registerAnalysisRefresher) {
+        window.registerAnalysisRefresher('recap', function(data) {
+            setAnalysisEmptyState('recap', 'ready');
+            render(data);
+        });
+    }
 
     $('#btn-recap').on('click', function() {
         var btn = $(this);

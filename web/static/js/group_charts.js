@@ -971,6 +971,20 @@ var GROUP_RENDERERS = {
 };
 
 function wireGroupAnalyzeButtons(members) {
+    $('.btn-analyze').each(function () {
+        var btn = $(this);
+        var dim = btn.data('dim');
+        var target = btn.data('target');
+        var renderer = GROUP_RENDERERS[dim];
+        if (dim === 'member_profiles' && members) {
+            renderer = function (el, data) { return renderMemberProfiles(el, data, members); };
+        }
+        if (window.registerAnalysisRefresher && dim && target && renderer) {
+            window.registerAnalysisRefresher(dim, function (data) {
+                renderGroupTarget(target, renderer, data, null);
+            });
+        }
+    });
     $('.btn-analyze').on('click', function () {
         var btn = $(this);
         var dim = btn.data('dim');

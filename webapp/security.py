@@ -66,8 +66,8 @@ def _now() -> float:
 
 
 def ensure_csrf_token():
-    """确保会话中存在 CSRF token（豁免 BYPASS_ENDPOINTS，避免探针写会话文件）。"""
-    if request.endpoint in BYPASS_ENDPOINTS:
+    """确保会话中存在 CSRF token（豁免静态资源与探针端点，避免无 cookie 静态请求新建空会话覆盖登录态）。"""
+    if request.endpoint in BYPASS_ENDPOINTS or request.endpoint == "static":
         return None
     if "csrf_token" not in session:
         session["csrf_token"] = secrets.token_hex(32)

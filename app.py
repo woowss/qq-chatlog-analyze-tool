@@ -121,6 +121,8 @@ def create_app() -> Flask:
     app.config["SESSION_TYPE"] = "cachelib"
     app.config["SESSION_CACHELIB"] = FileSystemCache(SESSION_FILE_DIR, threshold=500, mode=0o600)
     app.config["SESSION_PERMANENT"] = False
+    # 非永久会话不随每次 GET 回写存储，避免并发只读请求用旧副本覆盖 POST /upload 或作用域修改
+    app.config["SESSION_REFRESH_EACH_REQUEST"] = False
     app.config["SESSION_COOKIE_HTTPONLY"] = True  # 禁止 JS 读取会话 cookie
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"  # 跨站请求不携带 cookie（CSRF 纵深防御）
     # Secure：非回环绑定默认开启（HTTPS 才回传会话 cookie）。详见 _secure_cookie_enabled
