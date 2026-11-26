@@ -36,6 +36,7 @@ from typing import Optional
 
 from config import env_number
 from parser.qq_parser import CST, MEDIA_KINDS, is_statistical
+from analyzer.llm_runtime import QuotaExhaustedError
 from analyzer.local_stats import _median, is_session_start
 from analyzer.logger import get_logger
 
@@ -395,11 +396,6 @@ def _vision_digest(messages: list, chat_hash: str, label: str) -> str:
     """图片摘要：未开启/无图/失败都返回空串，绝不影响文本分析主流程"""
     if not label:
         return ""
-    # 延迟导入：QuotaExhaustedError 由 API 层（deepseek_client）拥有，而它反过来要 import
-    # 本模块的对话构建函数，模块级互相导入会成环。这个错误类型只在真的要走图片摘要时
-    # 才需要，放在函数里最省事也最不容易出环。
-    from analyzer.deepseek_client import QuotaExhaustedError
-
     try:
         from analyzer import vision
 

@@ -408,7 +408,7 @@ class TestMixedMediaAndMultiImageVision(unittest.TestCase):
 
 
 class TestRecapAndAnalyzeAllFixes(unittest.TestCase):
-    """空范围 recap 不出网且计划标为不可分析；_run_analyze_all 如实上报局部失败"""
+    """空范围 recap 不出网且计划标为不可分析；_run_selected_plan 如实上报局部失败"""
 
     def test_recap_empty_scope_short_circuits_and_marks_plan_empty(self):
         sys_msg = _msg("uA", "我", "系统提示", msg_id="s1")
@@ -423,8 +423,10 @@ class TestRecapAndAnalyzeAllFixes(unittest.TestCase):
     def test_analyze_all_marks_error_and_keeps_partial_results_on_partial_failure(self):
         chat = _private_chat()
         chat_hash = "hash-all-partial-01"
+        plan = analysis_plan.build_analysis_plan(chat, chat_hash, ["emotion", "topics"], refresh=True)
+        selected = [u["key"] for u in plan["units"] if u["status"] != "无可分析消息"]
         jid = "job-all-partial-01"
-        jobs.JOBS[jid] = {"status": "running", "chat_hash": chat_hash, "cancel": False}
+        jobs.JOBS[jid] = {"status": "running", "dim": "all", "chat_hash": chat_hash, "cancel": False}
         self.addCleanup(lambda: jobs.JOBS.pop(jid, None))
 
         def ok_emotion(*_a, **_kw):
@@ -440,22 +442,23 @@ class TestRecapAndAnalyzeAllFixes(unittest.TestCase):
             mock.patch.object(store, "_load_chat_cached", return_value=chat),
             mock.patch.object(store, "AI_CACHE_DIR", tmpdir),
             mock.patch.object(store, "append_job_history"),
-            mock.patch.object(jobs, "dimensions_for_mode", return_value=["emotion", "topics"]),
             mock.patch.object(jobs, "analyze_func_for", side_effect=funcs.__getitem__),
             mock.patch.object(jobs, "validate_dimension_result"),
         ):
-            jobs._run_analyze_all(jid, "synthetic.json", chat_hash, refresh=True)
+            jobs._run_selected_plan(jid, "synthetic.json", chat_hash, True, plan, selected)
         job = jobs.JOBS[jid]
         self.assertEqual(job["status"], "error")
         self.assertEqual(job["result"], {"emotion": "done", "topics": "error"})
-        self.assertEqual(job["partial_results"], {"emotion": {"2024-01": {"self_emotion": "平静"}}})
+        self.assertEqual(job["results"], {"emotion": {"2024-01": {"self_emotion": "平静"}}})
         self.assertTrue(job["partial"])
 
     def test_analyze_all_quota_abort_preserves_partial_results(self):
         chat = _private_chat()
         chat_hash = "hash-all-quota-01"
+        plan = analysis_plan.build_analysis_plan(chat, chat_hash, ["emotion", "topics"], refresh=True)
+        selected = [u["key"] for u in plan["units"] if u["status"] != "无可分析消息"]
         jid = "job-all-quota-01"
-        jobs.JOBS[jid] = {"status": "running", "chat_hash": chat_hash, "cancel": False}
+        jobs.JOBS[jid] = {"status": "running", "dim": "all", "chat_hash": chat_hash, "cancel": False}
         self.addCleanup(lambda: jobs.JOBS.pop(jid, None))
 
         def ok_emotion(*_a, **_kw):
@@ -471,15 +474,14 @@ class TestRecapAndAnalyzeAllFixes(unittest.TestCase):
             mock.patch.object(store, "_load_chat_cached", return_value=chat),
             mock.patch.object(store, "AI_CACHE_DIR", tmpdir),
             mock.patch.object(store, "append_job_history"),
-            mock.patch.object(jobs, "dimensions_for_mode", return_value=["emotion", "topics"]),
             mock.patch.object(jobs, "analyze_func_for", side_effect=funcs.__getitem__),
             mock.patch.object(jobs, "validate_dimension_result"),
         ):
-            jobs._run_analyze_all(jid, "synthetic.json", chat_hash, refresh=True)
+            jobs._run_selected_plan(jid, "synthetic.json", chat_hash, True, plan, selected)
         job = jobs.JOBS[jid]
         self.assertEqual(job["status"], "error")
         self.assertEqual(job["result"], {"emotion": "done", "topics": "aborted"})
-        self.assertEqual(job["partial_results"], {"emotion": {"2024-01": {"self_emotion": "平静"}}})
+        self.assertEqual(job["results"], {"emotion": {"2024-01": {"self_emotion": "平静"}}})
 
 
 class TestEvidenceBundleAndSecurityHardening(unittest.TestCase):

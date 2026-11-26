@@ -29,32 +29,41 @@ from typing import Callable, Optional
 from config import GROUP_AI_MAX_MEMBERS, env_number
 from parser.qq_parser import ChatData, is_statistical
 from parser.group_identity import Participant
+from analyzer import deepseek_client as dc
 from analyzer import group_prompts as gp
+from analyzer import llm_runtime
 from analyzer import llm_stream
 from analyzer import person_context
+from analyzer import purge_marks
 from analyzer.deepseek_client import (
-    AnalysisIncompleteError,
-    MAX_TOKENS_BY_DIM,
     _PromptText,
-    QuotaExhaustedError,
-    ResultValidationError,
     _analyze_periods,
-    _call_api,
+    _clamp_int,
     _fit_lines,
     _has_content,
     _message_line,
-    validate_result,
+    _normalize_topic_weights,
     _truncate_dialog_line,
     _vision_digest,
-    scope_cache_fingerprint,
     logger,
+    scope_cache_fingerprint,
 )
+from analyzer.llm_runtime import (
+    AnalysisIncompleteError,
+    MAX_TOKENS_BY_DIM as MAX_TOKENS_BY_DIM,
+    QuotaExhaustedError,
+)
+from analyzer.month_cache import _month_key
+from analyzer.result_schema import ResultValidationError, validate_result
 from analyzer.group_stats import (
     calc_member_activity,
     calc_member_interaction_summary,
     is_unknown_message,
 )
 from analyzer.logger import mask_name
+
+_ORIG_CALL_API = llm_runtime._call_api
+_call_api = llm_runtime._call_api
 
 GROUP_CACHE_VERSION = "v2"
 #: 单个群聊月的对话文本上限（字符）。默认与私聊同档（准确性优先），
@@ -623,13 +632,11 @@ def _member_cache_key(member: Participant, user_content: str, chat: ChatData | N
     真实数据实测过：一次 10 人的成员画像里有 2 位因模型输出非法 JSON 失败，
     没有按人缓存时补这 2 位要重付 10 次的钱。
     """
-    import analyzer.deepseek_client as dc
-
     version = f":{person_context.STRATEGY_VERSION}" if person_context.PERSON_CONTEXT_ENABLED else ""
     fingerprint = group_prompt_fingerprint()
     if chat is not None:
         fingerprint = scope_cache_fingerprint(chat, fingerprint, include_targets=True)
-    return dc._month_key(f"member_profiles{version}:{member.uid}", user_content, fingerprint)
+    return _month_key(f"member_profiles{version}:{member.uid}", user_content, fingerprint)
 
 
 def _prepare_member_request(
@@ -693,13 +700,11 @@ def _prepare_member_request(
     prompt = prompt_template.format(
         display_name=member.name, group_name=chat.chat_name, context=context, dialog=dialog
     )
-    import analyzer.deepseek_client as dc
-
     return {
         "messages": msgs,
         "prompt": prompt,
         "cache_key": _member_cache_key(member, prompt, chat),
-        "thinking": dc.thinking_enabled(tag),
+        "thinking": llm_runtime.thinking_enabled(tag),
     }
 
 
@@ -724,8 +729,6 @@ def _analyze_member(
             request_data = _prepare_member_request(chat, member, prompt_template, tag, chat_hash)
             if request_data is None:
                 return None
-            import analyzer.deepseek_client as dc
-
             msgs = request_data["messages"]
             prompt = request_data["prompt"]
             key = request_data["cache_key"]
@@ -740,7 +743,8 @@ def _analyze_member(
                 )
             else:
                 llm_stream.emit_event("stage", f"开始分析成员 {member.name}（{len(msgs)} 条消息）")
-                result = _call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag, dim=tag)
+                call_api = _call_api if _call_api is not _ORIG_CALL_API else llm_runtime._call_api
+                result = call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag, dim=tag)
                 if result:
                     try:
                         validate_result(tag, result)
@@ -755,7 +759,7 @@ def _analyze_member(
                         ) from e
                     llm_stream.emit_result_fallback(result)
                     llm_stream.emit_event("stage", f"成员 {member.name} 分析完成")
-                if result and not dc.purge_marks.is_marked(chat_hash):
+                if result and not purge_marks.is_marked(chat_hash):
                     dc._write_month_cache(key, result, thinking=want_thinking)
             if result is not None and used_keys is not None:
                 used_keys.add(key)
@@ -816,7 +820,7 @@ def analyze_member_profiles(
                 member,
                 gp.GROUP_SYSTEM_PROMPT_MEMBER_PROFILE,
                 template,
-                max_tokens=MAX_TOKENS_BY_DIM["member_profiles"],
+                max_tokens=llm_runtime.MAX_TOKENS_BY_DIM["member_profiles"],
                 tag="member_profiles",
                 chat_hash=chat_hash,
                 used_keys=used_keys,
@@ -849,8 +853,6 @@ def _record_member_usage(chat_hash: str, keys: "set") -> None:
     """把本维度用到的成员缓存记进 manifest（与月份缓存共用引用计数与清理规则）"""
     if not keys:
         return
-    import analyzer.deepseek_client as dc
-
     dc._record_month_usage(chat_hash, keys)
 
 
@@ -863,7 +865,7 @@ def _monthly_group_dimension(
         months,
         system_prompt,
         lambda p, msgs: _group_month_prompt(chat, p, msgs, chat_hash=chat_hash),
-        max_tokens=MAX_TOKENS_BY_DIM[tag],
+        max_tokens=llm_runtime.MAX_TOKENS_BY_DIM[tag],
         tag=tag,
         on_progress=on_progress,
         should_cancel=should_cancel,
@@ -884,8 +886,6 @@ def analyze_group_topics(chat: ChatData, on_progress=None, should_cancel=None, c
     results = _monthly_group_dimension(
         gp.GROUP_SYSTEM_PROMPT_TOPICS, "group_topics", chat, on_progress, should_cancel, chat_hash
     )
-    from analyzer.deepseek_client import _normalize_topic_weights
-
     for r in results.values():
         _normalize_topic_weights(r)  # 权重归一化：各月占比之和恒为 1.0
     return results
@@ -896,8 +896,6 @@ def analyze_group_emotion(chat: ChatData, on_progress=None, should_cancel=None, 
     results = _monthly_group_dimension(
         gp.GROUP_SYSTEM_PROMPT_EMOTION, "group_emotion", chat, on_progress, should_cancel, chat_hash
     )
-    from analyzer.deepseek_client import _clamp_int
-
     for r in results.values():
         _clamp_int(r, "group_intensity", 0, 10)
         for item in r.get("member_emotions") or []:
@@ -929,10 +927,10 @@ def _group_fingerprint_inputs():
             MEMBER_PROFILE_SAMPLES,
             INTERACTION_DIGEST_PAIRS,
             GROUP_AI_MAX_MEMBERS,
-            MAX_TOKENS_BY_DIM.get("group_dynamics"),
-            MAX_TOKENS_BY_DIM.get("group_topics"),
-            MAX_TOKENS_BY_DIM.get("group_emotion"),
-            MAX_TOKENS_BY_DIM.get("member_profiles"),
+            llm_runtime.MAX_TOKENS_BY_DIM.get("group_dynamics"),
+            llm_runtime.MAX_TOKENS_BY_DIM.get("group_topics"),
+            llm_runtime.MAX_TOKENS_BY_DIM.get("group_emotion"),
+            llm_runtime.MAX_TOKENS_BY_DIM.get("member_profiles"),
         ),
     )
 

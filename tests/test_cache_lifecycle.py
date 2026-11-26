@@ -60,6 +60,7 @@ from analyzer import deepseek_client as dc  # noqa: E402
 from analyzer import month_cache as mc  # noqa: E402
 from analyzer import purge_marks  # noqa: E402
 from parser.qq_parser import Message  # noqa: E402
+from webapp import analysis_plan  # noqa: E402
 from webapp import jobs  # noqa: E402
 from webapp import store  # noqa: E402
 
@@ -530,9 +531,14 @@ class TestResurrectionGuards(CacheLifecycleCase):
             store._purge_chat_caches(chat_hash)  # 第一个维度开工即被清理
             return {"2023-11": {"k": 1}}
 
-        job_id = jobs._get_or_create_job(sid, "all", h, total=5)[0]
+        loaded_chat = store._load_chat_cached(filepath)
+        plan = analysis_plan.build_analysis_plan(
+            loaded_chat, h, jobs.dimensions_for_mode(False), refresh=False
+        )
+        selected = [u["key"] for u in plan["units"] if u["status"] != "无可分析消息"]
+        job_id = jobs._get_or_create_job(sid, "all", h, total=len(selected))[0]
         with mock.patch.object(jobs, "analyze_func_for", return_value=fake):
-            jobs._run_analyze_all(job_id, filepath, h, refresh=False)
+            jobs._run_selected_plan(job_id, filepath, h, False, plan, selected)
         with jobs.JOBS_LOCK:
             status = jobs.JOBS.get(job_id, {}).get("status")
         self.assertEqual(status, "cancelled", f"清理打断的全量必须记 cancelled，实际 {status}")

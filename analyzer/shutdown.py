@@ -24,7 +24,7 @@
 有了这个标志：信号处理器先置位，分析循环里所有"是否还要再启动一个新任务"的
 判断都会看到它并停止派发；已经在跑的那一个月允许跑完，结果照常落盘。
 三处消费点：analyzer.deepseek_client._analyze_periods（逐月）、
-webapp.jobs._run_analyze_all（逐维度）、webapp.jobs._run_job（收尾判定）。
+webapp.jobs._run_selected_plan（计划/全量）、webapp.jobs._run_job（收尾判定）。
 
 放在独立模块而不是 deepseek_client 里：webapp 层要用它，但 webapp 不该为了
 一个布尔量去 import 整个 API 客户端（那会连带初始化 openai 客户端与密钥检查）。
