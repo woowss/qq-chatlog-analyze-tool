@@ -31,7 +31,7 @@ import uuid
 from flask import session
 
 from config import JOB_TTL_SECONDS
-from analyzer.deepseek_client import (
+from analyzer.llm_runtime import (
     AnalysisIncompleteError,
     QuotaExhaustedError,
     begin_run,
@@ -252,7 +252,7 @@ def _fail_job(job_id: str, message: str) -> None:
         if j:
             found = True
             j.update(status="error", error=message, finished_at=time.time())
-            if j.get("dim") == "plan":
+            if j.get("dim") in {"all", "plan"}:
                 j.setdefault("result", {})
                 j.setdefault("results", {})
                 j.setdefault("summary", {})
@@ -434,213 +434,6 @@ def _run_job(
         # 与 begin_run 配对（即使中途 return/抛异常也要释放）：漏掉的后果是
         # _run_depth 永远 >0，之后每次 begin_run 都不再清零，LLM_MAX_CALLS_PER_RUN
         # 会悄悄变成"进程启动以来的累计"，把正常的一次分析也掐断。
-        end_run()
-
-
-def _run_analyze_all(
-    job_id: str, filepath: str, chat_hash: str, refresh: bool, is_group: bool = False, scope=None
-) -> None:
-    """一键全量分析：按维度顺序执行（维度内部已有月份级并发），
-    已缓存的维度直接跳过（refresh 时强制重跑），单维度失败不阻断其余维度。
-
-    is_group 默认 False（私聊维度集）：既有调用点与老测试不带这个参数时行为完全不变。
-    """
-    # 整个全量循环只清一次计数：这样 LLM_MAX_CALLS_PER_RUN 覆盖的是"一次点击的全量"，
-    # 而不是每个维度各自一份额度（那样 5 个维度会把它放大 5 倍）。
-    begin_run()
-    try:
-        # 同 _run_job：全量任务可能排在文件被清理之后才开工
-        if not os.path.exists(filepath):
-            logger.warning("一键全量分析中止：会话文件已被清理（%s…）", chat_hash[:8])
-            _fail_job(job_id, "会话文件已被清理（上传文件只保留 24 小时），请重新上传聊天记录")
-            return
-        chat, _scope = apply_scope(store._load_chat_cached(filepath), scope)
-        dims = dimensions_for_mode(is_group)
-        total = len(dims)
-        summary: dict[str, str] = {}
-        partial_results: dict = {}
-
-        def should_cancel() -> bool:
-            return _stop_requested(job_id)
-
-        with llm_stream.stream_context(sink=job_stream.make_sink(job_id), cancel_check=should_cancel):
-            llm_stream.emit_event(
-                "stage", f"开始一键全量分析（共 {total} 个维度）", unit="all", label="一键全量"
-            )
-            for idx, dim in enumerate(dims, 1):
-                if should_cancel():
-                    break
-                dim_name = ALL_DIMENSION_NAMES.get(dim, dim)
-                detail_msg = f"{idx}/{total} {dim_name}"
-                with JOBS_LOCK:
-                    j = JOBS.get(job_id)
-                    if j:
-                        j["detail"] = detail_msg
-                job_stream.update_job_meta(job_id, detail=detail_msg)
-                cache_fp = store.analysis_cache_fingerprint(dim, chat)
-                cached = None if refresh else store._read_cache(dim, chat_hash, fingerprint=cache_fp)
-                if cached is not None:
-                    summary[dim] = "cached"
-                    partial_results[dim] = cached
-                    llm_stream.emit_event(
-                        "cache",
-                        f"「{dim_name}」命中维度缓存，跳过重复分析",
-                        unit=f"dim:{dim}",
-                        label=dim_name,
-                        data={"cached": True},
-                    )
-                else:
-                    unit = dimension_unit(dim)
-                    llm_stream.emit_event(
-                        "stage",
-                        f"[{idx}/{total}] 开始分析「{dim_name}」",
-                        unit=f"dim:{dim}",
-                        label=dim_name,
-                    )
-
-                    def on_inner(done: int, tot: int, _dim=dim_name, _idx=idx, _unit=unit):
-                        inner_detail = f"{_idx}/{total} {_dim}（{_done_str(done, tot, _unit)}）"
-                        with JOBS_LOCK:
-                            j = JOBS.get(job_id)
-                            if j:
-                                j["detail"] = inner_detail
-                        job_stream.update_job_meta(job_id, detail=inner_detail)
-
-                    try:
-                        with content_cache_policy(refresh, should_cancel):
-                            result = analyze_func_for(dim)(
-                                chat, on_progress=on_inner, should_cancel=should_cancel, chat_hash=chat_hash
-                            )
-                        if result and should_cancel():
-                            # 取消/关闭打断的维度：不写缓存（残缺结果一旦落盘，重跑会命中它，
-                            # 缺的月份就再也不会补上）；已完成的月份仍在月份缓存里，不重复付费
-                            summary[dim] = "cancelled"
-                            llm_stream.emit_event(
-                                "stage", f"「{dim_name}」已取消", unit=f"dim:{dim}", label=dim_name
-                            )
-                        elif result:
-                            validate_dimension_result(dim, result)
-                            store._write_cache(dim, chat_hash, result, fingerprint=cache_fp)
-                            summary[dim] = "done"
-                            partial_results[dim] = result
-                            llm_stream.emit_event(
-                                "stage", f"「{dim_name}」分析完成", unit=f"dim:{dim}", label=dim_name
-                            )
-                        else:
-                            summary[dim] = "empty"
-                            llm_stream.emit_event(
-                                "warn", f"「{dim_name}」未生成有效结果", unit=f"dim:{dim}", label=dim_name
-                            )
-                    except QuotaExhaustedError as e:
-                        # 配额/限流致命：已完成的维度结果已落盘缓存，如实报告
-                        summary[dim] = "aborted"
-                        if not store._is_recently_purged(chat_hash):
-                            with JOBS_LOCK:
-                                j = JOBS.get(job_id)
-                                if j:
-                                    j["result"] = dict(summary)
-                                    if partial_results:
-                                        j["partial_results"] = dict(partial_results)
-                                        j["partial"] = True
-                        _fail_job(job_id, f"{e}（已完成维度：{len(summary)}，其结果已缓存）")
-                        return
-                    except ResultValidationError as e:
-                        logger.warning("一键全量分析 %s 结果结构无效（字段 %s）", dim_name, e.path)
-                        summary[dim] = "invalid"
-                        llm_stream.emit_event(
-                            "error",
-                            f"「{dim_name}」结果结构无效（字段 {e.path}）",
-                            unit=f"dim:{dim}",
-                            label=dim_name,
-                        )
-                    except Exception as e:
-                        logger.error("一键全量分析 %s 失败: %s", dim_name, scrub_secrets(e))
-                        summary[dim] = "error"
-                        llm_stream.emit_event(
-                            "error",
-                            f"「{dim_name}」分析失败：{scrub_secrets(e)}",
-                            unit=f"dim:{dim}",
-                            label=dim_name,
-                        )
-                        partial = _validated_partial_result(dim, e)
-                        if partial is not None and not store._is_recently_purged(chat_hash):
-                            partial_results[dim] = partial
-                with JOBS_LOCK:
-                    j = JOBS.get(job_id)
-                    if j:
-                        j.update(done=idx, total=total)
-                job_stream.update_job_meta(job_id, done=idx, total=total, force_flush=True)
-            with JOBS_LOCK:
-                j = JOBS.get(job_id)
-                if not j:
-                    return
-                # 这里已经在 JOBS_LOCK 里，不能再调 _stop_requested()/_job_cancelled()
-                # ——JOBS_LOCK 是不可重入的 Lock，同线程二次获取会直接死锁。
-                # j["cancel"] 现成可读，关闭标志则由无锁的 shutdown_requested() 给出；
-                # 第三个停止条件（刚被清理）同理从手头直接判 —— 循环就是因此中断的，
-                # 这里漏判会把"清理后整轮作废"如实发生的任务标成 done。
-                purged = purge_marks.is_marked(j.get("chat_hash", ""))
-                if j.get("cancel") or shutdown_requested() or purged:
-                    j.update(status="cancelled", finished_at=time.time())
-                    if purged:
-                        j.pop("partial_results", None)
-                        j.pop("partial", None)
-                else:
-                    failed = [
-                        ALL_DIMENSION_NAMES.get(d, d)
-                        for d, st in summary.items()
-                        if st in ("error", "invalid", "aborted", "empty")
-                    ]
-                    if failed:
-                        update = {
-                            "status": "error",
-                            "error": f"部分维度未完成：{', '.join(failed)}（已完成结果已缓存）",
-                            "result": summary,
-                            "finished_at": time.time(),
-                        }
-                        if partial_results:
-                            update["partial_results"] = partial_results
-                            update["partial"] = True
-                        j.update(update)
-                    else:
-                        j.update(status="done", result=summary, finished_at=time.time())
-                final_status = j.get("status", "error")
-                final_done = int(j.get("done", 0))
-                final_total = int(j.get("total", 0))
-                final_detail = str(j.get("detail", ""))
-                final_error = str(j.get("error", ""))
-                hist = {
-                    "t": j.get("finished_at"),
-                    "dim": "all",
-                    "status": j.get("status"),
-                    "done": final_done,
-                    "total": final_total,
-                    "chat": (j.get("chat_hash") or "")[:12],
-                }
-            store.append_job_history(hist)
-            if purged:
-                job_stream.purge_chat(chat_hash)
-            else:
-                if final_status == "done":
-                    llm_stream.emit_event("stage", "一键全量分析已完成", unit="all", label="一键全量")
-                elif final_status == "cancelled":
-                    llm_stream.emit_event("stage", "一键全量分析已取消", unit="all", label="一键全量")
-                elif final_error:
-                    llm_stream.emit_event("error", final_error, unit="all", label="一键全量")
-                job_stream.finalize_job(
-                    job_id,
-                    status=final_status,
-                    done=final_done,
-                    total=final_total,
-                    detail=final_detail,
-                    error=final_error,
-                )
-        logger.info("一键全量分析完成（任务 %s）: %s", job_id[:8], summary)
-    except Exception as e:
-        logger.error("一键全量分析失败: %s", scrub_secrets(e))
-        _fail_job(job_id, f"AI 分析失败: {scrub_secrets(e)}")
-    finally:
-        # 与 _run_job 同理：全量循环里的 return（配额/花费上限中止）也必须释放运行边界
         end_run()
 
 
@@ -867,13 +660,22 @@ def _run_selected_plan(job_id, filepath, chat_hash, refresh, plan, selected_unit
         quota_exhausted = False
         completed = 0
 
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            job_dim = (job or {}).get("dim", "plan")
+        plan_unit = "all" if job_dim == "all" else "plan"
+        plan_label = "一键全量" if job_dim == "all" else "自选计划"
+        start_text = (
+            f"开始一键全量分析（共 {total} 个单元）"
+            if job_dim == "all"
+            else f"开始执行自选分析计划（共 {total} 个单元）"
+        )
+
         def should_cancel():
             return _stop_requested(job_id)
 
         with llm_stream.stream_context(sink=job_stream.make_sink(job_id), cancel_check=should_cancel):
-            llm_stream.emit_event(
-                "stage", f"开始执行自选分析计划（共 {total} 个单元）", unit="plan", label="自选计划"
-            )
+            llm_stream.emit_event("stage", start_text, unit=plan_unit, label=plan_label)
             for dimension in plan["dimensions"]:
                 keys = grouped[dimension]
                 if not keys:
@@ -1056,7 +858,11 @@ def _run_selected_plan(job_id, filepath, chat_hash, refresh, plan, selected_unit
                     )
                 job.update(
                     status=status,
-                    result=summary if len(plan["dimensions"]) > 1 else results.get(plan["dimensions"][0], {}),
+                    result=(
+                        summary
+                        if (len(plan["dimensions"]) > 1 or job_dim == "all")
+                        else results.get(plan["dimensions"][0], {})
+                    ),
                     results=results,
                     summary=summary,
                     partial_results={
@@ -1072,7 +878,7 @@ def _run_selected_plan(job_id, filepath, chat_hash, refresh, plan, selected_unit
                 final_detail = str(job.get("detail", ""))
                 history = {
                     "t": job["finished_at"],
-                    "dim": "plan",
+                    "dim": job_dim,
                     "status": job["status"],
                     "done": final_done,
                     "total": int(job.get("total", 0)),
@@ -1083,11 +889,11 @@ def _run_selected_plan(job_id, filepath, chat_hash, refresh, plan, selected_unit
                 job_stream.purge_chat(chat_hash)
             else:
                 if status == "done":
-                    llm_stream.emit_event("stage", "自选分析计划已完成", unit="plan", label="自选计划")
+                    llm_stream.emit_event("stage", f"{plan_label}已完成", unit=plan_unit, label=plan_label)
                 elif status == "cancelled":
-                    llm_stream.emit_event("stage", "自选分析计划已取消", unit="plan", label="自选计划")
+                    llm_stream.emit_event("stage", f"{plan_label}已取消", unit=plan_unit, label=plan_label)
                 elif error_message:
-                    llm_stream.emit_event("error", error_message, unit="plan", label="自选计划")
+                    llm_stream.emit_event("error", error_message, unit=plan_unit, label=plan_label)
                 job_stream.finalize_job(
                     job_id,
                     status=status,

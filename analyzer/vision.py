@@ -44,6 +44,7 @@ from config import (
     VISION_MIN_SIDE,
 )
 from analyzer.logger import get_logger, mask_name
+from analyzer import llm_runtime
 from analyzer import purge_marks
 from analyzer.atomic_write import write_json_atomic
 
@@ -365,10 +366,13 @@ def pick_images(msgs: list, limit: int = None, chat_hash: str = "") -> list[dict
 
 def _images_key(images: list[dict]) -> str:
     """摘要缓存键：图片内容指纹 + 顺序 + 模型/系统提示词/清晰度都要进哈希。"""
-    from analyzer import deepseek_client as dc  # 延迟导入，避免循环依赖
-
     digest = hashlib.sha256()
-    for part in (dc.DEEPSEEK_MODEL, dc.PROMPT_FINGERPRINT, VISION_SYSTEM, VISION_DETAIL):
+    for part in (
+        llm_runtime.DEEPSEEK_MODEL,
+        llm_runtime.default_prompt_fingerprint(),
+        VISION_SYSTEM,
+        VISION_DETAIL,
+    ):
         digest.update(str(part).encode("utf-8"))
         digest.update(b"\x00")
     for img in images:
@@ -448,9 +452,7 @@ def digest(msgs: list, chat_hash: str = "", label: str = "") -> str:
         _memo_put_for_chat(chat_hash, key, cached)
         return cached
 
-    from analyzer import deepseek_client as dc  # 延迟导入，避免循环依赖
-
-    text = dc._call_vision(VISION_SYSTEM, _build_user_text(images, label), images)
+    text = llm_runtime._call_vision(VISION_SYSTEM, _build_user_text(images, label), images)
     if not text:
         return ""
     # 与月份缓存、维度缓存同一道守卫：这批摘要背后是一次付费调用，落盘本身天经地义，
