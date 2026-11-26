@@ -66,6 +66,17 @@ class TestWindowsLauncherHelpers(unittest.TestCase):
             LAUNCHER.remove_runtime_info(path, pid=1234)
             self.assertFalse(path.exists())
 
+    def test_runtime_info_rejects_boolean_port_or_pid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.json"
+            for bad in (
+                '{"host": "127.0.0.1", "port": true, "pid": 1234}',
+                '{"host": "127.0.0.1", "port": 5123, "pid": true}',
+                '{"host": "127.0.0.1", "port": false, "pid": 1234}',
+            ):
+                path.write_text(bad, encoding="utf-8")
+                self.assertIsNone(LAUNCHER.read_runtime_info(path), f"应拒绝布尔字段: {bad}")
+
     def test_env_template_does_not_overwrite_existing_config(self):
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
