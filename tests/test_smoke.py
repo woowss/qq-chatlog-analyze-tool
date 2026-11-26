@@ -293,8 +293,10 @@ class TestAssetCacheBusting(unittest.TestCase):
         """
         index = self.client.get("/").get_data(as_text=True)
         self.assertRegex(index, r"css/style\.css\?v=\d+")
+        self.assertRegex(index, r"js/utils\.js\?v=\d+")
 
         base = (ROOT / "web" / "templates" / "base.html").read_text(encoding="utf-8")
+        self.assertRegex(base, r"js/utils\.js'\) \}\}\?v=\{\{ asset_v \}\}")
         self.assertRegex(base, r"js/charts\.js'\) \}\}\?v=\{\{ asset_v \}\}")
         self.assertRegex(base, r"js/analyze\.js'\) \}\}\?v=\{\{ asset_v \}\}")
 

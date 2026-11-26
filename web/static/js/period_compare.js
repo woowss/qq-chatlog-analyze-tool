@@ -2,10 +2,6 @@
     var root = $('#periodCompare');
     if (!root.length) return;
 
-    function esc(value) {
-        return String(value == null ? '' : value).replace(/&/g, '&amp;').replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-    }
     function fmt(value, digits) {
         if (value == null || !Number.isFinite(Number(value))) return '样本不足';
         return Number(value).toLocaleString(undefined, { maximumFractionDigits: digits == null ? 1 : digits });

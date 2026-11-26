@@ -36,8 +36,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     {# 自有 JS/CSS 带版本参数破缓存：vendor/ 的文件名自带版本，自有文件没有 #}
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v={{ asset_v }}">
     <script src="{{ url_for('static', filename='vendor/jquery.min.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/utils.js') }}?v={{ asset_v }}"></script>
     {# 可视化库仅供画图页面加载；分析任务脚本独立成块，纯文本页可跳过图表库。
-       jQuery 不放进这些块：上传与消息页面的交互仍会用到它。 #}
+       jQuery 与共用小工具（window.esc）不放进这些块：上传与消息页面也会用到。 #}
     {% block chart_scripts %}
     <script src="{{ url_for('static', filename='vendor/echarts.min.js') }}"></script>
     <script src="{{ url_for('static', filename='vendor/echarts-wordcloud.min.js') }}"></script>

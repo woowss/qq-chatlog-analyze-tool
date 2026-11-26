@@ -26,6 +26,7 @@ import config
 from config import LOG_REDACT_NAMES, MAX_CONTENT_LENGTH, UPLOAD_FOLDER
 from analyzer.deepseek_client import is_api_configured
 from analyzer.logger import get_logger, mask_name
+from webapp import job_stream
 from webapp import store
 from webapp.security import BYPASS_ENDPOINTS, _guard_post, wants_json
 from web import ASSET_VERSION
@@ -252,6 +253,7 @@ def upload():
         )
     if switching:
         store.forget_live_chat(old_hash, sid)
+        job_stream.purge_session(sid, old_hash)
         holders = store.other_live_sessions(old_hash, exclude_sid=sid)
         if holders:
             logger.info("旧聊天仍被其它 %d 个会话使用中，本次不清理其派生缓存", len(holders))

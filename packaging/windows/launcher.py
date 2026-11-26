@@ -212,9 +212,9 @@ def read_runtime_info(path: Path) -> Optional[dict]:
     pid = payload.get("pid")
     if not isinstance(host, str) or host.strip().lower() not in _LOCAL_HOSTS:
         return None
-    if not isinstance(port, int) or not 1 <= port <= 65535:
+    if type(port) is not int or not 1 <= port <= 65535:
         return None
-    if not isinstance(pid, int) or pid <= 0:
+    if type(pid) is not int or pid <= 0:
         return None
     return {"host": host, "port": port, "pid": pid}
 

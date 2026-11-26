@@ -917,7 +917,9 @@ class TestFrontendEscaping(unittest.TestCase):
     而这两个字段受聊天内容影响，等于给"聊天记录 → 页面 XSS"留了通道。
     """
 
-    CHARTS = Path(__file__).resolve().parent.parent / "web" / "static" / "js" / "charts.js"
+    WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
+    CHARTS = WEB_ROOT / "static" / "js" / "charts.js"
+    UTILS = WEB_ROOT / "static" / "js" / "utils.js"
 
     def test_emotion_tooltip_escapes_model_output(self):
         src = self.CHARTS.read_text(encoding="utf-8")
@@ -926,11 +928,27 @@ class TestFrontendEscaping(unittest.TestCase):
         self.assertNotIn("+ selfEmotions[idx] +", src)
         self.assertNotIn("+ otherEmotions[idx]", src)
 
-    def test_esc_covers_html_metacharacters(self):
-        src = self.CHARTS.read_text(encoding="utf-8")
+    def test_esc_covers_html_metacharacters_and_is_deduplicated(self):
+        src = self.UTILS.read_text(encoding="utf-8")
+        self.assertIn("window.esc = esc", src)
         body = src.split("function esc(s)")[1].split("\n}")[0]
         for entity in ("&amp;", "&lt;", "&gt;", "&quot;", "&#39;"):
             self.assertIn(entity, body, f"esc() 缺少 {entity} 转义")
+
+        base_html = (self.WEB_ROOT / "templates" / "base.html").read_text(encoding="utf-8")
+        self.assertIn("js/utils.js", base_html)
+
+        for rel in (
+            "static/js/charts.js",
+            "static/js/period_compare.js",
+            "templates/messages.html",
+            "templates/recap.html",
+        ):
+            content = (self.WEB_ROOT / rel).read_text(encoding="utf-8")
+            self.assertNotIn("function esc(", content, f"{rel} 不应重复定义 esc()")
+
+        assets = (self.WEB_ROOT / "templates" / "_report_assets.html").read_text(encoding="utf-8")
+        self.assertIn("function esc(s)", assets, "离线导出报告必须保留自包含 esc()")
 
 
 def _r4_msg(uid: str, ts: int, text: str = "在吗", has_image: bool = False, **kw) -> Message:
