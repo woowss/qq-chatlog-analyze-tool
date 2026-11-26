@@ -60,22 +60,21 @@ def _chat(*, with_image=False):
 
 
 class ReadOnlyPlanTests(unittest.TestCase):
-    def test_dimension_and_month_cache_reads_do_not_touch_or_migrate(self):
+    def test_dimension_and_month_cache_reads_do_not_touch(self):
         with tempfile.TemporaryDirectory() as directory:
             with mock.patch.object(store, "AI_CACHE_DIR", directory):
-                old_fp = dc.legacy_fingerprint_for_dimension("emotion")
-                old_path = Path(store._cache_path("emotion", "readonly-chat", fingerprint=old_fp))
-                old_path.parent.mkdir(parents=True, exist_ok=True)
-                old_path.write_text(json.dumps({"_created": 1, "result": {"paid": True}}), encoding="utf-8")
-                old_time = time.time() - 3600
-                os.utime(old_path, (old_time, old_time))
                 current_fp = dc.fingerprint_for_dimension("emotion")
+                cache_path = Path(store._cache_path("emotion", "readonly-chat", fingerprint=current_fp))
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(json.dumps({"_created": 1, "result": {"paid": True}}), encoding="utf-8")
+                old_time = time.time() - 3600
+                os.utime(cache_path, (old_time, old_time))
                 self.assertEqual(
                     store._read_cache("emotion", "readonly-chat", fingerprint=current_fp, read_only=True),
                     {"paid": True},
                 )
-                self.assertTrue(old_path.exists())
-                self.assertEqual(old_path.stat().st_mtime, old_time)
+                self.assertTrue(cache_path.exists())
+                self.assertEqual(cache_path.stat().st_mtime, old_time)
 
             mc.configure_month_cache(directory)
             self.addCleanup(mc.configure_month_cache, "")
@@ -126,6 +125,21 @@ class ReadOnlyPlanTests(unittest.TestCase):
         self.assertTrue(plan["units"][0]["vision_uncertain"])
         self.assertEqual(plan["units"][0]["text_calls_min"], 1)
         self.assertEqual(plan["summary"]["vision_calls_min"], 1)
+
+    def test_scoped_recap_unit_identity_matches_analysis_cache_fingerprint(self):
+        from analyzer import recap_client
+        from webapp.analysis_scope import apply_scope
+
+        chat = _chat()
+        scoped_chat, _scope = apply_scope(chat, {"date_from": "2025-02-01", "date_to": "2025-02-28"})
+        full_plan = analysis_plan.build_analysis_plan(chat, "recap-full-hash", ["recap"])
+        scoped_plan = analysis_plan.build_analysis_plan(scoped_chat, "recap-full-hash", ["recap"])
+        digest = recap_client._recap_digest(scoped_chat)
+        expected = hashlib.sha256(
+            (store.analysis_cache_fingerprint("recap", scoped_chat) + digest).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(scoped_plan["units"][0]["cache_identity"], expected)
+        self.assertNotEqual(full_plan["units"][0]["cache_identity"], expected)
 
 
 class AnalysisPlanApiTests(unittest.TestCase):

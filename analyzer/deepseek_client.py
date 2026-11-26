@@ -16,15 +16,13 @@
 #
 """DeepSeek API 调用封装与维度编排。
 
-对话构建（`analyzer/dialog.py`）、月份增量缓存（`analyzer/month_cache.py`）、
-限流重试（`analyzer/llm_transport.py`）与 AST 指纹（`analyzer/fingerprint_utils.py`）
-已拆至独立模块，并在此保留兼容重导出；测试打桩请直接作用于对应子模块的全局状态。
-`analyzer/dialog.py` 中参与指纹的函数名及内部实现不可改动，否则会触发历史缓存失效。
+对话构建（`analyzer/dialog.py`）、月份增量缓存（`analyzer/month_cache.py`）与
+限流重试（`analyzer/llm_transport.py`）已拆至独立模块，并在此保留兼容重导出；
+测试打桩请直接作用于对应子模块的全局状态。
 """
 
 import concurrent.futures
 import hashlib
-import inspect
 import json
 import os
 import re
@@ -47,7 +45,6 @@ from parser.qq_parser import ChatData, is_statistical, split_by_month
 from analyzer.logger import get_logger, mask_name
 from analyzer import purge_marks
 from analyzer import llm_transport
-from analyzer import fingerprint_utils
 from analyzer import person_context
 from analyzer.shutdown import shutdown_requested
 from analyzer.usage import record_call
@@ -66,23 +63,23 @@ from analyzer.prompts import (
     SYSTEM_PROMPT_PROFILE,
 )
 
-# 兼容重导出（dialog 中的指纹函数名及其源码均冻结，改动会改变 PROMPT_FINGERPRINT）
+# 兼容重导出（dialog 中的对话格式化函数）
 from analyzer.dialog import (
     MAX_DIALOG_CHARS,
     RELATIVE_MARK_MINUTES,
     TIME_MARK_MINUTES,
-    _build_dialog,  # noqa: F401 - public compatibility re-export
+    _build_dialog as _build_dialog,
     _build_dialog_with_meta,
-    _conversation_stats,
+    _conversation_stats as _conversation_stats,
     _dialog_needs_sampling,
     _fit_lines,
-    _fit_message_context,
-    _gap_mark,
+    _fit_message_context as _fit_message_context,
+    _gap_mark as _gap_mark,
     _has_content,
     _message_line,
-    _render_message_lines,
-    _short_time,
-    _truncate_dialog_line,  # noqa: F401 - public compatibility re-export
+    _render_message_lines as _render_message_lines,
+    _short_time as _short_time,
+    _truncate_dialog_line as _truncate_dialog_line,
     _vision_digest,
 )
 
@@ -98,7 +95,6 @@ from analyzer.month_cache import (
     _referenced_keys_locked as _referenced_keys_locked,
     _write_month_cache,
     configure_month_cache as configure_month_cache,
-    migrate_month_cache,
     month_cache_path as month_cache_path,
     month_cache_enabled as month_cache_enabled,
     purge_month_cache as purge_month_cache,
@@ -425,44 +421,7 @@ def _get_client() -> Optional[OpenAI]:
     return _CLIENT
 
 
-def _hashed_source(func) -> str:
-    # Stable compatibility hook; the frozen dialog functions are sourced and normalized
-    # by fingerprint_utils without changing their names or implementations.
-    return fingerprint_utils.hashed_source(func, canonical_ast=_canonical_ast, logger=logger)
-
-
-def _canonical_ast(node) -> str:
-    # Keep the historical patch point used by tests and tools.
-    return fingerprint_utils.canonical_ast(node)
-
-
-_PRIVATE_COMPAT_FINGERPRINT = "23fa36bc1d2a"
-# The historical formula is safe only while every formatter that can affect
-# the prompt still has the reviewed implementation.  Keep this as a literal:
-# recomputing it at import time would make a source change look compatible again.
-_PRIVATE_COMPAT_FORMAT_DIGEST = "fcfe0c9d898bccd9c0e81ec64ea01ed594b75fb411a36c87e5ffe65ca1da6f5c"
-
-
-_PRIVATE_FORMAT_FUNCS = (
-    _build_dialog_with_meta,
-    _fit_message_context,
-    _render_message_lines,
-    _truncate_dialog_line,
-    _message_line,
-    _gap_mark,
-    _fit_lines,
-    _conversation_stats,
-    _short_time,
-)
-_PRIVATE_COMPAT_FORMAT_FUNCS = (
-    _build_dialog_with_meta,
-    _render_message_lines,
-    _message_line,
-    _gap_mark,
-    _fit_lines,
-    _conversation_stats,
-    _short_time,
-)
+PRIVATE_CACHE_VERSION = "v2"
 
 
 def _private_fingerprint_inputs():
@@ -489,125 +448,37 @@ def _private_fingerprint_inputs():
     )
 
 
-def _private_compat_format_matches() -> bool:
-    try:
-        payload = "\n".join(_hashed_source(func) for func in _PRIVATE_COMPAT_FORMAT_FUNCS)
-    except (OSError, TypeError):
-        return False
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest() == _PRIVATE_COMPAT_FORMAT_DIGEST
+def _prompt_fingerprint(salt: "str | None" = None) -> str:
+    """私聊提示词 + 预算/版本号指纹，参与缓存键。
 
-
-def _private_source_parts(funcs: tuple, normalize: bool) -> list[str]:
-    try:
-        return [_hashed_source(func) if normalize else inspect.getsource(func) for func in funcs]
-    except (OSError, TypeError):
-        logger.warning(
-            "无法读取格式化函数源码（编译/打包环境），指纹降级为函数名级——"
-            "改动对话格式不会自动失效旧缓存；改过格式后请设 PROMPT_CACHE_SALT"
-            " 为任意新值手动换键"
-        )
-        return [f"<source-unavailable:{func.__name__}>" for func in funcs]
-
-
-def _private_fingerprint_from_inputs(current, salt: str, normalize: bool, compatible: bool = False) -> str:
-    prompt_values, const_values = current
-    parts = list(prompt_values)
-    parts.append("consts:%s" % repr(const_values))
-    if compatible:
-        from analyzer.dialog_cache_compat import historical_source
-
-        parts.append(historical_source("_build_dialog"))
-        parts += _private_source_parts((_message_line, _fit_lines, _conversation_stats, _short_time), True)
-    else:
-        parts += _private_source_parts(_PRIVATE_FORMAT_FUNCS, normalize)
+    **只哈希 _PRIVATE_PROMPT_NAMES 里显式列出的提示词**，保证新增其他维度常量
+    （如群聊或总括提示词）不会影响私聊缓存键。
+    """
+    if salt is None:
+        salt = (os.getenv("PROMPT_CACHE_SALT", "") or "").strip()
+    prompt_values, const_values = _private_fingerprint_inputs()
+    parts = [f"version:{PRIVATE_CACHE_VERSION}", *prompt_values, f"consts:{repr(const_values)}"]
     if salt:
         parts.append(f"salt:{salt}")
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
-def _prompt_fingerprint(salt: "str | None" = None, normalize: bool = True) -> str:
-    """提示词 + 对话格式的指纹，参与缓存键。
-
-    以前靠手工维护 PROMPT_VERSION：改了 prompt 或抓取/抽样逻辑却忘了 bump，
-    旧缓存就会顶着"新分析"的名义返回旧风格结果。现在把私聊的 SYSTEM_PROMPT_*
-    与所有影响模型输入的格式化函数一起哈希，任何改动都会自动让旧缓存失效。
-
-    **只哈希下面 _PRIVATE_PROMPT_NAMES 里显式列出的提示词**（不是"dir() 里所有
-    SYSTEM_PROMPT_*"）：这个指纹同时进维度级缓存文件名与月份级缓存键，一旦多出
-    一个常量（例如把群聊提示词放进 analyzer/prompts.py），全部私聊缓存与月份缓存
-    会在 24 小时后被孤儿回收删除，用户下次分析要**全量重新付费**。群聊提示词因此
-    必须放在独立模块（analyzer/group_prompts.py）并使用自己的指纹。
-    改动名单的内容或顺序 = 故意换键，等同于让所有私聊缓存失效。
-
-    取值仍然在调用时从 analyzer.prompts 现取（而不是 import 期把字符串绑进元组）：
-    这样"改了提示词文本必须换指纹"这条既有保证不受影响（tests 里有用例靠打桩
-    prompts 模块来验证它），也让运行时热改提示词同样能反映到指纹上。
-
-    normalize=False 复现"按原始源码哈希"的旧公式，只用来算 PROMPT_FINGERPRINT_LEGACY
-    （读旧缓存、读到就迁移，见 month_cache.month_keys 与 webapp.store._read_cache）。
-
-    源码不可读时（frozen/编译打包，inspect.getsource 抛 OSError）降级为
-    函数名占位——提示词改动仍然会失效缓存，但格式逻辑改动不会，
-    因此打一条警告并支持 PROMPT_CACHE_SALT 手动换键。
-    """
-    if salt is None:
-        salt = (os.getenv("PROMPT_CACHE_SALT", "") or "").strip()
-    current = _private_fingerprint_inputs()
-    # Rebuild the old formula with the actual configuration, including its budget.
-    # Only the reviewed formatter is compatible; subsequent format changes get a new key.
-    compatible = normalize and _private_compat_format_matches()
-    return _private_fingerprint_from_inputs(current, salt, normalize, compatible=compatible)
-
-
 def _unsampled_prompt_fingerprint(salt: "str | None" = None) -> str:
-    """未抽样输入复用同配置的历史键；预算变化仍需隔离维度缓存。"""
+    """未抽样输入复用同配置键；预算变化仍需隔离维度缓存。"""
     return _prompt_fingerprint(salt)
 
 
 def sampled_prompt_fingerprint(salt: "str | None" = None) -> str:
     """私聊触发预算抽样时使用的格式代次，不污染未抽样缓存键。"""
-    funcs = (
-        _build_dialog_with_meta,
-        _fit_message_context,
-        _render_message_lines,
-        _truncate_dialog_line,
-        _message_line,
-        _gap_mark,
-    )
-    source_parts = _private_source_parts(funcs, True)
-    parts = [
-        _prompt_fingerprint(salt),
-        "private-sampled-dialog-v1",
-        *source_parts,
-    ]
+    parts = [_prompt_fingerprint(salt), "private-sampled-dialog-v1"]
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
 PROMPT_FINGERPRINT = _prompt_fingerprint()
-#: 旧公式（按 getsource 原文哈希）的取值。只用于"读旧缓存并迁移"：
-#: 用 AST 归一之后，所有既有用户的缓存都是以这个值命名的，直接换键等于让他们重新付费。
-#:
-#: **这里必须写死成字面量，不可以再改成 _prompt_fingerprint(normalize=False)。**
-#: 旧公式的哈希对象是**当前源码原文**，所以只要动过任何一个进指纹的函数
-#: （哪怕只是重排一行、或有意改一次口径），现算值就跟着漂——而它是
-#: "读取 AST 归一之前写下的缓存并免费迁移"的唯一凭据。漂掉的后果不是测试变红那么简单：
-#: 那批老用户的旧缓存永远读不到，本该免费的迁移退化成一次真实重付费，
-#: 而且症状与"我们改了什么"毫无关联，排查时会完全想不到这条路径断了。
-#: 历史值本身就是**事实**，事实不该由活的源码算出来。它由
-#: tests/test_group_foundation.py 的 PINNED_LEGACY_PRIVATE_FINGERPRINT 钉住，
-#: 并由 tests/test_privacy_guards.py::TestFingerprintMigration 端到端验证仍然读得通。
-PROMPT_FINGERPRINT_LEGACY = "26bf952fe772"
 
 
 def fingerprint_for_dimension(dim: str) -> str:
-    """该维度该用哪个提示词指纹：群聊维度走群聊指纹，recap 走 recap 指纹，其余（私聊/未知）走私聊指纹。
-
-    维度级缓存的文件名里嵌着这个值，所以群聊提示词一改，群聊维度的旧缓存自动失效，
-    而私聊维度的文件名**一个字都不变**（用户不会因为新增群聊功能而重新付费）。
-    recap 独立成族的理由同 group_client：它有自己的 system prompt 与摘要构建逻辑，
-    既不能被私聊指纹的变动无谓刷掉，也不能因为不在 `_PRIVATE_PROMPT_NAMES` 里而
-    改了自身提示词却不失效（那会让旧复盘永远命中）。
-    """
+    """该维度该用哪个提示词指纹：群聊维度走群聊指纹，recap 走 recap 指纹，其余（私聊/未知）走私聊指纹。"""
     from analyzer import group_client  # 延迟导入：group_client 在模块级 import 本模块
 
     if dim in group_client.GROUP_DIMENSIONS:
@@ -619,23 +490,8 @@ def fingerprint_for_dimension(dim: str) -> str:
     return PROMPT_FINGERPRINT
 
 
-def legacy_person_context_fingerprint(dim: str) -> str:
-    """Return the pre-context dimension fingerprint for display-only cache fallback."""
-    if dim == "profile":
-        return PROMPT_FINGERPRINT
-    if dim == "member_profiles":
-        from analyzer import group_client
-
-        return group_client.GROUP_PROMPT_FINGERPRINT
-    return fingerprint_for_dimension(dim)
-
-
 def analysis_cache_fingerprint(dimension: str, chat: ChatData) -> str:
-    """按这份聊天是否真的触发上下文抽样选择维度级缓存指纹。
-
-    未超预算的输入继续使用既有维度键；只有会产生新抽样文本的输入进入新代，
-    这样旧的错误抽样结果不会遮住修复，同时普通月份不会整体失效。
-    """
+    """按这份聊天是否真的触发上下文抽样选择维度级缓存指纹。"""
     private_monthly = {"emotion", "topics", "relationship"}
     if dimension in private_monthly:
         for messages in chat.months().values():
@@ -682,69 +538,6 @@ def scope_cache_fingerprint(chat: ChatData, fingerprint: str, *, include_targets
     if not scope_id:
         return fingerprint
     return hashlib.sha256(f"{fingerprint}:scope:{scope_id}".encode("utf-8")).hexdigest()[:16]
-
-
-#: 私聊族的历史代链（最新一代在前）。设计见 legacy_fingerprints_for_dimension：
-#: 每次有意换代，把"当时的当前值"压进这里，读侧就会挨代找到旧缓存并搬到新键。
-#:
-#: f4bd6aa06d52 —— 中位数口径换代时的值。_conversation_stats 的 median_gap 从
-#: 就地 `s[n//2]`（上中位）改为复用 local_stats._median（教科书定义，偶数取中间两数
-#: 平均）。这句改动真的改变喂给模型的那行"回复间隔中位数约 N 秒"，所以必须换键；
-#: 换键让既有私聊用户的五维缓存不再命中当前键，**默认就是全员重付费**（已确认接受）。
-#: 把它留在链里，是为了让"重付费一次"不会变成"每次换代都重付一次"：
-#: 下一代键的用户仍能沿链搬回这一代已付费的结果。
-PRIVATE_FINGERPRINT_GENERATIONS = ("f4bd6aa06d52",)
-
-
-def _legacy_chain_for_fingerprint_value(fp: str) -> tuple:
-    """某个族指纹**值**对应的历史代链（认不出该值 = 这族没有历史包袱，返回空链）。"""
-    if fp == PROMPT_FINGERPRINT:
-        # The pinned historical chain belongs to the default configuration only.
-        # Custom budgets/salts must not migrate a result produced with other inputs.
-        if fp != _PRIVATE_COMPAT_FINGERPRINT:
-            return ()
-        chain = (*PRIVATE_FINGERPRINT_GENERATIONS, PROMPT_FINGERPRINT_LEGACY)
-        # 顺序：先按"上一代的当前键"找（AST 归一时代写的），再按更早的原文公式找；
-        # 与当前键相同的值剔掉，否则会白读一次自己
-        return tuple(dict.fromkeys(x for x in chain if x != fp))
-    from analyzer import group_client, recap_client
-
-    if fp == group_client.GROUP_PROMPT_FINGERPRINT:
-        if fp != group_client._GROUP_COMPAT_FINGERPRINT:
-            return ()
-        return (
-            (group_client.GROUP_PROMPT_FINGERPRINT_LEGACY,)
-            if group_client.GROUP_PROMPT_FINGERPRINT_LEGACY != fp
-            else ()
-        )
-    if fp == recap_client.RECAP_PROMPT_FINGERPRINT:
-        return (
-            (recap_client.RECAP_PROMPT_FINGERPRINT_LEGACY,)
-            if recap_client.RECAP_PROMPT_FINGERPRINT_LEGACY != fp
-            else ()
-        )
-    return ()
-
-
-def legacy_fingerprints_for_dimension(dim: str) -> tuple:
-    """该维度"历史代"指纹值的链（读旧缓存时的尝试顺序，最新一代在前）。
-
-    此前每族只认**一代**旧键（AST 归一之前的原文公式），意味着第三次指纹换代时，
-    第二代键写下的缓存再也读不到——用户为同一段对话再付一次钱，而这次改动与内容
-    无关。泛化成链：以后每次换代，把"当时的当前值"压进对应族的链头，读侧逻辑一字不改。
-    现在每族仍只有既有的一代，行为与升级前逐字节一致（纯机制扩展，零现值变化）。
-    """
-    return _legacy_chain_for_fingerprint_value(fingerprint_for_dimension(dim))
-
-
-def legacy_fingerprint_for_dimension(dim: str) -> str:
-    """该维度"旧公式"的指纹：只用来读 AST 归一之前写下的缓存（读到即迁移）。
-
-    保留单值入口（`_cache_path(legacy=True)` 与既有用例依赖它）；链式读取请用
-    legacy_fingerprints_for_dimension。链空时回当前指纹（等价"没有历史包袱"）。
-    """
-    chain = legacy_fingerprints_for_dimension(dim)
-    return chain[0] if chain else fingerprint_for_dimension(dim)
 
 
 # 思考模式的最低输出预算：思维链 token 也计入 max_tokens，低于这个值必然截断
@@ -993,7 +786,7 @@ def _analyze_periods(
     chat_hash: str = "",
     fingerprint: "str | None" = None,
 ) -> dict[str, Any]:
-    """按有界并发窗口逐月调用 API；支持取消、月份级增量缓存（含多代指纹链迁移）及配额中止。"""
+    """按有界并发窗口逐月调用 API；支持取消、月份级增量缓存及配额中止。"""
     results: dict[str, Any] = {}
     total = len(months)
     done = 0
@@ -1013,13 +806,9 @@ def _analyze_periods(
         return shutdown_requested() or bool(should_cancel and should_cancel())
 
     def _keys_for(prompt: str, active_fingerprint: "str | None" = None) -> list:
-        """返回该月提示词的 [当前键, 历史代键...] 列表（供按代迁移旧月份缓存）。"""
+        """返回该月提示词对应的当前月份缓存键。"""
         current_fp = active_fingerprint or fingerprint or PROMPT_FINGERPRINT
-        keys = [_month_key(system_prompt, prompt, current_fp)]
-        for legacy_fp in _legacy_chain_for_fingerprint_value(current_fp):
-            if legacy_fp != current_fp:
-                keys.append(_month_key(system_prompt, prompt, legacy_fp))
-        return keys
+        return [_month_key(system_prompt, prompt, current_fp)]
 
     def _work(period: str, msgs: list) -> tuple[str, Optional[dict]]:
         if _cancel_requested():
@@ -1029,26 +818,10 @@ def _analyze_periods(
                 prompt = make_prompt(period, msgs)
                 if not prompt.strip():
                     return period, None
-                keys = _keys_for(prompt, getattr(prompt, "cache_fingerprint", None))
-                key = keys[0]
+                key = _keys_for(prompt, getattr(prompt, "cache_fingerprint", None))[0]
                 # 思考模式须与 _call_api 口径一致并参与月份缓存校验
                 want_thinking = thinking_enabled(tag)
                 result = _read_result_cache(key, tag, expect_thinking=want_thinking, chat_hash=chat_hash)
-                if result is None:
-                    # 按指纹代次链逐代回溯旧缓存并在命中后就地迁移到当前键
-                    for legacy_key in keys[1:]:
-                        result = _read_result_cache(
-                            legacy_key, tag, expect_thinking=want_thinking, chat_hash=chat_hash
-                        )
-                        if result is None:
-                            continue
-                        if migrate_month_cache(
-                            legacy_key, key, dimension=tag, expect_thinking=want_thinking, chat_hash=chat_hash
-                        ):
-                            logger.info("%s 命中旧指纹的月份缓存，已迁移到当前键", period)
-                        else:
-                            logger.info("%s 命中旧指纹的月份缓存", period)
-                        break
                 if result is not None:
                     logger.info("%s 命中月份缓存，跳过 API 调用", period)
                     llm_stream.emit_event(

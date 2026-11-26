@@ -1,9 +1,6 @@
 import hashlib
-import json
-import tempfile
 import unittest
 from datetime import datetime
-from pathlib import Path
 from unittest import mock
 
 from _bootstrap import bootstrap
@@ -235,83 +232,6 @@ class PersonContextClientIntegrationTests(unittest.TestCase):
         self.assertIn("[目标人物]", prompt)
         self.assertIn("[仅供上下文]", prompt)
         self.assertLess(prompt.index("你能先看一下目录吗"), prompt.index("我来检查第一页"))
-
-
-class LegacyPersonContextCacheTests(unittest.TestCase):
-    def test_old_result_is_visible_and_evidence_uses_legacy_selection_without_promotion(self):
-        import app as app_module
-        from webapp import api, store
-
-        before = _message("u_other", "对话者", 0, "先看目录", message_id="before")
-        target = _message("u_target", "目标", 1, "我看第一页", message_id="target", reply_to_id="before")
-        chat = _chat([before, target])
-        payload = {"self": {"name": "目标", "verdict": "旧策略样本"}}
-
-        with tempfile.TemporaryDirectory() as directory:
-            with mock.patch.object(store, "AI_CACHE_DIR", directory):
-                legacy_path = Path(
-                    store._cache_path(
-                        "profile",
-                        "synthetic-chat-hash",
-                        fingerprint=dc.PROMPT_FINGERPRINT,
-                    )
-                )
-                legacy_path.write_text(
-                    json.dumps({"_created": 1.0, "result": payload}, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-                app_module.app.config["TESTING"] = True
-                client = app_module.app.test_client()
-                client.get("/")
-                with client.session_transaction() as session:
-                    session["chat_mode"] = "private"
-                    session["chat_hash"] = "synthetic-chat-hash"
-                with (
-                    mock.patch.object(api, "_session_chat_file", return_value=("synthetic.json", None)),
-                    mock.patch.object(store, "_load_chat_cached", return_value=chat),
-                ):
-                    result_response = client.get("/api/analysis/profile")
-                    evidence_response = client.get("/api/evidence/profile")
-
-                new_fp = store.analysis_cache_fingerprint("profile", chat)
-                new_path = Path(store._cache_path("profile", "synthetic-chat-hash", fingerprint=new_fp))
-                self.assertEqual(result_response.status_code, 200)
-                self.assertTrue(result_response.get_json()["stale_strategy"])
-                self.assertEqual(result_response.get_json()["result"], payload)
-                self.assertEqual(evidence_response.status_code, 200)
-                self.assertTrue(evidence_response.get_json()["stale_strategy"])
-                self.assertTrue(legacy_path.exists())
-                self.assertFalse(new_path.exists())
-
-    def test_context_free_cache_does_not_match_new_strategy_key(self):
-        from webapp import store
-
-        chat = _chat([_message("u_target", "目标", 1, "合成消息", message_id="target")])
-        with tempfile.TemporaryDirectory() as directory:
-            with mock.patch.object(store, "AI_CACHE_DIR", directory):
-                old_path = Path(
-                    store._cache_path(
-                        "profile",
-                        "synthetic-chat-hash",
-                        fingerprint=dc.PROMPT_FINGERPRINT,
-                    )
-                )
-                old_path.write_text(json.dumps({"_created": 1.0, "result": {"old": True}}), encoding="utf-8")
-                current_fp = store.analysis_cache_fingerprint("profile", chat)
-                self.assertIsNone(store._read_cache("profile", "synthetic-chat-hash", fingerprint=current_fp))
-                self.assertEqual(
-                    store._read_legacy_person_context_cache("profile", "synthetic-chat-hash"),
-                    {"old": True},
-                )
-                with mock.patch.object(person_context, "PERSON_CONTEXT_ENABLED", False):
-                    self.assertEqual(
-                        store._read_cache(
-                            "profile",
-                            "synthetic-chat-hash",
-                            fingerprint=store.analysis_cache_fingerprint("profile", chat),
-                        ),
-                        {"old": True},
-                    )
 
 
 def _multi_month_chat():

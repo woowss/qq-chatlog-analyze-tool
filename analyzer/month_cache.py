@@ -34,12 +34,7 @@ from analyzer import purge_marks
 from analyzer.cache_policy import refreshing, refresh_cancelled
 from analyzer.atomic_write import tmp_sibling, write_json_atomic
 from analyzer.logger import get_logger
-from analyzer.result_schema import (
-    CachedModelResult,
-    ResultValidationError,
-    supports_dimension,
-    validate_cached_result,
-)
+from analyzer.result_schema import CachedModelResult
 
 logger = get_logger("deepseek")
 
@@ -102,40 +97,6 @@ def _month_key(system_prompt: str, user_content: str, fingerprint: "str | None" 
         digest.update(part.encode("utf-8"))
         digest.update(b"\x00")
     return digest.hexdigest()[:20]
-
-
-def migrate_month_cache(
-    old_key: str,
-    new_key: str,
-    *,
-    dimension: str = "",
-    expect_thinking: "Optional[bool]" = None,
-    chat_hash: str = "",
-) -> bool:
-    """将旧指纹月份缓存改名迁移至新键（不保留两份含原句的敏感文件）；目标已有有效缓存时直接清理旧文件。"""
-    if not _MONTH_CACHE_DIR or not old_key or old_key == new_key:
-        return False
-    src, dst = month_cache_path(old_key), month_cache_path(new_key)
-    try:
-        if os.path.exists(dst):
-            destination_valid = True
-            if supports_dimension(dimension) or expect_thinking is not None:
-                existing = _read_month_cache(new_key, expect_thinking=expect_thinking, chat_hash=chat_hash)
-                if existing is None:
-                    destination_valid = False
-                elif supports_dimension(dimension):
-                    try:
-                        validate_cached_result(dimension, existing)
-                    except ResultValidationError:
-                        destination_valid = False
-            if destination_valid:
-                os.remove(src)
-                return False
-        os.replace(src, dst)
-        return True
-    except OSError as e:
-        _warn_write_failure("月份缓存迁移", dst, e)
-        return False
 
 
 def month_cache_path(key: str) -> str:

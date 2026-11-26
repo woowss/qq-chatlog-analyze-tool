@@ -428,29 +428,18 @@ class TestRecapDimension(unittest.TestCase):
 
         self.assertEqual(dc.fingerprint_for_dimension("recap"), rc.RECAP_PROMPT_FINGERPRINT)
         self.assertNotEqual(rc.RECAP_PROMPT_FINGERPRINT, dc.PROMPT_FINGERPRINT, "recap 不得寄生在私聊指纹下")
-        self.assertEqual(dc.legacy_fingerprint_for_dimension("recap"), rc.RECAP_PROMPT_FINGERPRINT_LEGACY)
         # 缓存文件名里嵌的是 recap 指纹（族隔离在文件名层面可见）
         path = store._cache_path("recap", "hashR")
         self.assertIn(rc.RECAP_PROMPT_FINGERPRINT, path)
         self.assertNotIn(dc.PROMPT_FINGERPRINT, path)
 
     def test_recap_and_ask_fingerprint_cover_their_own_input(self):
-        """recap/ask 的模型输入若改变，指纹必须跟着变——与私聊族同一条保证。
-
-        这条不是"锦上添花的一致性"，而是本仓库已经踩过一次的坑：
-        指纹哈希的是 **AST 归一的函数源码**，函数体里的模块级常量只是 Name 节点，
-        所以"把抽样条数 800 改成 200"不改变任何节点形状。少了显式的 consts 段与上游
-        函数名单，旧抽样算出的旧复盘会继续以"新配置"的名义命中 30 天，而缓存命中时
-        _recap_digest 根本不会重跑——没有任何一处会发现输入变了。
-        私聊族用 deepseek_client 的 "consts:" 块修过同类问题，并由
-        tests/test_optimizations.py::test_input_budget_change_changes_fingerprint 钉住；
-        这里给 recap/ask 补上同一条绳，避免第三次换代时再犯。
-        """
+        """recap/ask 的版本号、提示词、抽样预算、输出预算或 salt 变更必须换键。"""
         from unittest import mock
 
-        from analyzer import dialog
-        from analyzer import local_stats as ls
+        from analyzer import deepseek_client as dc
         from analyzer import recap_client as rc
+        from analyzer import recap_prompts as rp
 
         recap_base = rc.recap_prompt_fingerprint()
         ask_base = rc.ask_fingerprint()
@@ -461,17 +450,24 @@ class TestRecapDimension(unittest.TestCase):
             self.assertNotEqual(ask_base, rc.ask_fingerprint(), "改抽样条数必须换 ask 指纹")
         with mock.patch.object(rc, "RECAP_SAMPLE_CHARS", 1000):
             self.assertNotEqual(recap_base, rc.recap_prompt_fingerprint(), "改抽样字符预算必须换指纹")
+            self.assertNotEqual(ask_base, rc.ask_fingerprint(), "改抽样字符预算必须换 ask 指纹")
 
-        # ② 摘要头行与"本地事实"段的数字来自 calc_overview：它必须在名单里
-        with mock.patch.object(ls, "calc_overview", lambda chat: {"total_messages": 1}):
-            self.assertNotEqual(recap_base, rc.recap_prompt_fingerprint(), "calc_overview 口径变了必须换指纹")
-            self.assertNotEqual(ask_base, rc.ask_fingerprint(), "calc_overview 口径变了必须换 ask 指纹")
+        # ② 提示词 / 版本号 / 输出预算 / salt 变化必须换键
+        with mock.patch.object(rp, "SYSTEM_PROMPT_RECAP", "新的总括提示词"):
+            self.assertNotEqual(recap_base, rc.recap_prompt_fingerprint())
+        with mock.patch.object(rp, "SYSTEM_PROMPT_ASK", "新的提问提示词"):
+            self.assertNotEqual(ask_base, rc.ask_fingerprint())
+        with mock.patch.object(rc, "RECAP_CACHE_VERSION", "v999"):
+            self.assertNotEqual(recap_base, rc.recap_prompt_fingerprint())
+        with mock.patch.object(rc, "ASK_CACHE_VERSION", "v999"):
+            self.assertNotEqual(ask_base, rc.ask_fingerprint())
+        with mock.patch.dict(dc.MAX_TOKENS_BY_DIM, {"recap": 4096, "ask": 4096}):
+            self.assertNotEqual(recap_base, rc.recap_prompt_fingerprint())
+            self.assertNotEqual(ask_base, rc.ask_fingerprint())
+        with mock.patch.dict(os.environ, {"PROMPT_CACHE_SALT": "recap-ask-salt"}):
+            self.assertNotEqual(recap_base, rc.recap_prompt_fingerprint())
+            self.assertNotEqual(ask_base, rc.ask_fingerprint())
 
-        # ③ 抽样对话原文逐条经 dialog 成型：换格式=换模型输入
-        with mock.patch.object(dialog, "_message_line", lambda *a, **k: "REFORMATTED"):
-            self.assertNotEqual(recap_base, rc.recap_prompt_fingerprint(), "对话行格式变了必须换指纹")
-
-        # ④ 纯重排不许换键：这条保证"改注释/被格式化"不会让用户重新付费
         self.assertEqual(recap_base, rc.recap_prompt_fingerprint(), "无改动时指纹必须稳定")
         self.assertEqual(ask_base, rc.ask_fingerprint(), "无改动时 ask 指纹必须稳定")
 

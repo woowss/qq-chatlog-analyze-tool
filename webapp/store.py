@@ -54,9 +54,6 @@ from analyzer.atomic_write import tmp_sibling, write_bytes_atomic, write_json_at
 from analyzer.deepseek_client import (
     analysis_cache_fingerprint as analysis_cache_fingerprint,
     fingerprint_for_dimension,
-    legacy_person_context_fingerprint,
-    legacy_fingerprint_for_dimension,
-    legacy_fingerprints_for_dimension,
     purge_month_cache,
     thinking_enabled,
 )
@@ -616,26 +613,10 @@ def _stats_with_word_freq(stats: dict, chat_hash: str):
 # ---------------------------------------------------------------------------
 
 
-def _cache_path(
-    dimension: str, chat_hash: str, legacy: bool = False, fingerprint: "str | None" = None
-) -> str:
-    # 键含提示词/格式指纹：由 SYSTEM_PROMPT_* 与对话格式化函数自动哈希而来，改了提示词或
-    # 输入格式后旧缓存自动失效（不再依赖人工 bump 版本号）。**按维度取**：群聊维度用群聊
-    # 指纹，私聊维度用私聊指纹——这样新增/修改群聊提示词不会让私聊缓存文件名发生变化
-    # （文件名一变，用户就得为同样的分析重新付费）。
-    # 键含思考模式：同一模型开关 thinking 前后的结果差异很大，必须分开存放，
-    # 否则切换 LLM_THINKING(_DIMS) 后会命中另一种模式的旧结果（看起来"没区别"）。
-    # 非思考模式不加后缀，保持既有缓存键兼容。
-    #
-    # legacy=True 给出"旧指纹公式"下的文件名：指纹改为 AST 归一之后，既有用户的缓存
-    # 仍叫那个名字。_read_cache 会先按当前键找、找不到再看旧键，读到就改名（迁移），
-    # 于是这次公式变更不会让任何人为同样的分析重新付费。
+def _cache_path(dimension: str, chat_hash: str, fingerprint: "str | None" = None) -> str:
+    # 键含提示词/格式指纹与思考模式后缀
     suffix = "_think" if thinking_enabled(dimension) else ""
-    if fingerprint is not None:
-        prompt_fp = fingerprint
-    else:
-        pick = legacy_fingerprint_for_dimension if legacy else fingerprint_for_dimension
-        prompt_fp = pick(dimension)
+    prompt_fp = fingerprint if fingerprint is not None else fingerprint_for_dimension(dimension)
     model_key = _cache_model_key()
     return os.path.join(AI_CACHE_DIR, f"{dimension}_{chat_hash}_{model_key}_{prompt_fp}{suffix}.json")
 
@@ -789,52 +770,10 @@ def _read_cache(
     *,
     read_only: bool = False,
 ):
-    """读取维度缓存；当前指纹未命中时沿历史指纹链迁移旧文件至当前键。"""
+    """直接读取当前指纹对应的维度缓存。"""
     current_fp = fingerprint or fingerprint_for_dimension(dimension)
     current_path = _cache_path(dimension, chat_hash, fingerprint=current_fp)
-    data = _load_cache_file(current_path, touch=not read_only)
-    if data is not None:
-        return data
-    suffix = "_think" if thinking_enabled(dimension) else ""
-    # A sampled dimension has its own current key and must never fall back to a
-    # pre-fix result that was generated from context-free sampled lines.
-    legacy_fps = (
-        legacy_fingerprints_for_dimension(dimension)
-        if current_fp == fingerprint_for_dimension(dimension)
-        else ()
-    )
-    model_key = _cache_model_key()
-    for legacy_fp in legacy_fps:
-        if legacy_fp == current_fp:
-            continue  # 两个指纹相同（没有历史包袱的干净环境），不必多查一次
-        legacy_path = os.path.join(
-            AI_CACHE_DIR, f"{dimension}_{chat_hash}_{model_key}_{legacy_fp}{suffix}.json"
-        )
-        data = _load_cache_file(legacy_path, touch=not read_only)
-        if data is None:
-            continue
-        if not read_only:
-            try:
-                os.replace(legacy_path, current_path)
-                logger.info("命中旧指纹的维度缓存并迁移到当前键: %s", dimension)
-            except OSError as e:
-                # 迁移失败不影响这次的结果（已经在 data 里了）；下次读还会再看到旧文件
-                logger.warning("维度缓存迁移失败（结果仍可用，只是留在旧文件名下）: %s", e)
-        return data
-    return None
-
-
-def _read_legacy_person_context_cache(dimension: str, chat_hash: str):
-    """Read an old profile result for display without treating it as a current-strategy hit."""
-    from analyzer import person_context
-
-    if not person_context.PERSON_CONTEXT_ENABLED or dimension not in person_context.CONTEXT_DIMENSIONS:
-        return None
-    return _read_cache(
-        dimension,
-        chat_hash,
-        fingerprint=legacy_person_context_fingerprint(dimension),
-    )
+    return _load_cache_file(current_path, touch=not read_only)
 
 
 def _write_cache(dimension: str, chat_hash: str, result, fingerprint: "str | None" = None) -> None:

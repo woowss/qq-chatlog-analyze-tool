@@ -576,42 +576,21 @@ class TestPromptFingerprint(unittest.TestCase):
         with mock.patch.object(dc, "TIME_MARK_MINUTES", 5):
             self.assertNotEqual(base, dc._prompt_fingerprint(), "改了时间标记口径必须换指纹")
 
-    def test_unsampled_custom_budget_keeps_historical_cache_key(self):
-        """同配置升级应保留历史键；不同预算不能混用维度缓存。"""
-        base = int(datetime(2024, 1, 1, 8, 0, tzinfo=CST).timestamp() * 1000)
-        chat = _chat([_msg("u1", base, text="短消息"), _msg("u2", base + 1000, text="回复")])
-        current = dc.analysis_cache_fingerprint("emotion", chat)
-        with mock.patch.object(dc, "MAX_DIALOG_CHARS", 10_000):
-            historical = "d305632c87ea"
-            self.assertNotEqual(historical, current)
-            self.assertEqual(dc.analysis_cache_fingerprint("emotion", chat), historical)
-            self.assertEqual(dc._unsampled_prompt_fingerprint(), historical)
-            prompt = dc._month_prompt(chat, "2024-01", chat.messages)
-            self.assertEqual(getattr(prompt, "cache_fingerprint", None), historical)
+    def test_sampled_fingerprint_is_distinct_from_unsampled(self):
+        self.assertEqual(len(dc.sampled_prompt_fingerprint()), 12)
+        self.assertNotEqual(dc.sampled_prompt_fingerprint(), dc._unsampled_prompt_fingerprint())
 
-    def test_compat_fingerprint_detects_formatter_change(self):
-        """固定历史指纹必须先确认格式源码仍是已审核版本。"""
-        import inspect
-
+    def test_version_and_model_changes_rotate_keys(self):
         base = dc._prompt_fingerprint()
-        original = inspect.getsource
-
-        def changed_source(func):
-            source = original(func)
-            if func is dc._build_dialog_with_meta:
-                return source.replace("统计：", "统计(修订)：")
-            return source
-
-        with mock.patch("inspect.getsource", side_effect=changed_source):
-            self.assertNotEqual(base, dc._prompt_fingerprint())
-
-    def test_sampled_fingerprint_falls_back_when_source_is_unavailable(self):
-        """打包环境读不到源码时，新抽样键仍须稳定地产生。"""
-        with mock.patch("inspect.getsource", side_effect=OSError("no source here")):
-            first = dc.sampled_prompt_fingerprint()
-            second = dc.sampled_prompt_fingerprint()
-        self.assertEqual(len(first), 12)
-        self.assertEqual(first, second)
+        with mock.patch.object(dc, "PRIVATE_CACHE_VERSION", "v999"):
+            self.assertNotEqual(base, dc._prompt_fingerprint(), "版本号变更必须换指纹")
+        with mock.patch.object(dc, "DEEPSEEK_MODEL", "other-model"):
+            self.assertNotEqual(
+                dc._month_key("SYS", "USER"),
+                storemod._cache_path("emotion", "deadbeefdeadbeef"),
+            )
+            with mock.patch.object(storemod, "DEEPSEEK_MODEL", "other-model"):
+                self.assertIn("other-model", storemod._cache_path("emotion", "deadbeefdeadbeef"))
 
     def test_cache_key_uses_fingerprint_not_manual_version(self):
         path = storemod._cache_path("emotion", "deadbeefdeadbeef")
@@ -1237,43 +1216,8 @@ class TestStopwordsExternal(unittest.TestCase):
         self.assertEqual(out["word_freq"]["self"], [{"word": "你好", "count": 1}])
 
 
-class TestFingerprintMigrationChain(unittest.TestCase):
-    """7-E 迁移链扩展：单代 if → 有序链 + 读侧循环。现值零变化，未来换代不再断层。"""
-
-    def test_current_values_untouched(self):
-        """链式机制：群聊/recap 仍各只有一代旧键；私聊已有两代（中位数换代）。
-
-        私聊那条从"单代"变成两代是有意的：_conversation_stats 的 median_gap 改用
-        local_stats._median（上中位 → 真中位），改变了喂给模型的那行文本，
-        所以必须换键；换出去的那一代压进链头，让沿链迁移继续读得到它。
-        这正好反过来验证了链式改造的价值：第三次换代不再断层。
-        """
-        from analyzer import deepseek_client as dc
-        from analyzer import group_client as gc
-        from analyzer import recap_client as rc
-
-        self.assertEqual(
-            dc.legacy_fingerprints_for_dimension("emotion"),
-            (*dc.PRIVATE_FINGERPRINT_GENERATIONS, dc.PROMPT_FINGERPRINT_LEGACY),
-        )
-        self.assertEqual(len(dc.legacy_fingerprints_for_dimension("emotion")), 2, "私聊应为两代")
-        self.assertEqual(
-            dc.legacy_fingerprints_for_dimension("group_dynamics"), (gc.GROUP_PROMPT_FINGERPRINT_LEGACY,)
-        )
-        self.assertEqual(dc.legacy_fingerprints_for_dimension("recap"), (rc.RECAP_PROMPT_FINGERPRINT_LEGACY,))
-        # 链头是"上一代的当前键"（AST 归一时代写的），链尾是更早的原文公式
-        self.assertEqual(dc.legacy_fingerprints_for_dimension("emotion")[0], "f4bd6aa06d52")
-        self.assertEqual(dc.legacy_fingerprints_for_dimension("emotion")[-1], dc.PROMPT_FINGERPRINT_LEGACY)
-        # 单值入口取链头（老调用点语义保持："先试最近的那一代"）
-        self.assertEqual(
-            dc.legacy_fingerprint_for_dimension("emotion"), dc.PRIVATE_FINGERPRINT_GENERATIONS[0]
-        )
-        self.assertEqual(
-            dc.legacy_fingerprint_for_dimension("group_dynamics"), gc.GROUP_PROMPT_FINGERPRINT_LEGACY
-        )
-        # 链里不许混进当前键自己：那等于白读一次自己，还会把"命中"误报成"迁移成功"
-        for dim in ("emotion", "profile", "group_dynamics", "recap"):
-            self.assertNotIn(dc.fingerprint_for_dimension(dim), dc.legacy_fingerprints_for_dimension(dim))
+class TestConversationStatsMedian(unittest.TestCase):
+    """给模型看的回复间隔中位数与本地统计保持同口径。"""
 
     def test_median_now_matches_local_stats_algorithm(self):
         """给模型看的"回复间隔中位数"与界面卡用的是同一个算法（口径唯一）。
@@ -1334,43 +1278,6 @@ class TestFingerprintMigrationChain(unittest.TestCase):
         odd = _conversation_stats(msgs[:4], "uA")["median_gap"]
         self.assertEqual(odd, ls._median(sorted([10.0, 20.0, 30.0])))
 
-    def test_read_cache_walks_multi_generation_chain(self):
-        """链里放**两代**假旧键，_read_cache 必须挨代找到并搬到当前键。
-
-        反向验证：旧实现只认一代——写在中止于第一代，第二代永远读不到，本条变红。
-        """
-        from analyzer import deepseek_client as dc
-        from webapp import store as storemod
-
-        chat_hash = "chash-chain-001"
-        dim = "emotion"
-        gen1 = "ffffffffffff"
-        gen0 = "eeeeeeeeeeee"
-        # 旧键文件名必须复刻 _cache_path 的真实口径（思考模式开启时带 _think 后缀）
-        suffix = "_think" if dc.thinking_enabled(dim) else ""
-        legacy_payload = {"_created": time.time(), "result": {"self_emotion": "旧代产出"}}
-        path0 = os.path.join(
-            storemod.AI_CACHE_DIR, f"{dim}_{chat_hash}_{storemod.DEEPSEEK_MODEL}_{gen0}{suffix}.json"
-        )
-        try:
-            os.makedirs(storemod.AI_CACHE_DIR, exist_ok=True)
-            with open(path0, "w", encoding="utf-8") as f:
-                json.dump(legacy_payload, f)
-            # 打桩在**消费侧**的绑定名上（store 是 import 期绑定的，patch 源模块不影响它——
-            # 这正是本项目 _bootstrap.api_configured_patcher 文档里写过的同一课）
-            with mock.patch.object(storemod, "legacy_fingerprints_for_dimension", return_value=(gen1, gen0)):
-                got = storemod._read_cache(dim, chat_hash)
-            self.assertIsNotNone(got, "链上的每一代都要被尝试")
-            self.assertEqual(got["self_emotion"], "旧代产出")
-            self.assertFalse(os.path.exists(path0), "迁移是改名不是复制（敏感内容不留两份）")
-            self.assertTrue(os.path.exists(storemod._cache_path(dim, chat_hash)))
-        finally:
-            for p in (storemod._cache_path(dim, chat_hash), path0):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-
 
 class TestCleanupTriggeredWithoutUpload(unittest.TestCase):
     """清理不再只挂在上传路径：任何请求都会按小时去抖触发"""
@@ -1424,20 +1331,7 @@ class TestCleanupTriggeredWithoutUpload(unittest.TestCase):
 
 
 class TestFingerprintRobustness(unittest.TestCase):
-    """源码不可读时指纹降级不崩；PROMPT_CACHE_SALT 可手动换键"""
-
-    def test_fallback_when_source_unavailable(self):
-        import analyzer.deepseek_client as dc
-
-        with (
-            mock.patch("inspect.getsource", side_effect=OSError("no source here")),
-            mock.patch.dict(os.environ, {"PROMPT_CACHE_SALT": ""}),
-        ):
-            fp = dc._prompt_fingerprint()
-            fp2 = dc._prompt_fingerprint()  # 必须在同一个降级上下文里比稳定性
-        self.assertEqual(len(fp), 12)
-        self.assertNotEqual(fp, dc.PROMPT_FINGERPRINT, "降级指纹应与正常指纹不同")
-        self.assertEqual(fp, fp2, "降级指纹仍须稳定")
+    """PROMPT_CACHE_SALT 可手动换键；非法宽限期配置不崩。"""
 
     def test_salt_changes_fingerprint(self):
         import analyzer.deepseek_client as dc

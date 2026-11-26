@@ -416,14 +416,10 @@ class AnalysisScopeApiTests(unittest.TestCase):
             json={"scope": {"date_from": "2025-02-01", "date_to": "2025-02-01"}},
             headers=self.headers,
         )
-        with (
-            mock.patch.object(store, "_read_cache", return_value=None) as read_cache,
-            mock.patch.object(store, "_read_legacy_person_context_cache") as read_legacy,
-        ):
+        with mock.patch.object(store, "_read_cache", return_value=None) as read_cache:
             response = self.client.get("/api/analysis/emotion")
         self.assertEqual(response.status_code, 404)
         self.assertNotEqual(read_cache.call_args.kwargs["fingerprint"], dc._unsampled_prompt_fingerprint())
-        read_legacy.assert_not_called()
 
     def test_ask_uses_the_active_message_range_and_scope_specific_cache_key(self):
         self.client.post(

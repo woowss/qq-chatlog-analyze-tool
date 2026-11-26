@@ -257,39 +257,6 @@ class TestBrowserFlows(unittest.TestCase):
         self.page.keyboard.press("Escape")
         self.assertFalse(self.errors, self.errors)
 
-    def test_old_person_profile_cache_is_marked_stale(self):
-        from playwright.sync_api import expect
-        from test_p1 import payload
-        from result_fixtures import for_dimension
-
-        self.upload(payload())
-        identity = self.page.evaluate("window.ANALYSIS_PAGE_IDENTITY")
-
-        def stale_result(route):
-            route.fulfill(
-                status=200,
-                content_type="application/json",
-                body=json.dumps(
-                    {"result": for_dimension("profile"), "stale_strategy": True, **identity},
-                    ensure_ascii=False,
-                ),
-            )
-
-        self.page.route("**/api/analysis/profile", stale_result)
-        self.page.route(
-            "**/api/evidence/profile",
-            lambda route: route.fulfill(
-                status=200,
-                content_type="application/json",
-                body=json.dumps({"sources": []}),
-            ),
-        )
-        self.page.goto(self.base + "/profile")
-        warning = self.page.locator("#loadWarnBox[data-stale-strategy='true']")
-        expect(warning).to_contain_text("旧版人物画像结果")
-        expect(self.page.get_by_role("button", name="运行人物锐评")).to_be_visible()
-        self.assertFalse(self.errors, self.errors)
-
     def test_plan_preview_partial_selection_and_revalidation_message(self):
         from playwright.sync_api import expect
         from test_p1 import payload
@@ -1837,60 +1804,6 @@ class TestBrowserFlows(unittest.TestCase):
             expect(sec).to_contain_text("重载后局部保留结论")
             expect(sec).to_contain_text("未保存为完整维度结果")
             expect(self.page.locator('[data-analysis-empty="member_profiles"]')).to_have_count(0)
-            self.errors = [e for e in self.errors if not ("ERR_ABORTED" in e and "/api/analyze-job/" in e)]
-            self.assertFalse(self.errors, self.errors)
-
-    def test_reload_partial_private_plan_preserves_stale_strategy_warning(self):
-        from playwright.sync_api import expect
-        from analyzer import deepseek_client as dc
-        from result_fixtures import for_dimension
-        from test_p1 import payload
-        from webapp import store
-
-        started = threading.Event()
-        release = threading.Event()
-        self.addCleanup(release.set)
-
-        def slow_profile(*args, **kwargs):
-            started.set()
-            release.wait(timeout=15)
-            return for_dimension("profile")
-
-        doc = json.loads(payload().decode("utf-8"))
-        doc["chatInfo"]["name"] = "私聊部分重载告警保留"
-        raw = json.dumps(doc, ensure_ascii=False).encode("utf-8")
-        self.upload(raw)
-        chat_hash = self.page.evaluate("window.ANALYSIS_PAGE_IDENTITY.chat_hash")
-        legacy_fp = dc.legacy_person_context_fingerprint("profile")
-        store._write_cache(
-            "profile",
-            chat_hash,
-            {"self": for_dimension("profile"), "other": for_dimension("profile")},
-            fingerprint=legacy_fp,
-        )
-        self.addCleanup(lambda: store._purge_chat_caches(chat_hash))
-
-        with mock.patch.object(dc, "_call_api", side_effect=slow_profile):
-            self.page.goto(self.base + "/profile")
-            warning = self.page.locator("#loadWarnBox[data-stale-strategy='true']")
-            expect(warning).to_contain_text("旧版人物画像结果")
-
-            self.page.locator("#inPageAnalyze").click()
-            dialog = self.page.locator("#analysisPlanDialog")
-            expect(dialog).to_be_visible()
-            # Keep only 1 person selected so the plan job ends with meta.partial === true
-            dialog.locator(".analysis-plan-table tbody input[type='checkbox']").last.uncheck()
-            dialog.locator(".analysis-plan-footer .btn-primary").click()
-
-            self.assertTrue(started.wait(timeout=10))
-            expect(self.page.locator("#aiOutputStatus")).to_have_text("进行中", timeout=10_000)
-            self.page.reload()
-            expect(warning).to_contain_text("旧版人物画像结果", timeout=10_000)
-            expect(self.page.locator("#aiOutputStatus")).to_have_text("进行中", timeout=10_000)
-            release.set()
-
-            expect(self.page.locator("#inPageStatus")).to_contain_text("部分分析已完成", timeout=20_000)
-            expect(warning).to_contain_text("旧版人物画像结果")
             self.errors = [e for e in self.errors if not ("ERR_ABORTED" in e and "/api/analyze-job/" in e)]
             self.assertFalse(self.errors, self.errors)
 

@@ -73,7 +73,6 @@ function startAnalyze(dim, opts) {    opts.dim = dim;      // 轮询遇到 404 �
             done(result, meta);
             return;
         }
-        clearStaleStrategyWarning();
         done(result, meta);
         if (window.updateEvidence) window.updateEvidence(dim);
     };
@@ -299,8 +298,6 @@ function loadAnalysis(dim, cb) {
                     cb(null);
                     return;
                 }
-                if (data.stale_strategy) showStaleStrategyWarning();
-                else clearStaleStrategyWarning();
                 setAnalysisEmptyState(dim, 'ready');
                 cb(data.result, identity);
                 if (window.updateEvidence) window.updateEvidence(dim);
@@ -387,17 +384,6 @@ function showLoadWarning(message) {
         host.insertBefore(box, host.firstChild);
     }
     if (box.textContent !== message) box.textContent = message;
-}
-
-function showStaleStrategyWarning() {
-    showLoadWarning('当前显示的是旧版人物画像结果，原结果仍保留供查看；点击“运行人物锐评”或“运行成员画像”可按含对话上下文的新策略重新生成。');
-    var box = document.getElementById('loadWarnBox');
-    if (box) box.dataset.staleStrategy = 'true';
-}
-
-function clearStaleStrategyWarning() {
-    var box = document.getElementById('loadWarnBox');
-    if (box && box.dataset.staleStrategy === 'true') box.remove();
 }
 
 function _isAnalyzeCancelled(msg, meta) {
@@ -1051,7 +1037,6 @@ function restoreLatestAnalysisJob() {
             },
             onDone: function (result, meta) {
                 _unlockRestoredButtons();
-                if (!(meta && meta.partial)) clearStaleStrategyWarning();
                 if (statusEl.length) {
                     _renderStatusAlert(
                         statusEl,

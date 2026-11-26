@@ -77,21 +77,15 @@ def _unit(
 
 def _month_cache_status(prompt, system_prompt, dimension, chat_hash, refresh):
     fp = getattr(prompt, "cache_fingerprint", None) or dc.fingerprint_for_dimension(dimension)
-    keys = [dc._month_key(system_prompt, prompt, fp)]
-    keys.extend(
-        dc._month_key(system_prompt, prompt, old_fp)
-        for old_fp in dc._legacy_chain_for_fingerprint_value(fp)
-        if old_fp != fp
-    )
+    key = dc._month_key(system_prompt, prompt, fp)
     if refresh:
-        return False, keys[0]
+        return False, key
     thinking = dc.thinking_enabled(dimension)
-    hit = any(
+    hit = (
         dc._read_result_cache(key, dimension, expect_thinking=thinking, chat_hash=chat_hash, read_only=True)
         is not None
-        for key in keys
     )
-    return hit, keys[0]
+    return hit, key
 
 
 def _build_units(chat, chat_hash, dimension, dimension_cache, refresh):
@@ -302,7 +296,7 @@ def _build_units(chat, chat_hash, dimension, dimension_cache, refresh):
                         thinking=dc.thinking_enabled(dimension),
                         refresh=refresh,
                         identity=hashlib.sha256(
-                            (recap_client.RECAP_PROMPT_FINGERPRINT + digest).encode("utf-8")
+                            (store.analysis_cache_fingerprint("recap", chat) + digest).encode("utf-8")
                         ).hexdigest(),
                     )
                 )
