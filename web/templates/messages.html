@@ -112,11 +112,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {% block scripts %}
 <script>
 (function() {
-    function esc(s) {
-        return String(s == null ? '' : s)
-            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-    }
     var state = { page: 1, pages: 1, total: 0 };
     var sendersLoaded = false;
     var selectedScopePositions = new Set();

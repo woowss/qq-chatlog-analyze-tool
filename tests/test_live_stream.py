@@ -7,6 +7,7 @@
 
 """实时 AI 输出流与 UI 重载恢复的单元与接口回归测试。"""
 
+import io
 import json
 import os
 import sys
@@ -751,6 +752,108 @@ class TestJobStreamPersistenceAndApi(unittest.TestCase):
                 dc._call_vision("sys", "user", [{"path": __file__, "mime": "image/png"}]),
                 "",
             )
+
+    def test_snapshot_handles_corrupted_disk_event_missing_seq(self):
+        corrupted = {
+            "job_id": "job-bad-seq",
+            "status": "done",
+            "events": [{"kind": "stage", "text": "damaged"}],
+        }
+        snap_done = job_stream._format_snapshot(corrupted)
+        self.assertEqual(snap_done["stream_seq"], 0)
+
+        corrupted_running = {
+            "job_id": "job-bad-seq-run",
+            "status": "running",
+            "events": [{"kind": "stage", "text": "still-damaged"}],
+        }
+        snap_interrupted = job_stream._format_snapshot(corrupted_running, live_check=lambda _j: False)
+        self.assertEqual(snap_interrupted["status"], "error")
+        self.assertEqual(snap_interrupted["stream_seq"], 1)
+        self.assertEqual(snap_interrupted["events"][-1]["seq"], 0)
+
+    def test_switch_file_purges_session_job_logs_even_when_chat_shared(self):
+        def make_bytes(text):
+            return json.dumps(
+                {
+                    "chatInfo": {"name": "对方", "selfUid": "uA", "selfName": "我"},
+                    "statistics": {"senders": [{"uid": "uA", "name": "我"}, {"uid": "uB", "name": "对方"}]},
+                    "messages": [
+                        {
+                            "id": "m1",
+                            "timestamp": 1704067200000,
+                            "time": "2024-01-01 08:00:00",
+                            "sender": {"uid": "uA", "name": "我"},
+                            "content": text,
+                        },
+                        {
+                            "id": "m2",
+                            "timestamp": 1704067260000,
+                            "time": "2024-01-01 08:01:00",
+                            "sender": {"uid": "uB", "name": "对方"},
+                            "content": "回复",
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+
+        def new_client():
+            c = appmod.app.test_client()
+            c.get("/")
+            with c.session_transaction() as sess:
+                headers = {"Origin": "http://localhost:5000", "X-CSRF-Token": sess["csrf_token"]}
+            return c, headers
+
+        c1, h1 = new_client()
+        c2, h2 = new_client()
+        self.addCleanup(store.clear_live_chat_refs)
+
+        shared_bytes = make_bytes("同一份对话内容")
+        other_bytes = make_bytes("另一份完全不同的对话内容")
+        self.assertEqual(
+            c1.post("/upload", data={"file": (io.BytesIO(shared_bytes), "a.json")}, headers=h1).status_code,
+            302,
+        )
+        self.assertEqual(
+            c2.post("/upload", data={"file": (io.BytesIO(shared_bytes), "a.json")}, headers=h2).status_code,
+            302,
+        )
+        with c1.session_transaction() as s1:
+            sid1, old_hash, p1 = s1.sid, s1["chat_hash"], s1["filepath"]
+        with c2.session_transaction() as s2:
+            sid2, p2 = s2.sid, s2["filepath"]
+
+        job_stream.init_job("job-sid1-old", sid=sid1, chat_hash=old_hash, dim="emotion", total=1)
+        job_stream.finalize_job("job-sid1-old", status="done", done=1, total=1)
+        job_stream.init_job("job-sid2-old", sid=sid2, chat_hash=old_hash, dim="emotion", total=1)
+        job_stream.finalize_job("job-sid2-old", status="done", done=1, total=1)
+
+        try:
+            self.assertEqual(
+                c1.post(
+                    "/upload", data={"file": (io.BytesIO(other_bytes), "b.json")}, headers=h1
+                ).status_code,
+                302,
+            )
+            with c1.session_transaction() as s1_new:
+                new_hash, p1_new = s1_new["chat_hash"], s1_new["filepath"]
+            self.assertNotEqual(new_hash, old_hash)
+            self.assertIsNone(
+                job_stream.get_job_snapshot("job-sid1-old", sid=sid1, chat_hash=old_hash),
+                "换文件后本会话针对旧聊天的 joblog 必须被清掉",
+            )
+            self.assertIsNotNone(
+                job_stream.get_job_snapshot("job-sid2-old", sid=sid2, chat_hash=old_hash),
+                "其它仍在共用旧聊天的会话 joblog 必须保留",
+            )
+        finally:
+            for p in (p1, p2, locals().get("p1_new")):
+                if p and os.path.exists(p):
+                    os.remove(p)
+            store._purge_chat_caches(old_hash)
+            if "new_hash" in locals():
+                store._purge_chat_caches(new_hash)
 
 
 if __name__ == "__main__":

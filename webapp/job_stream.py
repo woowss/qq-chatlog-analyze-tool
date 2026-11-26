@@ -507,7 +507,10 @@ def _format_snapshot(
         status = "error"
         if not error:
             error = _INTERRUPTED_MSG
-        next_idx = max((int(events[-1]["seq"]) + 1) if events else 0, int(data.get("next_seq") or 0))
+        next_idx = max(
+            (int(events[-1].get("seq", -1)) + 1) if events else 0,
+            int(data.get("next_seq") or 0),
+        )
         if not (events and events[-1].get("text") == _INTERRUPTED_MSG):
             events.append(
                 {
@@ -520,7 +523,7 @@ def _format_snapshot(
                 }
             )
 
-    stream_seq = (int(events[-1]["seq"]) + 1) if events else 0
+    stream_seq = (int(events[-1].get("seq", -1)) + 1) if events else 0
     if "next_seq" in data:
         stream_seq = max(stream_seq, int(data["next_seq"]))
     sliced = [ev for ev in events if int(ev.get("seq", -1)) >= after]
