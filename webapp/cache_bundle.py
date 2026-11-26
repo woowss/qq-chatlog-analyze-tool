@@ -53,6 +53,8 @@ def chat_bundle_files(
     except OSError:
         entries = []
     for name in entries:
+        if name.startswith("joblog_"):
+            continue
         if not cache_belongs_to(name, chat_hash):
             continue
         ai.append(name)

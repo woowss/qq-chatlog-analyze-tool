@@ -104,6 +104,7 @@ from analyzer.month_cache import (
     purge_month_cache as purge_month_cache,
     sweep_orphan_month_cache as sweep_orphan_month_cache,
 )
+from analyzer import llm_stream
 
 logger = get_logger("deepseek")
 
@@ -852,6 +853,7 @@ def _call_api(
     max_attempts = retry + TPM_MAX_ATTEMPTS
 
     while True:
+        llm_stream.reset_delta_emitted()
         # partial 而不是闭包：把当前的 think 值**绑定**进参数里（闭包会跟着
         # 后面的 think = False 一起变，被截断降级后的重试就不是同一个请求了）
         resp, reason = _request_with_retry(
@@ -882,18 +884,26 @@ def _call_api(
                 logger.warning(
                     "输出被 max_tokens=%s 截断，改用非思考模式重试一次（保住这个月的结果）", max_tokens
                 )
+                llm_stream.emit_event(
+                    "warn",
+                    f"输出被 max_tokens={max_tokens} 截断，改用非思考模式重试一次",
+                )
                 think = False
                 continue
             logger.error("模型输出被 max_tokens=%s 截断，放弃本次结果（不重试）", max_tokens)
+            llm_stream.emit_event("error", f"模型输出被 max_tokens={max_tokens} 截断，放弃本次结果")
             return None
         try:
             # strict=False：容忍字符串里未转义的控制字符。模型偶尔把多行文本写成**裸换行**
             # （锐评、群动态里常见），严格模式会直接判非法 JSON，从而丢掉整月/整位成员的结果。
             # 真实数据实测：三次失败里有两次属于这种"内容合法、转义偷懒"，放宽解析即可救回；
             # 它只影响解析容忍度，不会把合法 JSON 解析错。
-            return json.loads(choice.message.content, strict=False)
+            parsed = json.loads(choice.message.content, strict=False)
+            llm_stream.emit_result_fallback(parsed)
+            return parsed
         except (json.JSONDecodeError, TypeError) as e:
             logger.error("模型返回非法 JSON（不重试）: %s", e)
+            llm_stream.emit_event("error", f"模型返回非法 JSON：{e}")
             return None
 
 
@@ -1004,58 +1014,73 @@ def _analyze_periods(
     def _work(period: str, msgs: list) -> tuple[str, Optional[dict]]:
         if _cancel_requested():
             return period, None
-        try:
-            prompt = make_prompt(period, msgs)
-            if not prompt.strip():
-                return period, None
-            keys = _keys_for(prompt, getattr(prompt, "cache_fingerprint", None))
-            key = keys[0]
-            # 思考模式须与 _call_api 口径一致并参与月份缓存校验
-            want_thinking = thinking_enabled(tag)
-            result = _read_result_cache(key, tag, expect_thinking=want_thinking, chat_hash=chat_hash)
-            if result is None:
-                # 按指纹代次链逐代回溯旧缓存并在命中后就地迁移到当前键
-                for legacy_key in keys[1:]:
-                    result = _read_result_cache(
-                        legacy_key, tag, expect_thinking=want_thinking, chat_hash=chat_hash
+        with llm_stream.stream_context(unit=f"{tag}:{period}", label=f"{period} 月", fresh_state=True):
+            try:
+                prompt = make_prompt(period, msgs)
+                if not prompt.strip():
+                    return period, None
+                keys = _keys_for(prompt, getattr(prompt, "cache_fingerprint", None))
+                key = keys[0]
+                # 思考模式须与 _call_api 口径一致并参与月份缓存校验
+                want_thinking = thinking_enabled(tag)
+                result = _read_result_cache(key, tag, expect_thinking=want_thinking, chat_hash=chat_hash)
+                if result is None:
+                    # 按指纹代次链逐代回溯旧缓存并在命中后就地迁移到当前键
+                    for legacy_key in keys[1:]:
+                        result = _read_result_cache(
+                            legacy_key, tag, expect_thinking=want_thinking, chat_hash=chat_hash
+                        )
+                        if result is None:
+                            continue
+                        if migrate_month_cache(
+                            legacy_key, key, dimension=tag, expect_thinking=want_thinking, chat_hash=chat_hash
+                        ):
+                            logger.info("%s 命中旧指纹的月份缓存，已迁移到当前键", period)
+                        else:
+                            logger.info("%s 命中旧指纹的月份缓存", period)
+                        break
+                if result is not None:
+                    logger.info("%s 命中月份缓存，跳过 API 调用", period)
+                    llm_stream.emit_event(
+                        "cache",
+                        f"{period} 月命中本地缓存（{len(msgs)} 条消息），跳过 API 调用",
+                        data={"cached": True},
                     )
-                    if result is None:
-                        continue
-                    if migrate_month_cache(
-                        legacy_key, key, dimension=tag, expect_thinking=want_thinking, chat_hash=chat_hash
-                    ):
-                        logger.info("%s 命中旧指纹的月份缓存，已迁移到当前键", period)
-                    else:
-                        logger.info("%s 命中旧指纹的月份缓存", period)
-                    break
-            if result is not None:
-                logger.info("%s 命中月份缓存，跳过 API 调用", period)
-            else:
-                result = _call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag, dim=tag)
-                if not result:
-                    _mark_failed(period)
-                elif supports_dimension(tag):
-                    try:
-                        _validate_before_month_cache(tag, result)
-                    except ResultValidationError as e:
-                        # 仅记录维度/月份/字段路径，避免原始消息或错误体泄露到日志
-                        _mark_failed(period, e.path)
-                        logger.warning("%s 月 AI 结果结构无效（字段 %s）", period, e.path)
-                        result = None
-                # 若分析期间聊天已被清理，仅返回内存结果而不回写月份磁盘缓存
-                if result and not purge_marks.is_marked(chat_hash):
-                    _write_month_cache(key, result, thinking=want_thinking)
-            if result:
-                result["period"] = period
-                result["month"] = period
-                used_keys.add(key)
-                return period, result
-        except QuotaExhaustedError as e:
-            fatal.setdefault("error", str(e))
-            logger.error("%s 月 AI 分析中止（配额耗尽）", period)
-        except Exception as e:
-            _mark_failed(period)
-            logger.error("%s 月 AI 分析失败: %s", period, e)
+                else:
+                    llm_stream.emit_event("stage", f"开始分析 {period} 月（{len(msgs)} 条消息）")
+                    result = _call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag, dim=tag)
+                    if not result:
+                        _mark_failed(period)
+                    elif supports_dimension(tag):
+                        try:
+                            _validate_before_month_cache(tag, result)
+                        except ResultValidationError as e:
+                            # 仅记录维度/月份/字段路径，避免原始消息或错误体泄露到日志
+                            _mark_failed(period, e.path)
+                            logger.warning("%s 月 AI 结果结构无效（字段 %s）", period, e.path)
+                            llm_stream.emit_event("error", f"{period} 月 AI 结果结构无效（字段 {e.path}）")
+                            result = None
+                    if result:
+                        llm_stream.emit_result_fallback(result)
+                        llm_stream.emit_event("stage", f"{period} 月分析完成")
+                    # 若分析期间聊天已被清理，仅返回内存结果而不回写月份磁盘缓存
+                    if result and not purge_marks.is_marked(chat_hash):
+                        _write_month_cache(key, result, thinking=want_thinking)
+                if result:
+                    result["period"] = period
+                    result["month"] = period
+                    used_keys.add(key)
+                    return period, result
+            except llm_stream.StreamCancelledError:
+                llm_stream.emit_event("stage", f"{period} 月已取消")
+            except QuotaExhaustedError as e:
+                fatal.setdefault("error", str(e))
+                logger.error("%s 月 AI 分析中止（配额耗尽）", period)
+                llm_stream.emit_event("error", f"{period} 月分析中止：配额耗尽")
+            except Exception as e:
+                _mark_failed(period)
+                logger.error("%s 月 AI 分析失败: %s", period, e)
+                llm_stream.emit_event("error", f"{period} 月 AI 分析失败：{scrub_secrets(e)}")
         return period, None
 
     pending = list(months.items())
@@ -1369,65 +1394,84 @@ def _analyze_person(
     stratified=True（锐评）：按时间均匀抽样覆盖整个时段 —— 否则 growth_observation
     要求的"这段时间的变化"根本不在样本里，模型只能编或写数据不足。
     """
-    try:
-        request_data = _prepare_person_request(
-            system_prompt,
-            sample_size,
-            msgs,
-            display_name,
-            prompt_template,
-            tag=tag,
-            stratified=stratified,
-            chat_hash=chat_hash,
-            context_messages=context_messages,
-            speaker_name_of=speaker_name_of,
-            scope_id=scope_id,
-        )
-        if request_data is None:
-            return None
-        valid_all = request_data["valid_all"]
-        user_content = request_data["user_content"]
-        cache_key = request_data["cache_key"]
-        want_thinking = request_data["thinking"]
-        result = _read_result_cache(cache_key, tag, expect_thinking=want_thinking, chat_hash=chat_hash)
-        if result is not None:
-            logger.info("%s 命中个人分析缓存，跳过 API 调用", mask_name(display_name))
-        else:
-            result = _call_api(
+    unit_id = f"{tag}:{display_name}"
+    with llm_stream.stream_context(unit=unit_id, label=display_name, fresh_state=True):
+        try:
+            request_data = _prepare_person_request(
                 system_prompt,
-                user_content,
-                max_tokens=max_tokens,
+                sample_size,
+                msgs,
+                display_name,
+                prompt_template,
                 tag=tag,
-                dim=tag,
+                stratified=stratified,
+                chat_hash=chat_hash,
+                context_messages=context_messages,
+                speaker_name_of=speaker_name_of,
+                scope_id=scope_id,
             )
+            if request_data is None:
+                return None
+            valid_all = request_data["valid_all"]
+            user_content = request_data["user_content"]
+            cache_key = request_data["cache_key"]
+            want_thinking = request_data["thinking"]
+            result = _read_result_cache(cache_key, tag, expect_thinking=want_thinking, chat_hash=chat_hash)
+            if result is not None:
+                logger.info("%s 命中个人分析缓存，跳过 API 调用", mask_name(display_name))
+                llm_stream.emit_event(
+                    "cache",
+                    f"{display_name} 命中个人缓存（{len(valid_all)} 条消息），跳过 API 调用",
+                    data={"cached": True},
+                )
+            else:
+                llm_stream.emit_event("stage", f"开始分析 {display_name}（{len(valid_all)} 条有效消息）")
+                result = _call_api(
+                    system_prompt,
+                    user_content,
+                    max_tokens=max_tokens,
+                    tag=tag,
+                    dim=tag,
+                )
+                if result:
+                    try:
+                        _validate_before_month_cache(tag, result)
+                    except ResultValidationError as e:
+                        logger.warning(
+                            "%s 的 %s 结果结构无效（字段 %s）",
+                            mask_name(display_name),
+                            tag,
+                            e.path,
+                        )
+                        llm_stream.emit_event(
+                            "error",
+                            f"{display_name} 的 {tag} 结果结构无效（字段 {e.path}）",
+                        )
+                        raise AnalysisIncompleteError(
+                            f"{mask_name(display_name)} 的 {tag} 结果结构无效（字段 {e.path}）；可重试该成员"
+                        ) from e
+                    llm_stream.emit_result_fallback(result)
+                    llm_stream.emit_event("stage", f"{display_name} 分析完成")
+                if result and not purge_marks.is_marked(chat_hash):
+                    _write_month_cache(cache_key, result, thinking=want_thinking)
+            if result and chat_hash:
+                _record_month_usage(chat_hash, {cache_key})
             if result:
-                try:
-                    _validate_before_month_cache(tag, result)
-                except ResultValidationError as e:
-                    logger.warning(
-                        "%s 的 %s 结果结构无效（字段 %s）",
-                        mask_name(display_name),
-                        tag,
-                        e.path,
-                    )
-                    raise AnalysisIncompleteError(
-                        f"{mask_name(display_name)} 的 {tag} 结果结构无效（字段 {e.path}）；可重试该成员"
-                    ) from e
-            if result and not purge_marks.is_marked(chat_hash):
-                _write_month_cache(cache_key, result, thinking=want_thinking)
-        if result and chat_hash:
-            _record_month_usage(chat_hash, {cache_key})
-        if result:
-            result["name"] = display_name
-            result["total_messages"] = len(valid_all)
-            return result
-    except QuotaExhaustedError:
-        raise  # 配额耗尽需中止整个维度，不能被当作单人失败吞掉
-    except AnalysisIncompleteError:
-        raise
-    except Exception as e:
-        logger.error("%s 的 AI 分析失败: %s", mask_name(display_name), scrub_secrets(e))
-    return None
+                result["name"] = display_name
+                result["total_messages"] = len(valid_all)
+                return result
+        except llm_stream.StreamCancelledError:
+            llm_stream.emit_event("stage", f"{display_name} 已取消")
+            raise
+        except QuotaExhaustedError:
+            llm_stream.emit_event("error", f"{display_name} 分析中止：配额耗尽")
+            raise  # 配额耗尽需中止整个维度，不能被当作单人失败吞掉
+        except AnalysisIncompleteError:
+            raise
+        except Exception as e:
+            logger.error("%s 的 AI 分析失败: %s", mask_name(display_name), scrub_secrets(e))
+            llm_stream.emit_event("error", f"{display_name} 的 AI 分析失败：{scrub_secrets(e)}")
+        return None
 
 
 def _person_analysis_spec(dimension: str) -> tuple[str, str, int, bool]:
@@ -1490,6 +1534,8 @@ def analyze_habits(
                 chat_hash=chat_hash,
                 scope_id=getattr(chat, "analysis_scope_id", ""),
             )
+        except llm_stream.StreamCancelledError:
+            break
         except QuotaExhaustedError:
             raise
         except AnalysisIncompleteError:
@@ -1555,6 +1601,8 @@ def analyze_profile(
                 ),
                 scope_id=getattr(chat, "analysis_scope_id", ""),
             )
+        except llm_stream.StreamCancelledError:
+            break
         except QuotaExhaustedError:
             raise
         except AnalysisIncompleteError:

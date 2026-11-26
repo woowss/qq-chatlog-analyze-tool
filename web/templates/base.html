@@ -173,6 +173,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         </div>
         {%- endif %}
         {% block content %}{% endblock %}
+        {% if has_stats and request.endpoint in ['dashboard', 'emotion', 'relationship', 'habits', 'topics', 'profile', 'recap'] %}
+        {% include '_ai_output_panel.html' %}
+        {% endif %}
         {% if request.endpoint in ['emotion', 'relationship', 'habits', 'topics', 'profile', 'recap'] %}
         {% include '_evidence_panel.html' %}
         {% endif %}

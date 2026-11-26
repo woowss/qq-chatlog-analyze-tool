@@ -755,6 +755,13 @@ def _purge_chat_caches(chat_hash: str) -> int:
         removed += purge_job_history(chat_hash)
     except Exception as e:
         logger.warning("任务历史按聊天清理失败: %s", e)
+    # 清理进程内任务实时输出流（磁盘 joblog_{chat_hash}_*.json 已在上方 AI_CACHE_DIR 清扫）
+    try:
+        from webapp import job_stream
+
+        job_stream.purge_chat(chat_hash)
+    except Exception as e:
+        logger.warning("任务输出流清理失败: %s", e)
     return removed
 
 

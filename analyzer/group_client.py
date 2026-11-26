@@ -31,6 +31,7 @@ from config import GROUP_AI_MAX_MEMBERS, env_number
 from parser.qq_parser import ChatData, is_statistical
 from parser.group_identity import Participant
 from analyzer import group_prompts as gp
+from analyzer import llm_stream
 from analyzer import person_context
 from analyzer.deepseek_client import (
     AnalysisIncompleteError,
@@ -786,47 +787,66 @@ def _analyze_member(
     抽样口径与私聊锐评一致（stratified）：growth_observation 要的是"这段时间的变化"，
     只取最近 800 条会让变化根本不在样本里。
     """
-    try:
-        request_data = _prepare_member_request(chat, member, prompt_template, tag, chat_hash)
-        if request_data is None:
-            return None
-        import analyzer.deepseek_client as dc
+    unit_id = f"{tag}:{member.uid or member.name}"
+    with llm_stream.stream_context(unit=unit_id, label=member.name, fresh_state=True):
+        try:
+            request_data = _prepare_member_request(chat, member, prompt_template, tag, chat_hash)
+            if request_data is None:
+                return None
+            import analyzer.deepseek_client as dc
 
-        msgs = request_data["messages"]
-        prompt = request_data["prompt"]
-        key = request_data["cache_key"]
-        want_thinking = request_data["thinking"]
-        result = dc._read_result_cache(key, tag, expect_thinking=want_thinking, chat_hash=chat_hash)
-        if result is not None:
-            logger.info("%s 命中成员缓存，跳过 API 调用", mask_name(member.name))
-        else:
-            result = _call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag, dim=tag)
+            msgs = request_data["messages"]
+            prompt = request_data["prompt"]
+            key = request_data["cache_key"]
+            want_thinking = request_data["thinking"]
+            result = dc._read_result_cache(key, tag, expect_thinking=want_thinking, chat_hash=chat_hash)
+            if result is not None:
+                logger.info("%s 命中成员缓存，跳过 API 调用", mask_name(member.name))
+                llm_stream.emit_event(
+                    "cache",
+                    f"{member.name} 命中成员缓存（{len(msgs)} 条消息），跳过 API 调用",
+                    data={"cached": True},
+                )
+            else:
+                llm_stream.emit_event("stage", f"开始分析成员 {member.name}（{len(msgs)} 条消息）")
+                result = _call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag, dim=tag)
+                if result:
+                    try:
+                        validate_result(tag, result)
+                    except ResultValidationError as e:
+                        logger.warning("%s 的成员画像结果结构无效（字段 %s）", mask_name(member.name), e.path)
+                        llm_stream.emit_event(
+                            "error",
+                            f"{member.name} 的成员画像结果结构无效（字段 {e.path}）",
+                        )
+                        raise AnalysisIncompleteError(
+                            f"{mask_name(member.name)} 的成员画像结果结构无效（字段 {e.path}）；可重试该成员"
+                        ) from e
+                    llm_stream.emit_result_fallback(result)
+                    llm_stream.emit_event("stage", f"成员 {member.name} 分析完成")
+                if result and not dc.purge_marks.is_marked(chat_hash):
+                    dc._write_month_cache(key, result, thinking=want_thinking)
+            if result is not None and used_keys is not None:
+                used_keys.add(key)
             if result:
-                try:
-                    validate_result(tag, result)
-                except ResultValidationError as e:
-                    logger.warning("%s 的成员画像结果结构无效（字段 %s）", mask_name(member.name), e.path)
-                    raise AnalysisIncompleteError(
-                        f"{mask_name(member.name)} 的成员画像结果结构无效（字段 {e.path}）；可重试该成员"
-                    ) from e
-            if result and not dc.purge_marks.is_marked(chat_hash):
-                dc._write_month_cache(key, result, thinking=want_thinking)
-        if result is not None and used_keys is not None:
-            used_keys.add(key)
-        if result:
-            result["name"] = member.name
-            result["uid"] = member.uid
-            result["is_self"] = member.is_self
-            result["total_messages"] = len(msgs)
-            return result
-        raise AnalysisIncompleteError(f"{mask_name(member.name)} 的成员画像未得到有效结果")
-    except QuotaExhaustedError:
-        raise
-    except AnalysisIncompleteError:
-        raise
-    except Exception as e:
-        logger.error("%s 的群内画像失败: %s", mask_name(member.name), e)
-        raise AnalysisIncompleteError(f"{mask_name(member.name)} 的成员画像分析失败") from e
+                result["name"] = member.name
+                result["uid"] = member.uid
+                result["is_self"] = member.is_self
+                result["total_messages"] = len(msgs)
+                return result
+            raise AnalysisIncompleteError(f"{mask_name(member.name)} 的成员画像未得到有效结果")
+        except llm_stream.StreamCancelledError:
+            llm_stream.emit_event("stage", f"{member.name} 已取消")
+            raise
+        except QuotaExhaustedError:
+            llm_stream.emit_event("error", f"{member.name} 分析中止：配额耗尽")
+            raise
+        except AnalysisIncompleteError:
+            raise
+        except Exception as e:
+            logger.error("%s 的群内画像失败: %s", mask_name(member.name), e)
+            llm_stream.emit_event("error", f"{member.name} 的群内画像失败")
+            raise AnalysisIncompleteError(f"{mask_name(member.name)} 的成员画像分析失败") from e
 
 
 def _member_prompt_template() -> str:
@@ -870,6 +890,8 @@ def analyze_member_profiles(
                 chat_hash=chat_hash,
                 used_keys=used_keys,
             )
+        except llm_stream.StreamCancelledError:
+            break
         except QuotaExhaustedError as exc:
             # 前面已完成的成员画像各自有内容缓存；重试时命中它们，只补尚未完成的成员。
             _record_member_usage(chat_hash, used_keys)
