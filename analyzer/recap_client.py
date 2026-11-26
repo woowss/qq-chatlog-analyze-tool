@@ -18,38 +18,27 @@
 
 为什么需要它：逐月的五个维度各自只看得到自己那一个月，prompt 里却被要求给出
 "亲密趋势/话题迁移"——结构上无从看见上月，只能靠猜（docs/reviews 与调研都点了这条）。
-recap 不修补那五支的键（动它们=全员重付费），而是新增一支**真的拿得到跨月事实**的
-独立维度：输入是本地统计的逐月表（calc_trends/calc_milestones，确定性、chat_hash 不变
-则输入不变），加时间均匀抽样对话，一次调用产出全周期复盘。
-
-指纹隔离（本项目的最高约束）：
-- 私聊指纹只哈希 analyzer/prompts.py 里显式列名的常量 + dialog.py 的 5 个格式化函数，
-  本模块不在其列 → 既有私聊缓存逐字节不动。
-- recap 有**自己的指纹**（哈希自己的 system prompt、自己的摘要构建源码、以及摘要会
-  消费的 calc_trends/calc_milestones 源码）：这些任何一个变了，只有 recap 缓存换代。
-  摘要数字来自本地统计函数——把它们源码进指纹正是为了"统计口径变了，复盘跟着重算"，
-  而本地统计重算本来就免费，代价只有一次 recap 调用。
-- 只进维度缓存、不进月份缓存（habits/profile 同样是单次调用维度，先例一致）：
-  输入对同一 chat_hash 完全确定，维度缓存即够用，强制重分析在页面上有开关。
+recap 不修补那五支的键，而是新增一支**真的拿得到跨月事实**的独立维度：输入是本地统计的
+逐月表（calc_trends/calc_milestones，确定性、chat_hash 不变则输入不变），加时间均匀抽样
+对话，一次调用产出全周期复盘。
 """
 
 import hashlib
-import inspect
 import os
 from typing import Any, Callable, Optional
 
 from analyzer import llm_stream
-
+from analyzer import recap_prompts as rp
 from analyzer.logger import get_logger
 from analyzer.recap_prompts import SYSTEM_PROMPT_ASK, SYSTEM_PROMPT_RECAP
 
 logger = get_logger("app")
 
 RECAP_DIMENSION = "recap"
+RECAP_CACHE_VERSION = "v2"
 
-# 抽样预算：均匀抽样条数与字符上限。这两个数字进指纹（走 _recap_consts_part 显式列名，
-# **不是**靠 _recap_digest 的源码——函数源码里它们只是 Name 节点，改值不改形状），
-# 调整=recap 换代重算：只有这一族，付一次调用，代价可控、语义也真变了。
+# 抽样预算：均匀抽样条数与字符上限。这两个数字进指纹（走 _recap_consts_part 显式列名），
+# 调整=recap 换代重算。
 RECAP_SAMPLE_LINES = 800
 RECAP_SAMPLE_CHARS = 150_000
 
@@ -141,51 +130,20 @@ def _recap_max_tokens() -> int:
 
 
 def _recap_consts_part() -> str:
-    """把"改变 recap 模型输入、但不出现在任何函数源码里"的模块级常量收成一段。
-
-    为什么必须单列而不是靠 _recap_digest 的源码：指纹哈希的是 **AST 归一的函数源码**，
-    函数体里的 RECAP_SAMPLE_LINES / RECAP_SAMPLE_CHARS 只是 Name 节点——把 800 改成 200
-    不改变任何一个节点的形状，于是"喂给模型的对话样本少了一整半"这件事在指纹上完全
-    隐形，而旧样本算出的旧复盘照旧以"新配置"的名义命中 30 天（缓存命中时 _recap_digest
-    根本不会重跑，没有任何地方会发现输入变了）。私聊族早已用同一段（deepseek_client
-    的 "consts:" 块）修过这个坑，并有用例 test_optimizations.
-    test_input_budget_change_changes_fingerprint 钉着；recap 族诞生时漏了这段，
-    等于把同一个 bug 重新引入一遍。
-
-    列在这里的每一项都必须是**真的会进模型输入**的量：抽样条数、抽样字符预算。
-    模型名与思考开关已各自在文件名里，不必重复。
-    """
+    """把改变 recap/ask 模型输入的抽样预算常量收成一段参与指纹计算。"""
     return f"consts:{RECAP_SAMPLE_LINES},{RECAP_SAMPLE_CHARS}"
 
 
-def recap_prompt_fingerprint(salt: Optional[str] = None, normalize: bool = True) -> str:
-    """recap 独立指纹：system prompt + 摘要构建源码 + 它消费的全部上游函数源码 + 常量 + 预算 + 盐。
-
-    统计函数（calc_overview/calc_trends/calc_milestones）进指纹是有意的：recap 的输入数字
-    由它们产出，口径一变旧复盘就配不上新数字——换代重算只花一次调用，且这本来就意味着
-    输入变了。calc_overview 此前漏在名单外，而 _recap_digest 的头行与"本地事实"段的每条
-    数字都由它产出（见那里对 ov[...] 的取值），它一改旧键照样命中。
-    对话格式化函数（_message_line/_has_content）同理：抽样对话原文逐条经它们成型，
-    换格式=换模型输入。私聊族一直把这两个函数进指纹，recap 不能例外。
-    normalize 语义与其他族一致（AST 归一 / 旧原文公式，读旧缓存迁移用）。
-    """
-    from analyzer import deepseek_client as dc
-    from analyzer import local_stats as ls
-    from analyzer.dialog import _has_content, _message_line
-
+def recap_prompt_fingerprint(salt: Optional[str] = None) -> str:
+    """recap 独立指纹：版本号 + system prompt + 抽样预算常量 + 输出预算 + 盐。"""
     if salt is None:
         salt = (os.getenv("PROMPT_CACHE_SALT", "") or "").strip()
-    funcs = (_recap_digest, ls.calc_overview, ls.calc_trends, ls.calc_milestones, _message_line, _has_content)
-    try:
-        hashed = [dc._hashed_source(f) if normalize else inspect.getsource(f) for f in funcs]
-    except (OSError, TypeError):
-        hashed = [f"<source-unavailable:{f.__name__}>" for f in funcs]
-        logger.warning("recap 指纹源码不可读，降级为函数名级（改动需手动设盐换键）")
     parts = [
+        f"version:{RECAP_CACHE_VERSION}",
+        rp.SYSTEM_PROMPT_RECAP,
         SYSTEM_PROMPT_RECAP,
         f"budget:{_recap_max_tokens()}",
         _recap_consts_part(),
-        *hashed,
     ]
     if salt:
         parts.append(f"salt:{salt}")
@@ -193,15 +151,6 @@ def recap_prompt_fingerprint(salt: Optional[str] = None, normalize: bool = True)
 
 
 RECAP_PROMPT_FINGERPRINT = recap_prompt_fingerprint()
-#: 与私聊/群聊两族同构的"旧公式"值。新族诞生即预置：读不到当前键时再试这一支并迁移，
-#: 让未来的 recap 指纹演进也能走"用户不重复付费"的既有机制，而不是第三次换代时断层。
-#:
-#: 写死成**字面量**而不是 recap_prompt_fingerprint(normalize=False)：旧公式哈希的是当前
-#: 源码原文，任何一次对 _recap_digest / build_ask_user / 那几个统计与格式化函数的改动
-#: 都会让现算值漂移，而它偏偏是"记住过去那个键"的凭据——漂掉的后果是那条
-#: "用户不重复付费"的迁移路径静默断掉。理由同 deepseek_client.PROMPT_FINGERPRINT_LEGACY。
-#: 本族尚未发布，所以这里就取它诞生时（当前源码）的旧公式值。
-RECAP_PROMPT_FINGERPRINT_LEGACY = "16439af05a71"
 
 
 def analyze_recap(
@@ -261,6 +210,7 @@ RECAP_DIMENSIONS: dict = {RECAP_DIMENSION: ("整体总括", analyze_recap, "次"
 # ---------------------------------------------------------------------------
 
 ASK_DIMENSION = "ask"
+ASK_CACHE_VERSION = "v2"
 
 
 def build_ask_user(question: str, digest: str) -> str:
@@ -274,37 +224,17 @@ def build_ask_user(question: str, digest: str) -> str:
 
 
 def ask_fingerprint(salt: Optional[str] = None) -> str:
-    """ask 独立指纹：ask 的 system prompt + 问题拼装方式 + 摘要会消费的全部上游源码 + 常量 + 预算 + 盐。
-
-    复用 recap 的 _recap_digest 源码进指纹：摘要口径一变，旧答案配不上新材料，换代重算
-    （每个问题各付一次，作用域是"问过的题"，不是全部历史）。
-    抽样常量与上游统计/格式化函数与 recap 同口径（见 _recap_consts_part 的理由）：
-    ask 与 recap 吃的是**同一份 digest**，所以让 recap 隐形的改动同样不能对 ask 隐形。
-    """
+    """ask 独立指纹：版本号 + system prompt + 抽样预算常量 + 输出预算 + 盐。"""
     from analyzer import deepseek_client as dc
-    from analyzer import local_stats as ls
-    from analyzer.dialog import _has_content, _message_line
 
     if salt is None:
         salt = (os.getenv("PROMPT_CACHE_SALT", "") or "").strip()
-    funcs = (
-        build_ask_user,
-        _recap_digest,
-        ls.calc_overview,
-        ls.calc_trends,
-        ls.calc_milestones,
-        _message_line,
-        _has_content,
-    )
-    try:
-        hashed = [dc._hashed_source(f) for f in funcs]
-    except (OSError, TypeError):
-        hashed = ["<source-unavailable:ask>"]
     parts = [
+        f"version:{ASK_CACHE_VERSION}",
+        rp.SYSTEM_PROMPT_ASK,
         SYSTEM_PROMPT_ASK,
         f"budget:{dc.MAX_TOKENS_BY_DIM.get(ASK_DIMENSION, 8192)}",
         _recap_consts_part(),
-        *hashed,
     ]
     if salt:
         parts.append(f"salt:{salt}")

@@ -369,39 +369,8 @@ class TestChatDataCompatibility(unittest.TestCase):
         self.assertEqual(list(chat.months()), ["2025-03"])
 
 
-#: 私聊提示词指纹的**绝对值**（默认配置下实测值）。
-#:
-#: 为什么要钉死一个字面量：这个值同时进维度缓存文件名与月份缓存键，它一变，
-#: 所有既有用户的私聊分析缓存（含月份级增量缓存）就全部不再命中——用户下次分析
-#: 要**重新为同样的对话付费**。所以"指纹变了"必须是代码评审里**看得见**的一件事，
-#: 而不是 CI 静默放过。
-#:
-#: 改这个值的前提：① 确实改了提示词/对话格式/进哈希的常量或预算；
-#: ② CHANGELOG 里写明"会让既有缓存在宽限期后被回收，用户需重新分析"。
-#: 只更新数字而不写 CHANGELOG，等于把一笔用户成本藏进测试改动里。
-#:
-#: 历史：M0（2026-09-12）实测 b6c5074dc226；此后提示词与输出预算改过，到 2026-09
-#: 为 26bf952fe772；同月哈希对象从"源码原文"改为"源码的 AST 归一"（见 _hashed_source），
-#: 现值如下。**旧值仍然有效**：它是 LEGACY 常量，用来读取旧指纹命名的缓存并迁移，
-#: 所以那次公式变更没有让任何人为同样的分析重新付费（有专门的用例钉住迁移）。
-#:
-#: 换代记录：83f7b5eaa608（本轮）—— _conversation_stats 的 median_gap 从就地
-#: `s[n//2]`（上中位）改为复用 local_stats._median（偶数取中间两数平均）。这行改动
-#: 真的改变喂给模型的那句"回复间隔中位数约 N 秒"，所以必须换键。
-#: 代价**已在 CHANGELOG 写明**：既有私聊用户下次跑五个维度会重新付费。
-#: 被换出去的 f4bd6aa06d52 压进了 deepseek_client.PRIVATE_FINGERPRINT_GENERATIONS，
-#: 因此它不是"消失"，而是变成链条里可读可迁的一代——下一次换代时老用户仍能沿链搬回。
-#:
-#: 再换代：23fa36bc1d2a —— 归一化从 `ast.dump` 换成自写的规范折叠（_canonical_ast）。
-#: 原因是 `ast.dump` 的输出**随 Python 版本变**（3.13 起默认不再打印空字段），
-#: 于是同一份源码在 3.10/3.12 与 3.13/3.14 上得到两个不同的指纹：CI 里低版本那两个
-#: 用例必红，而用户换个 Python 版本就要为同一份聊天重新付费。**83f7b5eaa608 从未发布**
-#: （它只存在于本轮未提交的改动里），所以这一换是零成本，没有任何用户为它付过钱。
-PINNED_PRIVATE_FINGERPRINT = "23fa36bc1d2a"
-
-#: 旧公式（按 getsource 原文哈希）的取值。它必须继续可复现——降低它的唯一方式是
-#: 让"旧缓存读不到"，也就是让用户重新付费。改动它同样要写 CHANGELOG。
-PINNED_LEGACY_PRIVATE_FINGERPRINT = "26bf952fe772"
+#: 私聊提示词指纹的**绝对值**（默认配置下实测值，显式版本号 + 纯内容哈希）。
+PINNED_PRIVATE_FINGERPRINT = "68875dd158fd"
 
 #: 会让上面那个绝对值必然对不上的环境变量（它们都通过常量进哈希）。
 #: 本机配了其中任何一个，说明这位开发者正在用非默认预算/视觉参数跑测试——
@@ -414,28 +383,8 @@ _FINGERPRINT_ENV_KEYS = (
     "LLM_VISION_MIN_SIDE",
 )
 
-#: 群聊提示词指纹的**绝对值**（默认配置下实测值）。成本等级与私聊那份完全相同：
-#: 它进群聊维度缓存文件名与群聊月份缓存键，一变就等于让所有既有群聊用户为同样的
-#: 对话重新付费。私聊那条 pin 覆盖不到它——群聊缓存里嵌的是另一个值。
-#:
-#: 历史：群聊功能落地（2026-09）时为 5f1f7bb3c0ce（旧公式，按 getsource 原文哈希）；
-#: 同月哈希对象改为 AST 归一后现值为 a8e00d5ae5ca。**旧值仍然是有效凭据**：它负责
-#: 读取"AST 归一之前"写下的群聊缓存并迁移（见 tests/test_privacy_guards.py 的
-#: TestFingerprintMigration），所以两边都必须继续可复现。
-#:
-#: 第二次换代（成员感知抽样修复）：_fit_group_lines 的预算单位从"把字符数当行数用"
-#: 改成真的换算成行数，**喂给模型的对话样本因此变了**（修复前那段抽样是死代码，
-#: 每次都落到均匀截断，低频成员被丢掉，而提示词却告诉模型"每位成员都有保底条数"）。
-#: 输入变了就必须换键——继续命中旧键等于让新口径下的结论配不上旧样本。
-#: 代价：既有群聊用户下次分析群聊维度时重付一次（成员画像是每人一次调用）。
-#: 旧凭据 5f1f7bb3c0ce 不受影响：它已改为字面量冻结，不再随源码浮动。
-#:
-#: 第三次换代（归一化改自写规范折叠，见上面 PINNED_PRIVATE_FINGERPRINT 那段说明）：
-#: f9b8b7d70e13 → 30c7d6356e3a。同样是"从未发布过"的值，零成本。
-PINNED_GROUP_FINGERPRINT = "30c7d6356e3a"
-
-#: 旧公式下的群聊指纹取值，作用同上：改它的后果是所有既有群聊用户的旧缓存读不到。
-PINNED_LEGACY_GROUP_FINGERPRINT = "5f1f7bb3c0ce"
+#: 群聊提示词指纹的**绝对值**（默认配置下实测值，显式版本号 + 纯内容哈希）。
+PINNED_GROUP_FINGERPRINT = "e5d7f7647b80"
 
 #: 会让群聊指纹绝对值对不上的环境变量。与私聊那份**各自独立**：私聊多一个视觉参数，
 #: 群聊多两个群聊预算（两者的常量元组本来就不同）。
@@ -451,7 +400,6 @@ class TestPrivateFingerprintIsolation(unittest.TestCase):
 
     def test_private_fingerprint_absolute_value_is_pinned(self):
         """绝对值断言：指纹一变就红，逼着改动者面对"用户要为缓存重新付费"这件事"""
-        from analyzer import deepseek_client as dc
 
         overrides = sorted(
             k for k in os.environ if k in _FINGERPRINT_ENV_KEYS or k.startswith("LLM_MAX_TOKENS_")
@@ -466,24 +414,12 @@ class TestPrivateFingerprintIsolation(unittest.TestCase):
             PINNED_PRIVATE_FINGERPRINT,
             "私聊提示词指纹变了。它进维度缓存文件名与月份缓存键，一变就等于让所有既有用户"
             "在下次分析时重新付费（月份缓存会在宽限期后被孤儿回收）。若确属有意改动，"
-            "请同步更新本用例的 PINNED_PRIVATE_FINGERPRINT，并在 CHANGELOG 写明这一点。",
-        )
-        self.assertEqual(
-            dc.PROMPT_FINGERPRINT_LEGACY,
-            PINNED_LEGACY_PRIVATE_FINGERPRINT,
-            "旧公式的指纹变了：它是「读取并迁移旧缓存」的唯一凭据。改它的后果是所有既有"
-            "用户的旧缓存都读不到，也就是让他们为同样的分析重新付费。",
+            "请同步更新本用例的 PINNED_PRIVATE_FINGERPRINT。",
         )
 
     def test_every_listed_env_input_really_changes_the_fingerprint(self):
-        """名单的**下界**要有依据：里面每个变量都必须真的参与哈希。
-
-        名单一旦多出一个不相干的变量，绝对值用例就会为它白白放宽适用面（开发者只是
-        设了个无关参数，指纹断言却静默跳过）；少一个则会让那位开发者拿到一条假红。
-        这里逐个把它们改掉，验证指纹确实跟着变。
-        """
+        """名单的**下界**要有依据：里面每个变量都必须真的参与哈希。"""
         import analyzer.vision as vision
-        from analyzer import deepseek_client as dc
 
         base = dc._prompt_fingerprint()
         cases = [
@@ -501,47 +437,16 @@ class TestPrivateFingerprintIsolation(unittest.TestCase):
         with mock.patch.object(vision, "VISION_SYSTEM", vision.VISION_SYSTEM + "（探测）"):
             self.assertNotEqual(dc._prompt_fingerprint(), base, "视觉 system prompt 应当参与提示词指纹")
 
-    def test_source_moves_do_not_change_the_fingerprint(self):
-        """搬迁不改指纹：进哈希的是**函数自身源码**，不是它在哪个文件里。
-
-        这条是重构的安全绳。它同时也是警告：改名、改注释、改 docstring、被
-        ruff format 重排——这些都在 getsource 的返回范围内，会让指纹变化。
-        """
-        import inspect
-
-        from analyzer import deepseek_client as dc
-
-        funcs = (dc._build_dialog, dc._message_line, dc._fit_lines, dc._conversation_stats, dc._short_time)
-        for f in funcs:
-            src = inspect.getsource(f)
-            module_path = inspect.getsourcefile(f)
-            self.assertNotIn(
-                module_path,
-                src,
-                "%s 的源码里不含模块路径，因此把它搬到别的文件不会换键" % f.__name__,
-            )
-            self.assertTrue(
-                src.lstrip().startswith("def "), "%s 的源码以 def 行起始（含名字与 docstring）" % f.__name__
-            )
-
-    def test_explicit_list_matches_legacy_dir_order(self):
-        """显式名单必须与旧实现 sorted(dir(prompts)) 的项与顺序逐一致
-
-        这是"零值变更"的证明：指纹函数其余部分未动，输入清单又完全相同，
-        所以新增群聊提示词不会让私聊指纹发生变化（当前绝对值见
-        test_private_fingerprint_absolute_value_is_pinned，那里是唯一记录它的地方），
-        既有私聊维度缓存与月份缓存全部继续命中。
-        """
+    def test_explicit_list_matches_prompts_dir_order(self):
+        """显式名单必须覆盖 prompts.py 里全部 SYSTEM_PROMPT_* 常量。"""
         import analyzer.prompts as prompts
-        from analyzer import deepseek_client as dc
 
-        legacy = [n for n in sorted(dir(prompts)) if n.startswith("SYSTEM_PROMPT_")]
-        self.assertEqual(legacy, list(dc._PRIVATE_PROMPT_NAMES))
+        defined = [n for n in sorted(dir(prompts)) if n.startswith("SYSTEM_PROMPT_")]
+        self.assertEqual(defined, list(dc._PRIVATE_PROMPT_NAMES))
 
     def test_group_prompt_constant_does_not_change_fingerprint(self):
         """往 analyzer/prompts.py 里加群聊提示词不得改变私聊指纹（否则缓存全废）"""
         import analyzer.prompts as prompts
-        from analyzer import deepseek_client as dc
 
         before = dc._prompt_fingerprint()
         prompts.SYSTEM_PROMPT_GROUP_DYNAMICS = "群聊提示词占位"
@@ -553,34 +458,26 @@ class TestPrivateFingerprintIsolation(unittest.TestCase):
     def test_private_prompt_change_does_change_fingerprint(self):
         """反面证明：真改了私聊提示词，指纹必须变（否则新风格会顶着旧缓存返回）"""
         import analyzer.prompts as prompts
-        from analyzer import deepseek_client as dc
 
         before = dc._prompt_fingerprint()
         with mock.patch.object(prompts, "SYSTEM_PROMPT_EMOTION", "完全不同的提示词"):
             self.assertNotEqual(dc._prompt_fingerprint(), before)
 
     def test_salt_still_changes_fingerprint(self):
-        from analyzer import deepseek_client as dc
 
         self.assertNotEqual(dc._prompt_fingerprint("s1"), dc._prompt_fingerprint("s2"))
 
     def test_month_key_default_is_unchanged_path(self):
         """月份键不给指纹参数时，与"显式传私聊指纹"必须同值（私聊键不变）"""
-        from analyzer import deepseek_client as dc
 
         self.assertEqual(dc._month_key("SYS", "USER"), dc._month_key("SYS", "USER", dc.PROMPT_FINGERPRINT))
 
 
 class TestGroupFingerprintIsolation(unittest.TestCase):
-    """群聊提示词指纹：与私聊同等成本，因此要有同等强度的护栏
-
-    少了这一类用例，"改了群聊提示词却没换键"或"让 ruff format 重排了群聊格式化函数"
-    这两件事在 CI 上都不会出声，而代价是把既有群聊用户的维度缓存与月份缓存全部作废
-    （宽限期后被孤儿回收，下次分析全量重新付费）。
-    """
+    """群聊提示词指纹：与私聊同等成本，因此要有同等强度的护栏"""
 
     def test_group_fingerprint_absolute_value_is_pinned(self):
-        """绝对值断言：当前值与**旧公式**的取值都必须继续可复现"""
+        """绝对值断言：确保默认配置下的群聊指纹稳定可预期"""
         from analyzer import group_client as gc
 
         overrides = sorted(
@@ -596,56 +493,8 @@ class TestGroupFingerprintIsolation(unittest.TestCase):
             PINNED_GROUP_FINGERPRINT,
             "群聊提示词指纹变了。它进群聊维度缓存文件名与群聊月份缓存键，一变就等于让所有"
             "既有群聊用户在下次分析时重新付费。若确属有意改动，请同步更新本用例的"
-            "PINNED_GROUP_FINGERPRINT，并在 CHANGELOG 写明这一点。",
+            "PINNED_GROUP_FINGERPRINT。",
         )
-        self.assertEqual(
-            gc.GROUP_PROMPT_FINGERPRINT_LEGACY,
-            PINNED_LEGACY_GROUP_FINGERPRINT,
-            "旧公式的群聊指纹变了：它是「读取并迁移旧群聊缓存」的唯一凭据。改它的后果是"
-            "所有既有群聊用户的旧缓存都读不到，也就是让他们为同样的分析重新付费。",
-        )
-
-    def test_legacy_credentials_are_frozen_not_recomputed(self):
-        """三族的"旧公式凭据"必须是字面量，不许改回"从当前源码现算"。
-
-        这条不是风格偏好，而是一次真实事故的教训：现算的 LEGACY 值会随任何一次
-        对进指纹函数的改动而漂移，可它的职责恰恰是"记住过去那个键"。漂掉的后果
-        不是测试变红这么简单——"读取 AST 归一之前的缓存并免费迁移"这条路会静默断掉，
-        那批老用户本该免费的迁移退化成一次真实重付费，而且症状与"我们改了什么"
-        毫无关联，排查时根本想不到是这条链断了。
-
-        本轮改 _fit_group_lines 时正好踩到：现算的群聊 LEGACY 从 5f1f7bb3c0ce
-        飘到了 70ed3c31e351，是上面那条 pin 用例把它逮住的。修法是冻结，
-        而不是把 pin 跟着改掉——所以这里再钉一道，防止将来有人"顺手"改回现算。
-        """
-        import inspect
-        import re
-
-        import analyzer.deepseek_client as dc
-        from analyzer import group_client as gc
-        from analyzer import recap_client as rc
-
-        targets = (
-            ("analyzer.deepseek_client", dc, "PROMPT_FINGERPRINT_LEGACY"),
-            ("analyzer.group_client", gc, "GROUP_PROMPT_FINGERPRINT_LEGACY"),
-            ("analyzer.recap_client", rc, "RECAP_PROMPT_FINGERPRINT_LEGACY"),
-        )
-        for module_name, module, const in targets:
-            with self.subTest(credential=const):
-                self.assertRegex(
-                    getattr(module, const),
-                    r"^[0-9a-f]{12}$",
-                    "旧公式凭据必须是 12 位十六进制字面量",
-                )
-                src = inspect.getsource(sys.modules[module_name])
-                assignment = re.search(rf"^{const}\s*=\s*(.+)$", src, re.MULTILINE)
-                self.assertIsNotNone(assignment, f"找不到 {const} 的赋值语句")
-                self.assertNotIn(
-                    "fingerprint(",
-                    assignment.group(1),
-                    f"{const} 又被改成从当前源码现算了：这会随任何一次改动漂移，"
-                    "并静默切断'读旧缓存免费迁移'这条路（见本用例说明）",
-                )
 
     def test_group_prompt_change_moves_group_fingerprint_only(self):
         """改群聊提示词：群聊键必须变，私聊键必须一个字节都不动
@@ -654,7 +503,6 @@ class TestGroupFingerprintIsolation(unittest.TestCase):
         改动会让私聊缓存整体作废，而那条路径的代价（所有私聊用户重新付费）最贵。
         """
         import analyzer.group_prompts as gp
-        from analyzer import deepseek_client as dc
         from analyzer import group_client as gc
 
         names = [n for n in sorted(dir(gp)) if n.startswith("GROUP_SYSTEM_PROMPT_")]
@@ -902,59 +750,6 @@ class TestGroupFixture(unittest.TestCase):
         self.assertEqual(chat.mode, "group")
 
 
-class TestFingerprintIsStableAcrossPythonVersions(unittest.TestCase):
-    """同一份源码在任何受支持的 Python 上必须得到同一个指纹。
-
-    真实事故：指纹原先哈希 `ast.dump` 的输出，而 CPython 3.13 起 `ast.dump` 多了
-    `show_empty` 且默认 False——空字段（`returns=None`、`type_params=[]`）不再被打印，
-    3.12 及更早则会全打出来。后果有两条，都在 CI 上现形：① 3.10/3.12 的"指纹绝对值"
-    用例必红（四个版本只过两个）；② 用户换一个 Python 版本，维度缓存与月份缓存的键
-    全变，**同一份聊天要重新付费**。指纹的全部意义是"同样输入同样键"，版本相关直接
-    把它打穿。修法是自写的 `_canonical_ast`：只取节点类型名与非空语义字段、字段名排序。
-    """
-
-    def test_new_empty_fields_do_not_change_the_canonical_form(self):
-        """给每个节点挂一个"未来版本新增的可选空字段"，规范串必须一字不变。
-
-        这正是 3.13 那类变化的形状（新字段 + 空值）。少了这条守卫，指纹会随解释器
-        版本漂移，而症状只在别的 Python 上出现——开发机（3.14）永远看不到。
-        """
-        import ast as _ast
-
-        tree = _ast.parse("def f(x, y=1):\n    return [i for i in x if i]\n")
-        before = dc._canonical_ast(tree)
-        for node in _ast.walk(tree):
-            node._fields = tuple(node._fields) + ("qqchat_future_optional",)
-            node.qqchat_future_optional = []
-        self.assertEqual(before, dc._canonical_ast(tree), "新增的空字段不该换键")
-
-    def test_field_order_does_not_matter(self):
-        """字段顺序也不该影响结果（版本间 `_fields` 顺序可能不同）。"""
-        import ast as _ast
-
-        tree = _ast.parse("def f(a):\n    return a + 1\n")
-        before = dc._canonical_ast(tree)
-        for node in _ast.walk(tree):
-            node._fields = tuple(reversed(node._fields))
-        self.assertEqual(before, dc._canonical_ast(tree))
-
-    def test_semantic_changes_still_move_the_fingerprint(self):
-        """反向：真正的语义改动**必须**换键，否则缓存会拿旧结果冒充新口径。"""
-        import ast as _ast
-
-        a = _ast.parse("def f(x):\n    return x + 1\n")
-        b = _ast.parse("def f(x):\n    return x + 2\n")
-        self.assertNotEqual(dc._canonical_ast(a), dc._canonical_ast(b))
-
-    def test_comments_and_reformatting_do_not_move_the_fingerprint(self):
-        """本轮引入 AST 归一的初衷：改注释/重排不该让用户重新付费。"""
-        import ast as _ast
-
-        a = _ast.parse("def f(x):\n    # 说明\n    return x\n")
-        b = _ast.parse("def f(x):\n\n    return    x\n")
-        self.assertEqual(dc._canonical_ast(a), dc._canonical_ast(b))
-
-
 class TestGroupSaltSplit(unittest.TestCase):
     """QQCHAT_GROUP_CACHE_SALT：非空才并入群聊指纹；私聊指纹对它完全免疫。"""
 
@@ -966,7 +761,6 @@ class TestGroupSaltSplit(unittest.TestCase):
             self.assertEqual(gc.group_prompt_fingerprint(), base, "默认（空盐）时指纹逐字节不变")
 
     def test_group_salt_rotates_group_only(self):
-        from analyzer import deepseek_client as dc
         from analyzer import group_client as gc
 
         base_g, base_p = gc.group_prompt_fingerprint(), dc.PROMPT_FINGERPRINT

@@ -549,7 +549,6 @@ class TestResurrectionGuards(CacheLifecycleCase):
         img = [
             {
                 "key": "vkey-1",
-                "legacy_key": "vkey-1",
                 "trusted_md5": False,
                 "content_sha256": "a" * 64,
                 "path": "resources/images/a.jpg",
@@ -581,7 +580,6 @@ class TestResurrectionGuards(CacheLifecycleCase):
             img2 = [
                 {
                     "key": "vkey-2",
-                    "legacy_key": "vkey-2",
                     "trusted_md5": False,
                     "content_sha256": "b" * 64,
                     "path": "resources/images/b.jpg",

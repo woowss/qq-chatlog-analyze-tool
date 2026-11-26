@@ -696,41 +696,16 @@ class TestFingerprintIsolation(unittest.TestCase):
         with mock.patch.object(gp, "GROUP_SYSTEM_PROMPT_DYNAMICS", "完全不同的群聊提示词"):
             self.assertNotEqual(gc.group_prompt_fingerprint(), before)
 
-    def test_unsampled_custom_budget_keeps_historical_cache_key(self):
-        """同配置升级应保留历史键；不同预算不能混用维度缓存。"""
-        chat = _group([_msg("uA", "A", 0, "短消息"), _msg("uB", "B", 1, "回复")])
-        current = dc.analysis_cache_fingerprint("group_dynamics", chat)
-        with mock.patch.object(gc, "GROUP_MAX_DIALOG_CHARS", 10_000):
-            historical = "04a4e41ad76d"
-            self.assertNotEqual(historical, current)
-            self.assertEqual(dc.analysis_cache_fingerprint("group_dynamics", chat), historical)
-            self.assertEqual(gc._unsampled_group_prompt_fingerprint(), historical)
-            prompt = gc._group_month_prompt(chat, "2024-01", chat.messages)
-            self.assertEqual(getattr(prompt, "cache_fingerprint", None), historical)
+    def test_group_sampled_fingerprint_differs_from_unsampled(self):
+        self.assertEqual(len(gc.group_sampled_prompt_fingerprint()), 12)
+        self.assertNotEqual(gc.group_sampled_prompt_fingerprint(), gc._unsampled_group_prompt_fingerprint())
 
-    def test_compat_fingerprint_detects_formatter_change(self):
-        """群聊固定历史指纹也必须确认格式源码仍是已审核版本。"""
-        import inspect
-
-        base = gc.group_prompt_fingerprint()
-        original = inspect.getsource
-
-        def changed_source(func):
-            source = original(func)
-            if func is gc.build_group_dialog:
-                return source.replace("统计：", "统计(修订)：")
-            return source
-
-        with mock.patch("inspect.getsource", side_effect=changed_source):
-            self.assertNotEqual(base, gc.group_prompt_fingerprint())
-
-    def test_sampled_fingerprint_falls_back_when_source_is_unavailable(self):
-        """打包环境读不到源码时，群聊抽样键仍须稳定地产生。"""
-        with mock.patch("inspect.getsource", side_effect=OSError("no source here")):
-            first = gc.group_sampled_prompt_fingerprint()
-            second = gc.group_sampled_prompt_fingerprint()
-        self.assertEqual(len(first), 12)
-        self.assertEqual(first, second)
+    def test_group_version_bump_rotates_group_fingerprint_only(self):
+        before_group = gc.group_prompt_fingerprint()
+        before_private = dc._prompt_fingerprint()
+        with mock.patch.object(gc, "GROUP_CACHE_VERSION", "v999"):
+            self.assertNotEqual(gc.group_prompt_fingerprint(), before_group)
+            self.assertEqual(dc._prompt_fingerprint(), before_private)
 
     def test_private_fingerprint_ignores_group_module(self):
         """群聊提示词放独立模块，因此私聊指纹与月份键一个字都不变"""
@@ -1055,8 +1030,6 @@ class TestRealFileShapedGroup(unittest.TestCase):
         chat = _group(msgs)
         me = next(p for p in chat.participants() if p.is_self)
         context = gc._member_context_from_sparse(chat, me)
-        legacy_context = gc._member_context(_group(msgs), me)
-        self.assertEqual(context, legacy_context, "稀疏摘要必须保留原画像上下文")
         self.assertIn("被精确回复 1 次", context)
         self.assertIn("主动回复别人 0 次", context)
         self.assertIn("主动 @ 别人 1 次", context)

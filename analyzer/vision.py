@@ -352,7 +352,6 @@ def pick_images(msgs: list, limit: int = None, chat_hash: str = "") -> list[dict
             {
                 "path": path,
                 "key": media_id or media_path,
-                "legacy_key": media_id or media_path,
                 "trusted_md5": trusted_md5,
                 "content_sha256": content_sha256,
                 "size": size,
@@ -364,23 +363,16 @@ def pick_images(msgs: list, limit: int = None, chat_hash: str = "") -> list[dict
     return picked
 
 
-def _images_key(images: list[dict], legacy: bool = False, *, legacy_content: bool = False) -> str:
-    """摘要缓存键：图片指纹（md5）+ 顺序 + 模型/系统提示词/清晰度都要进哈希。
-
-    legacy=True 用源码原文指纹和原始图片标识；legacy_content=True 保留当前 AST
-    指纹但使用修复前的原始图片标识。两种旧键只用于 verified MD5 的缓存迁移。
-    """
+def _images_key(images: list[dict]) -> str:
+    """摘要缓存键：图片内容指纹 + 顺序 + 模型/系统提示词/清晰度都要进哈希。"""
     from analyzer import deepseek_client as dc  # 延迟导入，避免循环依赖
 
-    fingerprint = dc.PROMPT_FINGERPRINT_LEGACY if legacy else dc.PROMPT_FINGERPRINT
     digest = hashlib.sha256()
-    for part in (dc.DEEPSEEK_MODEL, fingerprint, VISION_SYSTEM, VISION_DETAIL):
+    for part in (dc.DEEPSEEK_MODEL, dc.PROMPT_FINGERPRINT, VISION_SYSTEM, VISION_DETAIL):
         digest.update(str(part).encode("utf-8"))
         digest.update(b"\x00")
     for img in images:
-        if legacy or legacy_content:
-            identity = img.get("legacy_key", img["key"])
-        elif img.get("trusted_md5") is True:
+        if img.get("trusted_md5") is True:
             identity = f"md5:{str(img['key']).lower()}:{img['content_sha256']}"
         elif img.get("trusted_md5") is False:
             content_sha256 = img.get("content_sha256")
@@ -392,23 +384,6 @@ def _images_key(images: list[dict], legacy: bool = False, *, legacy_content: boo
         digest.update(str(identity).encode("utf-8"))
         digest.update(b"\x00")
     return digest.hexdigest()[:20]
-
-
-def _can_migrate_legacy_cache(images: list[dict]) -> bool:
-    """Old keys contain no byte fingerprint, so migrate only verified MD5 identities."""
-    return bool(images) and all(image.get("trusted_md5") is True for image in images)
-
-
-def _legacy_cache_keys(images: list[dict]) -> list[str]:
-    """Return both historical formulas that used the raw, verified MD5 identity."""
-    return list(
-        dict.fromkeys(
-            (
-                _images_key(images, legacy_content=True),
-                _images_key(images, legacy=True),
-            )
-        )
-    )
 
 
 def _cache_path(chat_hash: str, key: str, *, create: bool = True) -> str:
@@ -469,21 +444,6 @@ def digest(msgs: list, chat_hash: str = "", label: str = "") -> str:
     chat_id = chat_hash or "nohash"
     path = _cache_path(chat_id, key)
     cached = None if force_refresh else _read_cache(path)
-    if cached is None and not force_refresh and _can_migrate_legacy_cache(images):
-        for legacy_key in _legacy_cache_keys(images):
-            if legacy_key == key:
-                continue
-            legacy_path = _cache_path(chat_id, legacy_key)
-            cached = _read_cache(legacy_path)
-            if cached is None:
-                continue
-            if not (chat_hash and purge_marks.is_marked(chat_hash)):
-                try:
-                    os.replace(legacy_path, path)
-                    logger.info("命中旧指纹的图片摘要缓存并迁移到当前键（%d 张）", len(images))
-                except OSError as e:
-                    logger.warning("图片摘要缓存迁移失败（结果仍可用）: %s", e)
-            break
     if cached is not None:
         _memo_put_for_chat(chat_hash, key, cached)
         return cached
@@ -524,14 +484,6 @@ def preview_digest(msgs: list, chat_hash: str = "") -> tuple[str, bool]:
         chat_id = chat_hash or "nohash"
         path = _cache_path(chat_id, key, create=False)
         cached = _read_cache(path, touch=False)
-        if cached is None and _can_migrate_legacy_cache(images):
-            for legacy_key in _legacy_cache_keys(images):
-                if legacy_key == key:
-                    continue
-                legacy_path = _cache_path(chat_id, legacy_key, create=False)
-                cached = _read_cache(legacy_path, touch=False)
-                if cached is not None:
-                    break
         if cached is not None:
             return cached, False
     return "", True

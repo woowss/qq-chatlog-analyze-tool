@@ -608,10 +608,6 @@ def api_analysis_result(dimension: str):
     chat_hash = session.get("chat_hash") or store._chat_hash(filepath)
     cache_fp = store.analysis_cache_fingerprint(dimension, chat)
     cached = store._read_cache(dimension, chat_hash, fingerprint=cache_fp)
-    stale_strategy = False
-    if cached is None and not scope:
-        cached = store._read_legacy_person_context_cache(dimension, chat_hash)
-        stale_strategy = cached is not None
     if cached is None:
         return jsonify(
             {
@@ -624,7 +620,6 @@ def api_analysis_result(dimension: str):
         {
             "cached": True,
             "chat_hash": chat_hash,
-            "stale_strategy": stale_strategy,
             "scope_id": scope_identity(scope),
             "scope_summary": scope_summary(scope),
             "result": cached,
@@ -1236,10 +1231,6 @@ def api_evidence(dimension: str):
     cached = store._read_cache(
         dimension, chat_hash, fingerprint=store.analysis_cache_fingerprint(dimension, chat)
     )
-    stale_strategy = False
-    if cached is None and not scope:
-        cached = store._read_legacy_person_context_cache(dimension, chat_hash)
-        stale_strategy = cached is not None
     if cached is None:
         return jsonify({"error": "暂无该维度的分析结果"}), 404
     from webapp.evidence import verify_sources
@@ -1250,10 +1241,7 @@ def api_evidence(dimension: str):
         cached,
         index_for(chat, _browse_body, _match_browse),
         _fmt_browse_message,
-        person_context_enabled=False if stale_strategy else None,
     )
-    if stale_strategy:
-        result["stale_strategy"] = True
     result["scope_id"] = scope_identity(scope)
     result["scope_summary"] = scope_summary(scope)
     return jsonify(result)

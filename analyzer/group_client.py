@@ -16,11 +16,10 @@
 #
 """群聊 AI 分析：成员感知抽样、互动事实上下文与 4 维度执行。
 
-复用 `deepseek_client` 传输/并发骨架，提示词与对话格式化函数单独哈希进
+复用 `deepseek_client` 传输/并发骨架，提示词与配置常量单独哈希进
 `GROUP_PROMPT_FINGERPRINT`，与私聊缓存完全隔离。"""
 
 import hashlib
-import inspect
 import os
 from bisect import bisect_left
 from collections import deque
@@ -42,25 +41,22 @@ from analyzer.deepseek_client import (
     _analyze_periods,
     _call_api,
     _fit_lines,
-    _gap_mark,
     _has_content,
-    _hashed_source,
     _message_line,
     validate_result,
-    _short_time,
     _truncate_dialog_line,
     _vision_digest,
     scope_cache_fingerprint,
     logger,
 )
 from analyzer.group_stats import (
-    calc_interaction_matrix,
     calc_member_activity,
     calc_member_interaction_summary,
     is_unknown_message,
 )
 from analyzer.logger import mask_name
 
+GROUP_CACHE_VERSION = "v2"
 #: 单个群聊月的对话文本上限（字符）。默认与私聊同档（准确性优先），
 #: 想省钱可在 .env 里调小 LLM_GROUP_MAX_DIALOG_CHARS。
 GROUP_MAX_DIALOG_CHARS = int(env_number("LLM_GROUP_MAX_DIALOG_CHARS", 600_000, 1000, 2_000_000))
@@ -70,11 +66,6 @@ GROUP_MEMBER_MIN_LINES = int(env_number("LLM_GROUP_MEMBER_MIN_LINES", 20, 1, 500
 MEMBER_PROFILE_SAMPLES = 800
 #: 单条 prompt 里展示的互动"Top 对"数量（三张矩阵各取前 N 对，太长反而淹没重点）
 INTERACTION_DIGEST_PAIRS = 8
-
-_GROUP_COMPAT_FINGERPRINT = "30c7d6356e3a"
-# Keep the historical formula behind a literal source check.  Recomputing
-# this digest at import time would make a formatter change look compatible again.
-_GROUP_COMPAT_FORMAT_DIGEST = "91ebeee1c18355a095ebf21eef21b9ab0083fa441dac87c1e4bcde9e1ee2fd3e"
 
 
 def select_ai_members(chat: ChatData, limit: int = 0) -> list[Participant]:
@@ -166,15 +157,7 @@ def _interaction_digest(msgs: list, name_of: Callable[[str], str]) -> str:
     )
 
 
-# 注意：_member_facts / build_group_dialog 在 GROUP_PROMPT_FINGERPRINT 的哈希集合里，
-# 而 *_LEGACY 指纹按**原始源码**哈希——函数体内连注释都不许动（提交前复核在这里加过
-# 说明注释，把 GROUP_PROMPT_FINGERPRINT_LEGACY 挤离钉值、被 CI 拦下；已知口径分歧的
-# 说明因此只能挂在这里——函数体外）。
 # 已知口径分歧（故意保留）：_member_facts 的图片数按"含图消息条数"，仪表盘按张。
-# 一条消息连发多张图时两个数字不一致。不在函数内改成 image_count 的原因：动它 = 群聊
-# 指纹换代，而迁移链只认"当前 + 一代旧"两代键，换代即让所有既有群聊月份/维度缓存
-# 不可达（LEGACY 是历史值、无法跟着重算，全体群聊用户重新付费）。想统一必须先扩
-# 多代迁移链，见 docs/reviews/2026-09-26-round6-precommit-review.md P1-3。
 def _member_facts(msgs: list, chat: ChatData) -> tuple[str, list[tuple[str, int]]]:
     """本月群级事实（统计头用）与成员条数排行"""
     from collections import Counter
@@ -524,9 +507,6 @@ def _group_dialog_needs_sampling(chat: ChatData, msgs: list, max_chars: int = 0)
     return sum(len(line) + 1 for line in lines) > (max_chars or GROUP_MAX_DIALOG_CHARS)
 
 
-# build_group_dialog 的隐私面：函数体内的注释同样受上方"LEGACY 按原始源码哈希"约束，
-# 因此"重名成员显示名带 #完整uid 会随 prompt 外发名单内成员的号"这笔隐私记账只能写在这里
-# （见 privacy-audit-report.md 与 CHANGELOG「未发布」节），不进去改函数体内那行注释。
 def build_group_dialog(
     chat: ChatData, msgs: list, chat_hash: str = "", vision_label: str = "", max_chars: int = 0
 ) -> str:
@@ -606,55 +586,6 @@ def _group_month_prompt(chat: ChatData, period: str, msgs: list, chat_hash: str 
             chat, getattr(dialog, "cache_fingerprint", _unsampled_group_prompt_fingerprint())
         ),
     )
-
-
-# Retained for historical group prompt fingerprint compatibility; production uses the sparse helper below.
-def _member_context(chat: ChatData, member: Participant) -> str:
-    """成员画像的群上下文：本地精确算出的互动数字（事实与推断分开标注）"""
-    # top_k=0 在这里的含义是**不截断**，而这不是"顺手传个 0"：下面要按 uid 取每位
-    # 成员的互动计数，矩阵默认只保留发言量前 30 名（GROUP_MATRIX_MEMBERS）。
-    # 榜外成员在 totals 里根本没有条目 → totals.get(uid, {}) 拿到空 dict → 下面的
-    # 数字全成 0 → 提示词写成"被精确回复 0 次、主动回复别人 0 次（事实）"，
-    # 而 select_ai_members 恰恰会专门把不在前列的"我"选进来（见那里的注释），
-    # 也就是说最容易踩到的正是"用户本人被编成零互动"。这是最贵的一档维度
-    # （每位成员一次付费调用）拿到的假数据。
-    # 早先同样写的是 top_k=0，但那时 group_stats 用 `top_k or 默认上限` 解释参数，
-    # 0 被当成"没传"→ 照样截断 → 这句注释承诺的事从未发生（见该函数里的说明）。
-    matrix = calc_interaction_matrix(chat, top_k=0)
-    totals = {t["uid"]: t for t in matrix["totals"]}
-    t = totals.get(member.uid, {})
-    activity = {a["uid"]: a for a in calc_member_activity(chat)}
-    a = activity.get(member.uid, {})
-
-    def _top_partners(key: str) -> str:
-        """该成员互动最多的对象（取矩阵行/列最强的前 3 位）"""
-        names = {p["uid"]: p["name"] for p in matrix["members"]}
-        idx = {p["uid"]: i for i, p in enumerate(matrix["members"])}
-        i = idx.get(member.uid)
-        if i is None:
-            return "无"
-        picks = []
-        for j in range(len(matrix["members"])):
-            if j == i:
-                continue
-            value = matrix["explicit_undirected"][i][j] if key == "explicit" else matrix["undirected"][i][j]
-            if value:
-                picks.append((value, names[matrix["members"][j]["uid"]]))
-        picks.sort(reverse=True)
-        return "、".join(f"{n}（{v} 次）" for v, n in picks[:3]) or "无"
-
-    lines = [
-        f"- 发言 {a.get('msg_count', 0)} 条（占全群 {a.get('share', 0) * 100:.1f}%），"
-        f"活跃 {a.get('active_days', 0)} 天，平均每条 {a.get('avg_chars', 0)} 字",
-        f"- 被精确回复 {t.get('explicit_replied_by', 0)} 次、"
-        f"主动回复别人 {t.get('explicit_replies_to', 0)} 次（事实）",
-        f"- 被 @ {t.get('mentions_received', 0)} 次、主动 @ 别人 {t.get('mentions_sent', 0)} 次（事实）",
-        f"- 被接话 {t.get('replied_by', 0)} 次、接别人话 {t.get('replies_to', 0)} 次（推断）",
-        f"- 主要互动对象（精确回复/@）：{_top_partners('explicit')}",
-    ]
-    if member.is_self:
-        lines.append("- 注意：这个人就是导出者本人（我），评价同样要客观")
-    return "\n".join(lines)
 
 
 def _member_context_from_sparse(chat: ChatData, member: Participant) -> str:
@@ -985,33 +916,6 @@ GROUP_DIMENSIONS: dict = {
 }
 
 
-_GROUP_FORMAT_FUNCS = (
-    build_group_dialog,
-    _fit_group_entries,
-    _render_group_entries,
-    _fit_group_lines,
-    _fit_lines,
-    _interaction_digest,
-    _member_facts,
-    _member_context,
-    _message_line,
-    _gap_mark,
-    _short_time,
-    _truncate_dialog_line,
-)
-_GROUP_COMPAT_FORMAT_FUNCS = (
-    build_group_dialog,
-    _render_group_entries,
-    _fit_lines,
-    _interaction_digest,
-    _member_facts,
-    _member_context,
-    _message_line,
-    _gap_mark,
-    _short_time,
-)
-
-
 def _group_fingerprint_inputs():
     prompt_values = tuple(
         getattr(gp, name) for name in sorted(dir(gp)) if name.startswith("GROUP_SYSTEM_PROMPT_")
@@ -1033,42 +937,6 @@ def _group_fingerprint_inputs():
     )
 
 
-def _group_compat_format_matches() -> bool:
-    try:
-        payload = "\n".join(_hashed_source(func) for func in _GROUP_COMPAT_FORMAT_FUNCS)
-    except (OSError, TypeError):
-        return False
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest() == _GROUP_COMPAT_FORMAT_DIGEST
-
-
-def _group_source_parts(funcs: tuple, normalize: bool = True) -> list[str]:
-    try:
-        return [_hashed_source(func) if normalize else inspect.getsource(func) for func in funcs]
-    except (OSError, TypeError):
-        logger.warning(
-            "无法读取群聊格式化函数源码（编译/打包环境），群聊指纹降级为函数名级——"
-            "改动群聊对话格式不会自动失效旧缓存；改过格式后请设 PROMPT_CACHE_SALT 手动换键"
-        )
-        return [f"<source-unavailable:{func.__name__}>" for func in funcs]
-
-
-def _group_fingerprint_from_inputs(current, salt: str, compatible: bool = False) -> str:
-    prompt_values, context_notes, const_values = current
-    parts = list(prompt_values)
-    parts.append(context_notes)
-    parts.append("consts:%s" % repr(const_values))
-    if compatible:
-        from analyzer.dialog_cache_compat import historical_source
-
-        parts += [historical_source("build_group_dialog"), historical_source("_fit_group_lines")]
-        parts += _group_source_parts((_interaction_digest, _member_facts, _member_context))
-    else:
-        parts += _group_source_parts(_GROUP_FORMAT_FUNCS)
-    if salt:
-        parts.append(f"salt:{salt}")
-    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
-
-
 def _group_cache_salt(salt: "str | None") -> str:
     if salt is not None:
         return salt
@@ -1079,20 +947,16 @@ def _group_cache_salt(salt: "str | None") -> str:
     return value
 
 
-def group_prompt_fingerprint(salt: "str | None" = None, normalize: bool = True) -> str:
-    """计算群聊提示词与格式化函数指纹（与私聊独立；支持 PROMPT_CACHE_SALT / QQCHAT_GROUP_CACHE_SALT）。"""
+def group_prompt_fingerprint(salt: "str | None" = None) -> str:
+    """计算群聊提示词与预算/版本号指纹（与私聊独立；支持 PROMPT_CACHE_SALT / QQCHAT_GROUP_CACHE_SALT）。"""
     salt = _group_cache_salt(salt)
-    current = _group_fingerprint_inputs()
-    if normalize:
-        return _group_fingerprint_from_inputs(current, salt, compatible=_group_compat_format_matches())
-    prompt_values, context_notes, const_values = current
-    parts = list(prompt_values)
-    parts.append(context_notes)
-    parts.append("consts:%s" % repr(const_values))
-    parts += _group_source_parts(
-        (build_group_dialog, _fit_group_lines, _interaction_digest, _member_facts, _member_context),
-        normalize=False,
-    )
+    prompt_values, context_notes, const_values = _group_fingerprint_inputs()
+    parts = [
+        f"version:{GROUP_CACHE_VERSION}",
+        *prompt_values,
+        context_notes,
+        f"consts:{repr(const_values)}",
+    ]
     if salt:
         parts.append(f"salt:{salt}")
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
@@ -1102,29 +966,14 @@ GROUP_PROMPT_FINGERPRINT = group_prompt_fingerprint()
 
 
 def _unsampled_group_prompt_fingerprint(salt: "str | None" = None) -> str:
-    """未抽样输入复用同配置的历史键；预算变化仍需隔离维度缓存。"""
+    """未抽样输入复用同配置键；预算变化仍需隔离维度缓存。"""
     return group_prompt_fingerprint(salt)
 
 
 def group_sampled_prompt_fingerprint(salt: "str | None" = None) -> str:
     """群聊触发预算抽样时的格式代次，保留未抽样缓存键。"""
-    funcs = (
-        _entry_line,
-        _fit_group_entries,
-        _trim_group_entries,
-        _render_group_entries,
-        _truncate_dialog_line,
-        _message_line,
-        _gap_mark,
-        _short_time,
-    )
     parts = [
         group_prompt_fingerprint(salt),
         "group-sampled-dialog-v1",
-        *_group_source_parts(funcs),
     ]
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
-
-
-#: AST 归一前旧公式的冻结指纹字面量，仅用于迁移旧群聊缓存（不可改为实时计算）
-GROUP_PROMPT_FINGERPRINT_LEGACY = "5f1f7bb3c0ce"
