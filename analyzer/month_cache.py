@@ -30,6 +30,7 @@ import time
 from typing import Iterable, Optional
 
 from config import env_number
+from analyzer import llm_runtime
 from analyzer import purge_marks
 from analyzer.cache_policy import refreshing, refresh_cancelled
 from analyzer.atomic_write import tmp_sibling, write_json_atomic
@@ -90,10 +91,13 @@ def _month_key(system_prompt: str, user_content: str, fingerprint: "str | None" 
     本模块（它才是这些函数的调用方），模块级互相导入会成环。取的是**调用时**的值，
     所以打桩 deepseek_client.DEEPSEEK_MODEL / PROMPT_FINGERPRINT 依然生效。
     """
-    from analyzer import deepseek_client as dc
-
     digest = hashlib.sha256()
-    for part in (dc.DEEPSEEK_MODEL, fingerprint or dc.PROMPT_FINGERPRINT, system_prompt, user_content):
+    for part in (
+        llm_runtime.DEEPSEEK_MODEL,
+        fingerprint or llm_runtime.default_prompt_fingerprint(),
+        system_prompt,
+        user_content,
+    ):
         digest.update(part.encode("utf-8"))
         digest.update(b"\x00")
     return digest.hexdigest()[:20]

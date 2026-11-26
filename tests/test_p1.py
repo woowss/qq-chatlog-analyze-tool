@@ -18,7 +18,7 @@ import app  # noqa: E402
 from analyzer import deepseek_client as dc, group_client as gc, month_cache as mc  # noqa: E402
 from analyzer.cache_policy import content_cache_policy  # noqa: E402
 from parser.qq_parser import ChatData, Message, CST, load_chat  # noqa: E402
-from webapp import api, jobs, store  # noqa: E402
+from webapp import analysis_plan, api, jobs, store  # noqa: E402
 from webapp.evidence import verify_sources  # noqa: E402
 from webapp.message_index import index_for, MAX_QUERY_POSITIONS, MAX_QUERIES  # noqa: E402
 from result_fixtures import emotion, habits, profile  # noqa: E402
@@ -175,9 +175,10 @@ class TestForceRefresh(unittest.TestCase):
                     jid, _, _ = jobs._get_or_create_job(sid, "emotion", chat_hash, 0, refresh=True)
                     jobs._run_job(jid, "emotion", filepath, chat_hash, True)
                     self.assertEqual(call.call_count, 2)
-                    with mock.patch.object(jobs, "dimensions_for_mode", return_value=["emotion"]):
-                        jid, _, _ = jobs._get_or_create_job(sid, "all", chat_hash, 1, refresh=True)
-                        jobs._run_analyze_all(jid, filepath, chat_hash, True)
+                    plan = analysis_plan.build_analysis_plan(loaded, chat_hash, ["emotion"], refresh=True)
+                    selected = [u["key"] for u in plan["units"] if u["status"] != "无可分析消息"]
+                    jid, _, _ = jobs._get_or_create_job(sid, "all", chat_hash, len(selected), refresh=True)
+                    jobs._run_selected_plan(jid, filepath, chat_hash, True, plan, selected)
                     self.assertEqual(call.call_count, 3)
                 before = store._read_cache("emotion", chat_hash, fp)
                 with mock.patch.object(dc, "_call_api", return_value=None):

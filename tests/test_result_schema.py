@@ -32,7 +32,7 @@ from analyzer.result_schema import (  # noqa: E402
 )
 from parser.qq_parser import ChatData, Message, load_chat  # noqa: E402
 from result_fixtures import for_dimension  # noqa: E402
-from webapp import jobs  # noqa: E402
+from webapp import analysis_plan, jobs  # noqa: E402
 
 
 class TestResultSchemas(unittest.TestCase):
@@ -227,22 +227,25 @@ class TestCacheValidationBoundary(unittest.TestCase):
                 chat_hash="schema-mixed",
             )
 
+        plan = analysis_plan.build_analysis_plan(
+            self._private_chat(), "schema-mixed", ["emotion"], refresh=False
+        )
+        selected = [u["key"] for u in plan["units"] if u["status"] != "无可分析消息"]
         with (
             mock.patch.object(jobs.os.path, "exists", return_value=True),
             mock.patch.object(jobs.store, "_load_chat_cached", return_value=self._private_chat()),
             mock.patch.object(jobs.store, "_read_cache", return_value=None),
             mock.patch.object(jobs.store, "_write_cache") as write,
             mock.patch.object(jobs.store, "append_job_history"),
-            mock.patch.object(jobs, "dimensions_for_mode", return_value=["emotion"]),
             mock.patch.object(jobs, "analyze_func_for", return_value=runner),
             mock.patch.object(dc, "_call_api", side_effect=lambda *a, **k: for_dimension("emotion")) as call,
             mock.patch.dict(jobs.JOBS, {}, clear=True),
         ):
             for run_all in (False, True):
                 jid = "schema-job-" + str(run_all)
-                jobs.JOBS[jid] = {"status": "running"}
+                jobs.JOBS[jid] = {"status": "running", "dim": "all" if run_all else "emotion"}
                 if run_all:
-                    jobs._run_analyze_all(jid, "synthetic.json", "schema-mixed", False)
+                    jobs._run_selected_plan(jid, "synthetic.json", "schema-mixed", False, plan, selected)
                 else:
                     jobs._run_job(jid, "emotion", "synthetic.json", "schema-mixed")
                 self.assertEqual(jobs.JOBS[jid]["status"], "done")
