@@ -38,6 +38,8 @@ import inspect
 import os
 from typing import Any, Callable, Optional
 
+from analyzer import llm_stream
+
 from analyzer.logger import get_logger
 from analyzer.recap_prompts import SYSTEM_PROMPT_ASK, SYSTEM_PROMPT_RECAP
 
@@ -220,16 +222,27 @@ def analyze_recap(
     if dc.shutdown_requested() or (should_cancel and should_cancel()):
         logger.info("recap：已请求停止，跳过本次调用")
         return None
+    if not any(dc._has_content(m) for m in chat.statistical()):
+        return None
     digest = _recap_digest(chat)
     if not digest.strip():
         return None
-    result = dc._call_api(
-        SYSTEM_PROMPT_RECAP,
-        digest,
-        max_tokens=_recap_max_tokens(),
-        tag=RECAP_DIMENSION,
-        dim=RECAP_DIMENSION,
-    )
+    with llm_stream.stream_context(unit=RECAP_DIMENSION, label="整体总括", fresh_state=True):
+        llm_stream.emit_event("stage", "开始生成整体总括（跨月趋势与关键节点）")
+        try:
+            result = dc._call_api(
+                SYSTEM_PROMPT_RECAP,
+                digest,
+                max_tokens=_recap_max_tokens(),
+                tag=RECAP_DIMENSION,
+                dim=RECAP_DIMENSION,
+            )
+        except llm_stream.StreamCancelledError:
+            llm_stream.emit_event("stage", "整体总括已取消")
+            result = None
+        if result:
+            llm_stream.emit_result_fallback(result)
+            llm_stream.emit_event("stage", "整体总括生成完成")
     if on_progress:
         on_progress(1, 1)
     return result
@@ -315,10 +328,20 @@ def answer_question(chat, question: str, chat_hash: str = "") -> Optional[dict]:
     digest = _recap_digest(chat)
     if not digest.strip():
         return None
-    return dc._call_api(
-        SYSTEM_PROMPT_ASK,
-        build_ask_user(question, digest),
-        max_tokens=dc.MAX_TOKENS_BY_DIM.get(ASK_DIMENSION, 8192),
-        tag=ASK_DIMENSION,
-        dim=ASK_DIMENSION,
-    )
+    with llm_stream.stream_context(unit=ASK_DIMENSION, label="自定义提问", fresh_state=True):
+        llm_stream.emit_event("stage", "开始思考自定义提问")
+        try:
+            result = dc._call_api(
+                SYSTEM_PROMPT_ASK,
+                build_ask_user(question, digest),
+                max_tokens=dc.MAX_TOKENS_BY_DIM.get(ASK_DIMENSION, 8192),
+                tag=ASK_DIMENSION,
+                dim=ASK_DIMENSION,
+            )
+        except llm_stream.StreamCancelledError:
+            llm_stream.emit_event("stage", "自定义提问已取消")
+            return None
+        if result:
+            llm_stream.emit_result_fallback(result)
+            llm_stream.emit_event("stage", "自定义提问回答生成完成")
+        return result

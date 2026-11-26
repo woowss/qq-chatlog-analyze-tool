@@ -52,6 +52,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from parser import qq_parser  # noqa: E402
 from parser.qq_parser import ChatData, Message, load_chat  # noqa: E402
+from analyzer import deepseek_client as dc  # noqa: E402
+from webapp import store as storemod  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
 _BASE_MS = int(datetime(2025, 3, 1, 20, 0, tzinfo=CST).timestamp() * 1000)
@@ -898,6 +900,308 @@ class TestGroupFixture(unittest.TestCase):
         chat = load_chat(str(self.FIXTURE))
         self.assertTrue(chat.is_group_chat)
         self.assertEqual(chat.mode, "group")
+
+
+class TestFingerprintIsStableAcrossPythonVersions(unittest.TestCase):
+    """同一份源码在任何受支持的 Python 上必须得到同一个指纹。
+
+    真实事故：指纹原先哈希 `ast.dump` 的输出，而 CPython 3.13 起 `ast.dump` 多了
+    `show_empty` 且默认 False——空字段（`returns=None`、`type_params=[]`）不再被打印，
+    3.12 及更早则会全打出来。后果有两条，都在 CI 上现形：① 3.10/3.12 的"指纹绝对值"
+    用例必红（四个版本只过两个）；② 用户换一个 Python 版本，维度缓存与月份缓存的键
+    全变，**同一份聊天要重新付费**。指纹的全部意义是"同样输入同样键"，版本相关直接
+    把它打穿。修法是自写的 `_canonical_ast`：只取节点类型名与非空语义字段、字段名排序。
+    """
+
+    def test_new_empty_fields_do_not_change_the_canonical_form(self):
+        """给每个节点挂一个"未来版本新增的可选空字段"，规范串必须一字不变。
+
+        这正是 3.13 那类变化的形状（新字段 + 空值）。少了这条守卫，指纹会随解释器
+        版本漂移，而症状只在别的 Python 上出现——开发机（3.14）永远看不到。
+        """
+        import ast as _ast
+
+        tree = _ast.parse("def f(x, y=1):\n    return [i for i in x if i]\n")
+        before = dc._canonical_ast(tree)
+        for node in _ast.walk(tree):
+            node._fields = tuple(node._fields) + ("qqchat_future_optional",)
+            node.qqchat_future_optional = []
+        self.assertEqual(before, dc._canonical_ast(tree), "新增的空字段不该换键")
+
+    def test_field_order_does_not_matter(self):
+        """字段顺序也不该影响结果（版本间 `_fields` 顺序可能不同）。"""
+        import ast as _ast
+
+        tree = _ast.parse("def f(a):\n    return a + 1\n")
+        before = dc._canonical_ast(tree)
+        for node in _ast.walk(tree):
+            node._fields = tuple(reversed(node._fields))
+        self.assertEqual(before, dc._canonical_ast(tree))
+
+    def test_semantic_changes_still_move_the_fingerprint(self):
+        """反向：真正的语义改动**必须**换键，否则缓存会拿旧结果冒充新口径。"""
+        import ast as _ast
+
+        a = _ast.parse("def f(x):\n    return x + 1\n")
+        b = _ast.parse("def f(x):\n    return x + 2\n")
+        self.assertNotEqual(dc._canonical_ast(a), dc._canonical_ast(b))
+
+    def test_comments_and_reformatting_do_not_move_the_fingerprint(self):
+        """本轮引入 AST 归一的初衷：改注释/重排不该让用户重新付费。"""
+        import ast as _ast
+
+        a = _ast.parse("def f(x):\n    # 说明\n    return x\n")
+        b = _ast.parse("def f(x):\n\n    return    x\n")
+        self.assertEqual(dc._canonical_ast(a), dc._canonical_ast(b))
+
+
+class TestGroupSaltSplit(unittest.TestCase):
+    """QQCHAT_GROUP_CACHE_SALT：非空才并入群聊指纹；私聊指纹对它完全免疫。"""
+
+    def test_empty_keeps_fingerprint_identical(self):
+        from analyzer import group_client as gc
+
+        base = gc.group_prompt_fingerprint()
+        with mock.patch.dict(os.environ, {"QQCHAT_GROUP_CACHE_SALT": ""}):
+            self.assertEqual(gc.group_prompt_fingerprint(), base, "默认（空盐）时指纹逐字节不变")
+
+    def test_group_salt_rotates_group_only(self):
+        from analyzer import deepseek_client as dc
+        from analyzer import group_client as gc
+
+        base_g, base_p = gc.group_prompt_fingerprint(), dc.PROMPT_FINGERPRINT
+        with mock.patch.dict(os.environ, {"QQCHAT_GROUP_CACHE_SALT": "redo-group"}):
+            self.assertNotEqual(gc.group_prompt_fingerprint(), base_g, "群盐应参与群聊指纹")
+        from analyzer.deepseek_client import _prompt_fingerprint
+
+        with mock.patch.dict(os.environ, {"QQCHAT_GROUP_CACHE_SALT": "redo-group"}):
+            self.assertEqual(_prompt_fingerprint(), base_p, "群盐绝不能动私聊指纹（那会让私聊用户重新付费）")
+
+
+_FIX_CST = timezone(timedelta(hours=8))
+
+
+def _fix_chat_payload(uids_to_msgs):
+    msgs = []
+    base = int(datetime(2025, 3, 1, 20, 0, tzinfo=_FIX_CST).timestamp() * 1000)
+    i = 0
+    for uid, texts in uids_to_msgs.items():
+        for t in texts:
+            msgs.append(
+                {
+                    "id": str(i),
+                    "timestamp": base + i * 60000,
+                    "time": "2025-03-01 20:%02d:00" % (i % 60),
+                    "sender": {"uid": uid, "name": "人" + uid[-1]},
+                    "content": t,
+                }
+            )
+            i += 1
+    return _fix_wrap(msgs, {k: "人" + k[-1] for k in uids_to_msgs})
+
+
+def _fix_wrap(msgs, senders, self_uid="uA"):
+    """按导出格式包装（msgs 为完整消息字典，便于构造 system/type_23 等特殊条目）"""
+    return json.dumps(
+        {
+            "chatInfo": {
+                "name": senders.get("uB", "对方"),
+                "selfUid": self_uid,
+                "selfName": senders.get(self_uid, "我"),
+            },
+            "statistics": {
+                "senders": [{"uid": uid, "name": name} for uid, name in senders.items()],
+                "totalMessages": len(msgs),
+            },
+            "messages": msgs,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _fix_bulk(uid, name, n, start=0, text="在吗", **extra):
+    """批量构造某人的 n 条普通消息"""
+    base = int(datetime(2025, 3, 1, 20, 0, tzinfo=_FIX_CST).timestamp() * 1000)
+    out = []
+    for i in range(n):
+        m = {
+            "id": str(start + i),
+            "timestamp": base + (start + i) * 60000,
+            "time": "2025-03-01 20:%02d:00" % ((start + i) % 60),
+            "sender": {"uid": uid, "name": name},
+            "content": text,
+        }
+        m.update(extra)
+        out.append(m)
+    return out
+
+
+def _fix_write_tmp(payload):
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        f.write(payload)
+        return f.name
+
+
+class TestGroupChatGuard(unittest.TestCase):
+    """多人（群聊）导出必须被拦下，而不是静默把所有人并进"对方"。
+
+    另一面同样重要：QQChatExporter 会给系统类消息安排占位 sender
+    （name="系统消息"），实测真实私聊导出里这类条目 system 标记并不齐全，
+    早期版本因此把正常私聊误判成群聊直接拒收——这里用真实形态回归。
+    """
+
+    def test_three_participant_export_is_detected_as_group(self):
+        """3 位有实质发言者 = 群聊：2026-09-12 起按群聊分析（不再是拒收）
+
+        这是本项目**唯一一次有意的行为变更**，因此在这里写清两件事：
+        - 默认（QQCHAT_GROUP_CHAT=auto）识别为群聊，各自统计；
+        - 设为 off 时完全回到升级前的拒收行为（下一条用例钉住它）。
+        """
+        msgs = (
+            _fix_bulk("uA", "我", 20)
+            + _fix_bulk("uB", "对方", 20, start=20)
+            + _fix_bulk("uC", "第三人", 6, start=40)
+        )
+        path = _fix_write_tmp(_fix_wrap(msgs, {"uA": "我", "uB": "对方", "uC": "第三人"}))
+        try:
+            from parser.qq_parser import load_chat
+
+            with mock.patch.dict(os.environ, {"QQCHAT_GROUP_CHAT": "auto"}):
+                chat = load_chat(path)
+            self.assertTrue(chat.is_group_chat)
+            self.assertEqual(chat.mode, "group")
+            self.assertEqual(len(chat.participants()), 3)
+            self.assertEqual(chat.other_uid, "", "群聊没有单一「对方」")
+        finally:
+            os.remove(path)
+
+    def test_group_export_rejected_when_switched_off(self):
+        """QQCHAT_GROUP_CHAT=off：回到升级前的拒收（文案仍说明原因与两条出路）"""
+        msgs = (
+            _fix_bulk("uA", "我", 20)
+            + _fix_bulk("uB", "对方", 20, start=20)
+            + _fix_bulk("uC", "第三人", 6, start=40)
+        )
+        path = _fix_write_tmp(_fix_wrap(msgs, {"uA": "我", "uB": "对方", "uC": "第三人"}))
+        try:
+            from parser.qq_parser import load_chat
+
+            with mock.patch.dict(os.environ, {"QQCHAT_GROUP_CHAT": "off"}):
+                with self.assertRaises(ValueError) as ctx:
+                    load_chat(path)
+            self.assertIn("群聊", str(ctx.exception))
+            self.assertIn("3 位有实质发言", str(ctx.exception))
+            self.assertIn("QQCHAT_GROUP_CHAT", str(ctx.exception), "文案要指向新开关")
+        finally:
+            os.remove(path)
+
+    def test_system_placeholder_sender_is_not_group_chat(self):
+        """真实形态：占位 sender（系统消息）里混了一条无 system 标记的 type_23"""
+        msgs = _fix_bulk("uA", "我", 30) + _fix_bulk("uB", "对方", 28, start=30)
+        placeholder = _fix_bulk("未知uid未知", "系统消息", 4, start=100, system=True)
+        placeholder.append(
+            {  # 唯一没有 system 标记的占位消息
+                "id": "999",
+                "timestamp": int(datetime(2025, 3, 2, 9, 0, tzinfo=CST).timestamp() * 1000),
+                "time": "2025-03-02 09:00:00",
+                "sender": {"uid": "未知uid未知", "name": "系统消息"},
+                "type": "type_23",
+                "content": "商城表情",
+            }
+        )
+        path = _fix_write_tmp(
+            _fix_wrap(msgs + placeholder, {"uA": "我", "uB": "对方", "未知uid未知": "系统消息"})
+        )
+        try:
+            from parser.qq_parser import load_chat
+
+            chat = load_chat(path)  # 不得抛异常
+            self.assertEqual(chat.self_uid, "uA")
+            self.assertEqual(len(chat.messages), 63)
+        finally:
+            os.remove(path)
+
+    def test_stray_few_messages_do_not_reject(self):
+        """偶发第三方条目（未达"实质参与"门槛）不该把私聊判成群聊"""
+        msgs = _fix_bulk("uA", "我", 25) + _fix_bulk("uB", "对方", 24, start=25)
+        stray = _fix_bulk("uX", "路人", 2, start=60)
+        path = _fix_write_tmp(_fix_wrap(msgs + stray, {"uA": "我", "uB": "对方", "uX": "路人"}))
+        try:
+            from parser.qq_parser import load_chat
+
+            self.assertEqual(len(load_chat(path).messages), 51)
+        finally:
+            os.remove(path)
+
+    def test_env_override_allows_multi_party(self):
+        msgs = (
+            _fix_bulk("uA", "我", 20)
+            + _fix_bulk("uB", "对方", 20, start=20)
+            + _fix_bulk("uC", "第三人", 6, start=40)
+        )
+        path = _fix_write_tmp(_fix_wrap(msgs, {"uA": "我", "uB": "对方", "uC": "第三人"}))
+        try:
+            from parser.qq_parser import load_chat
+
+            with mock.patch.dict(os.environ, {"QQCHAT_ALLOW_MULTI_PARTY": "1"}):
+                chat = load_chat(path)
+            self.assertEqual(len(chat.messages), 46)
+            # 放行时仍按"我 vs 其他人"两类归并（口径写死在错误文案里，用户知情）
+            self.assertEqual(chat.self_uid, "uA")
+        finally:
+            os.remove(path)
+
+    def test_two_participant_upload_still_fine(self):
+        import app as appmod
+
+        payload = _fix_chat_payload({"uA": ["在吗"], "uB": ["在的"]})
+        client = appmod.app.test_client()
+        client.get("/")
+        with client.session_transaction() as sess:
+            token = sess["csrf_token"]
+        r = client.post(
+            "/upload",
+            data={"file": (io.BytesIO(payload), "ok.json")},
+            headers={"Origin": "http://localhost:5000", "X-CSRF-Token": token},
+        )
+        self.assertEqual(r.status_code, 302)
+        with client.session_transaction() as sess:
+            p, h = sess.get("filepath"), sess.get("chat_hash")
+        storemod.wait_for_stats(h)
+        try:
+            storemod._purge_chat_caches(h)
+        finally:
+            if p and os.path.exists(p):
+                os.remove(p)
+
+
+class TestOtherUidDerivation(unittest.TestCase):
+    """对方的 UID 必须取"发言最多的非自己一方"，不能被占位 sender 抢走"""
+
+    def test_placeholder_sender_does_not_take_other_uid(self):
+        from parser.qq_parser import load_chat
+
+        # 占位 sender 排在文件最前面，且有一条非 system 消息（真实导出就是这样）
+        msgs = (
+            [
+                {
+                    "id": "0",
+                    "timestamp": 1704067200000,
+                    "time": "2024-01-01 08:00:00",
+                    "sender": {"uid": "未知uid未知", "name": "系统消息"},
+                    "content": "验证消息",
+                }
+            ]
+            + _fix_bulk("uA", "我", 20, start=1)
+            + _fix_bulk("uB", "对方", 18, start=21)
+        )
+        path = _fix_write_tmp(_fix_wrap(msgs, {"uA": "我", "uB": "对方", "未知uid未知": "系统消息"}))
+        try:
+            chat = load_chat(path)
+            self.assertEqual(chat.other_uid, "uB")
+            self.assertEqual(chat.other_name, "对方")
+        finally:
+            os.remove(path)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,7 @@
+<details class="analysis-options{{ ' ' ~ refresh_details_class if refresh_details_class else '' }}">
+    <summary>{{ refresh_summary_label | default('重新分析与费用') }}</summary>
+    <label class="form-check mb-0 mt-2">
+        <input class="form-check-input{{ ' ' ~ refresh_input_class if refresh_input_class else '' }}" type="checkbox" id="{{ refresh_checkbox_id | default('forceRefresh') }}">
+        <span class="form-check-label small">忽略缓存，重新调用 API（会产生费用）</span>
+    </label>
+</details>

@@ -62,6 +62,7 @@ import config as configmod  # noqa: E402
 import web as webpkg  # noqa: E402
 
 import app as appmod  # noqa: E402
+from analyzer import deepseek_client as dc  # noqa: E402
 
 #: 第三方 import 名 -> 发行包名（两者拼写不一致的少数几个）
 _DIST_ALIASES = {"dotenv": "python-dotenv"}
@@ -340,6 +341,29 @@ class TestDataDirEnvFile(unittest.TestCase):
             (Path(tmp) / ".env").write_text("FLASK_PORT=5099\n", encoding="utf-8")
             probed = self._probe(Path(tmp), "config.FLASK_PORT", {"FLASK_PORT": "5111"})
         self.assertEqual(probed, "5111")
+
+
+class TestEnvExampleBudgetDocs(unittest.TestCase):
+    """.env.example 里写的输出预算必须与代码默认值一致（本轮修的就是这类文档漂移）"""
+
+    def test_documented_max_tokens_match_code_defaults(self):
+        path = Path(__file__).resolve().parent.parent / ".env.example"
+        text = path.read_text(encoding="utf-8")
+        documented = {}
+        for line in text.splitlines():
+            line = line.strip().lstrip("#").strip()
+            if line.startswith("LLM_MAX_TOKENS_"):
+                name, _, value = line.partition("=")
+                documented[name[len("LLM_MAX_TOKENS_") :].strip().lower()] = int(value.strip())
+        self.assertTrue(documented, ".env.example 里应给出各维度预算的默认值")
+        for dim, value in documented.items():
+            with self.subTest(dim=dim):
+                self.assertIn(dim, dc._DEFAULT_MAX_TOKENS, f".env.example 提到未知维度 {dim}")
+                self.assertEqual(
+                    value,
+                    dc._DEFAULT_MAX_TOKENS[dim],
+                    f".env.example 的 {dim} 预算与 _DEFAULT_MAX_TOKENS 不一致（文档漂移）",
+                )
 
 
 if __name__ == "__main__":

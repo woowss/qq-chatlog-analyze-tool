@@ -48,6 +48,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from parser.qq_parser import CST, ChatData, Message  # noqa: E402
 from analyzer import deepseek_client as dc  # noqa: E402
 from analyzer import local_stats as ls  # noqa: E402
+import config  # noqa: E402
+from analyzer import usage as usage_mod  # noqa: E402
+from parser.qq_parser import split_by_month  # noqa: E402
+from parser.qq_parser import load_chat  # noqa: E402
 
 
 def _msg(uid: str, ts: int, text: str = "在吗") -> Message:
@@ -693,6 +697,777 @@ class TestCacheRetention(unittest.TestCase):
                 cleanupmod.cleanup_old_files()
             self.assertFalse(os.path.exists(old_log), "过期旧日志必须删除")
             self.assertTrue(os.path.exists(keep), "用量统计文件不属于日志轮转产物，不能误删")
+
+
+def _r3_msg(uid: str, ts: int, text: str) -> Message:
+    return Message(
+        id=f"{uid}-{ts}",
+        timestamp=ts,
+        time_str=datetime.fromtimestamp(ts / 1000, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        sender_name=uid,
+        sender_uid=uid,
+        text=text,
+        raw_text=text,
+        msg_type="type_1",
+        has_image=False,
+        is_reply=False,
+    )
+
+
+def _r4_msg(uid: str, ts: int, text: str = "在吗", has_image: bool = False, **kw) -> Message:
+    return Message(
+        id=str(ts),
+        timestamp=ts,
+        time_str=datetime.fromtimestamp(ts / 1000, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        sender_name=uid,
+        sender_uid=uid,
+        text=text,
+        raw_text=text,
+        msg_type="type_1",
+        has_image=has_image,
+        is_reply=False,
+        **kw,
+    )
+
+
+def _r4_chat(msgs) -> ChatData:
+    return ChatData(chat_name="", self_name="A", other_name="B", self_uid="u1", other_uid="u2", messages=msgs)
+
+
+def _r4_months_chat(n_months: int, pairs_per_month: int = 6) -> ChatData:
+    """跨 n 个月的聊天（每月内容互不相同）"""
+    msgs = []
+    for m in range(n_months):
+        year, month = 2025 + m // 12, (m % 12) + 1
+        for i in range(pairs_per_month):
+            t = datetime(year, month, 5, 20, 0, tzinfo=CST) + timedelta(minutes=17 * i)
+            text = f"{year}-{month:02d} 第{i}条消息"
+            msgs.append(_r4_msg("u1" if i % 2 else "u2", int(t.timestamp() * 1000), text=text))
+    return _r4_chat(msgs)
+
+
+class TestCacheWriteFailuresAreLoud(unittest.TestCase):
+    """写失败必须留痕：静默失败会变成"每次都在重复付费"且用户毫不知情"""
+
+    def test_month_cache_write_failure_logs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "not-a-dir")
+            with open(missing, "w", encoding="utf-8") as f:
+                f.write("占位：同名文件存在时，目录创建/写入必然失败")
+            dc.configure_month_cache(missing)
+            # 去抖比较的是 time.monotonic()（Linux 上即开机时长）。把它当成 0.0 时，
+            # 刚启动不到去抖窗口（300s）的机器上 now - 0 < 300 会成立、警告被吞掉，
+            # 用例就在 GitHub runner 上偶发失败。用 -inf 表示"从未告警过"，与开机时长无关。
+            dc._last_write_warning[0] = float("-inf")
+            try:
+                with self.assertLogs("qqchatlog.deepseek", level="WARNING") as logs:
+                    dc._write_month_cache("key1", {"a": 1})
+            finally:
+                dc.configure_month_cache("")
+            self.assertTrue(
+                any("写入失败" in line for line in logs.output), "月份缓存写失败要打警告，而不是静默吞掉"
+            )
+
+    def test_usage_flush_keeps_pending_on_failure(self):
+        """用量落盘失败时增量要留在内存里下次再写，而不是被清空丢掉"""
+        usage_mod._PENDING["days"].clear()
+        usage_mod._PENDING["dims"].clear()
+        for k in usage_mod._PENDING["total"]:
+            usage_mod._PENDING["total"][k] = 0
+        usage_mod.record_call("deepseek-flash", "emotion", 100, 50)
+        with mock.patch.object(usage_mod, "_dump", side_effect=OSError("磁盘满")):
+            usage_mod.flush()  # 不应抛异常
+        self.assertTrue(usage_mod._DIRTY, "失败后仍应标记为待落盘")
+        self.assertEqual(usage_mod._PENDING["total"]["calls"], 1, "增量不能被清空")
+        usage_mod._PENDING["days"].clear()
+        usage_mod._PENDING["dims"].clear()
+        for k in usage_mod._PENDING["total"]:
+            usage_mod._PENDING["total"][k] = 0
+        usage_mod._DIRTY = False
+
+
+class TestUsageRetention(unittest.TestCase):
+    """用量按天聚合，但历史不该无限累积（日志只留 7 天，这里口径应一致）"""
+
+    def test_old_days_are_pruned_on_flush(self):
+        path = os.path.join(os.environ["QQCHAT_DATA_DIR"], "usage_prune.json")
+        ancient = (datetime.now(tz=usage_mod.CST) - timedelta(days=config.LOG_RETENTION_DAYS + 10)).strftime(
+            "%Y-%m-%d"
+        )
+        recent = datetime.now(tz=usage_mod.CST).strftime("%Y-%m-%d")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "days": {
+                        ancient: {"calls": 9, "prompt": 1, "completion": 1},
+                        recent: {"calls": 1, "prompt": 1, "completion": 1},
+                    },
+                    "dims": {},
+                    "total": {"calls": 10, "prompt": 2, "completion": 2},
+                },
+                f,
+            )
+        try:
+            with mock.patch.object(usage_mod, "TOKEN_USAGE_FILE", path):
+                usage_mod.record_call("deepseek-flash", "emotion", 10, 5)
+                usage_mod.flush()
+            with open(path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertNotIn(ancient, saved["days"], "超过保留期的日期应被清掉")
+            self.assertIn(recent, saved["days"], "保留期内的记录必须还在")
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+
+class TestMonthGroupingCache(unittest.TestCase):
+    """split_by_month 在一次分析里会被多个维度各调一遍，不能每次都重算"""
+
+    def test_second_call_reuses_the_same_object(self):
+        chat = _r4_months_chat(3)
+        first = split_by_month(chat)
+        second = split_by_month(chat)
+        self.assertIs(first, second, "应直接返回缓存的字典")
+        self.assertEqual(list(first), ["2025-01", "2025-02", "2025-03"])
+
+    def test_cache_lives_on_the_instance_and_is_not_part_of_equality(self):
+        chat = _r4_months_chat(1)
+        self.assertIsNone(chat._months_cache, "初始为 None，不该在构造时就计算")
+        chat.months()
+        self.assertIsNotNone(chat._months_cache)
+        # 缓存字段不参与相等比较，也不该出现在 repr 里（它可能很大）
+        other = _r4_months_chat(1)
+        self.assertEqual(chat, other)
+        self.assertNotIn("_months_cache", repr(chat))
+
+    def test_stats_cache_is_a_declared_field(self):
+        """_stats_cache 曾经是 setattr 动态挂载；现在是声明字段，读代码时看得见"""
+        chat = _r4_months_chat(1)
+        self.assertIsNone(chat._stats_cache)
+        ls.calc_overview(chat)
+        self.assertIsNotNone(chat._stats_cache)
+
+
+class TestOverviewSinglePass(unittest.TestCase):
+    """calc_overview 合并成单次遍历后，字段口径必须与原实现逐项一致"""
+
+    def _reference(self, chat):
+        ms = chat.statistical()
+        self_count = sum(1 for m in ms if m.sender_uid == chat.self_uid)
+        image_msgs = [m for m in ms if m.has_image]
+        media = {}
+        for m in ms:
+            if m.media_kind:
+                media[m.media_kind] = media.get(m.media_kind, 0) + 1
+        return {
+            "self_count": self_count,
+            "other_count": len(ms) - self_count,
+            "self_chars": sum(len(m.text) for m in ms if m.sender_uid == chat.self_uid),
+            "other_chars": sum(len(m.text) for m in ms if m.sender_uid != chat.self_uid),
+            "total_images": len(image_msgs),
+            "total_faces": sum((len(m.face_names) or len(m.face_ids)) for m in ms),
+            "image_bytes": sum(m.media_bytes for m in image_msgs),
+            "other_media_bytes": sum(m.media_bytes for m in ms if m.media_kind),
+            "unique_images": len({m.media_id for m in image_msgs if m.media_id}) or None,
+            "media": media,
+        }
+
+    def test_fields_match_reference_implementation(self):
+        base = int(datetime(2025, 3, 1, 20, 0, tzinfo=CST).timestamp() * 1000)
+        msgs = [
+            _r4_msg("u1", base, text="图片消息", has_image=True, media_bytes=100, media_id="m1"),
+            _r4_msg("u2", base + 1000, text="同一张图", has_image=True, media_bytes=100, media_id="m1"),
+            _r4_msg("u1", base + 2000, text="文件", media_kind="file", media_bytes=5000, media_id="f1"),
+            _r4_msg("u2", base + 3000, text="视频", media_kind="video", media_bytes=9000),
+            _r4_msg("u1", base + 4000, text="表情", face_ids=[3], face_names=[]),
+            _r4_msg("u2", base + 5000, text="大表情", face_ids=[], face_names=["微笑"]),
+            _r4_msg("u1", base + 6000, text="没有媒体的普通消息"),
+        ]
+        chat = _r4_chat(msgs)
+        ov = ls.calc_overview(chat)
+        ref = self._reference(chat)
+        for key in (
+            "self_count",
+            "other_count",
+            "self_chars",
+            "other_chars",
+            "total_images",
+            "total_faces",
+            "image_bytes",
+            "other_media_bytes",
+            "unique_images",
+        ):
+            self.assertEqual(ov[key], ref[key], f"{key} 与参考实现不一致")
+        self.assertEqual(ov["total_files"], ref["media"].get("file", 0))
+        self.assertEqual(ov["total_videos"], ref["media"].get("video", 0))
+        self.assertEqual(ov["unique_images"], 1, "两张同 md5 的图应算一张")
+
+    def test_faces_prefer_names_over_ids(self):
+        """商城大表情没有数字 id：face_names 与 face_ids 取两者中有的那个，不能相加"""
+        base = int(datetime(2025, 3, 1, 20, 0, tzinfo=CST).timestamp() * 1000)
+        chat = _r4_chat([_r4_msg("u1", base, face_ids=[1, 2], face_names=["a", "b", "c"])])
+        self.assertEqual(ls.calc_overview(chat)["total_faces"], 3)
+
+
+class TestMonthManifestBatching(unittest.TestCase):
+    """manifest 从"每月读一次写一次"改成"每个维度读一次写一次" """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="qqchatlog-manifest-")
+        self.addCleanup(_shutil.rmtree, self.tmp, ignore_errors=True)
+        # 模块级状态读/写都打在 owns 它的模块上（deepseek_client 的重导出只是值拷贝）
+        from analyzer import month_cache as mc
+
+        self._orig_dir = mc._MONTH_CACHE_DIR
+        dc.configure_month_cache(self.tmp)
+        self.addCleanup(lambda: dc.configure_month_cache(self._orig_dir))
+
+    def _run(self, chat, chat_hash):
+        def fake_api(*a, **kw):
+            return valid_emotion()
+
+        with (
+            mock.patch.object(dc, "_call_api", side_effect=fake_api),
+            mock.patch.object(dc, "CALL_MIN_INTERVAL", 0.0),
+        ):
+            return dc.analyze_emotion(chat, chat_hash=chat_hash)
+
+    def test_manifest_written_once_per_dimension(self):
+        """3 个月的维度：_record_month_usage 只应被调用 1 次（而不是 3 次）"""
+        real = dc._record_month_usage
+        calls = []
+
+        def spy(chat_hash, keys):
+            calls.append(set(keys))
+            return real(chat_hash, keys)
+
+        with mock.patch.object(dc, "_record_month_usage", side_effect=spy):
+            result = self._run(_r4_months_chat(3), "hashBatch")
+        self.assertEqual(len(result), 3)
+        self.assertEqual(len(calls), 1, "应当只写一次 manifest")
+        self.assertEqual(len(calls[0]), 3, "三个月份的键都要记进 manifest")
+
+        with open(os.path.join(self.tmp, "manifest_hashBatch.json"), encoding="utf-8") as f:
+            self.assertEqual(len(json.load(f)["months"]), 3)
+
+    def test_manifest_accumulates_across_runs(self):
+        self._run(_r4_months_chat(2), "hashGrow")
+        self._run(_r4_months_chat(3), "hashGrow")
+        with open(os.path.join(self.tmp, "manifest_hashGrow.json"), encoding="utf-8") as f:
+            self.assertEqual(len(json.load(f)["months"]), 3, "第二次运行应把新月份并进同一个 manifest")
+
+    def test_referenced_keys_uses_mtime_cache(self):
+        """引用键集合带进程级缓存：manifest 没被改过就不该再读一遍文件"""
+        dc._record_month_usage("hashCache", {"k1", "k2"})
+        with (
+            mock.patch.object(dc, "_MONTH_CACHE_LOCK", dc._MONTH_CACHE_LOCK),
+            mock.patch.object(dc.json, "load", side_effect=AssertionError("不该重新解析 manifest")),
+        ):
+            keys = dc._referenced_keys_locked()
+        self.assertEqual(keys, {"k1", "k2"})
+
+    def test_mtime_change_invalidates_cache(self):
+        dc._record_month_usage("hashMtime", {"k1"})
+        path = os.path.join(self.tmp, "manifest_hashMtime.json")
+        # 绕过写路径直接改文件（模拟外部修改）：mtime 变了就必须重读
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"months": ["k9"]}, f)
+        os.utime(path, (time.time() + 5, time.time() + 5))
+        self.assertEqual(dc._referenced_keys_locked(), {"k9"})
+
+    def test_purge_ignores_other_manifests(self):
+        """purge 走的仍是"别人引用的不能删"这套语义（缓存不能把它改坏）"""
+        self._run(_r4_months_chat(2), "hashA")
+        self._run(_r4_months_chat(3), "hashB")
+        before = len([n for n in os.listdir(self.tmp) if n.startswith("month_")])
+        self.assertEqual(dc.purge_month_cache("hashA"), 0, "共享的月份文件不能被删")
+        self.assertEqual(len([n for n in os.listdir(self.tmp) if n.startswith("month_")]), before)
+
+
+class TestComputeStatsNoDoubleWork(unittest.TestCase):
+    """compute_stats 不再把轮次算两遍（calc_overview 内部已经算过一次）"""
+
+    def test_exchange_rounds_reused_from_overview(self):
+        base = datetime(2024, 1, 1, 8, 0, tzinfo=CST)
+        msgs = [
+            _r3_msg(uid, int((base + timedelta(minutes=5 * i)).timestamp() * 1000), f"m{i}")
+            for i, uid in enumerate(["uA", "uB", "uA", "uB", "uA"])
+        ]
+        chat = ChatData(
+            chat_name="c",
+            self_name="A",
+            other_name="B",
+            self_uid="uA",
+            other_uid="uB",
+            messages=msgs,
+        )
+        stats = storemod.compute_stats(chat)
+        self.assertEqual(stats["exchange_rounds"], stats["overview"]["exchange_rounds"])
+
+    def test_exchange_rounds_computed_only_once(self):
+        """用调用计数钉住"只算一次"，避免以后又被加回去。
+
+        调用点是 local_stats.calc_exchange_rounds（由 calc_overview 内部调用），
+        所以盯的是 local_stats 命名空间里的那个引用。
+        """
+        from analyzer import local_stats as ls
+
+        base = datetime(2024, 1, 1, 8, 0, tzinfo=CST)
+        msgs = [
+            _r3_msg(uid, int((base + timedelta(minutes=5 * i)).timestamp() * 1000), f"m{i}")
+            for i, uid in enumerate(["uA", "uB", "uA"])
+        ]
+        chat = ChatData(
+            chat_name="c",
+            self_name="A",
+            other_name="B",
+            self_uid="uA",
+            other_uid="uB",
+            messages=msgs,
+        )
+        real = ls.calc_exchange_rounds
+        calls = []
+
+        def counting(c):
+            calls.append(1)
+            return real(c)
+
+        with mock.patch.object(ls, "calc_exchange_rounds", counting):
+            storemod.compute_stats(chat)
+        self.assertEqual(len(calls), 1, f"轮次只应算一次，实际 {len(calls)} 次")
+
+
+class TestCleanupClosureBinding(unittest.TestCase):
+    """清理判定函数把 now 显式冻进闭包，不依赖外层变量的后续取值"""
+
+    def test_older_than_expired(self):
+        mtime = os.path.getmtime(__file__)
+        self.assertTrue(cleanupmod._older_than(mtime + 1000, 100)(__file__))
+
+    def test_older_than_fresh(self):
+        mtime = os.path.getmtime(__file__)
+        self.assertFalse(cleanupmod._older_than(mtime + 10, 100)(__file__))
+
+    def test_cleanup_still_purges_expired_upload(self):
+        """端到端：过期的 uploads 文件仍会被回收（别人的 now 改动不该漏掉它）"""
+        import time
+
+        with tempfile.TemporaryDirectory(prefix="qqchatlog-cleanup-") as tmp:
+            uploads = os.path.join(tmp, "uploads")
+            os.makedirs(uploads, exist_ok=True)
+            stale = os.path.join(uploads, "stale.json")
+            with open(stale, "w", encoding="utf-8") as f:
+                f.write("{}")
+            old = time.time() - 3 * 86400
+            os.utime(stale, (old, old))
+
+            with (
+                mock.patch.object(cleanupmod, "UPLOAD_FOLDER", uploads),
+                mock.patch.object(cleanupmod, "SESSION_FILE_DIR", os.path.join(tmp, "session")),
+                mock.patch.object(cleanupmod, "AI_CACHE_DIR", os.path.join(tmp, "ai")),
+                mock.patch.object(cleanupmod, "STATS_CACHE_DIR", os.path.join(tmp, "stats")),
+                mock.patch.object(cleanupmod, "LOG_DIR", os.path.join(tmp, "logs")),
+                mock.patch.object(cleanupmod, "sweep_orphan_month_cache", lambda: 0),
+            ):
+                cleanupmod.cleanup_old_files(max_age_seconds=86400)
+            self.assertFalse(os.path.exists(stale), "过期的上传文件应被清理")
+
+
+_F7_BASE = int(datetime(2025, 3, 1, 20, 0, tzinfo=CST).timestamp())
+
+
+def _f7_text(msg_id, uid, name, ts_s, text):
+    return {
+        "id": str(msg_id),
+        "timestamp": int(ts_s * 1000),
+        "time": datetime.fromtimestamp(ts_s, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        "sender": {"uid": uid, "name": name},
+        "type": "text",
+        "content": {"text": text, "elements": [{"type": "text", "data": {"text": text}}]},
+    }
+
+
+def _f7_load(msgs, self_uid="uA"):
+    payload = json.dumps(
+        {
+            "chatInfo": {"name": "对方", "selfUid": self_uid, "selfName": "我"},
+            "statistics": {
+                "senders": [{"uid": "uA", "name": "我"}, {"uid": "uB", "name": "对方"}],
+                "totalMessages": len(msgs),
+            },
+            "messages": msgs,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        f.write(payload)
+        path = f.name
+    try:
+        return load_chat(path)
+    finally:
+        os.remove(path)
+
+
+def _f7_touch_cache(name: str, content: str = '{"_created": 1}', age_days: int = 0) -> str:
+    path = os.path.join(storemod.AI_CACHE_DIR, name)
+    os.makedirs(storemod.AI_CACHE_DIR, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    if age_days:
+        old = time.time() - age_days * 86400
+        os.utime(path, (old, old))
+    return path
+
+
+class TestStatsVersionPin(unittest.TestCase):
+    def test_bumped(self):
+
+        # 旧缓存里"其他=0"是错的，必须失效重算（只花本地 CPU，零 API 费用）。
+        self.assertGreaterEqual(storemod.STATS_SCHEMA_VERSION, 6)
+        self.assertGreaterEqual(storemod.GROUP_STATS_SCHEMA_VERSION, 4)
+
+
+class TestRetentionSwitch(unittest.TestCase):
+    """QQCHAT_CACHE_SLIDE_DAYS / QQCHAT_CACHE_MAX_DAYS 决定派生缓存的命运；0 = 不过期。"""
+
+    def _aged(self, name: str, days: int):
+        return _f7_touch_cache(name, json.dumps({"_created": time.time() - days * 86400}), age_days=days)
+
+    def test_default_still_collects(self):
+        p = self._aged("emotion_hash_x.json", 40)
+        from webapp import cleanup as cm
+
+        with mock.patch.object(cm, "CACHE_SLIDE_DAYS", 30), mock.patch.object(cm, "CACHE_MAX_DAYS", 90):
+            cm.cleanup_old_files(max_age_seconds=86400)
+        self.assertFalse(os.path.exists(p))
+
+    def test_zero_means_never_expire(self):
+        p = self._aged("emotion_hash_y.json", 400)
+        from webapp import cleanup as cm
+
+        with mock.patch.object(cm, "CACHE_SLIDE_DAYS", 0), mock.patch.object(cm, "CACHE_MAX_DAYS", 0):
+            cm.cleanup_old_files(max_age_seconds=86400)
+        self.assertTrue(os.path.exists(p), "两条规则都关掉后，再老也不许删（用户显式要永久保留）")
+        os.remove(p)
+
+    def test_slide_off_hard_still_applies(self):
+        p = self._aged("emotion_hash_z.json", 100)
+        from webapp import cleanup as cm
+
+        with mock.patch.object(cm, "CACHE_SLIDE_DAYS", 0), mock.patch.object(cm, "CACHE_MAX_DAYS", 90):
+            cm.cleanup_old_files(max_age_seconds=86400)
+        self.assertFalse(os.path.exists(p), "关掉滑动不关掉绝对上限")
+
+
+class TestStopwordsExternal(unittest.TestCase):
+    """停用词外部化（评审遗留 #18）：内置词表永在，文件只做加法；改了文件词云要重算。"""
+
+    def _freq(self, words):
+        from datetime import timedelta
+
+        msgs = []
+        t = _F7_BASE
+        for w in words:
+            msgs.append(_f7_text(len(msgs) + 1, "uA", "我", t, w))
+            t += int(timedelta(minutes=1).total_seconds())
+        return ls.calc_word_freq(_f7_load(msgs))
+
+    def test_builtin_never_disappears(self):
+        out = self._freq(["因为 因为"])
+        self.assertNotIn("因为", {x["word"] for x in out["self"]}, "内置停用词永远生效")
+
+    def test_external_file_is_additive_and_roundtrips(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "stop.txt")
+            base_fp = ls.stopwords_fingerprint()
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("# 我们的口头禅，从词云里摘掉\n加班\n")
+            ls._STOP_CACHE.update(stamp="force-reload", words=frozenset(), text="")
+            with mock.patch.dict(os.environ, {"QQCHAT_STOPWORD_FILE": path}):
+                fp2 = ls.stopwords_fingerprint()
+                self.assertNotEqual(fp2, base_fp, "文件改了，指纹必须变（词云才会重算）")
+                out = self._freq(["加班 加班", "加班"])
+                self.assertNotIn("加班", {x["word"] for x in out["self"]})
+                self.assertEqual(out["stop_fp"], fp2)
+            ls._STOP_CACHE.update(stamp="force-reload", words=frozenset(), text="")
+            self.assertEqual(ls.stopwords_fingerprint(), base_fp, "撤掉文件回到内置口径")
+
+    def test_freq_result_carries_fingerprint(self):
+        self.assertIn("stop_fp", self._freq(["你好"]), "词频要带停用词指纹，懒算缓存靠它判新旧")
+
+    def test_lazy_cache_recomputes_on_fingerprint_mismatch(self):
+        """旧词频带着过期 stop_fp → _stats_with_word_freq 必须重算并盖上新指纹。"""
+        import app as appmod
+        from flask import session as flask_session
+        from webapp import store as storemod
+
+        stale = {
+            "overview": {"total_messages": 1},
+            "word_freq": {"self": [], "other": [], "stop_fp": "STALE00000"},
+        }
+        with appmod.app.test_request_context("/habits"):
+            flask_session["filepath"] = __file__
+            flask_session["chat_hash"] = "hashStop"
+            with (
+                mock.patch.object(
+                    storemod,
+                    "_load_chat_cached",
+                    return_value=_f7_load([_f7_text(1, "uA", "我", _F7_BASE, "你好")]),
+                ),
+                mock.patch.object(storemod, "_save_stats"),
+            ):
+                out = storemod._stats_with_word_freq(dict(stale), "hashStop")
+        self.assertNotEqual(out["word_freq"]["stop_fp"], "STALE00000")
+
+    def test_lazy_cache_hit_when_fresh(self):
+        """指纹一致：命中缓存、绝不再分词（外部化不能把懒算的省钱效果打回去）。"""
+        import app as appmod
+        from flask import session as flask_session
+        from webapp import store as storemod
+
+        fresh_fp = ls.stopwords_fingerprint()
+        stats = {
+            "overview": {"total_messages": 1},
+            "word_freq": {"self": [{"word": "你好", "count": 1}], "other": [], "stop_fp": fresh_fp},
+        }
+        with appmod.app.test_request_context("/habits"):
+            flask_session["filepath"] = __file__  # 路径真实存在，唯一能短路的就是 stop_fp 命中
+            with mock.patch.object(storemod, "_load_chat_cached", side_effect=AssertionError("不该重算")):
+                out = storemod._stats_with_word_freq(dict(stats), "hashStop")
+        self.assertEqual(out["word_freq"]["self"], [{"word": "你好", "count": 1}])
+
+
+class TestFingerprintMigrationChain(unittest.TestCase):
+    """7-E 迁移链扩展：单代 if → 有序链 + 读侧循环。现值零变化，未来换代不再断层。"""
+
+    def test_current_values_untouched(self):
+        """链式机制：群聊/recap 仍各只有一代旧键；私聊已有两代（中位数换代）。
+
+        私聊那条从"单代"变成两代是有意的：_conversation_stats 的 median_gap 改用
+        local_stats._median（上中位 → 真中位），改变了喂给模型的那行文本，
+        所以必须换键；换出去的那一代压进链头，让沿链迁移继续读得到它。
+        这正好反过来验证了链式改造的价值：第三次换代不再断层。
+        """
+        from analyzer import deepseek_client as dc
+        from analyzer import group_client as gc
+        from analyzer import recap_client as rc
+
+        self.assertEqual(
+            dc.legacy_fingerprints_for_dimension("emotion"),
+            (*dc.PRIVATE_FINGERPRINT_GENERATIONS, dc.PROMPT_FINGERPRINT_LEGACY),
+        )
+        self.assertEqual(len(dc.legacy_fingerprints_for_dimension("emotion")), 2, "私聊应为两代")
+        self.assertEqual(
+            dc.legacy_fingerprints_for_dimension("group_dynamics"), (gc.GROUP_PROMPT_FINGERPRINT_LEGACY,)
+        )
+        self.assertEqual(dc.legacy_fingerprints_for_dimension("recap"), (rc.RECAP_PROMPT_FINGERPRINT_LEGACY,))
+        # 链头是"上一代的当前键"（AST 归一时代写的），链尾是更早的原文公式
+        self.assertEqual(dc.legacy_fingerprints_for_dimension("emotion")[0], "f4bd6aa06d52")
+        self.assertEqual(dc.legacy_fingerprints_for_dimension("emotion")[-1], dc.PROMPT_FINGERPRINT_LEGACY)
+        # 单值入口取链头（老调用点语义保持："先试最近的那一代"）
+        self.assertEqual(
+            dc.legacy_fingerprint_for_dimension("emotion"), dc.PRIVATE_FINGERPRINT_GENERATIONS[0]
+        )
+        self.assertEqual(
+            dc.legacy_fingerprint_for_dimension("group_dynamics"), gc.GROUP_PROMPT_FINGERPRINT_LEGACY
+        )
+        # 链里不许混进当前键自己：那等于白读一次自己，还会把"命中"误报成"迁移成功"
+        for dim in ("emotion", "profile", "group_dynamics", "recap"):
+            self.assertNotIn(dc.fingerprint_for_dimension(dim), dc.legacy_fingerprints_for_dimension(dim))
+
+    def test_median_now_matches_local_stats_algorithm(self):
+        """给模型看的"回复间隔中位数"与界面卡用的是同一个算法（口径唯一）。
+
+        就地 `s[n//2]` 在偶数样本上取的是**上中位**：[10,20,30,40] 会报成 30（真值 25），
+        两句长度 [1,9] 报成 9（真值 5）。local_stats 为同一个毛病专门顶过
+        STATS_SCHEMA_VERSION，而模型侧这句漏了——同一个词在两处算出两个数。
+        """
+        from analyzer import local_stats as ls
+        from analyzer.dialog import _conversation_stats
+        from parser.qq_parser import Message
+
+        def mk(i, uid, ts):
+            return Message(
+                id=str(i),
+                timestamp=ts,
+                time_str="x",
+                sender_uid=uid,
+                sender_name=uid,
+                text="t",
+                raw_text="t",
+                msg_type="text",
+                has_image=False,
+                is_reply=False,
+                media_kind="",
+                media_label="",
+                media_bytes=0,
+                media_id="",
+                media_path="",
+                media_w=0,
+                media_h=0,
+                face_url="",
+                face_ids=[],
+                face_names=[],
+                image_bytes=0,
+                image_count=0,
+                image_ids=[],
+                recalled=False,
+                system=False,
+                reply_to_id="",
+                reply_to_uid="",
+                mentions=[],
+                mentions_all=False,
+            )
+
+        # 换人且都在同一段内 → gaps = [10, 20, 30, 40]，偶数样本
+        msgs = [
+            mk(0, "uA", 1_700_000_000_000),
+            mk(1, "uB", 1_700_000_010_000),
+            mk(2, "uA", 1_700_000_030_000),
+            mk(3, "uB", 1_700_000_060_000),
+            mk(4, "uA", 1_700_000_100_000),
+        ]
+        got = _conversation_stats(msgs, "uA")["median_gap"]
+        self.assertEqual(got, 25.0, f"偶数样本必须取中间两数平均，实际 {got}（30 = 上中位，就是原来的错法）")
+        self.assertEqual(got, ls._median(sorted([10.0, 20.0, 30.0, 40.0])), "与 local_stats 同口径")
+        # 奇数样本两种取法本来就一致，顺手钉住别把它改坏
+        odd = _conversation_stats(msgs[:4], "uA")["median_gap"]
+        self.assertEqual(odd, ls._median(sorted([10.0, 20.0, 30.0])))
+
+    def test_read_cache_walks_multi_generation_chain(self):
+        """链里放**两代**假旧键，_read_cache 必须挨代找到并搬到当前键。
+
+        反向验证：旧实现只认一代——写在中止于第一代，第二代永远读不到，本条变红。
+        """
+        from analyzer import deepseek_client as dc
+        from webapp import store as storemod
+
+        chat_hash = "chash-chain-001"
+        dim = "emotion"
+        gen1 = "ffffffffffff"
+        gen0 = "eeeeeeeeeeee"
+        # 旧键文件名必须复刻 _cache_path 的真实口径（思考模式开启时带 _think 后缀）
+        suffix = "_think" if dc.thinking_enabled(dim) else ""
+        legacy_payload = {"_created": time.time(), "result": {"self_emotion": "旧代产出"}}
+        path0 = os.path.join(
+            storemod.AI_CACHE_DIR, f"{dim}_{chat_hash}_{storemod.DEEPSEEK_MODEL}_{gen0}{suffix}.json"
+        )
+        try:
+            os.makedirs(storemod.AI_CACHE_DIR, exist_ok=True)
+            with open(path0, "w", encoding="utf-8") as f:
+                json.dump(legacy_payload, f)
+            # 打桩在**消费侧**的绑定名上（store 是 import 期绑定的，patch 源模块不影响它——
+            # 这正是本项目 _bootstrap.api_configured_patcher 文档里写过的同一课）
+            with mock.patch.object(storemod, "legacy_fingerprints_for_dimension", return_value=(gen1, gen0)):
+                got = storemod._read_cache(dim, chat_hash)
+            self.assertIsNotNone(got, "链上的每一代都要被尝试")
+            self.assertEqual(got["self_emotion"], "旧代产出")
+            self.assertFalse(os.path.exists(path0), "迁移是改名不是复制（敏感内容不留两份）")
+            self.assertTrue(os.path.exists(storemod._cache_path(dim, chat_hash)))
+        finally:
+            for p in (storemod._cache_path(dim, chat_hash), path0):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+
+class TestCleanupTriggeredWithoutUpload(unittest.TestCase):
+    """清理不再只挂在上传路径：任何请求都会按小时去抖触发"""
+
+    def test_get_request_triggers_maybe_cleanup(self):
+        import app as appmod
+        from webapp import cleanup as cleanupmod
+
+        with (
+            mock.patch.object(cleanupmod, "_last_cleanup", [0.0]),
+            mock.patch.object(cleanupmod, "cleanup_old_files") as co,
+        ):
+            appmod.app.test_client().get("/")
+            self.assertTrue(co.called, "GET / 也必须触发过期回收")
+
+    def test_debounce_prevents_rescan(self):
+        from webapp import cleanup as cleanupmod
+
+        with (
+            mock.patch.object(cleanupmod, "_last_cleanup", [time.time()]),
+            mock.patch.object(cleanupmod, "cleanup_old_files") as co,
+        ):
+            cleanupmod.maybe_cleanup(3600)
+            self.assertFalse(co.called, "一小时内重复请求不该反复扫描目录")
+
+
+class TestFingerprintRobustness(unittest.TestCase):
+    """源码不可读时指纹降级不崩；PROMPT_CACHE_SALT 可手动换键"""
+
+    def test_fallback_when_source_unavailable(self):
+        import analyzer.deepseek_client as dc
+
+        with (
+            mock.patch("inspect.getsource", side_effect=OSError("no source here")),
+            mock.patch.dict(os.environ, {"PROMPT_CACHE_SALT": ""}),
+        ):
+            fp = dc._prompt_fingerprint()
+            fp2 = dc._prompt_fingerprint()  # 必须在同一个降级上下文里比稳定性
+        self.assertEqual(len(fp), 12)
+        self.assertNotEqual(fp, dc.PROMPT_FINGERPRINT, "降级指纹应与正常指纹不同")
+        self.assertEqual(fp, fp2, "降级指纹仍须稳定")
+
+    def test_salt_changes_fingerprint(self):
+        import analyzer.deepseek_client as dc
+
+        with mock.patch.dict(os.environ, {"PROMPT_CACHE_SALT": "2026-08-a"}):
+            fp1 = dc._prompt_fingerprint()
+            fp2 = dc._prompt_fingerprint()
+        with mock.patch.dict(os.environ, {"PROMPT_CACHE_SALT": "2026-08-b"}):
+            fp3 = dc._prompt_fingerprint()
+        self.assertEqual(fp1, fp2)
+        self.assertNotEqual(fp1, fp3)
+        self.assertNotEqual(fp1, dc.PROMPT_FINGERPRINT)
+
+    def test_grace_hours_env_invalid_does_not_crash(self):
+        import config
+
+        with mock.patch.dict(os.environ, {"LLM_MONTH_CACHE_GRACE_HOURS": "abc"}):
+            val = config.env_number("LLM_MONTH_CACHE_GRACE_HOURS", 24, 0, 720)
+        self.assertEqual(val, 24)  # 回退默认而不是 ValueError 崩在 import
+
+
+class TestUsageBatchWrite(unittest.TestCase):
+    """50 次调用合并成一次落盘；读接口永远能立刻看到最新值"""
+
+    def test_batching_and_read_your_write(self):
+        import analyzer.usage as usage
+
+        fd, tmp = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        os.remove(tmp)
+        usage.flush()  # 清掉别的测试可能留下的未决增量
+        orig_file, orig_dump = usage.TOKEN_USAGE_FILE, usage._dump
+        writes = []
+
+        def counting_dump(d):
+            writes.append(1)
+            orig_dump(d)
+
+        usage.TOKEN_USAGE_FILE = tmp
+        usage._dump = counting_dump
+        try:
+            for _ in range(50):
+                usage.record_call("deepseek-flash", "emotion", 100, 20)
+            self.assertEqual(len(writes), 0, "增量不该逐次落盘")
+            u = usage.get_usage()
+            self.assertEqual(u["total"]["calls"], 50)
+            self.assertEqual(u["dims"]["emotion|deepseek-flash"]["calls"], 50)
+            self.assertEqual(len(writes), 1, "读前应恰好冲刷一次")
+            usage.get_usage()
+            self.assertEqual(len(writes), 1, "无增量的读不该再写盘")
+        finally:
+            usage._dump = orig_dump
+            usage.TOKEN_USAGE_FILE = orig_file
+            usage.flush()
+            if os.path.exists(tmp):
+                os.remove(tmp)
 
 
 if __name__ == "__main__":

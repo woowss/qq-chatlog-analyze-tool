@@ -46,20 +46,12 @@ logger = get_logger("app")
 
 PUBLIC_ENDPOINTS = {"login", "static"}
 
-#: 完全不参与中间件链路的端点（存活探针）。它会被反代/容器编排高频调用：
-#: 不该建会话（每次探针都写一个 session 文件纯属浪费）、不该要求登录（设了口令后
-#: 探针永远被 302 到登录页，等于没有探针）、也不该写日志与触发清理。
-#: 消费点：ensure_csrf_token / require_login / views.log_request / cleanup.register。
+#: 豁免登录、会话、CSRF、日志与定期清理中间件的探针端点（如存活探针）
 BYPASS_ENDPOINTS = frozenset({"health"})
 
-# 登录失败限流：同一 IP 在滑动窗口内失败达到上限后暂时拒绝，避免绑定局域网时被爆破。
-# 上限与窗口来自 config（`QQCHAT_LOGIN_MAX_ATTEMPTS` / `QQCHAT_LOGIN_WINDOW_SECONDS`），
-# 之所以可调：计数器按 remote_addr 计，反代或 NAT 之后所有请求共享一个地址，
-# 一个人连续输错会把所有人一起锁住（见 config.py 里那段注释）。
+# 登录失败限流：同 IP 在滑动窗口内超限后暂时拒绝（上限见 _LOGIN_FAILURES_MAX，防爆破/表膨胀）
 _login_failures: dict[str, list[float]] = {}
 _login_lock = threading.Lock()
-#: 失败记录表的硬上限。窗口内的失败才计数，但扫描流量可以伪造大量**不同**地址，
-#: 只按"过期"清理的话表会一直涨；超过上限就按最近一次失败时间淘汰最旧的。
 _LOGIN_FAILURES_MAX = 1000
 
 
@@ -74,30 +66,20 @@ def _now() -> float:
 
 
 def ensure_csrf_token():
-    """确保会话中存在 CSRF token（session 服务端存储，攻击者无法读取）"""
-    if request.endpoint in BYPASS_ENDPOINTS:
-        return None  # 探针不建会话：否则每次健康检查都在磁盘上留一个 session 文件
+    """确保会话中存在 CSRF token（豁免静态资源与探针端点，避免无 cookie 静态请求新建空会话覆盖登录态）。"""
+    if request.endpoint in BYPASS_ENDPOINTS or request.endpoint == "static":
+        return None
     if "csrf_token" not in session:
         session["csrf_token"] = secrets.token_hex(32)
 
 
 def inject_csrf_token():
-    """向所有模板注入 csrf_token，供表单与 AJAX 请求使用
-
-    顺带注入 auth_enabled：导航栏只应在**真的设了口令**时才渲染"退出登录"。
-    没设口令时模板不输出任何东西，于是各页面的渲染结果与加这个按钮之前逐字节一致
-    （私聊 8 页有对照用例钉着）。
-    """
+    """向所有模板注入 csrf_token 与 auth_enabled（仅启用口令时渲染退出按钮）。"""
     return {"csrf_token": session.get("csrf_token", ""), "auth_enabled": bool(ACCESS_PASSWORD)}
 
 
 def _check_csrf() -> bool:
-    """校验请求携带的 CSRF token 与会话一致
-
-    注意：secrets.compare_digest 对含非 ASCII 字符的 str 会抛 TypeError，
-    而 token 来自请求方（可被任意构造），必须先落到 bytes 再比较，
-    否则一个中文 token 就能把 POST 打成 500。
-    """
+    """校验请求携带的 CSRF token 与会话一致（转 UTF-8 bytes 再 compare_digest，防非 ASCII 抛错）。"""
     provided = request.headers.get("X-CSRF-Token") or request.form.get("csrf_token") or ""
     expected = session.get("csrf_token", "")
     if not expected or not provided:
@@ -109,12 +91,7 @@ def _check_csrf() -> bool:
 
 
 def _csrf_error_response():
-    """CSRF 校验失败时给用户可执行的提示。
-
-    这里最常见的原因不是攻击，而是**会话文件被 24 小时回收**（清理任务按 mtime
-    回收 flask_session/，而只读浏览不会刷新 mtime）：用户隔天回来点上传/分析，
-    旧页面带的 token 对不上新会话，原先只回一句"CSRF 校验失败"，无从下手。
-    """
+    """CSRF 校验失败时返回含刷新引导的 400 错误。"""
     if not session.get("csrf_token"):
         msg = "CSRF 校验失败：会话已过期（长期未操作会被自动回收），请刷新页面（F5）后重试"
     else:
@@ -124,15 +101,7 @@ def _csrf_error_response():
 
 
 def _origin_allowed() -> bool:
-    """校验浏览器 Origin 来源（存在时）。拒绝非白名单来源，防御跨站提交/DNS rebinding。
-
-    curl 等非浏览器请求不带 Origin，交由 CSRF token 校验兜底。
-    允许：回环地址、当前绑定地址 FLASK_HOST、以及显式配置的 ALLOWED_ORIGINS
-    （局域网 IP / 自定义域名请写进 .env 的 ALLOWED_ORIGINS）。
-
-    这里**故意不**把请求自带的 Host 计入白名单：DNS rebinding 场景下浏览器发出的
-    Origin 与 Host 同为攻击者域名，一旦信任 Host，该校验就恒为 True、形同虚设。
-    """
+    """校验浏览器 Origin 是否在白名单内（回环、FLASK_HOST 与 ALLOWED_ORIGINS；不信任请求 Host 头）。"""
     origin = request.headers.get("Origin")
     if not origin:
         return True
@@ -330,24 +299,10 @@ def require_login():
 
 
 def _regenerate_session_id() -> None:
-    """认证状态升级后轮换服务端 session id（防御会话固定）。
-
-    调用时机有硬要求：必须**在会话已经写入内容之后**。flask-session 的
-    ``regenerate()`` 内部用 ``if session:`` 做前置判断，而只剩 ``_permanent``
-    的空会话在 ``ServerSideSession.__bool__`` 下是 falsy——放在 session.clear()
-    之后、写入 auth_ok 之前调用会被静默跳过，看起来"轮换过了"其实没有。
-
-    为什么必须轮换：``session.clear()`` 只清空服务端**内容**，浏览器 cookie 里的
-    sid 原样不变。攻击者若能预先固定住受害者的 sid（明文 HTTP 嗅探、或诱导受害者
-    点击带 Set-Cookie 的响应），该 sid 一旦登录就直接是已认证状态。
-    ``regenerate()`` 会删掉旧 sid 的存储、生成新 sid 并置 ``modified=True``，
-    于是响应会重下 cookie——旧 sid 随即失效。
-    """
+    """认证状态切换后轮换服务端 sid（须在 session 写入新键后调用，避免空 session 跳过 regenerate）。"""
     try:
         current_app.session_interface.regenerate(session)
     except AttributeError:
-        # 换用不支持 regenerate 的会话后端（或更老的 flask-session）时降级：
-        # 内容与 CSRF token 已轮换，只是 sid 复用——记一条便于排查。
         logger.warning("当前会话后端不支持 session id 轮换，会话固定防护已降级")
 
 
@@ -357,73 +312,54 @@ def login():
         return redirect(url_for("index"))
     error = None
     if request.method == "POST":
+        if not _origin_allowed():
+            return "非法来源", 403
         ip = request.remote_addr or "127.0.0.1"
-        # 一次加锁内完成"判超限 + 记下这次尝试"：拆成两步会留下并发窗口，
-        # 让实际允许的尝试次数变成 上限 + 并发数（见 _register_login_attempt）。
         wait = _register_login_attempt(ip)
         if wait:
             logger.warning("登录尝试过于频繁，暂时拒绝 [%s]（还需 %d 秒）", ip, wait)
-            # Retry-After 是给脚本/客户端看的（浏览器会忽略）；页面提示用同一份秒数，
-            # 免得用户只看到"请稍后再试"却不知道要等多久。
             resp = make_response(
                 render_template("login.html", error=f"尝试次数过多，请 {wait} 秒后再试"), 429
             )
             resp.headers["Retry-After"] = str(wait)
             return resp
-        # 登录接口自身豁免 CSRF（无 session 时先建 token）
         pwd = request.form.get("password", "")
         if hmac.compare_digest(pwd.encode("utf-8"), ACCESS_PASSWORD.encode("utf-8")):
-            # 登录成功即换一份会话内容：丢弃匿名阶段的残留，并轮换 CSRF token 与 sid
+            # 登录成功后重置内容、CSRF token 并轮换 sid（须在写入 session 之后调用）
             session.clear()
             session["auth_ok"] = True
             session["csrf_token"] = secrets.token_hex(32)
-            # 必须排在写入 auth_ok/CSRF 之后：regenerate() 用 `if session:` 判空，
-            # 空会话会被它静默跳过（详见函数注释）。
             _regenerate_session_id()
             _clear_login_failures(ip)
             nxt = request.args.get("next") or ""
-            # 防开放重定向：反斜杠先归一为斜杠再判断。浏览器把 `/\evil.com` 当作
-            # 协议相对地址（等价于 //evil.com），只查 "//" 会被这样绕过。
-            safe_next = nxt.replace("\\", "/")
-            if not safe_next.startswith("/") or safe_next.startswith("//"):
+            # 反斜杠先归一，防止 `/\\evil.com` 绕过协议相对 URL 检查
+            safe_next = (nxt or "").strip().replace("\\", "/")
+            parsed_next = urlparse(safe_next)
+            if (
+                not safe_next.startswith("/")
+                or safe_next.startswith("//")
+                or parsed_next.scheme
+                or parsed_next.netloc
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in safe_next)
+            ):
                 safe_next = url_for("index")
             logger.info("登录成功 [%s]", ip)
             return redirect(safe_next)
-        # 这次尝试在上面已经记下了（_register_login_attempt），这里只报告失败——
-        # 再记一次会让一次输入算两次失败，用户更早被锁在门外。
+        # 失败计数已在 _register_login_attempt 记录
         error = "口令错误，请重试"
         logger.warning("登录失败 [%s]", ip)
     return render_template("login.html", error=error)
 
 
 def logout():
-    """退出登录：作废服务端会话（连旧 sid 的存储一起删掉）。
-
-    只接受 POST 且必须过 `_guard_post()`（Origin + CSRF）：
-
-    - 不接受 GET，因为登出是**改状态**的操作，而任意第三方页面都能用
-      `<img src="http://127.0.0.1:5000/logout">` 触发它（登出 CSRF 危害有限，
-      但本项目的口径是"改状态就过 _guard_post"，这里不开口子）；
-    - 只 `session.clear()` 不够：它清掉的是服务端**内容**，浏览器上的 sid 原样保留，
-      那份（现在是空的）会话文件还会躺在盘上直到 24 小时回收——用户点了"退出登录"，
-      却指望不了"这个会话从此不存在"。所以这里显式轮换 sid：`regenerate()` 会删掉
-      旧 sid 的存储并下发一个新的空会话，旧 cookie 即使被别人捡走也指不到任何东西。
-    - 轮换之后**不再**额外 `delete_cookie`：`save_session` 会为新 sid 下发 cookie，
-      与显式删除争同一个响应头，结果只取决于先后（后写的生效）。而"旧 sid 已作废"
-      这件事已经由上面的存储删除保证，留一个全新的匿名会话反而是对的
-      （登录页需要的 CSRF token 也随新会话重新生成，旧的 token 一并失效）。
-
-    注意这里**不**清登录失败限流的计数：登出本身与该地址的失败历史无关。
-    """
+    """退出登录（仅 POST 且校验 Origin/CSRF）：清空并轮换作废旧 sid 存储，不重置限流计数。"""
     guard = _guard_post()
     if guard:
         return guard
 
     ip = request.remote_addr or "127.0.0.1"
-    # 松开本会话对当前聊天内容的引用：会话即将作废，留着那条记录等于让一个
-    # 已经不存在的会话继续"主张"这份缓存还在被使用，从而把级联清理挡住最多 24 小时。
-    # （引用表的 TTL 是兜底，不是不用管的理由：退出登录就是明确的"不再使用"。）
-    from webapp import store  # 延迟导入：store 不依赖本模块，但避免模块级互相缠绕
+    # 立即释放当前会话对缓存的活跃引用，避免继续阻塞清理
+    from webapp import store
 
     store.forget_live_chat(session.get("chat_hash", "") or "", getattr(session, "sid", "") or "")
     session.clear()

@@ -33,17 +33,11 @@ from parser.group_identity import (
 # 北京时间固定偏移，供月份分组与本地统计共用，避免口径不一致
 CST = timezone(timedelta(hours=8))
 
-# 不应进入统计与 AI 分析的消息类型：合并转发（旧格式 type_11，内容是一整段外部聊天，
-# 不是两人的对话）、豆腐记录等小程序卡片（旧格式 type_23，无正文可分析）。
-# 新版导出器改用语义化类型名（text/reply/system/file/forward/json/video…），因此这里
-# 补上 "system"：系统提示消息在群里占 5% 上下（实测导出就是这个量级），绝大多数带
-# system 标记、由 is_statistical 拦下，但"标记不齐全"是实测踩过的坑，多一道类型防线更稳。
-# 注意 type_17（商城大表情）**不在**这里：它是表情信号，按表情统计与展示。
-# 也**故意不**跳过 forward/json：新版导出器给它们的是结构化短标签（标题+条数、卡片摘要），
-# 由 MEDIA_KINDS 的媒体口径承载，长度有上限（MEDIA_LABEL_MAX），不会灌进 prompt。
+# 不参与统计与 AI 分析的消息类型：type_11（合并转发）、type_23（小程序卡片）、system（部分缺 system 标记）。
+# 保留 type_17（商城大表情）与 forward/json（走 MEDIA_KINDS 受控短标签）。
 SKIP_MSG_TYPES = {"type_11", "type_23", "system"}
 
-# 非文本媒体元素 → 中文标签（用于给模型与统计一个可读的占位说明）
+# 非文本媒体元素 → 中文标签
 MEDIA_KINDS = {
     "file": "文件",
     "video": "视频",
@@ -51,13 +45,9 @@ MEDIA_KINDS = {
     "wallet": "红包",
     "face_bubble": "表情气泡",
     "markdown": "Markdown消息",
-    "json": "卡片消息",  # QQ 小程序/分享卡片（导出器只给到 "[JSON消息]"）
-    "av_record": "通话",  # 语音/视频通话记录（"通话 - 未接听" 之类）
-    # 语音消息本体（不是通话记录）。此前它不在任何分派分支里：一条语音会以
-    # 零正文、零标记的形态混进消息计数，词频与句长按空串处理、模型则完全看不见
-    # 它——"语音多的人整段内容消失"。补进媒体口径后它至少**可见且可数**
-    # （有 duration/summary 就给标签）。ASR 转写是另一件事，不在本地承诺范围内。
-    "voice": "语音",
+    "json": "卡片消息",
+    "av_record": "通话",
+    "voice": "语音",  # 语音消息本体（按 MEDIA_LABEL_MAX 展示 duration/summary）
 }
 # 媒体标签的长度上限：文件名/转发标题可能很长，截断保留可读性
 MEDIA_LABEL_MAX = 40
@@ -67,11 +57,7 @@ _TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M")
 
 
 def _to_int(value) -> int:
-    """导出器把体积写成字符串，解析失败按 0 处理（统计不该被脏字段打断）
-
-    OverflowError 也要接住：json.loads 默认接受 `Infinity` 字面量，
-    `int(float(inf))` 抛的是 OverflowError，不在 (TypeError, ValueError) 之列。
-    """
+    """将体积等数值字段安全转为非负整数（含 Infinity → OverflowError），失败返回 0。"""
     try:
         return max(0, int(float(value)))
     except (TypeError, ValueError, OverflowError):
@@ -121,37 +107,19 @@ def _media_label(el_type: str, el_data: dict, raw_text: str = "") -> str:
 
 
 def _allow_multi_party() -> bool:
-    """旧的 QQCHAT_ALLOW_MULTI_PARTY 开关（调用时读 env，方便测试与临时放行）。
-
-    新口径统一由 group_chat_mode() 表达；本函数只保留"旧变量怎么解析"这唯一一处，
-    作为 two_party 模式的别名来源。旧文档与旧用户配置都指向这个变量，不能删。
-
-    解析走 config.env_bool：这个变量原先自己写了一份词表（1/true/yes/on），
-    与别处的布尔解析各写各的，正是"口径漂移"的起点。词表没有任何放宽——
-    同一批写法仍然是真、其余仍然是假，所以既有配置的行为逐字不变。
-    """
+    """兼容旧开关 QQCHAT_ALLOW_MULTI_PARTY（作为 two_party 别名，走 config.env_bool 解析）。"""
     return env_bool("QQCHAT_ALLOW_MULTI_PARTY", False)
 
 
-#: 群聊轨是否已经可以对外服务。**这是"多人导出不再拒收"的唯一闸门**。
-#: 2026-09-12 随 M3（群聊页面、互动矩阵、成员画像、成本预提示）一起打开；
-#: 打开前它一直是 False：群聊的数据层/统计/AI/页面没就绪时，默认模式下多人导出仍被拒收，
-#: 用户看不到半成品。想回到升级前的行为（多人导出直接拒收）把 QQCHAT_GROUP_CHAT 设为 off，
-#: 或设为 two_party 继续用旧的「我 vs 其他人」两分类归并。
+#: 群聊轨对外开放开关（配合 QQCHAT_GROUP_CHAT=auto|off|two_party 控制多人导出策略）
 GROUP_TRACK_READY = True
 
-#: QQCHAT_GROUP_CHAT 的合法取值。auto=识别为群聊（需 GROUP_TRACK_READY）；
-#: off=维持拒收；two_party=按「我 vs 其他人」两分类归并（旧 QQCHAT_ALLOW_MULTI_PARTY=1 语义）。
+#: QQCHAT_GROUP_CHAT 合法值：auto=按群聊解析，off=维持拒收，two_party=我 vs 其他人两分类归并
 _GROUP_MODES = ("auto", "off", "two_party")
 
 
 def group_chat_mode() -> str:
-    """多人（群聊）导出的处置模式，调用时读环境变量。
-
-    口径唯一来源：解析层、应用层与文档都以本函数为准，避免"配置读两遍、取值不一致"。
-    旧变量 QQCHAT_ALLOW_MULTI_PARTY 继续作为 two_party 的别名生效（README 与既有
-    测试都依赖它）；新变量优先，非法值回退默认并告警。
-    """
+    """返回多人导出处置模式（优先读 QQCHAT_GROUP_CHAT，兼容 QQCHAT_ALLOW_MULTI_PARTY）。"""
     raw = (os.getenv("QQCHAT_GROUP_CHAT", "") or "").strip().lower()
     if raw in _GROUP_MODES:
         return raw
@@ -164,20 +132,9 @@ def group_chat_mode() -> str:
 
 
 def multi_party_action(chat: "ChatData") -> str:
-    """多人防线对这份导出的处置：none | reject | merge | group。
+    """多人防线处置：none | reject | merge | group。
 
-    判定顺序即优先级：
-    1. 有"有实质发言的第三方"（按门槛，见 _multi_party_offenders）时：
-       - two_party → merge（旧逃生阀：所有人并进"对方"，用户知情）；
-       - auto 且群聊轨已就绪 → group（走群聊分析）；
-       - 其余（off，或 auto 但群聊轨未就绪）→ reject（与升级前逐字节一致）。
-    2. 没有达到门槛的第三方，但**导出器自报这是群聊**（新版导出器写 chatInfo.type=group）
-       且 auto 且群聊轨已就绪 → group。
-
-    第 2 条是新增能力，只在"按老口径会判成私聊"的缝隙里生效，因此**不会改变任何既有
-    分支的结果**：老分支该 merge 的仍 merge、该 reject 的仍 reject。它解决的是这类失真：
-    3 人小群里两位长期潜水时，按发言门槛会被当成私聊，除我之外的所有人被并进"对方"。
-    注意导出器自报类型**不**触发拒收（off 模式下它的行为与升级前完全一样）。
+    按门槛判定的实质第三方优先；无实质第三方但导出器声明 chatInfo.type='group' 且处于 auto 时也按 group 处理。
     """
     mode = group_chat_mode()
     if not _multi_party_offenders(chat):
@@ -191,37 +148,18 @@ def multi_party_action(chat: "ChatData") -> str:
     return "reject"
 
 
-# 第三方要"有实质发言"才认定成群聊：QQChatExporter 会给系统类消息安排占位
-# sender（name="系统消息"、uid 形如"未知…"），而这类条目的 system 标记并不齐全——
-# 实测较大规模的私聊导出里，若干占位消息中就有 1 条 type_23（商城表情）没有
-# system 标记。若按"出现过就算一位"，正常私聊会被判成群聊直接拒收（这正是把
-# 判定口径收紧到 is_statistical + 设门槛的原因）。
+# 排除系统占位发言者后，第三方达到条数与占比门槛才视为实质多人参与者
 MULTI_PARTY_MIN_MESSAGES = 3
 MULTI_PARTY_MIN_SHARE = 0.005
 
 
 def _statistical_sender_counts(chat: "ChatData") -> dict:
-    """统计口径下的发言者 → 条数（只算真正会进分析与统计的消息）。
-
-    走 ChatData.sender_counts() 的实例级缓存：多人防线、拒收文案里的占比、以及
-    "谁是对方"三处都要这份计数，原先各遍历一遍——数万条消息下是两到四遍全量。
-    返回的是缓存对象本身，调用方只读。
-    """
+    """返回统计口径下的只读发言者计数缓存（见 ChatData.sender_counts）。"""
     return chat.sender_counts()
 
 
 def _multi_party_offenders(chat: "ChatData") -> list[tuple[str, int]]:
-    """返回「除自己与主要对话方之外、且有实质发言」的第三方（条数降序）。
-
-    私聊返回空列表；群聊会返回其余参与者，由调用方决定是否拒收。
-
-    占位 sender 必须先摘掉（is_placeholder_sender），否则这里数出来的"第三方"里
-    混的是导出器给系统类消息安排的假发言人：门槛只有 3 条，而一份几百条的私聊导出
-    只要漏标 3 条，就会被整条流水线判成群聊（other_uid 置空、response_time 不再算），
-    在 QQCHAT_GROUP_CHAT=off 下更是直接拒收。身份层早就按名字/uid 前缀排除它们
-    （collect_participants 里那一手），门槛这侧此前一直漏了同一个判据 ——
-    两处口径不一致，出问题的是更难发现的那一侧。
-    """
+    """返回除自己与主要对话方外达到门槛的第三方 (uid, count) 列表（已过滤占位 sender）。"""
     counts = _statistical_sender_counts(chat)
     names = chat.sender_names()
     others = {
@@ -237,32 +175,17 @@ def _multi_party_offenders(chat: "ChatData") -> list[tuple[str, int]]:
     return [(uid, n) for uid, n in ranked[1:] if n >= threshold]
 
 
-#: 毫秒时间戳的合法区间：2001-01-01 ~ 2033-05-18（1e12 ~ 2e12 ms）。
-#: 落在这个区间之外的数值不是"晚一点/早一点"，而是**量级错了**：导出器写秒、
-#: 微秒或纳秒时，数值会整倍地偏出千倍。下游每个消费点都假定这个字段是毫秒
-#: （`datetime.fromtimestamp(timestamp / 1000)`、按月分组的键、时间跨度差值），
-#: 所以量级错的值有两种后果，都很糟：
-#:   ① 微秒/纳秒 → /1000 后是一个荒谬的年 → datetime 直接抛
-#:      `OSError: [Errno 22] Invalid argument`，**整份文件传不上去**，
-#:      而用户看到的症状是一个与"时间戳格式"毫不相干的 errno；
-#:   ② 秒 → 被当成毫秒解释成 1970-01，凭空多出一个"月份"，而 _analyze_periods
-#:      会把它当作真实月份**发一次付费调用**——正是本函数丢弃 ts<=0 想防的事。
-#: 因此这里做一次量级归一；归一不了的（例如落在合法区间但明显是错值）不猜，
-#: 落回 time 字符串，两条路都不通则返回 None 由调用方丢弃并计入 dropped_messages。
-_MS_MIN = 1_000_000_000_000  # 1e12  ≈ 2001-09
-_SEC_MIN, _SEC_MAX = 1_000_000_000, 2_000_000_000  # 1e9 ~ 2e9 秒 ≈ 2001 ~ 2033
-_USEC_MIN, _USEC_MAX = 1_000_000_000_000_000, 2_000_000_000_000_000  # ×1e3 of sec
-_NSEC_MIN, _NSEC_MAX = 1_000_000_000_000_000_000, 2_000_000_000_000_000_000  # ×1e6
+#: 合法毫秒时间戳区间（约 2001~2033），用于识别并换算秒/微秒/纳秒错位单位，避免落入 1970-01 或触发 OSError
+_MS_MIN = 1_000_000_000_000
+_SEC_MIN, _SEC_MAX = 1_000_000_000, 2_000_000_000
+_USEC_MIN, _USEC_MAX = 1_000_000_000_000_000, 2_000_000_000_000_000
+_NSEC_MIN, _NSEC_MAX = 1_000_000_000_000_000_000, 2_000_000_000_000_000_000
 
 
 def _normalise_epoch_ms(ts: int) -> Optional[int]:
-    """把"量级明显不是毫秒"的 epoch 值归一成毫秒；认不出来返回 None。
-
-    只认三种整倍错位（秒 / 微秒 / 纳秒），且都要求归一后落回合法毫秒区间——
-    宁可返回 None 让调用方回退 time 字符串，也不把一个仍然荒谬的值喂给下游。
-    """
+    """将秒/微秒/纳秒量级的时间戳归一到毫秒合法区间；无法归一回 None。"""
     if _MS_MIN <= ts <= 2_000_000_000_000:
-        return ts  # 本来就是毫秒
+        return ts
     if _SEC_MIN <= ts <= _SEC_MAX:
         return ts * 1000
     if _USEC_MIN <= ts <= _USEC_MAX:
@@ -273,24 +196,15 @@ def _normalise_epoch_ms(ts: int) -> Optional[int]:
 
 
 def _parse_timestamp(value, time_str: str = "") -> Optional[int]:
-    """把导出文件里的时间戳统一成毫秒整数；无法解析时返回 None。
-
-    导出文件可能存在缺失/为 null/是字符串的时间戳。缺键时会 get 到 0，
-    若照单全收，该消息会被归入 1970-01 并作为一个"月份"送去 AI 分析；
-    为 null 或字符串时则会让排序/统计直接抛异常。这里统一兜底：
-    先按数值解析并做量级归一（见 _normalise_epoch_ms），失败再用 time 字符串回退，
-    两者都不可用则返回 None（调用方丢弃该条）。
-    """
+    """统一时间戳为毫秒整数：优先数值并做量级归一，失败回退 time_str，均失败返回 None。"""
     try:
         ts = int(float(value))
         if ts > 0:
             normalised = _normalise_epoch_ms(ts)
             if normalised is not None:
                 return normalised
-            # 数值为正但量级救不回来：不许把荒谬值喂给下游，落回 time 字符串
     except (TypeError, ValueError, OverflowError):
-        # OverflowError 来自 Infinity 时间戳（json.loads 默认接受）——按"数值不可用"
-        # 处理，落回 time 字符串，两者都不行就返回 None 丢弃该条，不许崩整份文件
+        # 含 Infinity（OverflowError）等非法数值时回退到 time 字符串解析
         pass
     text = (time_str or "").strip()
     if text:
@@ -357,6 +271,7 @@ class Message:
     image_bytes: int = 0  # 只属于图片元素的字节
     image_count: int = 0  # 这条消息里有几个图片元素（一条消息连发 3 张图就是 3 张）
     image_ids: list[str] = field(default_factory=list)  # 各图片元素的 md5（去重口径用）
+    image_items: list[dict] = field(default_factory=list)  # 各图片元素的 path/md5/w/h 列表
 
 
 def is_statistical(m: "Message") -> bool:
@@ -428,7 +343,6 @@ class ChatData:
         _statistical_sender_counts，数万条消息就是两到四遍全量遍历。
         与 months()/participants() 同样的安全前提：解析完成后 messages 不再变动。
 
-        返回的是缓存对象**本身**——调用方只读，不要就地改（那会污染后续判定）。
         """
         if self._sender_counts_cache is None:
             counts: dict[str, int] = {}
@@ -440,11 +354,7 @@ class ChatData:
                     if shown:
                         by_name = name_tally.setdefault(m.sender_uid, {})
                         by_name[shown] = by_name.get(shown, 0) + 1
-            # 与 group_identity._Acc.display_name 同一条规则：**strip 后的名字**记票，
-            # 选名按次数降序、同数按名字升序。strip 这一步不能省：带尾空格的昵称若不归一，
-            # 会被拆成两个桶，同一份数据里 other_name 可能选出"小明 "而成员表/互动矩阵
-            # 是"小明"（身份层 _Acc.add 正是按 strip 后记票的）——"同一条规则"要的是
-            # 两边真用同一条规则，不是注释里写着就算数。
+            # 与 group_identity._Acc.display_name 保持一致：strip 后按次数降序、同数按名称升序取代表名
             self._sender_names_cache = {
                 uid: min(by.items(), key=lambda kv: (-kv[1], kv[0]))[0] for uid, by in name_tally.items()
             }
@@ -452,32 +362,19 @@ class ChatData:
         return self._sender_counts_cache
 
     def sender_names(self) -> dict:
-        """统计口径下的 发言者 uid → 最常用的显示名（与 sender_counts 同一趟遍历算出）。
-
-        返回的是缓存对象**本身**，调用方只读。
-        """
-        self.sender_counts()  # 保证两份缓存一起算出来（同一趟遍历）
+        """返回统计口径下的只读 uid → 常用显示名缓存（与 sender_counts 同趟计算）。"""
+        self.sender_counts()
         return self._sender_names_cache or {}
 
     def participants(self) -> list[Participant]:
-        """参与者身份列表（按发言条数降序，显示名已唯一化），结果缓存在本对象上。
-
-        与 months() 同样的安全前提：解析完成后 messages 不再变动，所以缓存只算一次。
-        注意这里**不设门槛**——有一条统计口径消息就算一位；"是不是群聊"由
-        multi_party_action() 按门槛判定。门槛用于判定，名单用于归属，二者不能混。
-        """
+        """参与者列表（按发言降序且显示名已唯一化，不设数量门槛；结果实例内缓存）。"""
         if self._participants_cache is None:
             found = collect_participants(self.statistical(), self.self_uid)
             self._participants_cache = unique_display_names(found)
         return self._participants_cache
 
     def months(self) -> dict[str, list["Message"]]:
-        """按月分组消息（结果缓存在本对象上）。
-
-        一次分析里月份分组会被多个维度各算一遍，每遍都要做全量时区转换 + strftime：
-        数万条消息每次约几十到一百多毫秒，几个维度叠加就是白烧几百毫秒。消息列表在解析
-        完成后不再变动，所以这里的缓存与 _stats_cache 同样安全。
-        """
+        """按 CST 月份分组的消息字典（解析后只读，结果实例内缓存）。"""
         if self._months_cache is None:
             self._months_cache = _group_by_month(self.messages)
         return self._months_cache
@@ -490,36 +387,23 @@ def load_chat(filepath: str) -> ChatData:
     with open(filepath, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
-    # 整份文件不是对象（null / 数字 / 数组）时，下面的 `in` 会抛
-    # TypeError: argument of type 'NoneType' is not a container —— 又是一句与
-    # "文件格式"毫不相干的 Python 内部错误。这里先如实拒绝。
     if not isinstance(raw, dict):
         raise ValueError("无效的 QQChatExporter JSON 格式：顶层不是一个对象")
     if "chatInfo" not in raw or "messages" not in raw:
         raise ValueError("无效的 QQChatExporter JSON 格式")
 
-    # 下面这几处 `or {}` / `or []` / isinstance 检查不是防御性过剩：导出文件里
-    # "键存在但值是 null"与"整个元素是 null"都实测出现过（撤回消息、被删的引用、
-    # 手工编辑过的样例文件），而 .get("k", {}) 只挡得住**缺键**，null 会照样返回给
-    # 调用方 —— 症状是上传返回 400，正文写着 'NoneType' object has no attribute 'get'，
-    # 一句 Python 内部错误，用户完全不知道该改文件还是该骂工具。
-    #
-    # messages 必须**报错**而不是静默跳过：它是 dict/str 时 `for msg in ...` 会逐 key
-    # 迭代、每个 key 都"不是对象"被计入 dropped —— 整份文件被静默吞掉（症状是
-    # "共 N 条消息、0 条可分析"，total_count 还照抄 statistics），比崩更难发现。
+    # messages 非数组时必须报错，避免 for 迭代 dict/str 静默吞掉整份记录；其余键为 null 时安全回退
     if not isinstance(raw.get("messages"), list):
         raise ValueError("无效的 QQChatExporter JSON 格式：messages 不是一个数组")
     chat_info = raw.get("chatInfo") or {}
     if not isinstance(chat_info, dict):
         raise ValueError("无效的 QQChatExporter JSON 格式：chatInfo 不是一个对象")
-    # uid 一律强转成 str：数字型 uid（异版导出器/手工编辑写成 JSON number）若不归一，
-    # 稍后 is_placeholder_sender 的 .strip() 会把整份文件崩成
-    # 'int' object has no attribute 'strip'（解析坏形状不抛异常正是本函数的承诺）。
+    # uid 强转为 str，避免数字型 uid 在后续 .strip()/查找中触发类型错误
     self_uid = str(chat_info.get("selfUid") or "")
     self_name = str(chat_info.get("selfName") or "")
     stats_raw = raw.get("statistics") or {}
     if not isinstance(stats_raw, dict):
-        stats_raw = {}  # 整段汇总不可用，按缺省处理（函数尾部同口径）
+        stats_raw = {}
     senders = stats_raw.get("senders") or []
     if not isinstance(senders, list):
         senders = []
@@ -609,6 +493,7 @@ def load_chat(filepath: str) -> ChatData:
         image_bytes = 0
         image_count = 0
         image_ids: list[str] = []
+        image_items: list[dict] = []
         media_kind = ""
         media_label = ""
         media_bytes = 0
@@ -616,6 +501,8 @@ def load_chat(filepath: str) -> ChatData:
         media_path = ""
         media_w = 0
         media_h = 0
+        non_image_id = ""
+        non_image_path = ""
         face_url = ""
         reply_to_id = ""
         mentions: list[str] = []
@@ -663,12 +550,16 @@ def load_chat(filepath: str) -> ChatData:
                 image_count += 1
                 media_bytes += img_size
                 img_md5 = str(el_data.get("md5") or "")
+                img_path = str(el_data.get("url") or el_data.get("localPath") or "")
+                img_w = _to_int(el_data.get("width"))
+                img_h = _to_int(el_data.get("height"))
                 if img_md5:
                     image_ids.append(img_md5)
+                image_items.append({"path": img_path, "id": img_md5, "w": img_w, "h": img_h})
                 media_id = media_id or img_md5
-                media_path = media_path or str(el_data.get("url") or el_data.get("localPath") or "")
-                media_w = media_w or _to_int(el_data.get("width"))
-                media_h = media_h or _to_int(el_data.get("height"))
+                media_path = media_path or img_path
+                media_w = media_w or img_w
+                media_h = media_h or img_h
             elif el_type == "reply":
                 is_reply = True
                 # 只给被回复消息的 id：发言人要在全量消息里回查（见下面的回填）
@@ -683,58 +574,40 @@ def load_chat(filepath: str) -> ChatData:
                 elif auid not in mentions:
                     mentions.append(auid)
             elif el_type in MEDIA_KINDS:
-                # 文件/视频/转发卡片/红包/表情气泡/通话/卡片：让它们参与统计与 AI 分析
-                # （正文仍保持干净，不塞占位符）。
-                # **字节逐个记**：media_kind/media_label 仍是"第一个非图片媒体"（标签与
-                # 按类计数是单条消息一个语义），但 media_bytes 若也只记第一个，一条"两个
-                # 文件"的消息会把后一个的字节凭空丢掉——统计层的 other_bytes = 合计-图片，
-                # 漏进的字节就哪个口径都找不回（旧注释还把这份合计说成"所有媒体的合计"）。
+                # media_kind/label 取首个非图片媒体；media_bytes 累加所有非图片媒体字节，避免多文件消息漏计
                 media_bytes += _to_int(el_data.get("size"))
                 if not media_kind:
                     media_kind = el_type
                     media_label = _media_label(el_type, el_data, raw_text)
-                    media_id = media_id or str(el_data.get("md5") or "")
-                    media_path = media_path or str(el_data.get("url") or el_data.get("localPath") or "")
+                    non_image_id = str(el_data.get("md5") or "")
+                    non_image_path = str(el_data.get("url") or el_data.get("localPath") or "")
             else:
-                # 未知元素类型：不再静默吞掉（旧实现里 elif 链没有尾巴，导出器哪天
-                # 改名 "text"，正文会丢光而统计照常出数——谁都看不见事故发生了）。
-                # 记一次类型与次数，供仪表盘提示条与 inspect_chat 对账；这里**不**
-                # 猜语义，猜错了比不猜更贵（会污染统计口径）。
+                # 记录未识别元素类型频次供格式漂移探测，不猜测语义
                 unknown_in_msg += 1
                 if el_type:
                     chat.unknown_element_types[el_type] = chat.unknown_element_types.get(el_type, 0) + 1
 
         clean_text = "".join(text_parts).strip()
-        # 没有结构化 text 元素但原始文本存在时（如无 elements 的纯文本消息），
-        # 回退到原始文本，避免消息内容丢失；有 elements 的消息不回落，
-        # 以免把 "[图片]" 之类的占位符当成正文统计。
-        # 唯一的例外：elements 非空但**每个**元素都无法识别（格式漂移的征兆，
-        # 比如导出器把 "text" 改了名）——此时结构化侧什么都给不出来，
-        # 再不回落正文就整条丢光。识别成功过半的消息不回落（占位符污染照旧防住）。
+        # 无结构化 text 时仅在纯文本或 elements 全部未知时回退 raw_text，防止把 "[图片]" 占位符混入正文
         if not clean_text and raw_text and elements and unknown_in_msg == len(elements):
             clean_text = raw_text.strip()
         elif not clean_text and not elements and raw_text:
             clean_text = raw_text.strip()
 
+        if not has_image:
+            media_id = media_id or non_image_id
+            media_path = media_path or non_image_path
+
         parsed = Message(
-            # id 必须与 reply_to_id 同一个类型口径：下面 :618 那类取值处把
-            # referencedMessageId 用 str() 归一了，而这里的 msg["id"] 若照原样收
-            # （数字导出就是 int），回填时 `uid_by_id = {m.id: ...}` 建的是 int 键、
-            # 查的是 str → 每条回复都查不到人，reply_to_uid 全空。
-            # 症状是静默的：精确回复是群聊互动里最强的信号，它整体归零后被计入
-            # reply_unresolved，显式互动矩阵全空，成员画像拿到"0 次"，而文件照样解析成功。
+            # id 与 reply_to_id 统一转 str，防止数字 ID 与字符串引用匹配失败
             id=str(msg.get("id") or ""),
             timestamp=timestamp,
-            # 时间字符串一律由时间戳（权威字段）按北京时间重算：新版导出器的 time
-            # 是 UTC ISO（"2024-01-01T00:00:00.000Z"），直接照抄会让 AI 对话行
-            # 比统计头（CST）早 8 小时——"凌晨三点还在聊"会被读成下午，直接影响判断。
+            # 时间统一按北京时间重算，屏蔽导出器 UTC ISO 字符串造成的 8 小时偏差
             time_str=datetime.fromtimestamp(timestamp / 1000, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
             sender_name=sender_name,
             sender_uid=sender_uid,
             text=clean_text,
             raw_text=raw_text,
-            # 同上：msg["type"] 被 is_statistical 放进 set 里做成员判断，
-            # 非字符串（数字/对象/数组）会导致 TypeError 或静默判错，一律归一。
             msg_type=str(msg.get("type") or ""),
             has_image=has_image,
             is_reply=is_reply,
@@ -756,6 +629,7 @@ def load_chat(filepath: str) -> ChatData:
             reply_to_id=reply_to_id,
             mentions=mentions,
             mentions_all=mentions_all,
+            image_items=image_items,
         )
         chat.messages.append(parsed)
 
@@ -763,19 +637,34 @@ def load_chat(filepath: str) -> ChatData:
 
     # 回填"这条回复的是谁"：reply 元素只给被回复消息的 id，要在全量消息里查一次发言人。
     # 必须等所有消息都解析完再做——被引用消息可能排在引用它的消息之后（实测绝大多数都能回查到）。
-    # 查不到时 reply_to_uid 留空，由统计层如实计入"未解析回复"，不猜、不丢。
+    # 查不到或同一 id 对应多位不同发言人时 reply_to_uid 留空，由统计层如实计入"未解析回复"，不猜、不丢。
     if any(m.reply_to_id for m in chat.messages):
-        uid_by_id = {m.id: m.sender_uid for m in chat.messages if m.id}
+        _unset = object()
+        global_uid: dict[str, Optional[str]] = {}
+        for m in chat.messages:
+            if not m.id:
+                continue
+            prev = global_uid.get(m.id, _unset)
+            if prev is _unset:
+                global_uid[m.id] = m.sender_uid
+            elif prev != m.sender_uid:
+                global_uid[m.id] = None
+
+        seen_uid: dict[str, Optional[str]] = {}
         for m in chat.messages:
             if m.reply_to_id:
-                m.reply_to_uid = uid_by_id.get(m.reply_to_id, "")
+                resolved = seen_uid.get(m.reply_to_id, _unset)
+                if resolved is _unset:
+                    resolved = global_uid.get(m.reply_to_id, "")
+                m.reply_to_uid = resolved or ""
+            if m.id:
+                prev_seen = seen_uid.get(m.id, _unset)
+                if prev_seen is _unset:
+                    seen_uid[m.id] = m.sender_uid
+                elif prev_seen != m.sender_uid:
+                    seen_uid[m.id] = None
 
-    # 多人（群聊）防线：本工具的历史口径是"我 vs 对方"两类。若导入群聊导出，
-    # 除 self 外的所有人都会静默并进"对方"名下——条数、回复速度、锐评全部失真，
-    # 而且用户在界面上完全看不出来。宁可报错也不给出错误的分析。
-    # 判定口径见 _multi_party_offenders：只看统计口径下的消息，且第三方需有实质发言。
-    # 处置方式由 multi_party_action 统一给出（none/reject/merge/group）：
-    # 默认 auto 在群聊轨就绪前仍是 reject，因此升级本版本**不改变任何既有行为**。
+    # 仅保留统计口径且非占位的第三方，按 multi_party_action 决定放行/归并/群聊/拒收
     action = multi_party_action(chat)
     if action == "reject":
         offenders = _multi_party_offenders(chat)
@@ -789,15 +678,7 @@ def load_chat(filepath: str) -> ChatData:
             "（当前是 off，即升级前的拒收行为。）"
         )
 
-    # 确定"对方"是谁：uid 与显示名必须同口径，都取自"统计口径下发言最多的那一方"。
-    # uid 侧早就改成按发言量选了（旧实现取"文件中第一个非自己的 sender"，占位 sender
-    # 一旦排在前面就被认成对方），但**名字侧当时漏了**：它仍按 statistics.senders 的
-    # 文件顺序取第一条非自己项。两份口径不一致时，other_uid 指向真人、other_name 却是
-    # "系统消息"——而 other_name 流向仪表盘"对方"标签、日志，以及喂给模型的对话里
-    # 所有非我方行的署名（dialog._build_dialog 用它当显示名）。等于让模型把真人说的话
-    # 标成"系统消息"，比数字算错更难被发现。
-    # 占位 sender 在这里同样要排除：它可能"发言 1 条"因而选不上，也可能在一份
-    # 全被过滤掉的空记录里成为唯一的非自己项。
+    # 对方 uid 与显示名均取统计口径下发言最多且非占位的另一方
     counts = _statistical_sender_counts(chat)
     names = chat.sender_names()
     ranked = sorted(
@@ -806,15 +687,11 @@ def load_chat(filepath: str) -> ChatData:
             for uid, n in counts.items()
             if uid != self_uid and not is_placeholder_sender(uid, names.get(uid, ""))
         ),
-        # 与 collect_participants 同一条 tie-break（发言量降序、同数按 uid 升序）：
-        # 只按条数排的话，并列时"谁是第一名"退化成 counts 的插入顺序（=最早发言顺序），
-        # 两套系统对同一份文件可以各认各的"对方"。确定性不该分两套。
+        # 同 collect_participants 保持确定性 tie-break（条数降序、同数按 uid 升序）
         key=lambda kv: (-kv[1], kv[0]),
     )
     if ranked:
         chat.other_uid = ranked[0][0]
-        # 名字优先取消息里实际用得最多的那个（比 statistics.senders 的汇总更贴近文件
-        # 本体），退而查 senders 里该 uid 的名字，最后才用 chatInfo.name 兜底。
         sender_name = ""
         for s in senders:
             if isinstance(s, dict) and str(s.get("uid") or "") == chat.other_uid and s.get("name"):
@@ -823,15 +700,12 @@ def load_chat(filepath: str) -> ChatData:
         chat.other_name = names.get(chat.other_uid) or sender_name or other_name
 
     if action == "group":
-        # 群聊：没有单一的"对方"。这里**保留字段**（不改 property，见方案 B2）而不是
-        # 让它悬空——日志与第三方调用点仍会读它。other_name 用群名，other_uid 置空，
-        # 让"群聊里没有对方"这件事在数据上就是显式的；群聊轨一律改用 participants()。
+        # 群聊无单一“对方”：保留字段为群名/空串以兼容旧读取点，成员走 participants()
         chat.is_group_chat = True
         chat.mode = "group"
         chat.other_uid = ""
         chat.other_name = chat.chat_name or "群聊"
     elif action == "merge":
-        # 旧逃生阀：仍按"我 vs 其他人"两分类，如实记下这次的口径，便于排查
         chat.mode = "two_party"
 
     stats = raw.get("statistics") or {}
@@ -841,17 +715,9 @@ def load_chat(filepath: str) -> ChatData:
     time_range = stats.get("timeRange") or {}
     if not isinstance(time_range, dict):
         time_range = {}
-    # 日期字段是字符串，原样保留但挡掉 null（模板与报告页会直接打印它，None 会印成
-    # 一个 "None" 而不是空）
     chat.time_start = time_range.get("start") or ""
     chat.time_end = time_range.get("end") or ""
-    # durationDays 必须过 _to_int：这是本函数里唯一一个直接采信文件数值的字段，
-    # 而导出器把数字写成字符串是常态（media 的 size 同样如此，所以那边过了 _to_int）。
-    # 没归一时 "31" 会一路带到 calc_overview 的除法里 → TypeError: unsupported operand
-    # type(s) for /: 'int' and 'str' → 整份文件的统计全废，而界面上的症状只是
-    # "上传说成功，仪表盘却把我踢回首页"。
-    # 负数同样挡掉（_to_int 夹到 0）：-5 会算出负的日均消息数，页面平静地显示它。
-    # 0 是安全值——calc_overview 见 0 会改按首末消息自己算跨度（days_basis=computed）。
+    # durationDays 统一转非负整数（0 时由 calc_overview 按首末消息计算跨度）
     chat.duration_days = _to_int(time_range.get("durationDays"))
 
     return chat

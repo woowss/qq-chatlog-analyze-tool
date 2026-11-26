@@ -14,36 +14,12 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 #
-"""DeepSeek API 调用封装
+"""DeepSeek API 调用封装与维度编排。
 
-本模块负责**API 层**：客户端复用、调用闸门与限流冷却、错误分类与重试、思考模式、
-各维度的执行体（逐月并发/取消/配额中止），以及进缓存的提示词指纹。
-
-职责拆分到独立模块（调用入口仍在本模块兼容保留）：
-- analyzer/dialog.py       对话构建（把消息压成喂模型的文本）与它自己那套格式化常量；
-- analyzer/month_cache.py  月份级增量缓存（内容寻址键 + manifest 引用计数 + 孤儿回收）。
-- analyzer/llm_transport.py 共享的调用计数、限流、用量记账与重试；
-- analyzer/fingerprint_utils.py 稳定的 AST 源码归一化。
-
-为什么拆：把跨维度共用的纯请求与指纹机械逻辑放在独立模块，方便单独核对与复用。
-为什么**不能**顺手改名：dialog 里那 5 个函数的源码进 PROMPT_FINGERPRINT，
-改名/改注释/被 ruff format 重排都会让所有既有用户的私聊缓存失效、重新付费——
-tests/test_group_foundation.py 的 PINNED_PRIVATE_FINGERPRINT 会让这种改动在 CI 上变红。
-
-两者仍从本模块**再导出**，既有调用点（app.py / webapp / tools / tests）不必改；
-但模块级状态的打桩要打在 owns 它的模块上（见下方导入处的说明）。
-
-命名约定（三条，都是被缓存键逼出来的）：
-1. **进指纹的 5 个函数不能改名**，而且它们正文里引用到的全局名也一起被冻住
-   （_has_content / _vision_digest / _fit_lines / _message_line 等）——理由见 dialog.py
-   的文件说明。下划线在这里不表示"私有"，而是"这个名字参与缓存键"。
-2. 跨模块使用的下划线名（`_analyze_periods` / `_call_api` / `_clamp_int` /
-   `_normalize_topic_weights` / `store._chat_hash` 等）**刻意保留原名**：它们同时是
-   测试的 patch 目标（约二十处，含 6 个测试文件），改名是纯外观收益却要全仓改动，
-   而改漏一处的表现是"打桩没生效"（真调 API 或静默命中真实缓存），代价远大于收益。
-   读代码时请按"约定俗成的内部 API"理解这些名字。
-3. 拆模块时的再导出写成 `X as X`：静态检查据此不再把它当"导入了没用"，
-   也让"哪些名字是对外契约"一眼可见。
+对话构建（`analyzer/dialog.py`）、月份增量缓存（`analyzer/month_cache.py`）、
+限流重试（`analyzer/llm_transport.py`）与 AST 指纹（`analyzer/fingerprint_utils.py`）
+已拆至独立模块，并在此保留兼容重导出；测试打桩请直接作用于对应子模块的全局状态。
+`analyzer/dialog.py` 中参与指纹的函数名及内部实现不可改动，否则会触发历史缓存失效。
 """
 
 import concurrent.futures
@@ -59,9 +35,6 @@ from typing import Any, Callable, Optional
 
 from openai import OpenAI
 
-# 环境变量解析统一走 config 的公开助手：口径只有一份（留空取默认、非法/越界回退并出声）。
-# 这里原先自己实现过一份 _env_number，与 config 的 _env_int 逻辑相同、失败通道却不同
-# （一个写 logger、一个写 stderr），排查"我明明设了参数为什么没生效"时不知道该看哪里。
 from config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_MODEL,
@@ -93,16 +66,7 @@ from analyzer.prompts import (
     SYSTEM_PROMPT_PROFILE,
 )
 
-# —— 下面两个模块是从本文件拆出去的。这里全部重导出：app.py / webapp / tools / tests
-#    既有的 `from analyzer.deepseek_client import configure_month_cache` 这类调用点不必改。
-#
-#    两条必须知道的约定：
-#    ① 进 PROMPT_FINGERPRINT 的 5 个函数（_build_dialog / _message_line / _fit_lines /
-#       _conversation_stats / _short_time）**函数名不可改**，而且它们正文里引用到的全局名
-#       也一起被冻住了（例如 _build_dialog 里调用的 _has_content / _vision_digest）——
-#       getsource 的返回值参与哈希，改名字或改注释都会让所有既有用户的私聊缓存失效、重新付费。
-#    ② **模块级状态**（month_cache._MONTH_CACHE_DIR 等）必须打桩在 owns 它的模块上：
-#       这里的重导出只是搬迁瞬间的值拷贝，改它不影响那边的逻辑。
+# 兼容重导出（dialog 中的指纹函数名及其源码均冻结，改动会改变 PROMPT_FINGERPRINT）
 from analyzer.dialog import (
     MAX_DIALOG_CHARS,
     RELATIVE_MARK_MINUTES,
@@ -122,12 +86,7 @@ from analyzer.dialog import (
     _vision_digest,
 )
 
-# 月份缓存的名字**为兼容而再导出**：app.py 用 configure_month_cache，webapp/cleanup 用
-# sweep_orphan_month_cache，webapp/store 用 purge_month_cache，测试还直接读 _MONTH_CACHE_LOCK /
-# MONTH_CACHE_GRACE_SECONDS 这些模块级状态。写成 `X as X` 是表达"这是有意的再导出"的
-# 标准写法（静态检查据此不再把它当"导入了没用"）。
-# 但**状态**的读写请打桩在 analyzer.month_cache 上：这里的 `_MONTH_CACHE_DIR` 之类只是
-# 搬迁瞬间的值拷贝（字符串/数值），改它不会影响那边的逻辑。
+# 兼容重导出月份缓存接口（状态变量如 _MONTH_CACHE_DIR 须在 analyzer.month_cache 上打桩）
 from analyzer.month_cache import (
     MONTH_CACHE_GRACE_SECONDS as MONTH_CACHE_GRACE_SECONDS,
     _MONTH_CACHE_LOCK as _MONTH_CACHE_LOCK,
@@ -145,6 +104,7 @@ from analyzer.month_cache import (
     purge_month_cache as purge_month_cache,
     sweep_orphan_month_cache as sweep_orphan_month_cache,
 )
+from analyzer import llm_stream
 
 logger = get_logger("deepseek")
 
@@ -173,63 +133,42 @@ _PRIVATE_PROMPT_NAMES = (
 )
 
 
-# 限流节奏默认值按服务商自适应：官方 DeepSeek（并发上限 2500）可以快得多，
-# 而阿里云百炼的 TPM 是按主账号聚合的，必须保守。两个值都可用环境变量覆盖。
+# 按服务商预设请求并发与节流间隔（阿里云百炼按主账号聚合 TPM，默认值更保守）
 _OFFICIAL = "api.deepseek.com" in DEEPSEEK_BASE_URL.lower()
 _DEFAULT_INTERVAL = 0.5 if _OFFICIAL else 3.0
 _DEFAULT_CONCURRENCY = 6 if _OFFICIAL else 2
 CONCURRENCY = int(env_number("LLM_CONCURRENCY", _DEFAULT_CONCURRENCY, 1, 64))
-# 全局请求平滑：两次 API 调用之间的最小间隔（秒）。注意 _pace() 是串行闸门，
-# N 次调用的排队下限是 (N-1)×该值，所以它直接决定多月份分析的墙钟时间。
 CALL_MIN_INTERVAL = float(env_number("LLM_CALL_MIN_INTERVAL", _DEFAULT_INTERVAL, 0.0, 60.0))
-# 单次 API 请求超时（秒）：准确性优先后单月 prompt 可达十几万 tokens、思考模式输出
-# 也可能很长，120s 偏紧（大月份实测 14s，但留足余量更稳）
 REQUEST_TIMEOUT = 300
-# TPM 限流（429 Allocated quota exceeded）：等待后重试，通常 1 分钟内恢复
 TPM_MAX_ATTEMPTS = 4
 TPM_WAIT_SECONDS = 25.0
 
-# 各维度输出 token 预算：准确性优先。官方 max output 为 384K，这里给足——
-# max_tokens 只是上限，模型停下来就不计费，卡太紧才会真的出事：
-# 实测最长那个月（prompt 可达数十万 tokens）开着思考模式时
-# 8192 会被思维链吃满 → finish_reason=length → 整月结果被丢弃。
+# 各维度输出 token 上限预算（供 LLM_MAX_TOKENS_<DIM> 覆盖；思考模式需预留思维链空间）
 _DEFAULT_MAX_TOKENS = {
     "emotion": 32768,
     "topics": 32768,
     "relationship": 32768,
     "habits": 32768,
     "profile": 49152,
-    # —— 群聊维度（analyzer/group_client.py）。加在这里是为了共用
-    #    LLM_MAX_TOKENS_<维度> 的环境变量覆盖；它们**不在**下面的私聊指纹常量元组里，
-    #    因此增删/调整不会让任何私聊缓存失效。成员画像与私聊锐评同档（每个成员一次调用）。
+    # 群聊、总括与提问共用 LLM_MAX_TOKENS_<维度> 覆盖机制，不计入私聊提示词指纹
     "group_dynamics": 32768,
     "group_topics": 32768,
     "group_emotion": 32768,
     "member_profiles": 49152,
-    # —— 「整体总括」维度（analyzer/recap_client.py）。加进这张表是为了共用
-    #    LLM_MAX_TOKENS_<维度> 的环境变量覆盖；它**不在**私聊指纹的常量元组里
-    #    （那里只 .get() 五维的名字），所以加这一行不会让任何既有缓存失效。
     "recap": 16384,
-    # 自定义提问：单问单答；预算同样守"≥16384 给思维链留足空间"的全维度不变量
-    # （max_tokens 只是上限，短答案不会因此多付一分钱）
     "ask": 16384,
 }
 
 
 def _max_tokens(dim: str, default: int) -> int:
-    """按维度读输出预算，可用 LLM_MAX_TOKENS_<维度> 覆盖（如 LLM_MAX_TOKENS_PROFILE=65536）。
-
-    此前遇到截断时，启动横幅让用户"调大 MAX_TOKENS_BY_DIM（analyzer/deepseek_client.py）"，
-    等于要求普通用户改源码；现在改 .env 即可。预算参与提示词指纹，
-    所以调大之后旧缓存会自动失效、按新预算重算。
-    """
+    """读取维度输出 token 上限（支持环境变量 LLM_MAX_TOKENS_<DIM> 覆盖，影响指纹键）。"""
     env_name = f"LLM_MAX_TOKENS_{dim.upper()}"
     raw = (os.getenv(env_name, "") or "").strip()
     if not raw:
         return default
     try:
         value = int(float(raw))
-    except ValueError:
+    except (TypeError, ValueError, OverflowError):
         logger.warning("%s=%r 不是数字，已回退为 %d", env_name, raw, default)
         return default
     if not 256 <= value <= 384_000:
@@ -240,15 +179,7 @@ def _max_tokens(dim: str, default: int) -> int:
 
 MAX_TOKENS_BY_DIM = {dim: _max_tokens(dim, default) for dim, default in _DEFAULT_MAX_TOKENS.items()}
 
-# 思考模式：准确性优先——官方 DeepSeek 端点默认**全维度开启**（思维链能显著提升
-# 证据引用与推断质量），并且各维度输出预算已提到 8192 以上，不会再出现
-# "思维链吃光预算 → finish_reason=length → 结果丢弃"的老问题。
-# - LLM_THINKING=disabled 可整体关掉；LLM_THINKING_DIMS=a,b 可只给指定维度开；
-# - 非官方网关（如百炼）不认识该字段：未显式配置时不发送，避免被严格网关判为非法参数。
-#
-# 这个开关历来还认 enabled/disabled（README 与 CHANGELOG 都这么写过），比共用的
-# parse_bool 词表宽。所以先归一成 true/false 再交给它——统一解析口径不该顺手改掉
-# 一个既有开关的语义（把 enabled 读成假，等于用户设了思考模式却静默失去它）。
+# 思考模式开关：官方端点默认全开，非官方网关未显式设置时不透传参数；兼容 enabled/disabled 取值
 _THINKING_ENV = (os.getenv("LLM_THINKING", "") or "").strip().lower()
 _THINKING_NORMALIZED = {"enabled": "true", "disabled": "false"}.get(_THINKING_ENV, _THINKING_ENV)
 THINKING_DEFAULT = parse_bool(_THINKING_NORMALIZED, _OFFICIAL)
@@ -259,10 +190,7 @@ _SEND_THINKING_PARAM = bool(_THINKING_ENV or THINKING_DIMS) or "deepseek" in DEE
 
 
 def thinking_enabled(dim: str) -> bool:
-    """该维度是否使用思考模式：全局开关命中，或维度名在 LLM_THINKING_DIMS 白名单中。
-
-    维度名与调用时传入的 tag 一致（emotion/topics/relationship/habits/profile）。
-    """
+    """判断维度是否启用思考模式（由全局开关或 LLM_THINKING_DIMS 控制）。"""
     return THINKING_DEFAULT or (dim or "").strip().lower() in THINKING_DIMS
 
 
@@ -922,9 +850,10 @@ def _call_api(
             THINKING_MIN_TOKENS,
         )
     tpm_wait = TPM_WAIT_SECONDS if tpm_wait is None else tpm_wait
-    max_attempts = max(retry, TPM_MAX_ATTEMPTS - 1) + 1
+    max_attempts = retry + TPM_MAX_ATTEMPTS
 
     while True:
+        llm_stream.reset_delta_emitted()
         # partial 而不是闭包：把当前的 think 值**绑定**进参数里（闭包会跟着
         # 后面的 think = False 一起变，被截断降级后的重试就不是同一个请求了）
         resp, reason = _request_with_retry(
@@ -955,18 +884,26 @@ def _call_api(
                 logger.warning(
                     "输出被 max_tokens=%s 截断，改用非思考模式重试一次（保住这个月的结果）", max_tokens
                 )
+                llm_stream.emit_event(
+                    "warn",
+                    f"输出被 max_tokens={max_tokens} 截断，改用非思考模式重试一次",
+                )
                 think = False
                 continue
             logger.error("模型输出被 max_tokens=%s 截断，放弃本次结果（不重试）", max_tokens)
+            llm_stream.emit_event("error", f"模型输出被 max_tokens={max_tokens} 截断，放弃本次结果")
             return None
         try:
             # strict=False：容忍字符串里未转义的控制字符。模型偶尔把多行文本写成**裸换行**
             # （锐评、群动态里常见），严格模式会直接判非法 JSON，从而丢掉整月/整位成员的结果。
             # 真实数据实测：三次失败里有两次属于这种"内容合法、转义偷懒"，放宽解析即可救回；
             # 它只影响解析容忍度，不会把合法 JSON 解析错。
-            return json.loads(choice.message.content, strict=False)
+            parsed = json.loads(choice.message.content, strict=False)
+            llm_stream.emit_result_fallback(parsed)
+            return parsed
         except (json.JSONDecodeError, TypeError) as e:
             logger.error("模型返回非法 JSON（不重试）: %s", e)
+            llm_stream.emit_event("error", f"模型返回非法 JSON：{e}")
             return None
 
 
@@ -1046,27 +983,15 @@ def _analyze_periods(
     chat_hash: str = "",
     fingerprint: "str | None" = None,
 ) -> dict[str, Any]:
-    """并发逐月调用 API，返回 {period: result}。
-
-    单月失败仅记录日志并跳过，不中断整体分析。
-    on_progress(done, total) 每完成一个月回调一次；
-    should_cancel() 返回 True 时不再启动新任务并尽快返回已完成部分。
-
-    提交策略是"有界窗口"（最多 CONCURRENCY 个月在跑）：早先一次性 submit
-    全部月份时，线程池队列里的月份已经排队，用户点取消也拦不住，剩余月份
-    照常调用计费——与"可随时取消"的承诺相反。
-
-    fingerprint：月份缓存的指纹，默认私聊指纹（既有行为、键值不变）。
-    群聊维度传 group_prompt_fingerprint()，两类月份的缓存互不干扰。
-    """
+    """按有界并发窗口逐月调用 API；支持取消、月份级增量缓存（含多代指纹链迁移）及配额中止。"""
     results: dict[str, Any] = {}
     total = len(months)
     done = 0
-    fatal: dict[str, str] = {}  # 配额耗尽等致命错误：中止剩余月份
-    failed_periods: set[str] = set()  # 普通请求失败或模型输出无效的月份
+    fatal: dict[str, str] = {}
+    failed_periods: set[str] = set()
     invalid_periods: dict[str, str] = {}
     failure_lock = threading.Lock()
-    used_keys: set[str] = set()  # 本维度命中的月份缓存键，收尾时一次性写 manifest
+    used_keys: set[str] = set()
 
     def _mark_failed(period: str, path: str = "") -> None:
         with failure_lock:
@@ -1075,18 +1000,10 @@ def _analyze_periods(
                 invalid_periods[period] = path
 
     def _cancel_requested() -> bool:
-        # 用户点了取消，或进程正在关闭（Ctrl+C）：都不该再往外发新请求
         return shutdown_requested() or bool(should_cancel and should_cancel())
 
     def _keys_for(prompt: str, active_fingerprint: "str | None" = None) -> list:
-        """该月 prompt 对应的缓存键：[当前键, 各历史代键…]（尝试顺序即链序）。
-
-        历史代是为了读取"AST 归一之前"（以及未来任何一次换代之前）写下的月份缓存。
-        不这么做的话，指纹公式一改，所有既有用户的月份缓存全部不再命中——他们会为
-        **同一段对话**重新付一次钱，而这次改动本身与提示词、与对话内容都无关。
-        链按**指纹值**映射（调用方传进来的就是这个族的值），换代时只需把上一代
-        当前值压进对应族的链头，这里不再逐族写 if。
-        """
+        """返回该月提示词的 [当前键, 历史代键...] 列表（供按代迁移旧月份缓存）。"""
         current_fp = active_fingerprint or fingerprint or PROMPT_FINGERPRINT
         keys = [_month_key(system_prompt, prompt, current_fp)]
         for legacy_fp in _legacy_chain_for_fingerprint_value(current_fp):
@@ -1095,74 +1012,75 @@ def _analyze_periods(
         return keys
 
     def _work(period: str, msgs: list) -> tuple[str, Optional[dict]]:
-        # 已被排入线程池但尚未开始执行时取消：直接跳过，不产生 API 调用
         if _cancel_requested():
             return period, None
-        try:
-            prompt = make_prompt(period, msgs)
-            if not prompt.strip():
-                return period, None
-            keys = _keys_for(prompt, getattr(prompt, "cache_fingerprint", None))
-            key = keys[0]
-            # 思考模式必须参与口径核对：思维链开与关产出的结果差别很大，让一次
-            # "关了思考"的分析吃到"开着思考"算出来的月份，用户看到的就是配置静默失效
-            # （维度缓存那侧早就用 `_think` 后缀把两者分开了，月份缓存这一侧一直漏着）。
-            # 取值与 _call_api 实际用的那一次完全一致（它按 dim=tag 决定发不发 thinking）。
-            want_thinking = thinking_enabled(tag)
-            result = _read_result_cache(key, tag, expect_thinking=want_thinking, chat_hash=chat_hash)
-            if result is None:
-                # 必须**挨代**试，不能只看 keys[1]：链里现在可能有两代以上
-                # （私聊在"原文公式"之外又多了一代 AST 归一期的键，见
-                # PRIVATE_FINGERPRINT_GENERATIONS）。写死下标的版本只会试到链头那一代，
-                # 于是"更早一代"写下的月份缓存永远读不到——用户为同一段对话再付一次钱，
-                # 而这正是 legacy_fingerprints_for_dimension 当初泛化成链要防的事，
-                # 只是读侧漏跟着改。顺序即链序：最近的换代在前。
-                for legacy_key in keys[1:]:
-                    result = _read_result_cache(
-                        legacy_key, tag, expect_thinking=want_thinking, chat_hash=chat_hash
+        with llm_stream.stream_context(unit=f"{tag}:{period}", label=f"{period} 月", fresh_state=True):
+            try:
+                prompt = make_prompt(period, msgs)
+                if not prompt.strip():
+                    return period, None
+                keys = _keys_for(prompt, getattr(prompt, "cache_fingerprint", None))
+                key = keys[0]
+                # 思考模式须与 _call_api 口径一致并参与月份缓存校验
+                want_thinking = thinking_enabled(tag)
+                result = _read_result_cache(key, tag, expect_thinking=want_thinking, chat_hash=chat_hash)
+                if result is None:
+                    # 按指纹代次链逐代回溯旧缓存并在命中后就地迁移到当前键
+                    for legacy_key in keys[1:]:
+                        result = _read_result_cache(
+                            legacy_key, tag, expect_thinking=want_thinking, chat_hash=chat_hash
+                        )
+                        if result is None:
+                            continue
+                        if migrate_month_cache(
+                            legacy_key, key, dimension=tag, expect_thinking=want_thinking, chat_hash=chat_hash
+                        ):
+                            logger.info("%s 命中旧指纹的月份缓存，已迁移到当前键", period)
+                        else:
+                            logger.info("%s 命中旧指纹的月份缓存", period)
+                        break
+                if result is not None:
+                    logger.info("%s 命中月份缓存，跳过 API 调用", period)
+                    llm_stream.emit_event(
+                        "cache",
+                        f"{period} 月命中本地缓存（{len(msgs)} 条消息），跳过 API 调用",
+                        data={"cached": True},
                     )
-                    if result is None:
-                        continue
-                    # 旧键里的结果照常可用：改名到当前键，并按**当前键**记账（下面 used_keys），
-                    # 否则新文件会成为"无引用"，宽限期后被孤儿回收删掉。
-                    if migrate_month_cache(
-                        legacy_key, key, dimension=tag, expect_thinking=want_thinking, chat_hash=chat_hash
-                    ):
-                        logger.info("%s 命中旧指纹的月份缓存，已迁移到当前键", period)
-                    else:
-                        logger.info("%s 命中旧指纹的月份缓存", period)
-                    break
-            if result is not None:
-                logger.info("%s 命中月份缓存，跳过 API 调用", period)
-            else:
-                result = _call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag, dim=tag)
-                if not result:
-                    _mark_failed(period)
-                elif supports_dimension(tag):
-                    try:
-                        _validate_before_month_cache(tag, result)
-                    except ResultValidationError as e:
-                        # 日志只保留维度、月份和字段路径；不记录模型结果，避免把聊天原句
-                        # 或服务商错误正文带进日志。失败月份不会进入月份缓存，重试时会补它。
-                        _mark_failed(period, e.path)
-                        logger.warning("%s 月 AI 结果结构无效（字段 %s）", period, e.path)
-                        result = None
-                # 清理守卫：用户在这几分钟里换了文件，这一轮就不该把含聊天原句引用
-                # 的结果写回盘上（否则级联清理报称"已删除"的数据会原地复活）。
-                # 已经付费拿到的结果本身照常返回给这一轮，只是不缓存。
-                if result and not purge_marks.is_marked(chat_hash):
-                    _write_month_cache(key, result, thinking=want_thinking)
-            if result:
-                result["period"] = period
-                result["month"] = period
-                used_keys.add(key)
-                return period, result
-        except QuotaExhaustedError as e:
-            fatal.setdefault("error", str(e))
-            logger.error("%s 月 AI 分析中止（配额耗尽）", period)
-        except Exception as e:
-            _mark_failed(period)
-            logger.error("%s 月 AI 分析失败: %s", period, e)
+                else:
+                    llm_stream.emit_event("stage", f"开始分析 {period} 月（{len(msgs)} 条消息）")
+                    result = _call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag, dim=tag)
+                    if not result:
+                        _mark_failed(period)
+                    elif supports_dimension(tag):
+                        try:
+                            _validate_before_month_cache(tag, result)
+                        except ResultValidationError as e:
+                            # 仅记录维度/月份/字段路径，避免原始消息或错误体泄露到日志
+                            _mark_failed(period, e.path)
+                            logger.warning("%s 月 AI 结果结构无效（字段 %s）", period, e.path)
+                            llm_stream.emit_event("error", f"{period} 月 AI 结果结构无效（字段 {e.path}）")
+                            result = None
+                    if result:
+                        llm_stream.emit_result_fallback(result)
+                        llm_stream.emit_event("stage", f"{period} 月分析完成")
+                    # 若分析期间聊天已被清理，仅返回内存结果而不回写月份磁盘缓存
+                    if result and not purge_marks.is_marked(chat_hash):
+                        _write_month_cache(key, result, thinking=want_thinking)
+                if result:
+                    result["period"] = period
+                    result["month"] = period
+                    used_keys.add(key)
+                    return period, result
+            except llm_stream.StreamCancelledError:
+                llm_stream.emit_event("stage", f"{period} 月已取消")
+            except QuotaExhaustedError as e:
+                fatal.setdefault("error", str(e))
+                logger.error("%s 月 AI 分析中止（配额耗尽）", period)
+                llm_stream.emit_event("error", f"{period} 月分析中止：配额耗尽")
+            except Exception as e:
+                _mark_failed(period)
+                logger.error("%s 月 AI 分析失败: %s", period, e)
+                llm_stream.emit_event("error", f"{period} 月 AI 分析失败：{scrub_secrets(e)}")
         return period, None
 
     pending = list(months.items())
@@ -1170,11 +1088,9 @@ def _analyze_periods(
         with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
             futures: dict[concurrent.futures.Future, str] = {}
             while pending or futures:
-                # 只补足到并发上限：取消后窗口内的任务跑完即止，剩余月份不再启动
                 while pending and len(futures) < CONCURRENCY and not fatal and not _cancel_requested():
                     period, msgs = pending.pop(0)
                     # ContextVars do not propagate into pool workers automatically.
-                    # Each submitted month gets its own context, including refresh/cancel policy.
                     from contextvars import copy_context
 
                     futures[pool.submit(copy_context().run, _work, period, msgs)] = period
@@ -1193,31 +1109,20 @@ def _analyze_periods(
                         try:
                             on_progress(done, total)
                         except Exception as e:
-                            # 进度回调只管界面显示，出错不该中断分析；留一条 debug 便于排查"进度不动"
                             logger.debug("进度回调异常（忽略）: %s", e)
                 if fatal:
-                    # 配额耗尽：取消排队中的月份，尽快收尾
                     for f in futures:
                         f.cancel()
                     break
     finally:
-        # manifest 一次写入：不管正常结束、取消还是配额中止，已经用到的月份都要记账
-        # （否则这些月份文件会变成"无引用"，宽限期后被孤儿回收删掉，增量分析白跑）
+        # 无论正常完成、取消或配额中止，均批量登记已引用月份键，避免已完成月份变为孤儿
         _record_month_usage(chat_hash, used_keys)
 
     if fatal:
-        # 配额中止一律上报，哪怕已经拿到几个月的结果。
-        # 原先"有一个月成功就当成正常结果返回"的做法，会让调用方把**缺了后面所有月**的
-        # 残缺结果写进维度缓存并置 done：用户之后每次点这个维度都直接命中这份残缺缓存，
-        # 缺掉的那几个月永远不会再补——界面显示"分析完成"，数据却少了一半，正是最难发现
-        # 的那类错。这里抛出去，jobs 侧会记为失败、不写维度缓存；而已成功的那几个月
-        # **已经落在月份缓存里**，充值或调高上限后重跑只为缺的月份付费。
-        # 与 _stop_requested 对"取消/关闭"立的规矩同一性质（见 webapp/jobs.py 那段注释）。
+        # 配额中止须上抛，避免残缺月份汇总写入维度缓存；已完成的月份已在月份缓存中保留
         raise QuotaExhaustedError(fatal["error"])
 
     if failed_periods and not _cancel_requested():
-        # 成功月份已独立写入内容缓存。不要把缺月的汇总结果交给 jobs.py 写成完整维度缓存，
-        # 否则之后的普通请求会永久命中这份残缺汇总，错过月份也不会再被补算。
         if invalid_periods:
             first_path = next(iter(invalid_periods.values()))
             raise AnalysisIncompleteError(
@@ -1489,65 +1394,84 @@ def _analyze_person(
     stratified=True（锐评）：按时间均匀抽样覆盖整个时段 —— 否则 growth_observation
     要求的"这段时间的变化"根本不在样本里，模型只能编或写数据不足。
     """
-    try:
-        request_data = _prepare_person_request(
-            system_prompt,
-            sample_size,
-            msgs,
-            display_name,
-            prompt_template,
-            tag=tag,
-            stratified=stratified,
-            chat_hash=chat_hash,
-            context_messages=context_messages,
-            speaker_name_of=speaker_name_of,
-            scope_id=scope_id,
-        )
-        if request_data is None:
-            return None
-        valid_all = request_data["valid_all"]
-        user_content = request_data["user_content"]
-        cache_key = request_data["cache_key"]
-        want_thinking = request_data["thinking"]
-        result = _read_result_cache(cache_key, tag, expect_thinking=want_thinking, chat_hash=chat_hash)
-        if result is not None:
-            logger.info("%s 命中个人分析缓存，跳过 API 调用", mask_name(display_name))
-        else:
-            result = _call_api(
+    unit_id = f"{tag}:{display_name}"
+    with llm_stream.stream_context(unit=unit_id, label=display_name, fresh_state=True):
+        try:
+            request_data = _prepare_person_request(
                 system_prompt,
-                user_content,
-                max_tokens=max_tokens,
+                sample_size,
+                msgs,
+                display_name,
+                prompt_template,
                 tag=tag,
-                dim=tag,
+                stratified=stratified,
+                chat_hash=chat_hash,
+                context_messages=context_messages,
+                speaker_name_of=speaker_name_of,
+                scope_id=scope_id,
             )
+            if request_data is None:
+                return None
+            valid_all = request_data["valid_all"]
+            user_content = request_data["user_content"]
+            cache_key = request_data["cache_key"]
+            want_thinking = request_data["thinking"]
+            result = _read_result_cache(cache_key, tag, expect_thinking=want_thinking, chat_hash=chat_hash)
+            if result is not None:
+                logger.info("%s 命中个人分析缓存，跳过 API 调用", mask_name(display_name))
+                llm_stream.emit_event(
+                    "cache",
+                    f"{display_name} 命中个人缓存（{len(valid_all)} 条消息），跳过 API 调用",
+                    data={"cached": True},
+                )
+            else:
+                llm_stream.emit_event("stage", f"开始分析 {display_name}（{len(valid_all)} 条有效消息）")
+                result = _call_api(
+                    system_prompt,
+                    user_content,
+                    max_tokens=max_tokens,
+                    tag=tag,
+                    dim=tag,
+                )
+                if result:
+                    try:
+                        _validate_before_month_cache(tag, result)
+                    except ResultValidationError as e:
+                        logger.warning(
+                            "%s 的 %s 结果结构无效（字段 %s）",
+                            mask_name(display_name),
+                            tag,
+                            e.path,
+                        )
+                        llm_stream.emit_event(
+                            "error",
+                            f"{display_name} 的 {tag} 结果结构无效（字段 {e.path}）",
+                        )
+                        raise AnalysisIncompleteError(
+                            f"{mask_name(display_name)} 的 {tag} 结果结构无效（字段 {e.path}）；可重试该成员"
+                        ) from e
+                    llm_stream.emit_result_fallback(result)
+                    llm_stream.emit_event("stage", f"{display_name} 分析完成")
+                if result and not purge_marks.is_marked(chat_hash):
+                    _write_month_cache(cache_key, result, thinking=want_thinking)
+            if result and chat_hash:
+                _record_month_usage(chat_hash, {cache_key})
             if result:
-                try:
-                    _validate_before_month_cache(tag, result)
-                except ResultValidationError as e:
-                    logger.warning(
-                        "%s 的 %s 结果结构无效（字段 %s）",
-                        mask_name(display_name),
-                        tag,
-                        e.path,
-                    )
-                    raise AnalysisIncompleteError(
-                        f"{mask_name(display_name)} 的 {tag} 结果结构无效（字段 {e.path}）；可重试该成员"
-                    ) from e
-            if result and not purge_marks.is_marked(chat_hash):
-                _write_month_cache(cache_key, result, thinking=want_thinking)
-        if result and chat_hash:
-            _record_month_usage(chat_hash, {cache_key})
-        if result:
-            result["name"] = display_name
-            result["total_messages"] = len(valid_all)
-            return result
-    except QuotaExhaustedError:
-        raise  # 配额耗尽需中止整个维度，不能被当作单人失败吞掉
-    except AnalysisIncompleteError:
-        raise
-    except Exception as e:
-        logger.error("%s 的 AI 分析失败: %s", mask_name(display_name), scrub_secrets(e))
-    return None
+                result["name"] = display_name
+                result["total_messages"] = len(valid_all)
+                return result
+        except llm_stream.StreamCancelledError:
+            llm_stream.emit_event("stage", f"{display_name} 已取消")
+            raise
+        except QuotaExhaustedError:
+            llm_stream.emit_event("error", f"{display_name} 分析中止：配额耗尽")
+            raise  # 配额耗尽需中止整个维度，不能被当作单人失败吞掉
+        except AnalysisIncompleteError:
+            raise
+        except Exception as e:
+            logger.error("%s 的 AI 分析失败: %s", mask_name(display_name), scrub_secrets(e))
+            llm_stream.emit_event("error", f"{display_name} 的 AI 分析失败：{scrub_secrets(e)}")
+        return None
 
 
 def _person_analysis_spec(dimension: str) -> tuple[str, str, int, bool]:
@@ -1610,6 +1534,8 @@ def analyze_habits(
                 chat_hash=chat_hash,
                 scope_id=getattr(chat, "analysis_scope_id", ""),
             )
+        except llm_stream.StreamCancelledError:
+            break
         except QuotaExhaustedError:
             raise
         except AnalysisIncompleteError:
@@ -1675,6 +1601,8 @@ def analyze_profile(
                 ),
                 scope_id=getattr(chat, "analysis_scope_id", ""),
             )
+        except llm_stream.StreamCancelledError:
+            break
         except QuotaExhaustedError:
             raise
         except AnalysisIncompleteError:

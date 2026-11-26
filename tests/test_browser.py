@@ -31,6 +31,7 @@ class TestBrowserFlows(unittest.TestCase):
                 result["group_evidence"] = "「今晚开黑吗」"
             return result
 
+        cls._real_dc_call_api = staticmethod(dc._call_api)
         cls.calls = mock.Mock(side_effect=fake_api)
         cls.patchers = [
             api_configured_patcher(),
@@ -111,6 +112,7 @@ class TestBrowserFlows(unittest.TestCase):
         expect(self.page.locator("canvas").first).to_be_visible()
         # 图表可见时缓存 XHR 可能还未完成；等待真实界面状态，避免跳转取消正常请求。
         expect(self.page.locator('[data-analysis-empty][data-state="checking"]')).to_have_count(0)
+        self.page.wait_for_load_state("networkidle")
 
     def confirm_plan(self):
         from playwright.sync_api import expect
@@ -579,6 +581,7 @@ class TestBrowserFlows(unittest.TestCase):
         self.page.locator("#msgList .msg-scope-check").first.check()
         self.page.locator("#useSelectedMessages").click()
         self.page.wait_for_url("**/dashboard")
+        self.page.wait_for_load_state("networkidle")
 
         self.page.goto(self.base + "/emotion")
         expect(self.page.locator('[data-analysis-empty][data-state="empty"]')).to_be_visible()
@@ -1189,6 +1192,7 @@ class TestBrowserFlows(unittest.TestCase):
                         "/api/jobs/history",
                         "/api/usage",
                         "/api/analysis-scope",
+                        "/api/analyze-jobs/latest",
                     )
                 )
             )
@@ -1331,7 +1335,16 @@ class TestBrowserFlows(unittest.TestCase):
         self.assertIsNone(self.page.evaluate("key => sessionStorage.getItem(key)", foreign_key))
         self.page.unroute("**/api/analysis/emotion")
         self.errors = [
-            error for error in self.errors if not ("/api/analysis-scope" in error and "ERR_ABORTED" in error)
+            error
+            for error in self.errors
+            if not (
+                "ERR_ABORTED" in error
+                and (
+                    "/api/analysis-scope" in error
+                    or "/api/analyze-jobs/latest" in error
+                    or "/api/analysis/emotion" in error
+                )
+            )
         ]
         self.assertFalse(self.errors, self.errors)
 
@@ -1506,7 +1519,16 @@ class TestBrowserFlows(unittest.TestCase):
         self.assertGreaterEqual(len(navigations), 2)
         self.assertEqual(self.page.evaluate("window.ANALYSIS_PAGE_IDENTITY"), page_identity)
         self.errors = [
-            error for error in self.errors if not ("/api/analysis-scope" in error and "ERR_ABORTED" in error)
+            error
+            for error in self.errors
+            if not (
+                "ERR_ABORTED" in error
+                and (
+                    "/api/analysis-scope" in error
+                    or "/api/analyze-jobs/latest" in error
+                    or "/api/analysis/emotion" in error
+                )
+            )
         ]
         self.assertFalse(self.errors, self.errors)
 
@@ -1558,6 +1580,157 @@ class TestBrowserFlows(unittest.TestCase):
         self.assertEqual(self.page.url, self.base + "/emotion")
         self.page.evaluate("() => { $.get = window.__scopeOriginalGet; }")
         self.assertFalse(self.errors, self.errors)
+
+    def test_group_partial_error_renders_partial_result_without_js_error(self):
+        from playwright.sync_api import expect
+        from analyzer import group_client as gc
+        from analyzer.deepseek_client import QuotaExhaustedError
+        from result_fixtures import for_dimension
+
+        calls = [0]
+
+        def fail_on_second_member(*args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 1:
+                result = for_dimension("member_profiles")
+                result["verdict"] = "首名成员合成局部结论"
+                return result
+            raise QuotaExhaustedError("合成测试配额耗尽")
+
+        group = json.loads((Path(__file__).parent / "fixtures/group_5p.json").read_text(encoding="utf-8"))
+        group["chatInfo"]["name"] = "摸鱼群局部失败回归"
+        payload_bytes = json.dumps(group, ensure_ascii=False).encode("utf-8")
+
+        with mock.patch.object(gc, "_call_api", side_effect=fail_on_second_member):
+            self.upload(payload_bytes)
+            self.page.goto(self.base + "/profile")
+            trigger = self.page.locator('.btn-analyze[data-dim="member_profiles"]')
+            trigger.click()
+            self.confirm_plan()
+
+            status = self.page.locator("#analyzeStatus")
+            expect(status).to_contain_text("合成测试配额耗尽", timeout=20_000)
+            sec = self.page.locator("#sec-profiles")
+            expect(sec).to_contain_text("首名成员合成局部结论")
+            expect(sec).to_contain_text("未保存为完整维度结果")
+            expect(trigger).to_be_enabled()
+            expect(trigger).to_contain_text("分析成员画像")
+            self.assertFalse(self.errors, self.errors)
+
+    def test_live_ai_output_streams_and_reloads_cleanly(self):
+        from types import SimpleNamespace
+        from playwright.sync_api import expect
+        from analyzer import deepseek_client as dc
+        from result_fixtures import for_dimension
+        from test_p1 import payload
+
+        base_emotion = for_dimension("emotion")
+        valid_emotion = {
+            "turning_point": "合成情绪转折<img src=x onerror=alert(1)>",
+            **{k: v for k, v in base_emotion.items() if k != "turning_point"},
+        }
+        full_json = json.dumps(valid_emotion, ensure_ascii=False)
+        anchor = "<img src=x onerror=alert(1)>"
+        split_at = max(85, full_json.index(anchor) + len(anchor) + 2)
+        first_json = full_json[:split_at]
+        second_json = full_json[split_at:]
+
+        first_part_sent = threading.Event()
+        release_gate = threading.Event()
+        self.addCleanup(release_gate.set)
+
+        def chunk(reasoning=None, content=None, finish_reason=None, usage=None):
+            delta = SimpleNamespace(reasoning_content=reasoning, content=content)
+            choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
+            return SimpleNamespace(
+                choices=[choice] if (reasoning or content or finish_reason) else [],
+                usage=usage,
+            )
+
+        class ControlledStream:
+            def __init__(self, first_call):
+                self._first = first_call
+
+            def __iter__(self):
+                if self._first:
+                    yield chunk(reasoning="合成思维阶段一：" + ("正在梳理对话起伏节奏。" * 6))
+                    yield chunk(content=first_json)
+                    first_part_sent.set()
+                    if not release_gate.wait(timeout=15):
+                        raise TimeoutError("release_gate timed out in browser stream test")
+                    yield chunk(content=second_json, finish_reason="stop")
+                    yield chunk(usage=SimpleNamespace(prompt_tokens=320, completion_tokens=96))
+                else:
+                    yield chunk(reasoning="合成思维补充阶段：" + ("复核语气变化细节。" * 6))
+                    yield chunk(content=full_json, finish_reason="stop")
+                    yield chunk(usage=SimpleNamespace(prompt_tokens=210, completion_tokens=64))
+
+        call_index = [0]
+
+        def fake_create(**_kwargs):
+            call_index[0] += 1
+            return ControlledStream(call_index[0] == 1)
+
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)))
+
+        stream_doc = json.loads(payload().decode("utf-8"))
+        stream_doc["chatInfo"]["name"] = "合成流式私聊"
+        stream_payload = json.dumps(stream_doc, ensure_ascii=False).encode("utf-8")
+
+        with (
+            mock.patch.object(dc, "_call_api", self._real_dc_call_api),
+            mock.patch.object(dc, "_get_client", return_value=fake_client),
+        ):
+            self.upload(stream_payload)
+            self.page.goto(self.base + "/emotion")
+            self.page.wait_for_load_state("networkidle")
+
+            self.page.locator("details:has(#inPageRefresh) summary").click()
+            self.page.locator("#inPageRefresh").check()
+            self.page.locator("#inPageAnalyze").click()
+            self.confirm_plan()
+
+            self.assertTrue(first_part_sent.wait(timeout=10), "first streaming chunk was not emitted")
+            panel = self.page.locator("#aiOutputPanel")
+            expect(panel).to_be_visible(timeout=10_000)
+            expect(self.page.locator("#aiOutputTitle")).to_contain_text("情绪")
+            expect(self.page.locator("#aiOutputStatus")).to_have_text("进行中")
+            expect(panel).to_contain_text("合成思维阶段一", timeout=10_000)
+            expect(panel).to_contain_text("<img src=x onerror=alert(1)>", timeout=10_000)
+
+            # Mid-run UI reload must restore all already-streamed output and keep polling.
+            self.page.reload()
+            expect(panel).to_be_visible(timeout=10_000)
+            expect(self.page.locator("#aiOutputStatus")).to_have_text("进行中")
+            expect(panel).to_contain_text("合成思维阶段一")
+            expect(panel).to_contain_text("<img src=x onerror=alert(1)>")
+            expect(self.page.locator("#inPageAnalyze")).to_be_disabled()
+
+            # Let streaming finish after reload; UI should settle to done and render chart.
+            release_gate.set()
+            expect(self.page.locator("#aiOutputStatus")).to_have_text("已完成", timeout=20_000)
+            expect(self.page.locator("#emotionLineChart canvas")).to_be_visible(timeout=10_000)
+            expect(self.page.locator("#inPageAnalyze")).to_be_enabled()
+            expect(panel).to_contain_text("一问一答，平稳收尾")
+            expect(panel).to_contain_text("prompt")
+
+            # Post-completion reload must restore complete detailed AI output.
+            self.page.reload()
+            expect(panel).to_be_visible(timeout=10_000)
+            expect(self.page.locator("#aiOutputStatus")).to_have_text("已完成")
+            expect(panel).to_contain_text("合成思维阶段一")
+            expect(panel).to_contain_text("一问一答，平稳收尾")
+            expect(panel).to_contain_text("<img src=x onerror=alert(1)>")
+            expect(panel).to_contain_text("prompt")
+
+            # Toggle thinking visibility and confirm zero injected images or JS errors.
+            self.page.locator("#aiOutputThinkingBtn").click()
+            self.assertTrue(panel.evaluate("el => el.classList.contains('ai-output-hide-thinking')"))
+            self.page.locator("#aiOutputThinkingBtn").click()
+            self.assertFalse(panel.evaluate("el => el.classList.contains('ai-output-hide-thinking')"))
+            expect(panel.locator("img")).to_have_count(0)
+            self.page.wait_for_load_state("networkidle")
+            self.assertFalse(self.errors, self.errors)
 
 
 if __name__ == "__main__":

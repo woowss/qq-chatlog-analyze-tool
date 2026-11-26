@@ -815,11 +815,11 @@ function renderGroupEmotionTrend(data, chart) {
     if (!el) return;
     var months = monthsOf(data);
     if (!months.length) return;
-    chart = chart || mountChart('emotionTrend');
-    if (!chart) return;
     el.classList.remove('d-none');
     var empty = document.getElementById('emotionTrendEmpty');
     if (empty) empty.classList.add('d-none');
+    chart = chart || mountChart('emotionTrend');
+    if (!chart) return;
     chart.setOption(applyChartTheme({
         tooltip: { trigger: 'axis' },
         grid: { left: 8, right: 16, top: 24, bottom: 24, containLabel: true },
@@ -898,76 +898,63 @@ function groupDimensionUnit(dim) {
     return dim === 'member_profiles' ? '人' : '月';
 }
 
+function renderGroupPartialNotice(el, message) {
+    var notice = document.createElement('div');
+    notice.className = 'alert alert-warning small';
+    notice.textContent = message;
+    el.prepend(notice);
+}
+
+function renderGroupTarget(containerId, renderer, data, partialMessage) {
+    if (!containerId || !renderer) return;
+    var el = document.getElementById(containerId);
+    if (!el) return;
+    try {
+        renderer(el, data);
+    } catch (e) {
+        var prefix = partialMessage ? '部分结果渲染失败：' : '结果渲染失败：';
+        el.innerHTML = '<div class="alert alert-warning small mb-0">' + esc(prefix + e.message) + '</div>';
+        return;
+    }
+    if (partialMessage) renderGroupPartialNotice(el, partialMessage);
+}
+
 // 单维度分析按钮的统一接线：发起 → 进度 → 完成后就地把结果渲染进 container
 // （群聊维度不再跳转页面：结果直接显示在当前页的卡片里，用户不必来回切）
 function analyzeGroupDimension(dim, btn, containerId, renderer, onFinish) {
-    var status = $('#analyzeStatus');
-    var refresh = $('#forceRefresh').is(':checked');
-    var orig = btn.data('orig') || btn.text();
     var unit = groupDimensionUnit(dim);
-    var opts = {
-        refresh: refresh,
-        onProgress: function (done, total) {
-            if (done < 0) { $('#aText').text('正在取消…'); return; }
-            if (total > 0) {
-                $('#aProg').css('width', Math.round(done / total * 100) + '%');
-                $('#aText').text('已完成 ' + done + '/' + total + '（' + unit + '）');
-            } else { $('#aText').text('准备中…'); }
+    runSingleDimension({
+        dim: dim,
+        btn: btn,
+        status: $('#analyzeStatus'),
+        refresh: $('#forceRefresh').is(':checked'),
+        origLabel: btn.data('orig') || btn.text(),
+        progressIds: { progId: 'aProg', textId: 'aText', cancelId: 'aCancel', inline: false },
+        compactAlert: false,
+        updateEmptyState: true,
+        formatProgress: function (done, total) {
+            return total > 0 ? ('已完成 ' + done + '/' + total + '（' + unit + '）') : '准备中…';
         },
-        onDone: function (result, meta) {
-            if (meta && meta.partial) {
-                if (containerId) {
-                    var partialEl = document.getElementById(containerId);
-                    if (partialEl && renderer) {
-                        try { renderer(partialEl, result); } catch (e) {
-                            partialEl.textContent = '部分结果渲染失败：' + e.message;
-                        }
-                        var notice = document.createElement('div');
-                        notice.className = 'alert alert-warning small';
-                        notice.textContent = '本次只处理了所选单元，未标记为完整维度结果。';
-                        partialEl.prepend(notice);
-                    }
-                }
-                status.html('<div class="alert alert-warning mb-0">部分分析已返回；重新预览并选择全部单元后，才会生成完整维度缓存。</div>');
-                btn.prop('disabled', false).text(orig);
-                if (onFinish) onFinish();
-                return;
-            }
+        onPartialResult: function (partialResult, _meta, isFromError) {
+            renderGroupTarget(
+                containerId,
+                renderer,
+                partialResult,
+                isFromError
+                    ? '本次分析未完整完成，以下为已完成部分（未保存为完整维度结果）。'
+                    : '本次只处理了所选单元，未标记为完整维度结果。'
+            );
             setAnalysisEmptyState(dim, 'ready');
-            if (containerId) {
-                var el = document.getElementById(containerId);
-                if (el && renderer) {
-                    try { renderer(el, result); } catch (e) {
-                        el.innerHTML = '<div class="alert alert-warning small mb-0">结果渲染失败：' + esc(e.message) + '</div>';
-                    }
-                }
-            }
-            status.html('<div class="alert alert-success mb-0">分析完成，结果已显示。</div>');
-            btn.prop('disabled', false).text(orig);
-            if (onFinish) onFinish();
+            return isFromError
+                ? null
+                : '部分分析已返回；重新预览并选择全部单元后，才会生成完整维度缓存。';
         },
-        onError: function (msg) {
-            var cancelled = msg === '分析已取消';
-            setAnalysisEmptyState(dim, cancelled ? 'empty' : 'error', cancelled ? null : msg);
-            status.html('<div class="alert alert-' + (cancelled ? 'secondary' : 'danger')
-                + ' mb-0">' + esc(msg) + '</div>');
-            btn.prop('disabled', false).text(orig);
-            if (onFinish) onFinish();
-        }
-    };
-    btn.prop('disabled', true).text('分析中…');
-    status.html(
-        '<div class="spinner-border spinner-border-sm text-primary" role="status"></div>' +
-        '<div class="progress mx-auto mt-2" style="max-width:320px;height:8px;">' +
-        '<div id="aProg" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div></div>' +
-        '<div id="aText" class="small text-muted mt-1">准备中…</div>' +
-        '<button id="aCancel" class="btn btn-sm btn-outline-secondary mt-2">取消</button>'
-    );
-    $('#aCancel').on('click', function () {
-        $(this).prop('disabled', true).text('取消中…');
-        cancelAnalyze(opts);
+        onFullDone: function (result) {
+            renderGroupTarget(containerId, renderer, result, null);
+            return '分析完成，结果已显示。';
+        },
+        onFinish: onFinish
     });
-    startAnalyze(dim, opts);
 }
 
 // 各群聊页面共用的按钮接线：#groupAnalyze 上的 data-dim / data-target 决定行为
@@ -984,6 +971,20 @@ var GROUP_RENDERERS = {
 };
 
 function wireGroupAnalyzeButtons(members) {
+    $('.btn-analyze').each(function () {
+        var btn = $(this);
+        var dim = btn.data('dim');
+        var target = btn.data('target');
+        var renderer = GROUP_RENDERERS[dim];
+        if (dim === 'member_profiles' && members) {
+            renderer = function (el, data) { return renderMemberProfiles(el, data, members); };
+        }
+        if (window.registerAnalysisRefresher && dim && target && renderer) {
+            window.registerAnalysisRefresher(dim, function (data) {
+                renderGroupTarget(target, renderer, data, null);
+            });
+        }
+    });
     $('.btn-analyze').on('click', function () {
         var btn = $(this);
         var dim = btn.data('dim');

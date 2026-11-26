@@ -123,18 +123,9 @@ def log_response(response):
 
 
 def track_active_chat():
-    """刷新"本会话正在用哪份聊天内容"的引用（见 webapp.store.note_live_chat）。
-
-    为什么挂在每个请求上而不是只在上传时记一次：级联清理的判据是"还有没有别的会话
-    在用这个哈希"，而"在用"这件事只有在请求到来时才看得出来。只在上传时记一次的话，
-    一个只浏览不上传的会话会被判成"没人用"，它的付费结果照样被别的会话换文件删掉——
-    修了一半等于没修。每个请求刷一次时间戳，代价是一次 dict 写入。
-
-    引用的有效期与会话文件本身的 24 小时回收同口径（store.LIVE_CHAT_REF_TTL）：
-    关掉的浏览器不再刷时间戳，一天后自动失效，不会把派生缓存永久钉住。
-    """
+    """每次非豁免请求刷新当前会话对 chat_hash 的活跃引用（TTL 同 store.LIVE_CHAT_REF_TTL）。"""
     if request.endpoint in BYPASS_ENDPOINTS:
-        return None  # 存活探针不该建会话，也不该在里面记任何东西
+        return None
     chat_hash = session.get("chat_hash")
     if not chat_hash:
         return None
@@ -144,16 +135,7 @@ def track_active_chat():
 
 
 def inject_stats_flag():
-    """导航栏需要的全局量在这里统一注入。
-
-    - has_stats：当前是否有数据（统计已移出 session，不能在模板里直接判断）
-    - api_ok：API Key 是否配好。原先由 7 个视图各自调一遍 is_api_configured()
-      再传进模板，值完全相同；新增页面时漏传就会显示成"未配置 API Key"，
-      属于看得见却想不到去查的误导。
-    - asset_v：自有 JS/CSS 的版本号，模板用它破浏览器缓存（详见 web/__init__.py）
-    """
-    # is_group_chat：导航栏按模式切换文案与链接。取自 session（上传时写好的解析口径），
-    # 不在这里重新解析文件——那意味着每个请求都要把几十 MB 的导出再读一遍。
+    """向模板全局注入导航状态（has_stats、api_ok、asset_v、is_group_chat、analysis_page_identity）。"""
     is_group = session.get("chat_mode") == "group"
     analysis_page_identity = _analysis_page_identity()
     if "overview" in session:  # 兼容旧会话
@@ -175,32 +157,21 @@ def inject_stats_flag():
 
 
 def index():
-    """首页 / 上传页面
-
-    stats_error：上次上传的统计若在后台线程里失败，这里如实告诉用户
-    （异步化之后没有 HTTP 响应能承载它，不说的话用户只会看到"上传成功却回首页"）。
-    """
+    """首页 / 上传页面，并透传后台统计失败原因。"""
     return render_template("index.html", stats_error=store.stats_error(session.get("chat_hash", "")))
 
 
 def health():
-    """存活探针：只回一行 ok，不碰会话 / 日志 / 登录 / 清理链路。
+    """存活探针：豁免登录、会话、日志与清理中间件（见 webapp.security.BYPASS_ENDPOINTS）。"""
+    from analyzer.shutdown import shutdown_requested
 
-    给反向代理与容器编排用。三条约束缺一不可：
-    - 不能走 require_login：设了口令时探针会被 302 到登录页，永远判为不健康；
-    - 不能建会话：探针可能每秒一次，每次都写一个 session 文件纯属浪费磁盘；
-    - 不能写日志、不能触发清理：同上，高频调用会把日志刷爆。
-    具体豁免见 webapp.security.BYPASS_ENDPOINTS。
-    """
+    if shutdown_requested():
+        return "shutting down", 503
     return "ok", 200
 
 
 def upload():
-    """接收上传的 JSON 文件, 解析并存入 session
-
-    请求线程只做两件事：流式落盘（顺带算哈希）与解析校验（坏文件要当场报 400）。
-    十项统计交给 store.start_stats_job 后台算完落盘——浏览器少等一秒是一秒。
-    """
+    """接收上传的 JSON 文件，解析校验后写会话并触发后台本地统计。"""
     guard = _guard_post()
     if guard:
         return guard
@@ -272,25 +243,14 @@ def upload():
             pass
         return f"解析失败: {e}", 400
 
-    # 新文件解析成功：处置上一份聊天。内容未变则保留其缓存（重传同文件应命中缓存省钱），
-    # 内容变了才联动清除旧文件的派生缓存，避免敏感分析结果成为孤儿。
-    # 「删旧文件的上传副本」与「清旧内容的派生缓存」必须各自判定：后者已经不再依赖
-    # 旧文件还在不在（见上面 old_hash 的取法），把它继续嵌在 os.path.exists(old_path)
-    # 里面，等于把刚修好的隐私缺口重新钉回原处。
+    # 换文件时释放当前会话引用；若已无其它活跃会话共用同一哈希，则联动清理其派生缓存（内容不变仅提示命中缓存）
     switching = bool(old_hash) and old_hash != new_hash
     if not switching and old_hash == new_hash:
-        # 重复上传同一份内容：如实说清"没有新文件、不会重复付费"——
-        # 此前这条最常见的误操作（手滑传了两次）静默成功，用户无从知道
-        # 缓存已经命中、更不知道会不会二次计费。
         flash(
             "这份内容与当前会话是同一份聊天记录：统计与已付费的 AI 结果都会直接命中缓存，不会重复计费。",
             "info",
         )
     if switching:
-        # 本会话先松开对旧内容的引用，再看还有没有**别的**会话在用同一份内容：
-        # 缓存按内容哈希寻址，两个浏览器/两台设备传同一个文件拿到的是同一个哈希，
-        # 于是原先一方换文件会把另一方的统计与已付费 AI 结果一起删掉（对方的症状是
-        # "仪表盘平白弹回首页"，恢复只能重新分析、重新付费）。没人用了才真删。
         store.forget_live_chat(old_hash, sid)
         holders = store.other_live_sessions(old_hash, exclude_sid=sid)
         if holders:
@@ -299,8 +259,7 @@ def upload():
             store._purge_chat_caches(old_hash)
             logger.info("同一会话上传了新文件，旧文件（%s…）的派生缓存已清理", old_hash[:8])
     if old_path and old_path != filepath and os.path.exists(old_path):
-        # 只回收本工具自己写进 uploads/ 的那份副本：会话里的路径万一指向别处
-        # （旧版本遗留、或会话文件被手工编辑过），这里也不该顺手删别人的文件
+        # 仅删除 uploads 目录内的托管副本，防止误删会话外的路径
         if os.path.dirname(old_path) == UPLOAD_FOLDER:
             try:
                 os.remove(old_path)
@@ -316,26 +275,19 @@ def upload():
     # Message IDs and date/member choices belong to the uploaded chat identity.
     session.pop("analysis_scope", None)
     session["total_messages"] = len(chat.messages)
-    # 本次解析用的口径（private/group/two_party）：页面与统计缓存都靠它判断走哪条轨，
-    # 不能在请求里重新判定——那意味着每个请求都重新解析一次大文件。
+    # 缓存解析口径供后续请求分支判断，避免重复解析大文件
     session["chat_mode"] = chat.mode
     store.note_live_chat(new_hash, sid)
-    # 这次上传成功 = 这份内容重新有人要了：撤销"刚被清理"标记，否则它会一直生效。
-    # 原先只有 start_stats_job 里那一处撤销，而它在本地上传统计**命中缓存**时不会执行
-    # ——清理时若统计文件没删掉（Windows 上文件被占用是常见情形），标记就会残留，
-    # 之后该聊天的分析任务会被 `_stop_requested` 当成"这份聊天已废弃"而直接取消：
-    # 不报错、不落盘，用户看到的是"一键全量永远停在取消状态"。放在这里与统计命中与否无关。
+    # 无条件撤销清理标记（含统计缓存命中的路径），避免后续分析任务误判取消
     store._unmark_purged(new_hash)
 
-    # 本地统计：内容相同的文件直接复用上次结果（统计是确定性的，重算纯属浪费）
+    # 本地统计：内容相同的文件直接复用上次结果
     if store._load_stats(new_hash, expect_mode=store.stats_mode_of(chat)) is None:
         logger.info("开始计算本地统计（后台线程）...")
         store.start_stats_job(chat, new_hash)
     else:
         logger.info("本地统计命中缓存，跳过重算")
 
-    # WebUI 图片上传流程：告诉前端"看图需要哪些文件"，由浏览器从用户选中的
-    # 导出目录里只挑这些上传（不搬整个 resources/，也不用改 .env 填路径）。
     wanted = []
     if store.vision_enabled():
         from parser.qq_parser import split_by_month
@@ -355,21 +307,12 @@ def upload():
 
 
 def _wants_json() -> bool:
-    """AJAX 上传（带选中的导出目录）走 JSON 响应，普通表单提交仍走 302 跳转。
-
-    判定口径与"会话过期时该回 401 还是 302"共用 security.wants_json()，
-    两处必须一致：否则会出现"上传接口认为自己在回 JSON、而登录守卫却给它 302"。
-    """
+    """AJAX 请求走 JSON 响应（与 security.wants_json 共用同一判定口径）。"""
     return wants_json()
 
 
 def upload_too_large(error):
-    """413：超过 MAX_CONTENT_LENGTH 时给出可执行的中文提示。
-
-    Flask 默认回的是 Werkzeug 自带的英文页（实测正文只有
-    "The data value transmitted exceeds the capacity limit."），既没说限制是多少，
-    也没说怎么调——用户只看到"上传失败"，无从下手。
-    """
+    """413：超过 MAX_CONTENT_LENGTH 时返回可读中文限制与调整建议。"""
     limit_mb = MAX_CONTENT_LENGTH // 1048576
     message = (
         f"上传文件超过 {limit_mb} MB 上限：可在 .env 中调大 QQCHAT_MAX_UPLOAD_MB 后重启，"
@@ -396,13 +339,7 @@ def _is_group() -> bool:
 
 
 def _group_ai_plan(stats: dict) -> dict:
-    """群聊 AI 全量的调用计划：给用户一个"点下去要花多少次调用"的明确预期。
-
-    群聊维度的成本结构与私聊不同：3 个群级维度**按月份**计费，成员画像**按人数**计费，
-    所以只报"4 个维度"是不诚实的（例如 6 个月、10 位成员的群，实际是 18 + 10 = 28 次调用）。
-    """
-    # 月份数 = 出现过的 "YYYY-MM" 个数。原先写成一串 and/or 短路求值，
-    # 依赖"空列表为假"来兜 0，读的人得在脑子里跑一遍才知道结果是不是数字。
+    """计算群聊全量分析预期调用数（3 个群维度按月、成员画像按人数）。"""
     daily = stats.get("daily_counts") or []
     months = len({d["date"][:7] for d in daily}) if daily else 0
     members = min(
@@ -413,10 +350,7 @@ def _group_ai_plan(stats: dict) -> dict:
 
 
 def _group_context(stats: dict) -> dict:
-    """群聊页面共用的模板上下文。
-
-    只放页面真正要用的键：群聊没有"对方"，因此不放 other_name 之类会让模板误用的字段。
-    """
+    """群聊页面共用的模板上下文（不含私聊专用字段 other_name）。"""
     return {
         "overview": stats["overview"],
         "member_activity": stats.get("member_activity") or [],
@@ -435,15 +369,7 @@ def _group_context(stats: dict) -> dict:
 
 
 def _render_by_mode(group_template: str, private_template: str, private_context):
-    """按当前记录类型渲染页面：群聊走群模板与群上下文，私聊走私模板与页面自己的上下文。
-
-    这七个页面原先各自抄一遍"取统计 → 拿不到就跳首页 → 判断群聊 → 选模板"。抄漏一处
-    的后果不是报错，而是**群聊记录渲染了私聊模板**：页面看起来完全正常，数字的含义
-    却全错了（群聊里没有"对方"这个人）。收成一份之后，新增页面不可能漏掉这个分支。
-
-    `private_context` 收的是**函数**而不是 dict：它可能很贵（词频要跑 jieba、
-    表情原图要读缓存），而群聊页面根本用不到它——先算好再丢掉纯属浪费。
-    """
+    """按 chat_mode 分发群/私聊模板；private_context 延迟求值，群聊路径不触发计算。"""
     stats, redir = _require_stats()
     if redir:
         return redir

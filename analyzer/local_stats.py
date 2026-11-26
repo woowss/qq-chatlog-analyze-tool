@@ -352,10 +352,7 @@ def calc_word_freq(chat: ChatData, top_n: int = 50) -> dict:
     _RE_MIXED = re.compile(r"^(?:\d+[a-zA-Z]+|[a-zA-Z]+\d+)[a-zA-Z0-9]*$")
 
     def _count(texts: list[str]) -> list[dict]:
-        # 逐条送进 jieba，而不是把整份发言 join 成一个可能上百万字符的大字符串：
-        # 内存峰值从 O(全部文本) 降到 O(最长一条)，同一条消息的分词结果不变。
-        # 逐条切分也避免了"跨消息把两个词粘成一个词"（原先靠 join 里的空格挡着，
-        # 而 jieba 对空格边界的处理并不保证）。
+        # 逐条分词，降低内存峰值并避免跨消息粘词
         counter: Counter = Counter()
         for text in texts:
             for w in jieba.lcut(text):
@@ -381,18 +378,12 @@ def calc_word_freq(chat: ChatData, top_n: int = 50) -> dict:
     return {
         "self": _count(self_texts),
         "other": _count(other_texts),
-        # 生效停用词集合的指纹：外部文件改了 → 指纹对不上 → 消费方按需重算词云（只花 CPU）
         "stop_fp": stopwords_fingerprint(),
     }
 
 
 def _statistical(chat: ChatData) -> tuple[list, list[tuple[str, int, int, str]]]:
-    """统计口径的消息 + 每条的 (日期, 小时, 星期, 月份)，整个 chat 只算一次。
-
-    这些派生字段原本在每个 calc_* 里各算一遍：数万条规模下 6 个函数累计
-    约 300 ms 花在重复的时区转换上，而 statistical() 也会被重建 12 次。
-    结果挂在 chat 的 _stats_cache 字段上（见 ChatData 的字段声明），随请求生命周期存续。
-    """
+    """返回统计口径消息及预计算的 (date, hour, weekday, month) 元组（挂在 chat._stats_cache）。"""
     cache = chat._stats_cache
     if cache is None:
         msgs = chat.statistical()
@@ -410,11 +401,7 @@ def _party(msg, self_uid: str) -> str:
 
 
 def calc_daily_counts(chat: ChatData, fill_gaps: bool = True) -> list[dict]:
-    """每日消息量，返回 [{"date": "2024-01-01", "self": 5, "other": 3}]
-
-    fill_gaps=True 时补齐首末之间的空档日期（计 0）。否则折线图用的是类目轴，
-    中间"没聊天的日子"会被整段抹掉——3 个月没说话可能看起来像天天在聊。
-    """
+    """每日消息量（[{"date": "2024-01-01", "self": 5, "other": 3}]），fill_gaps=True 时补全空档日。"""
     msgs, fields = _statistical(chat)
     daily: dict[str, dict] = {}
     for i, msg in enumerate(msgs):
@@ -426,8 +413,6 @@ def calc_daily_counts(chat: ChatData, fill_gaps: bool = True) -> list[dict]:
     if not daily or not fill_gaps:
         return [daily[k] for k in sorted(daily)]
 
-    # 逐日补齐：按 date 的序数递增（3 年记录 ≈ 1100 天，比每次 date + timedelta
-    # 造一个中间对象少一轮分配；结果与 while cur <= end 完全一致）。
     first, last = min(daily), max(daily)
     out: list[dict] = []
     for ordinal in range(_date.fromisoformat(first).toordinal(), _date.fromisoformat(last).toordinal() + 1):
@@ -458,17 +443,7 @@ def calc_weekly_distribution(chat: ChatData) -> list[dict]:
 
 
 def _median(sorted_values: list) -> float:
-    """中位数（教科书定义：偶数个取中间两个的平均）。
-
-    为什么要专门写一个而不是就地 s[n//2]：`s[n//2]` 取的是**上中位**，偶数样本上
-    它不是中位数——两句长度 [1, 9] 会被报成"中位句长 9"（真值 5.0），两句媒体
-    [1, 100] 直接报成 100（真值 50.5），等于把最长的那句当成了中位数。
-    回复间隔那侧的 p50 也走这里，于是"中位数"这个标签在本模块只有一种算法
-    （口径唯一是本地统计的立身之本：同一个词在两张卡上算出不同的数，
-    用户只会以为其中一张错了）。
-
-    调用方须传入已排序的列表；空列表返回 0.0（各消费点本来就按 0 显示"没有数据"）。
-    """
+    """计算已排序列表的严格中位数（偶数长度取中间两项均值）；空列表返回 0.0。"""
     n = len(sorted_values)
     if not n:
         return 0.0
@@ -526,32 +501,21 @@ def calc_face_stats(chat: ChatData) -> dict:
 
 
 def calc_response_time(chat: ChatData) -> dict:
-    """回复速度（秒）—— 只统计对方发来后本方做出的回复间隔。
-
-    除均值外给出 P50/P90：均值极易被单次长间隔带偏（实测 19 次 5 秒 + 1 次
-    5 分钟 → 均值 19.8 秒，而中位数只有 5 秒），界面以中位数为主指标更诚实。
-    """
+    """统计双方回复延迟分布（均值/P50/P90），仅统计对方消息后严格大于 0s 且 ≤6h 的回应。"""
     self_times, other_times = [], []
     msgs, _ = _statistical(chat)
     for i in range(1, len(msgs)):
         prev, curr = msgs[i - 1], msgs[i]
-        # 同一人连续发言不是"响应"，跳过，避免拉低/污染平均值
         if prev.sender_uid == curr.sender_uid:
             continue
         gap = (curr.timestamp - prev.timestamp) / 1000
-        # gap 必须**严格大于 0**：导出器的时间戳常常只到秒，两人同一秒内各说一句
-        # 就会算出 0 间隔。0 不是"回复速度"，把它计入会让均值和中位数一起塌到 0
-        # ——实测 self 侧三条同秒配对直接报成"平均回复 0.0 秒"，界面显示的是一件
-        # 不可能发生的事。对话构建那侧（analyzer/dialog.py）本来就用 0 < gap 过滤，
-        # 两处必须同一个口径，否则喂给模型的与实际展示的对不上。
-        if gap <= 0 or gap > 3600 * 6:  # 超过 6 小时不算同轮
+        # 严格 > 0 过滤同秒消息（与 dialog.py 口径一致）
+        if gap <= 0 or gap > 3600 * 6:
             continue
         (self_times if curr.sender_uid == chat.self_uid else other_times).append(gap)
 
     def _percentile(arr: list[float], q: float) -> float:
-        """分位数：取最近秩。加 0.5 再 floor，而不是用 Python 的 round()
-        （round 是银行家舍入：round(0.5)=0、round(1.5)=2、round(2.5)=2，
-        同一个数在 n=2 与 n=6 时会一边倒向上、一边倒向下，p90 跟着抖）。"""
+        """最近秩分位数（floor(q*(n-1)+0.5) 避免 round() 银行家舍入抖动）。"""
         if not arr:
             return 0.0
         s = sorted(arr)
@@ -561,10 +525,7 @@ def calc_response_time(chat: ChatData) -> dict:
     def _stats(arr: list[float]) -> dict:
         return {
             "avg": round(sum(arr) / len(arr), 1) if arr else 0.0,
-            # p50 就是中位数，走与句长 median 同一个实现（口径唯一）。
-            # **必须先排序**：arr 是按对话时间序 append 的间隔，未排序时"取中间"拿到的是
-            # 时间序列的中间那条，不是中位数——4 条 [10,100,20,30] 的真中位数是 25.0，
-            # 不排序会报 60.0，而 p50 恰恰是关系页与报告页的主展示指标。
+            # p50 须先排序，并与句长共用 _median 口径
             "p50": round(_median(sorted(arr)), 1),
             "p90": _percentile(arr, 0.90),
             "count": len(arr),
@@ -572,7 +533,6 @@ def calc_response_time(chat: ChatData) -> dict:
 
     self_stats, other_stats = _stats(self_times), _stats(other_times)
     return {
-        # 兼容旧字段（前端/报告仍在用）
         "self_avg_seconds": self_stats["avg"],
         "other_avg_seconds": other_stats["avg"],
         "self": self_stats,
@@ -582,11 +542,7 @@ def calc_response_time(chat: ChatData) -> dict:
 
 
 def calc_exchange_rounds(chat: ChatData) -> int:
-    """对话轮次：一次"发言交替"或"间隔超过 SESSION_GAP_MINUTES 的新段"算一轮。
-
-    旧口径只数说话人交替，连珠炮互刷会虚高；现在加入时间约束，
-    长时间中断后的第一条消息重新起一轮，数字更贴近"聊了多少个来回"。
-    """
+    """对话轮次：发言切换或超过 SESSION_GAP_MINUTES 的新会话计为一轮。"""
     msgs, _ = _statistical(chat)
     rounds = 0
     last_uid: Optional[str] = None

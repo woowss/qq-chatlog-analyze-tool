@@ -45,7 +45,7 @@ dependencies = [
 # 开发/CI 用：`pip install -e ".[dev]"`
 dev = ["ruff==0.17.0"]
 # Opt-in browser/CI checks; never a runtime dependency.
-browser-test = ["playwright==1.64.0"]
+browser-test = ["playwright==1.65.2"]
 
 [project.scripts]
 # 命令行入口。app:main 只负责启动横幅 + 校验 + app.run，

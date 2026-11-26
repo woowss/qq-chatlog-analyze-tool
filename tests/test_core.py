@@ -19,6 +19,7 @@
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -57,6 +58,8 @@ from analyzer.deepseek_client import (  # noqa: E402
     _fit_lines,
 )
 from analyzer.local_stats import calc_milestones, calc_overview, calc_response_time  # noqa: E402
+from analyzer import deepseek_client as dc  # noqa: E402
+from analyzer import local_stats as ls  # noqa: E402
 
 
 def _write_chat(data: dict) -> str:
@@ -1401,6 +1404,543 @@ class TestReuploadCacheLifecycle(unittest.TestCase):
         finally:
             if path_b and os.path.exists(path_b):
                 os.remove(path_b)
+
+
+def _r3_msg(uid: str, ts: int, text: str) -> Message:
+    return Message(
+        id=f"{uid}-{ts}",
+        timestamp=ts,
+        time_str=datetime.fromtimestamp(ts / 1000, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        sender_name=uid,
+        sender_uid=uid,
+        text=text,
+        raw_text=text,
+        msg_type="type_1",
+        has_image=False,
+        is_reply=False,
+    )
+
+
+class TestSessionBoundarySingleSource(unittest.TestCase):
+    """对话段口径只有一份实现：本地统计与 prompt 统计头必须完全一致"""
+
+    def _chat(self, gaps_minutes):
+        from parser.qq_parser import ChatData, Message
+
+        base = 1704067200000
+        ts = base
+        msgs = []
+        for i, gap in enumerate(gaps_minutes):
+            ts += gap * 60000
+            msgs.append(
+                Message(
+                    id=str(i),
+                    timestamp=ts,
+                    time_str="",
+                    sender_name="我" if i % 2 else "对方",
+                    sender_uid="u_self" if i % 2 else "u_other",
+                    text="在吗",
+                    raw_text="在吗",
+                    msg_type="type_1",
+                    has_image=False,
+                    is_reply=False,
+                )
+            )
+        chat = ChatData(
+            chat_name="c",
+            self_name="我",
+            other_name="对方",
+            self_uid="u_self",
+            other_uid="u_other",
+            messages=msgs,
+        )
+        return chat
+
+    def test_predicate_boundary(self):
+        self.assertTrue(ls.is_session_start(None, 1000), "首条必然是新段")
+        self.assertFalse(
+            ls.is_session_start(1000, 1000 + ls.SESSION_GAP_MS), "刚好等于阈值不算新段（与原口径一致）"
+        )
+        self.assertTrue(ls.is_session_start(1000, 1000 + ls.SESSION_GAP_MS + 1))
+
+    def test_local_and_prompt_agree_on_session_count(self):
+        chat = self._chat([0, 1, 31, 1, 40, 1])
+        local_sessions = len(ls.calc_conversation_sessions(chat))
+        stats = dc._conversation_stats(chat.messages, chat.self_uid)
+        self.assertEqual(
+            stats["sessions"], local_sessions, "prompt 统计头与本地统计的段数必须一致（同一份口径）"
+        )
+        self.assertEqual(stats["sessions"], 3)
+
+
+class TestMessageLineFormatCompatibility(unittest.TestCase):
+    """对话行压缩的三种形态：重构后必须逐字保持原样（缓存键含这两个函数的源码）"""
+
+    def setUp(self):
+        self.t0 = int(datetime(2024, 1, 1, 8, 0, tzinfo=CST).timestamp() * 1000)
+        self.m = {
+            i: _r3_msg(uid, self.t0 + off, f"消息{i}")
+            for i, (uid, off) in enumerate(
+                [("u2", 0), ("u1", 3 * 60000), ("u2", 6 * 60000), ("u2", 7 * 60000), ("u1", 207 * 60000)]
+            )
+        }
+
+    def test_first_line_has_absolute_time_and_name(self):
+        self.assertEqual(dc._message_line(self.m[0], "B"), "[01-01 08:00] B: 消息0")
+
+    def test_same_speaker_continuation_drops_everything(self):
+        line = dc._message_line(self.m[3], "B", prev_uid="u2", prev_ts=self.m[2].timestamp)
+        self.assertEqual(line, "消息3")
+
+    def test_speaker_change_keeps_name_and_relative_mark(self):
+        line = dc._message_line(self.m[1], "A", prev_uid="u2", prev_ts=self.m[0].timestamp)
+        self.assertEqual(line, "A(+3m): 消息1")
+
+    def test_large_gap_prints_absolute_time(self):
+        line = dc._message_line(self.m[4], "A", prev_uid="u2", prev_ts=self.m[3].timestamp)
+        self.assertTrue(line.startswith("["), line)
+        self.assertIn("A:", line)
+
+    def test_same_speaker_within_section_keeps_gap_mark(self):
+        """段内同人连发但间隔够大（≥2 分钟且 <30 分钟）：只留 (+Nm)，不重复昵称"""
+        gap_msg = _r3_msg("u2", self.m[0].timestamp + 10 * 60000, "消息X")
+        line = dc._message_line(gap_msg, "B", prev_uid="u2", prev_ts=self.m[0].timestamp)
+        self.assertEqual(line, "(+10m): 消息X")
+
+    def test_gap_at_threshold_switches_to_absolute_time(self):
+        """恰好 30 分钟就翻到"新的一段"：打印绝对时间（口径边界不能漂）"""
+        gap_msg = _r3_msg("u2", self.m[0].timestamp + 30 * 60000, "消息X")
+        line = dc._message_line(gap_msg, "B", prev_uid="u2", prev_ts=self.m[0].timestamp)
+        self.assertEqual(line, "[01-01 08:30] B: 消息X")
+
+
+class TestMaxTokensConfigurable(unittest.TestCase):
+    """输出预算要能通过 .env 调整，而不是让用户去改源码"""
+
+    def test_defaults_match_legacy_values(self):
+        self.assertEqual(dc.MAX_TOKENS_BY_DIM["emotion"], 32768)
+        self.assertEqual(dc.MAX_TOKENS_BY_DIM["profile"], 49152)
+
+    def test_env_override_and_invalid_value(self):
+        with mock.patch.dict(os.environ, {"LLM_MAX_TOKENS_PROFILE": "65536"}):
+            self.assertEqual(dc._max_tokens("profile", 49152), 65536)
+        with mock.patch.dict(os.environ, {"LLM_MAX_TOKENS_PROFILE": "abc"}):
+            self.assertEqual(dc._max_tokens("profile", 49152), 49152, "非法值应回退默认")
+        with mock.patch.dict(os.environ, {"LLM_MAX_TOKENS_PROFILE": "10"}):
+            self.assertEqual(dc._max_tokens("profile", 49152), 49152, "越界值应回退默认")
+
+
+_R7_BASE = 1704067200.0
+
+
+def _r7_write_chat(payload) -> str:
+    d = tempfile.mkdtemp(prefix="r7-parse-")
+    path = os.path.join(d, "chat.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    return path
+
+
+def _r7_msg(msg_id, uid, name, ts_s, el_type, el_data=None, text=""):
+    return {
+        "id": str(msg_id),
+        "timestamp": int(ts_s * 1000),
+        "time": datetime.fromtimestamp(ts_s, tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        "sender": {"uid": uid, "name": name},
+        "type": "text",
+        "content": {
+            "text": text,
+            "elements": [{"type": el_type, "data": el_data if el_data is not None else {"text": text}}],
+        },
+    }
+
+
+class TestParserToleratesNonStringTypeFields(unittest.TestCase):
+    """`type` 字段是 JSON 数字/对象时不许崩。
+
+    症状不是"少一条消息"而是"整份文件传不上去"：upload 视图把异常当"解析失败"，
+    **并删掉刚上传的文件**，界面上一句 `'int' object has no attribute 'strip'` 或
+    `unhashable type: 'dict'`，与"文件格式"毫无关系。四种形状都实测复现过。
+    """
+
+    def _load(self, payload):
+        path = _r7_write_chat(payload)
+        try:
+            return load_chat(path)
+        finally:
+            shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+
+    def test_message_type_as_object_or_array_does_not_crash(self):
+        for bad_type in ({"a": 1}, ["text"], 7, None):
+            with self.subTest(msg_type=bad_type):
+                payload = {
+                    "chatInfo": {"name": "对方", "selfUid": "uA", "selfName": "我"},
+                    "statistics": {"senders": [{"uid": "uA", "name": "我"}]},
+                    "messages": [
+                        {**_r7_msg(1, "uA", "我", _R7_BASE, "text", text="你好"), "type": bad_type},
+                        _r7_msg(2, "uB", "对方", _R7_BASE + 60, "text", text="在"),
+                    ],
+                }
+                chat = self._load(payload)
+                self.assertEqual(len(chat.messages), 2, "坏 type 不该让整份文件解析失败")
+
+    def test_element_type_as_object_does_not_crash(self):
+        """不可哈希的 el_type 会让 `el_type in MEDIA_KINDS` 抛 TypeError。"""
+        payload = {
+            "chatInfo": {"name": "对方", "selfUid": "uA", "selfName": "我"},
+            "statistics": {"senders": [{"uid": "uA", "name": "我"}]},
+            "messages": [
+                _r7_msg(1, "uA", "我", _R7_BASE, {"a": 1}, el_data={"text": "你好"}),
+                _r7_msg(2, "uB", "对方", _R7_BASE + 60, "text", text="在"),
+            ],
+        }
+        chat = self._load(payload)
+        self.assertEqual(len(chat.messages), 2)
+        self.assertTrue(chat.unknown_element_types, "认不出的元素要如实记账，而不是崩")
+
+    def test_chatinfo_type_as_number_does_not_crash(self):
+        payload = {
+            "chatInfo": {"name": "对方", "selfUid": "uA", "selfName": "我", "type": 1},
+            "statistics": {"senders": [{"uid": "uA", "name": "我"}]},
+            "messages": [_r7_msg(1, "uA", "我", _R7_BASE, "text", text="你好")],
+        }
+        chat = self._load(payload)
+        self.assertEqual(chat.chat_type, "1")
+
+    def test_non_object_top_level_is_rejected_as_a_format_error(self):
+        """顶层是 null / 数字 / 数组：要给"格式不对"的人话，而不是 TypeError。"""
+        for bad in (None, 123, [], "x"):
+            with self.subTest(payload=bad):
+                with self.assertRaises(ValueError) as ctx:
+                    self._load(bad)
+                self.assertIn("QQChatExporter", str(ctx.exception))
+
+    def test_senders_name_as_number_does_not_crash(self):
+        """`statistics.senders[].name` 是数字时，other_name 会带上 int 并让日志脱敏崩。
+
+        链路：other_name=int → views 里 mask_name(chat.other_name) → logger 的
+        `(name or "").strip()` → AttributeError → 上传被当成"解析失败"并删文件。
+
+        消息里**故意不带 sender.name**：只有走 statistics.senders 那条兜底取值时，
+        这个数字才会真的落到 other_name 上。消息自带名字的话，聚合名会先命中，
+        这条用例就变成恒真的了（第一版就是这么写的，校验不了任何东西）。
+        """
+        payload = {
+            "chatInfo": {"name": "对方", "selfUid": "uA", "selfName": "我"},
+            "statistics": {"senders": [{"uid": "uB", "name": 12345}]},
+            "messages": [_r7_msg(1, "uB", "", _R7_BASE, "text", text="在")],
+        }
+        chat = self._load(payload)
+        self.assertIsInstance(chat.other_name, str, "other_name 必须是字符串")
+        self.assertEqual(chat.other_name, "12345", "数字名归一成字符串，而不是留在 int 上")
+        from analyzer.logger import mask_name
+
+        mask_name(chat.other_name)  # 不该抛：这正是上传路径上的那一步
+
+
+_R6_BASE_MS = 1_700_000_000_000
+
+
+class TestParserShapeAndPhantomRobustness(unittest.TestCase):
+    """断言 B1/B2：占位 sender 不再冒充"对方"或把私聊判成群聊；坏形状不再抛"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="r6-parse-")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def load(self, messages, senders=None, stats_extra=None, chat_info=None):
+        payload = {
+            "chatInfo": chat_info or {"name": "对方", "selfUid": "u_self", "selfName": "我"},
+            "statistics": {
+                "totalMessages": len(messages),
+                "senders": senders
+                if senders is not None
+                else [
+                    {"uid": "u_self", "name": "我"},
+                    {"uid": "u_other", "name": "对方"},
+                ],
+            },
+            "messages": messages,
+        }
+        if stats_extra:
+            payload["statistics"].update(stats_extra)
+        p = Path(self.dir) / "case.json"
+        p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        from parser.qq_parser import load_chat
+
+        return load_chat(str(p))
+
+    @staticmethod
+    def msg(uid, name, i, text="说话", **extra):
+        m = {
+            "id": f"{uid}-{i}",
+            "timestamp": _R6_BASE_MS + i * 60000,
+            "time": "2023-11-14 22:13:20",
+            "sender": {"uid": uid, "name": name},
+            "type": "text",
+            "content": {"text": f"{text}{i}"},
+        }
+        m.update(extra)
+        return m
+
+    @staticmethod
+    def phantom(i):
+        """导出器给系统类消息安排的占位 sender，且**没有** system 标记（实测会漏标）"""
+        return {
+            "id": f"ph{i}",
+            "timestamp": _R6_BASE_MS + (500 + i) * 60000,
+            "time": "2023-11-14 23:00:00",
+            "sender": {"uid": "未知uid未知", "name": "系统消息"},
+            "type": "text",  # 不是被过滤的 type_23/system，is_statistical 会放行
+            "content": {"text": "[消息提示]"},
+        }
+
+    def test_two_party_with_three_unmarked_phantoms_stays_private(self):
+        """3 条未标记的占位消息不该把两人私聊判成群聊
+
+        反向验证：去掉 _multi_party_offenders 里的 is_placeholder_sender 过滤，本条变红
+        ——门槛只有 3 条，于是 mode 变成 group、other_uid 被置空、response_time 不再算。
+        """
+        msgs = [self.msg("u_self", "我", i) for i in range(30)]
+        msgs += [self.msg("u_other", "对方", 100 + i) for i in range(28)]
+        msgs += [self.phantom(i) for i in range(3)]
+        chat = self.load(msgs)
+        self.assertFalse(chat.is_group_chat, "占位 sender 不该被算成第三方")
+        self.assertEqual(chat.mode, "private")
+        self.assertEqual(chat.other_uid, "u_other")
+
+    def test_off_mode_does_not_reject_private_with_phantoms(self):
+        """QQCHAT_GROUP_CHAT=off 下同一份私聊文件也不该被当作群聊拒收"""
+        msgs = [self.msg("u_self", "我", i) for i in range(20)]
+        msgs += [self.msg("u_other", "对方", 100 + i) for i in range(20)]
+        msgs += [self.phantom(i) for i in range(4)]
+        with mock.patch.dict(os.environ, {"QQCHAT_GROUP_CHAT": "off"}):
+            chat = self.load(msgs)  # 旧实现会在这里抛 ValueError
+        self.assertFalse(chat.is_group_chat)
+
+    def test_real_third_party_still_detected(self):
+        """反向保护：真人第三方必须照样判成群聊（别把修复做成"永远不当群聊"）"""
+        msgs = [self.msg("u_self", "我", i) for i in range(20)]
+        msgs += [self.msg("u_other", "对方", 100 + i) for i in range(20)]
+        msgs += [self.msg("uC", "阿强", 200 + i) for i in range(6)]
+        chat = self.load(msgs)
+        self.assertTrue(chat.is_group_chat, "真第三方被漏判的话，多人导出又会退回两分类")
+
+    def test_other_name_follows_other_uid(self):
+        """other_name 与 other_uid 必须指向同一个人（名字此前按文件顺序取，会指错）
+
+        反向验证：把 load_chat 结尾按 uid 重算名字的三行删掉，本条变红 ——
+        statistics.senders 里占位条目排在前面的导出，"对方"会被写成"系统消息"，
+        而仪表盘、日志、以及喂给模型的每一行非我方发言都跟着错署名。
+        """
+        msgs = [self.msg("u_self", "我", i) for i in range(10)]
+        msgs += [self.msg("uB", "真人对方", 50 + i) for i in range(8)]
+        chat = self.load(
+            msgs,
+            senders=[
+                {"uid": "未知uid未知", "name": "系统消息"},  # 占位排在最前
+                {"uid": "uB", "name": "真人对方"},
+                {"uid": "u_self", "name": "我"},
+            ],
+        )
+        self.assertEqual(chat.other_uid, "uB")
+        self.assertEqual(chat.other_name, "真人对方", f"名字与 uid 指错了人：{chat.other_name!r}")
+
+    def test_duration_days_string_does_not_kill_stats(self):
+        """durationDays 写成字符串：归一为整数，不能让整份文件的统计崩掉
+
+        反向验证：把 load_chat 结尾的 _to_int(...) 改回直接采信文件值，本条变红 ——
+        "31" 会一路带进 calc_overview 的除法，抛 TypeError，症状只是"上传成功却被
+        踢回首页"，而文件本身是完全合法的。
+        """
+        msgs = [self.msg("u_self", "我", i) for i in range(6)]
+        msgs += [self.msg("u_other", "对方", 100 + i) for i in range(6)]
+        chat = self.load(
+            msgs,
+            stats_extra={"timeRange": {"start": "2023-11-01", "end": "2023-12-01", "durationDays": "31"}},
+        )
+        self.assertEqual(chat.duration_days, 31)
+        from analyzer.local_stats import calc_overview
+
+        ov = calc_overview(chat)
+        self.assertEqual(ov["total_days"], 31)
+        self.assertGreater(ov["avg_daily"], 0)
+
+    def test_negative_duration_days_falls_back_to_computed(self):
+        """负数跨度夹成 0 → 按首末消息自己算，日均不该是负数"""
+        msgs = [self.msg("u_self", "我", i) for i in range(6)]
+        msgs += [self.msg("u_other", "对方", 100 + i) for i in range(6)]
+        chat = self.load(msgs, stats_extra={"timeRange": {"durationDays": -5}})
+        self.assertEqual(chat.duration_days, 0)
+        from analyzer.local_stats import calc_overview
+
+        ov = calc_overview(chat)
+        self.assertGreaterEqual(ov["avg_daily"], 0, "日均消息数不该是负的")
+        self.assertEqual(ov["days_basis"], "computed")
+
+    def test_null_shapes_do_not_raise(self):
+        """六种实测出现过的坏形状：跳过坏条目，而不是把整份导出判死
+
+        反向验证：把这些 `or {}` / isinstance 检查删掉，本条会在前四种形状上抛
+        AttributeError/TypeError —— 而上传接口的症状是回一句
+        "解析失败: 'NoneType' object has no attribute 'get'"，用户既不知道哪里坏、
+        也不知道能不能修（同函数对 content 已有 isinstance 阶梯，这两侧不一致才是要修的）。
+        """
+        base = [self.msg("u_self", "我", i) for i in range(4)] + [
+            self.msg("u_other", "对方", 100 + i) for i in range(4)
+        ]
+        cases = {
+            "sender 为 null": ("msgs", lambda ms: ms.__setitem__(1, {**ms[1], "sender": None})),
+            "elements 为 null": (
+                "msgs",
+                lambda ms: ms.__setitem__(1, {**ms[1], "content": {"text": "", "elements": None}}),
+            ),
+            "单个元素为 null": (
+                "msgs",
+                lambda ms: ms.__setitem__(1, {**ms[1], "content": {"elements": [None]}}),
+            ),
+            "整条消息为 null": ("msgs", lambda ms: ms.insert(0, None)),
+            "text 元素内容为 null": (
+                "msgs",
+                lambda ms: ms.__setitem__(
+                    1, {**ms[1], "content": {"elements": [{"type": "text", "data": {"text": None}}]}}
+                ),
+            ),
+            "statistics 为 null": ("stats", lambda d: d.__setitem__("statistics", None)),
+            "timeRange 为 null": ("stats", lambda d: d.__setitem__("timeRange", None)),
+            "senders 为 null": ("stats", lambda d: d.__setitem__("senders", None)),
+        }
+        from parser.qq_parser import load_chat
+
+        for label, (kind, mutate) in cases.items():
+            msgs = json.loads(json.dumps(base))
+            stats = {"totalMessages": len(msgs), "senders": [{"uid": "u_self", "name": "我"}]}
+            if kind == "msgs":
+                mutate(msgs)
+            else:
+                mutate(stats)
+            payload = {
+                "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
+                "statistics": stats,
+                "messages": msgs,
+            }
+            p = Path(self.dir) / "shape.json"
+            p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            with self.subTest(case=label):
+                chat = load_chat(str(p))  # 不许抛
+                self.assertTrue(chat.messages or chat.dropped_messages, "至少要如实报告处理了什么")
+
+    def test_numeric_sender_uid_parses_instead_of_crashing(self):
+        """数字型 uid（异版导出器/手工编辑写成 JSON number）不许崩，也不许静默错归属
+
+        这是本轮新引入的回归：占位判定复用进 load_chat 主路径后，
+        is_placeholder_sender 的 .strip() 会抛 'int' object has no attribute 'strip'，
+        上传收到 400 + 一句 Python 内部错误——正是本轮宣称要消灭的症状（旧代码
+        只对 uid 做相等比较，反而不崩）。selfUid 与发言者 uid 两处归一都要钉：
+        只归一发言者、不归一 selfUid 的话，"我"的每一条都会因 int!=str 被判给
+        对方——不崩，但归属全错，比崩隐蔽。
+        反向验证：删掉 qq_parser 的 sender_uid str()、selfUid str() 或
+        group_identity.is_placeholder_sender 的入参归一，各自都会让本条变红。
+        """
+        chat = self.load(
+            [self.msg(111, "我", 0), self.msg(12345, "阿明", 1)],  # 数字 uid 进消息
+            senders=[{"uid": 111, "name": "我"}, {"uid": 12345, "name": "阿明"}],  # 也进汇总
+            chat_info={"name": "阿明", "selfUid": 111, "selfName": "我"},  # 也进 chatInfo
+        )
+        self.assertEqual(chat.self_uid, "111", "chatInfo.selfUid 同样要归一")
+        self.assertEqual(chat.other_uid, "12345", "数字 uid 归一成字符串后照常认定「对方」")
+        self.assertEqual(chat.other_name, "阿明")
+        self.assertEqual(len(chat.messages), 2)
+        self.assertEqual(chat.messages[0].sender_uid, "111", "消息侧的 self 归属不许因类型错判")
+
+    def test_messages_not_a_list_raises_instead_of_swallowing(self):
+        """messages 是 dict/str：整份文件会被静默吞掉（逐 key 迭代全计入 dropped），
+        症状是"共 N 条消息、0 条可分析"而 total_count 照抄 statistics——比崩难发现。
+        现在必须 ValueError 报错，且文案是人话而不是 Python 内部错误。
+
+        反向验证：删掉 isinstance(raw.get("messages"), list) 检查，本条变红（不再抛）。
+        """
+        payload = {
+            "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
+            "statistics": {"totalMessages": 5, "senders": []},
+            "messages": {"0": {"id": "x"}},
+        }
+        p = Path(self.dir) / "badmessages.json"
+        p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        from parser.qq_parser import load_chat
+
+        with self.assertRaises(ValueError) as cm:
+            load_chat(str(p))
+        self.assertIn("messages 不是一个数组", str(cm.exception))
+
+    def test_statistics_wrong_shape_and_null_senders_do_not_raise(self):
+        """statistics 写成数组、senders 里混 null：都是"键在、形状不对"，不许崩
+
+        反向验证：删掉 statistics 的 isinstance 守卫或"找回自己"循环的 isinstance，
+        两段各自变红（前者 'list' object has no attribute 'get'，后者 None.get）。
+        """
+        p = Path(self.dir) / "badstats.json"
+        p.write_text(
+            json.dumps(
+                {
+                    "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
+                    "statistics": [{"uid": "u_self"}],  # 非 dict
+                    "messages": [self.msg("u_self", "我", 0)],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        from parser.qq_parser import load_chat
+
+        chat = load_chat(str(p))
+        self.assertEqual(len(chat.messages), 1)
+
+        # 缺 selfUid、senders 里混着 null：靠"按名字找回自己"的循环，守卫必须齐
+        p2 = Path(self.dir) / "nullsenders.json"
+        p2.write_text(
+            json.dumps(
+                {
+                    "chatInfo": {"name": "对方", "selfName": "我"},
+                    "statistics": {"senders": [None, {"uid": "u_self", "name": "我"}]},
+                    "messages": [self.msg("u_self", "我", 0)],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        chat2 = load_chat(str(p2))
+        self.assertEqual(chat2.self_uid, "u_self")
+
+    def test_infinity_does_not_raise(self):
+        """JSON 的 Infinity 字面量（json.loads 默认接受）：_to_int/_parse_timestamp
+        只捕 TypeError/ValueError，int(float(inf)) 抛的是 OverflowError，没接住就崩。
+
+        反向验证：把两处 except 元组里的 OverflowError 删掉，本条变红。
+        """
+        chat = self.load(
+            [
+                self.msg("u_self", "我", 0),
+                self.msg("u_other", "对方", 1, timestamp=float("inf"), time=""),  # 数值不可用→丢弃
+            ],
+            stats_extra={"timeRange": {"durationDays": float("inf"), "start": "", "end": ""}},
+        )
+        self.assertEqual(chat.duration_days, 0, "Infinity 天数按 0 处理（calc 会改按首末消息算跨度）")
+        self.assertEqual(len(chat.messages), 1)
+        self.assertEqual(chat.dropped_messages, 1)
+
+    def test_bad_message_counted_as_dropped(self):
+        """整条不是对象：计入 dropped_messages，日志会如实报「跳过 N 条」"""
+        msgs = (
+            [self.msg("u_self", "我", i) for i in range(4)]
+            + [None, "字符串"]
+            + [self.msg("u_other", "对方", 100 + i) for i in range(4)]
+        )
+        chat = self.load(msgs)
+        self.assertEqual(chat.dropped_messages, 2)
+        self.assertEqual(len(chat.messages), 8)
 
 
 if __name__ == "__main__":

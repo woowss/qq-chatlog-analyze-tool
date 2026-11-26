@@ -188,7 +188,7 @@ async function buildReportSnapshot() {
     // 自有样式内联：分享版不依赖本机 /static（取不到就保留原链接，别让报告裸奔）
     var cssText = '';
     try {
-        var resp = await fetch('/static/css/style.css');
+        var resp = await fetch('/static/css/style.css?v={{ asset_v }}');
         if (resp.ok) cssText = await resp.text();
     } catch (e) { /* 忽略：下面按 cssText 是否为空决定要不要动样式表链接 */ }
     if (cssText) {
@@ -219,6 +219,9 @@ async function downloadReport() {
     var a = document.createElement('a');
     a.href = url;
     a.download = {{ report_download_name | tojson }};
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(url);
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
 }
+</script>

@@ -82,19 +82,49 @@ function startAnalyze(dim, opts) {    opts.dim = dim;      // 轮询遇到 404 �
 
 // 轮询任务进度：指数退避 + 后台标签页降频。
 // 早先是固定 1.5s 的 setInterval：一次全量分析几分钟就是几百次请求，而且标签页被
-// 切到后台时浏览器本来就限流，继续按前台频率发只是白烧请求。现在起步 1s，最多 8s，
-// 回到前台立刻补查一次，让用户不必干等。
-var POLL_MIN_DELAY_MS = 1000;
+// 切到后台时浏览器本来就限流，继续按前台频率发只是白烧请求。现在流式输出期间
+// 有增量时快速刷新（400ms），无新输出时指数退避到 8s，回到前台立刻补查一次。
+var POLL_MIN_DELAY_MS = 400;
 var POLL_MAX_DELAY_MS = 8000;
+
+var _AI_DIM_LABELS = {
+    emotion: '情绪分析',
+    topics: '话题趋势',
+    relationship: '人际关系',
+    habits: '说话习惯',
+    profile: '人物锐评',
+    recap: '整体总括',
+    group_dynamics: '群聊动态',
+    group_topics: '群聊话题',
+    group_emotion: '群聊情绪',
+    member_profiles: '成员画像',
+    all: '一键全量',
+    plan: '自选计划分析'
+};
+
+function _aiDimTitle(dim, fallbackLabel) {
+    if (fallbackLabel) return fallbackLabel + ' · 实时输出';
+    if (dim && _AI_DIM_LABELS[dim]) return _AI_DIM_LABELS[dim] + ' · 实时输出';
+    return 'AI 实时输出';
+}
 
 function pollAnalyzeJob(jobId, opts) {
     var timer = null;
     var delay = POLL_MIN_DELAY_MS;
     var stopped = false;
+    var afterSeq = Number(opts.afterSeq || 0);
     opts.jobId = jobId;
+    window.__activePollJobId = jobId;
+    if (!opts._isRestore && window.AiOutputFeed) {
+        window.AiOutputFeed.resetForJob(jobId, {
+            title: _aiDimTitle(opts.dim || (opts.planMode ? 'plan' : ''), opts.dimLabel),
+            show: true
+        });
+    }
 
     function stop() {
         stopped = true;
+        if (window.__activePollJobId === jobId) window.__activePollJobId = null;
         if (timer) { clearTimeout(timer); timer = null; }
         document.removeEventListener('visibilitychange', onVisibilityChange);
     }
@@ -115,8 +145,16 @@ function pollAnalyzeJob(jobId, opts) {
 
     function tick() {
         if (stopped) return;
-        $.get('/api/analyze-job/' + jobId, function(s) {
+        $.get('/api/analyze-job/' + jobId, { after: afterSeq }, function(s) {
             if (stopped) return;
+            var incoming = Array.isArray(s.events) ? s.events : [];
+            if (typeof s.stream_seq === 'number' && s.stream_seq > afterSeq) {
+                afterSeq = s.stream_seq;
+            }
+            if (window.AiOutputFeed) {
+                window.AiOutputFeed.appendEvents(incoming, s);
+                window.AiOutputFeed.setStatus(s.status, s);
+            }
             if (opts.onProgress) opts.onProgress(s.done || 0, s.total || 0, s.detail || '');
             if (s.status === 'done') {
                 stop();
@@ -136,7 +174,7 @@ function pollAnalyzeJob(jobId, opts) {
                         return;
                     }
                     if (!resultMeta.partial && window.cacheAnalysisResult) {
-                        if (opts.dim) window.cacheAnalysisResult(opts.dim, s.result, identity);
+                        if (opts.dim && s.result !== undefined) window.cacheAnalysisResult(opts.dim, s.result, identity);
                         else Object.keys(resultMeta.results).forEach(function(dim) {
                             window.cacheAnalysisResult(dim, resultMeta.results[dim], identity);
                         });
@@ -178,7 +216,9 @@ function pollAnalyzeJob(jobId, opts) {
                     opts.onError(s.error || '分析已取消', cancelledMeta);
                 });
             } else {
-                delay = Math.min(POLL_MAX_DELAY_MS, Math.round(delay * 1.5));
+                delay = incoming.length > 0
+                    ? POLL_MIN_DELAY_MS
+                    : Math.min(POLL_MAX_DELAY_MS, Math.round(delay * 1.5));
                 schedule();
             }
         }).fail(function(xhr) {
@@ -360,68 +400,692 @@ function clearStaleStrategyWarning() {
     if (box && box.dataset.staleStrategy === 'true') box.remove();
 }
 
+function _isAnalyzeCancelled(msg, meta) {
+    return Boolean(
+        (meta && meta.status === 'cancelled')
+        || (typeof msg === 'string' && msg.indexOf('分析已取消') === 0)
+    );
+}
+
+function _renderStatusAlert(statusEl, level, text, compact) {
+    if (!statusEl || !statusEl.length) return;
+    var cls = 'alert alert-' + level + (compact ? ' py-1 small' : '') + ' mb-0';
+    statusEl.empty().append($('<div>').addClass(cls).text(text));
+}
+
+function _mountAnalyzeProgress(statusEl, opts, ui) {
+    var progId = (ui && ui.progId) || 'aProg';
+    var textId = (ui && ui.textId) || 'aText';
+    var cancelId = (ui && ui.cancelId) || 'aCancel';
+    var inline = Boolean(ui && ui.inline);
+    if (inline) {
+        statusEl.html(
+            '<div class="d-flex align-items-center gap-2 flex-wrap">' +
+            '<div class="spinner-border spinner-border-sm text-primary" role="status"></div>' +
+            '<div class="progress" style="min-width:160px;height:8px;">' +
+            '<div id="' + progId + '" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div></div>' +
+            '<span id="' + textId + '" class="small text-muted">准备中…</span>' +
+            '<button id="' + cancelId + '" class="btn btn-sm btn-outline-secondary">取消</button></div>'
+        );
+    } else {
+        statusEl.html(
+            '<div class="spinner-border spinner-border-sm text-primary" role="status"></div>' +
+            '<div class="progress mx-auto mt-2" style="max-width:320px;height:8px;">' +
+            '<div id="' + progId + '" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div></div>' +
+            '<div id="' + textId + '" class="small text-muted mt-1">准备中…</div>' +
+            '<button id="' + cancelId + '" class="btn btn-sm btn-outline-secondary mt-2">取消</button>'
+        );
+    }
+    $('#' + cancelId).on('click', function () {
+        $(this).prop('disabled', true).text('取消中…');
+        cancelAnalyze(opts);
+    });
+    return function updateProgress(done, total, text) {
+        if (done < 0) { $('#' + textId).text('正在取消…'); return; }
+        if (total > 0) $('#' + progId).css('width', Math.round(done / total * 100) + '%');
+        $('#' + textId).text(text || '准备中…');
+    };
+}
+
+function runSingleDimension(config) {
+    var dim = config.dim;
+    var btn = config.btn;
+    var status = config.status;
+    var origLabel = config.origLabel || btn.data('orig') || btn.text();
+    var runningLabel = config.runningLabel || '分析中…';
+    var doneLabel = config.doneLabel || origLabel;
+    var compact = Boolean(config.compactAlert);
+    var updateEmptyState = Boolean(config.updateEmptyState);
+
+    btn.prop('disabled', true).text(runningLabel);
+    if (updateEmptyState) setAnalysisEmptyState(dim, 'running');
+
+    var updateProgress = null;
+    function finishButton(label) {
+        btn.prop('disabled', false).text(label || origLabel);
+        if (config.onFinish) config.onFinish();
+    }
+
+    var opts = {
+        refresh: Boolean(config.refresh),
+        onProgress: function (done, total, detail) {
+            var text = config.formatProgress
+                ? config.formatProgress(done, total, detail)
+                : (total > 0
+                    ? ('已完成 ' + done + '/' + total + '（' + Math.round(done / total * 100) + '%）')
+                    : '准备中…');
+            if (updateProgress) updateProgress(done, total, text);
+        },
+        onDone: function (result, meta) {
+            if (meta && meta.partial) {
+                var partialMsg = config.onPartialResult
+                    ? config.onPartialResult(result, meta, false)
+                    : null;
+                _renderStatusAlert(
+                    status,
+                    'warning',
+                    partialMsg || '本次只处理了所选单元，未标记为完整维度结果；可重新预览并补齐。',
+                    compact
+                );
+                finishButton(origLabel);
+                return;
+            }
+            if (updateEmptyState) setAnalysisEmptyState(dim, 'ready');
+            var doneMsg = config.onFullDone ? config.onFullDone(result, meta) : null;
+            _renderStatusAlert(status, 'success', doneMsg || '分析完成', compact);
+            finishButton(doneLabel);
+        },
+        onError: function (msg, meta) {
+            var cancelled = _isAnalyzeCancelled(msg, meta);
+            var partial = meta && meta.partialResults && meta.partialResults[dim];
+            var hasPartial = Boolean(partial && (typeof partial !== 'object' || Object.keys(partial).length > 0));
+            if (hasPartial && config.onPartialResult) {
+                var partialErrorMsg = config.onPartialResult(partial, meta, true);
+                _renderStatusAlert(status, 'warning', partialErrorMsg || msg, compact);
+                finishButton(origLabel);
+                return;
+            }
+            if (updateEmptyState) {
+                setAnalysisEmptyState(dim, cancelled ? 'empty' : 'error', cancelled ? null : msg);
+            }
+            var retained = Object.keys((meta && meta.results) || {});
+            var suffix = retained.length ? '；任务响应中保留了这些维度的结果：' + retained.join('、') : '';
+            var level = cancelled ? 'secondary' : (retained.length ? 'warning' : 'danger');
+            _renderStatusAlert(status, level, (cancelled ? '分析已取消' : msg) + suffix, compact);
+            finishButton(origLabel);
+        }
+    };
+
+    updateProgress = _mountAnalyzeProgress(status, opts, config.progressIds);
+    startAnalyze(dim, opts);
+}
+
+function runBatchAnalyze(config) {
+    var btn = config.btn;
+    var status = config.status;
+    var idleLabel = config.idleLabel || '全量分析';
+    var runningLabel = config.runningLabel || '全量分析中…';
+    $('.btn-analyze, #btn-analyze-all').prop('disabled', true);
+    btn.text(runningLabel);
+
+    function restoreAllButtons() {
+        $('.btn-analyze').prop('disabled', false).each(function () {
+            var orig = $(this).data('orig');
+            if (orig) $(this).text(orig);
+        });
+        btn.prop('disabled', false).text(idleLabel);
+    }
+
+    var updateProgress = null;
+    var opts = {
+        refresh: Boolean(config.refresh),
+        onProgress: function (done, total, detail) {
+            var text = config.formatProgress
+                ? config.formatProgress(done, total, detail)
+                : (detail || (total > 0 ? ('已完成 ' + done + '/' + total + ' 个维度') : '准备中…'));
+            if (updateProgress) updateProgress(done, total, text);
+        },
+        onDone: function (summary, meta) {
+            var outcome = config.onDone ? config.onDone(summary, meta, restoreAllButtons) : null;
+            restoreAllButtons();
+            if (outcome && outcome.text) {
+                _renderStatusAlert(status, outcome.level || 'success', outcome.text, false);
+            }
+        },
+        onError: function (msg, meta) {
+            restoreAllButtons();
+            var cancelled = _isAnalyzeCancelled(msg, meta);
+            var retained = Object.keys((meta && meta.results) || {});
+            var suffix = retained.length ? '；任务响应中保留了这些维度的结果：' + retained.join('、') : '';
+            var level = (cancelled || retained.length) ? 'warning' : 'danger';
+            var text = (cancelled ? '全量分析已取消。' : msg) + suffix;
+            _renderStatusAlert(status, level, text, false);
+        }
+    };
+
+    updateProgress = _mountAnalyzeProgress(status, opts, config.progressIds);
+    startAnalyzeAll(opts);
+}
+
+window._analysisPageRefreshers = window._analysisPageRefreshers || {};
+
+function registerAnalysisRefresher(dim, fn) {
+    if (dim && typeof fn === 'function') {
+        window._analysisPageRefreshers[dim] = fn;
+    }
+}
+window.registerAnalysisRefresher = registerAnalysisRefresher;
+
+var AiOutputFeed = (function () {
+    var currentJobId = '';
+    var renderedSeq = -1;
+    var unitMap = new Map();
+    var promptTotal = 0;
+    var completionTotal = 0;
+    var autoScroll = true;
+    var latestDone = 0;
+    var latestTotal = 0;
+    var initializedDom = false;
+
+    function el(id) {
+        return document.getElementById(id);
+    }
+
+    function mountIntoSlot() {
+        var panel = el('aiOutputPanel');
+        var slot = document.querySelector('[data-ai-output-slot]');
+        if (panel && slot && panel.parentNode !== slot) {
+            slot.appendChild(panel);
+        }
+    }
+
+    function initDomEvents() {
+        if (initializedDom) return;
+        var panel = el('aiOutputPanel');
+        if (!panel) return;
+        initializedDom = true;
+        mountIntoSlot();
+
+        var thinkBtn = el('aiOutputThinkingBtn');
+        if (thinkBtn) {
+            thinkBtn.addEventListener('click', function () {
+                var hidden = panel.classList.toggle('ai-output-hide-thinking');
+                thinkBtn.classList.toggle('active', !hidden);
+                thinkBtn.setAttribute('aria-pressed', hidden ? 'false' : 'true');
+            });
+        }
+
+        var toggleBtn = el('aiOutputToggleBtn');
+        var collapseBody = el('aiOutputCollapseBody');
+        if (toggleBtn && collapseBody) {
+            toggleBtn.addEventListener('click', function () {
+                var collapsed = collapseBody.classList.toggle('d-none');
+                toggleBtn.textContent = collapsed ? '展开' : '收起';
+                toggleBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+            });
+        }
+
+        var body = el('aiOutputBody');
+        var jumpWrap = el('aiOutputJumpWrap');
+        var jumpBtn = el('aiOutputJumpBtn');
+        if (body) {
+            body.addEventListener('scroll', function () {
+                autoScroll = (body.scrollHeight - body.scrollTop - body.clientHeight) <= 40;
+                if (jumpWrap) jumpWrap.classList.toggle('d-none', autoScroll);
+            });
+        }
+        if (jumpBtn && body) {
+            jumpBtn.addEventListener('click', function () {
+                body.scrollTop = body.scrollHeight;
+                autoScroll = true;
+                if (jumpWrap) jumpWrap.classList.add('d-none');
+            });
+        }
+    }
+
+    function showPanel() {
+        initDomEvents();
+        var panel = el('aiOutputPanel');
+        if (panel) panel.classList.remove('d-none');
+    }
+
+    function expandPanel() {
+        var collapseBody = el('aiOutputCollapseBody');
+        var toggleBtn = el('aiOutputToggleBtn');
+        if (collapseBody) collapseBody.classList.remove('d-none');
+        if (toggleBtn) {
+            toggleBtn.textContent = '收起';
+            toggleBtn.setAttribute('aria-expanded', 'true');
+        }
+    }
+
+    function updateMetaText() {
+        var meta = el('aiOutputMeta');
+        if (!meta) return;
+        var parts = [];
+        if (latestTotal > 0) parts.push('进度 ' + latestDone + '/' + latestTotal);
+        if (promptTotal > 0 || completionTotal > 0) {
+            parts.push('prompt ' + promptTotal.toLocaleString() + ' / completion ' + completionTotal.toLocaleString() + ' tok');
+        }
+        meta.textContent = parts.join(' · ');
+    }
+
+    function setStatus(status, meta) {
+        var badge = el('aiOutputStatus');
+        if (meta) {
+            if (typeof meta.done === 'number') latestDone = meta.done;
+            if (typeof meta.total === 'number') latestTotal = meta.total;
+            updateMetaText();
+            if (meta.dim_label || meta.dim) {
+                var t = el('aiOutputTitle');
+                if (t) t.textContent = _aiDimTitle(meta.dim || '', meta.dim_label || '');
+            }
+        }
+        if (!badge || !status) return;
+        var map = {
+            running: ['进行中', 'badge bg-primary ai-output-status'],
+            done: ['已完成', 'badge bg-success ai-output-status'],
+            cancelled: ['已取消', 'badge bg-secondary ai-output-status'],
+            error: ['异常', 'badge bg-danger ai-output-status']
+        };
+        var cfg = map[status] || [String(status), 'badge bg-secondary ai-output-status'];
+        badge.textContent = cfg[0];
+        badge.className = cfg[1];
+    }
+
+    function ensurePlaceholder(text) {
+        var body = el('aiOutputBody');
+        if (!body || body.children.length > 0) return;
+        var empty = document.createElement('div');
+        empty.className = 'ai-output-empty';
+        empty.textContent = text;
+        body.appendChild(empty);
+    }
+
+    function clearPlaceholder() {
+        var body = el('aiOutputBody');
+        if (!body) return;
+        var empty = body.querySelector('.ai-output-empty');
+        if (empty) empty.remove();
+    }
+
+    function resetForJob(jobId, opts) {
+        initDomEvents();
+        currentJobId = jobId || '';
+        renderedSeq = -1;
+        unitMap.clear();
+        promptTotal = 0;
+        completionTotal = 0;
+        latestDone = 0;
+        latestTotal = 0;
+        autoScroll = true;
+
+        var body = el('aiOutputBody');
+        if (body) body.textContent = '';
+        var jumpWrap = el('aiOutputJumpWrap');
+        if (jumpWrap) jumpWrap.classList.add('d-none');
+
+        var title = el('aiOutputTitle');
+        if (title) title.textContent = (opts && opts.title) || 'AI 实时输出';
+        setStatus((opts && opts.status) || 'running', opts && opts.meta);
+        updateMetaText();
+        ensurePlaceholder('等待模型响应与输出分片…');
+        if (!opts || opts.show !== false) showPanel();
+        expandPanel();
+    }
+
+    function isTimelineUnit(unit) {
+        return !unit || unit === 'all' || unit === 'plan' || unit === 'system' || unit.indexOf('dim:') === 0;
+    }
+
+    function setUnitStateBadge(card, text, badgeClass) {
+        card.stateBadge.textContent = text;
+        card.stateBadge.className = badgeClass;
+    }
+
+    function getOrCreateUnitCard(unitKey, label) {
+        if (unitMap.has(unitKey)) return unitMap.get(unitKey);
+        var body = el('aiOutputBody');
+        var root = document.createElement('div');
+        root.className = 'ai-output-unit';
+
+        var head = document.createElement('div');
+        head.className = 'ai-output-unit-head';
+        var title = document.createElement('span');
+        title.className = 'ai-output-unit-title';
+        title.textContent = label || unitKey;
+        head.appendChild(title);
+
+        var badges = document.createElement('div');
+        badges.className = 'ai-output-unit-badges';
+        var tokenBadge = document.createElement('span');
+        tokenBadge.className = 'badge bg-light text-secondary d-none ai-output-unit-tokens';
+        badges.appendChild(tokenBadge);
+        var stateBadge = document.createElement('span');
+        stateBadge.className = 'badge bg-primary ai-output-unit-state';
+        stateBadge.textContent = '生成中';
+        badges.appendChild(stateBadge);
+        head.appendChild(badges);
+        root.appendChild(head);
+
+        var notes = document.createElement('div');
+        notes.className = 'ai-output-unit-notes d-none';
+        root.appendChild(notes);
+
+        var thinkBox = document.createElement('details');
+        thinkBox.className = 'ai-output-thinking d-none';
+        thinkBox.open = true;
+        var thinkSummary = document.createElement('summary');
+        thinkSummary.textContent = '思考过程';
+        thinkBox.appendChild(thinkSummary);
+        var thinkPre = document.createElement('pre');
+        thinkPre.className = 'ai-output-pre';
+        thinkBox.appendChild(thinkPre);
+        root.appendChild(thinkBox);
+
+        var contentBox = document.createElement('div');
+        contentBox.className = 'ai-output-content d-none';
+        var contentLabel = document.createElement('div');
+        contentLabel.className = 'ai-output-content-label';
+        contentLabel.textContent = '生成内容';
+        contentBox.appendChild(contentLabel);
+        var contentPre = document.createElement('pre');
+        contentPre.className = 'ai-output-pre';
+        contentBox.appendChild(contentPre);
+        root.appendChild(contentBox);
+
+        if (body) body.appendChild(root);
+        var rec = {
+            root: root,
+            titleEl: title,
+            tokenBadge: tokenBadge,
+            stateBadge: stateBadge,
+            notes: notes,
+            thinkBox: thinkBox,
+            thinkPre: thinkPre,
+            contentBox: contentBox,
+            contentLabel: contentLabel,
+            contentPre: contentPre
+        };
+        unitMap.set(unitKey, rec);
+        return rec;
+    }
+
+    function safeKindClass(kind) {
+        if (['stage', 'cache', 'warn', 'error', 'usage', 'thinking', 'content', 'result'].indexOf(kind) !== -1) {
+            return 'kind-' + kind;
+        }
+        return 'kind-stage';
+    }
+
+    function appendTimelineNote(kind, text) {
+        var body = el('aiOutputBody');
+        if (!body || !text) return;
+        var row = document.createElement('div');
+        row.className = 'ai-output-timeline ' + safeKindClass(kind);
+        row.textContent = text;
+        body.appendChild(row);
+    }
+
+    function appendUnitNote(card, kind, text) {
+        if (!text) return;
+        card.notes.classList.remove('d-none');
+        var note = document.createElement('div');
+        note.className = 'ai-output-unit-note ' + safeKindClass(kind);
+        note.textContent = text;
+        card.notes.appendChild(note);
+    }
+
+    function appendEvents(events, meta) {
+        if (meta) {
+            if (typeof meta.done === 'number') latestDone = meta.done;
+            if (typeof meta.total === 'number') latestTotal = meta.total;
+        }
+        if (!Array.isArray(events) || !events.length) {
+            updateMetaText();
+            return;
+        }
+        showPanel();
+        clearPlaceholder();
+
+        events.slice().sort(function (a, b) {
+            return Number(a.seq || 0) - Number(b.seq || 0);
+        }).forEach(function (ev) {
+            var seq = Number(ev.seq);
+            if (!isNaN(seq)) {
+                if (seq <= renderedSeq) return;
+                renderedSeq = seq;
+            }
+            var kind = ev.kind || 'stage';
+            var unit = ev.unit || '';
+            var label = ev.label || unit;
+            var text = ev.text || '';
+            if (kind === 'usage' && ev.data) {
+                var pTok = Number(ev.data.prompt_tokens || 0);
+                var cTok = Number(ev.data.completion_tokens || 0);
+                promptTotal += pTok;
+                completionTotal += cTok;
+                if (!isTimelineUnit(unit)) {
+                    var uCard = getOrCreateUnitCard(unit, label);
+                    uCard.tokenBadge.textContent = 'in ' + pTok.toLocaleString() + ' / out ' + cTok.toLocaleString() + ' tok';
+                    uCard.tokenBadge.classList.remove('d-none');
+                }
+                return;
+            }
+            if (isTimelineUnit(unit)) {
+                appendTimelineNote(kind, text);
+                return;
+            }
+            var card = getOrCreateUnitCard(unit, label);
+            if (label && !card.titleEl.textContent) card.titleEl.textContent = label;
+            if (kind === 'thinking') {
+                card.thinkBox.classList.remove('d-none');
+                card.thinkPre.appendChild(document.createTextNode(text));
+                card.thinkPre.scrollTop = card.thinkPre.scrollHeight;
+            } else if (kind === 'content') {
+                card.contentBox.classList.remove('d-none');
+                card.contentLabel.textContent = '生成内容';
+                card.contentPre.appendChild(document.createTextNode(text));
+                card.contentPre.scrollTop = card.contentPre.scrollHeight;
+            } else if (kind === 'result') {
+                card.contentBox.classList.remove('d-none');
+                card.contentLabel.textContent = '结构化结果';
+                if (!card.contentPre.textContent) {
+                    card.contentPre.textContent = text;
+                }
+            } else if (kind === 'cache') {
+                appendUnitNote(card, kind, text);
+                setUnitStateBadge(card, '命中缓存', 'badge bg-secondary ai-output-unit-state');
+            } else if (kind === 'error') {
+                appendUnitNote(card, kind, text);
+                setUnitStateBadge(card, '失败', 'badge bg-danger ai-output-unit-state');
+            } else if (kind === 'warn') {
+                appendUnitNote(card, kind, text);
+            } else {
+                appendUnitNote(card, kind, text);
+                if (text.indexOf('已取消') !== -1) {
+                    setUnitStateBadge(card, '已取消', 'badge bg-secondary ai-output-unit-state');
+                } else if (text.indexOf('完成') !== -1) {
+                    setUnitStateBadge(card, '已完成', 'badge bg-success ai-output-unit-state');
+                }
+            }
+        });
+
+        updateMetaText();
+        var body = el('aiOutputBody');
+        var jumpWrap = el('aiOutputJumpWrap');
+        if (body) {
+            if (autoScroll) {
+                body.scrollTop = body.scrollHeight;
+                if (jumpWrap) jumpWrap.classList.add('d-none');
+            } else if (jumpWrap) {
+                jumpWrap.classList.remove('d-none');
+            }
+        }
+    }
+
+    function restoreSnapshot(snap) {
+        if (!snap || !snap.job_id) return;
+        resetForJob(snap.job_id, {
+            title: _aiDimTitle(snap.dim || '', snap.dim_label || ''),
+            status: snap.status || 'done',
+            meta: snap,
+            show: true
+        });
+        appendEvents(snap.events || [], snap);
+        setStatus(snap.status || 'done', snap);
+        if ((!snap.events || !snap.events.length) && snap.status !== 'running') {
+            clearPlaceholder();
+            ensurePlaceholder('本次任务暂无详细流式文本。');
+        }
+    }
+
+    return {
+        initDomEvents: initDomEvents,
+        resetForJob: resetForJob,
+        appendEvents: appendEvents,
+        setStatus: setStatus,
+        restoreSnapshot: restoreSnapshot
+    };
+})();
+window.AiOutputFeed = AiOutputFeed;
+
+function _unlockRestoredButtons() {
+    $('.btn-analyze, #inPageAnalyze, #btn-analyze-all, #btn-recap').prop('disabled', false).each(function () {
+        var orig = $(this).data('orig');
+        if (orig) $(this).text(orig);
+    });
+    if ($('#btn-analyze-all').length) $('#btn-analyze-all').text('全量分析');
+    if ($('#btn-recap').length && !$('#btn-recap').data('orig')) $('#btn-recap').text('生成整体总括');
+}
+
+function _applyRestoredCompletion(dim, result, meta) {
+    var refreshers = window._analysisPageRefreshers || {};
+    var isBatch = !dim || dim === 'all' || dim === 'plan';
+    if (!isBatch && refreshers[dim]) {
+        if (result) refreshers[dim](result);
+        else loadAnalysis(dim, function (data) { if (data) refreshers[dim](data); });
+    } else {
+        Object.keys(refreshers).forEach(function (d) {
+            var direct = meta && ((meta.results && meta.results[d]) || (meta.partialResults && meta.partialResults[d]));
+            if (direct) refreshers[d](direct);
+            else loadAnalysis(d, function (data) { if (data) refreshers[d](data); });
+        });
+    }
+    if (window.updateEvidence && dim && !isBatch) window.updateEvidence(dim);
+}
+
+function restoreLatestAnalysisJob() {
+    if (!$('#aiOutputPanel').length) return;
+    var pageId = window.ANALYSIS_PAGE_IDENTITY || null;
+    var query = (pageId && pageId.scope_id) ? { scope_id: pageId.scope_id } : {};
+    $.get('/api/analyze-jobs/latest', query, function (snap) {
+        if (!snap || !snap.found) return;
+        if (window.__activePollJobId && window.__activePollJobId !== snap.job_id) return;
+        if (pageId && ((snap.chat_hash && pageId.chat_hash && snap.chat_hash !== pageId.chat_hash)
+            || ((snap.scope_id || '') !== (pageId.scope_id || '')))) {
+            return;
+        }
+        AiOutputFeed.restoreSnapshot(snap);
+        if (snap.status !== 'running' || window.__activePollJobId === snap.job_id) return;
+
+        var statusEl = $('#analyzeStatus').length
+            ? $('#analyzeStatus')
+            : ($('#inPageStatus').length ? $('#inPageStatus') : $('#recapStatus'));
+        var isInline = Boolean(!$('#analyzeStatus').length && ($('#inPageStatus').length || $('#recapStatus').length));
+        $('.btn-analyze, #btn-analyze-all, #inPageAnalyze, #btn-recap').prop('disabled', true);
+
+        var singleDim = (snap.dim && snap.dim !== 'all' && snap.dim !== 'plan') ? snap.dim : null;
+        var updateProgress = null;
+        var opts = {
+            _isRestore: true,
+            afterSeq: snap.stream_seq || 0,
+            dim: singleDim,
+            dimLabel: snap.dim_label || '',
+            planMode: Boolean(snap.dim === 'all' || snap.dim === 'plan'),
+            onProgress: function (done, total, detail) {
+                var txt = detail || (total > 0 ? ('已完成 ' + done + '/' + total) : '分析中…');
+                if (updateProgress) updateProgress(done, total, txt);
+            },
+            onDone: function (result, meta) {
+                _unlockRestoredButtons();
+                clearStaleStrategyWarning();
+                if (statusEl.length) {
+                    _renderStatusAlert(
+                        statusEl,
+                        (meta && meta.partial) ? 'warning' : 'success',
+                        (meta && meta.partial) ? '部分分析已完成。' : '分析已完成。',
+                        isInline
+                    );
+                }
+                _applyRestoredCompletion(snap.dim, result, meta);
+            },
+            onError: function (msg, meta) {
+                _unlockRestoredButtons();
+                var cancelled = _isAnalyzeCancelled(msg, meta);
+                var hasPartial = meta && ((meta.results && Object.keys(meta.results).length)
+                    || (meta.partialResults && Object.keys(meta.partialResults).length));
+                if (statusEl.length) {
+                    var level = cancelled ? 'secondary' : (hasPartial ? 'warning' : 'danger');
+                    _renderStatusAlert(statusEl, level, cancelled ? '分析已取消' : (msg || '分析未完成'), isInline);
+                }
+                if (hasPartial) _applyRestoredCompletion(snap.dim, meta.result, meta);
+            }
+        };
+        if (statusEl.length) {
+            updateProgress = _mountAnalyzeProgress(statusEl, opts, {
+                progId: 'aProg',
+                textId: 'aText',
+                cancelId: 'aCancel',
+                inline: isInline
+            });
+            updateProgress(snap.done || 0, snap.total || 0, snap.detail || '恢复连接，继续输出…');
+        }
+        pollAnalyzeJob(snap.job_id, opts);
+    });
+}
+window.restoreLatestAnalysisJob = restoreLatestAnalysisJob;
+
 // 私聊维度页「页内运行本维度分析」的五页共用接线（此前只能回仪表盘触发，群聊页早有页内按钮）。
 // 页面模板提供 #inPageAnalyze 按钮 / #inPageStatus 状态区 / #inPageRefresh 复选框；
 // 没有这些元素的页面调用它会直接返回，因此对仪表盘、群聊页等零影响。
 // 进度、取消、完成回调与仪表盘完全同一套（都走 startAnalyze → pollAnalyzeJob）。
 function analyzeInPage(dim, renderFn) {
+    if (renderFn) registerAnalysisRefresher(dim, renderFn);
     var btn = $('#inPageAnalyze');
     if (!btn.length) return;
     btn.on('click', function () {
-        var status = $('#inPageStatus');
         var orig = btn.data('orig') || '运行本维度分析';
-        btn.prop('disabled', true).text('分析中…');
-        setAnalysisEmptyState(dim, 'running');
-        var opts = {
+        runSingleDimension({
+            dim: dim,
+            btn: btn,
+            status: $('#inPageStatus'),
             refresh: $('#inPageRefresh').length ? $('#inPageRefresh').is(':checked') : false,
-            onProgress: function (done, total) {
-                if (done < 0) { $('#ipText').text('正在取消…'); return; }
-                if (total > 0) {
-                    var pct = Math.round(done / total * 100);
-                    $('#ipProg').css('width', pct + '%');
-                    $('#ipText').text('已完成 ' + done + '/' + total + ' 个月');
-                }
+            origLabel: orig,
+            progressIds: { progId: 'ipProg', textId: 'ipText', cancelId: 'ipCancel', inline: true },
+            compactAlert: true,
+            updateEmptyState: true,
+            formatProgress: function (done, total) {
+                return total > 0 ? ('已完成 ' + done + '/' + total + ' 个月') : '准备中…';
             },
-            onDone: function (result, meta) {
-                if (meta && meta.partial) {
-                    setAnalysisEmptyState(dim, 'empty', '本次只分析了所选单元，尚未生成完整维度结果。');
-                    status.html('<div class="alert alert-warning py-1 mb-0 small">部分分析已显示，但未保存为完整结果；可重新预览并补齐。</div>');
-                    btn.prop('disabled', false).text(orig);
-                    if (renderFn) renderFn(result);
-                    return;
-                }
-                setAnalysisEmptyState(dim, 'ready');
-                status.html('<div class="alert alert-success py-1 mb-0 small">分析完成</div>');
-                btn.prop('disabled', false).text(orig);
+            onPartialResult: function (partialResult, _meta, isFromError) {
+                setAnalysisEmptyState(dim, 'empty', isFromError
+                    ? '本次分析未完整完成，当前显示已完成部分。'
+                    : '本次只分析了所选单元，尚未生成完整维度结果。');
+                if (renderFn) renderFn(partialResult);
+                return isFromError
+                    ? '分析未完整完成；已显示可用的部分结果，未保存为完整维度结果。'
+                    : '部分分析已显示，但未保存为完整结果；可重新预览并补齐。';
+            },
+            onFullDone: function (result) {
                 if (renderFn) renderFn(result);
-            },
-            onError: function (msg, meta) {
-                var cancelled = msg === '分析已取消';
-                var partialResult = meta && meta.partial && meta.partialResults
-                    && meta.partialResults[dim];
-                if (partialResult && typeof partialResult === 'object'
-                    && !Array.isArray(partialResult) && Object.keys(partialResult).length > 0) {
-                    setAnalysisEmptyState(dim, 'empty', '本次分析未完整完成，当前显示已完成部分。');
-                    status.html('<div class="alert alert-warning py-1 mb-0 small">分析未完整完成；已显示可用的部分结果，未保存为完整维度结果。</div>');
-                    btn.prop('disabled', false).text(orig);
-                    if (renderFn) renderFn(partialResult);
-                    return;
-                }
-                setAnalysisEmptyState(dim, cancelled ? 'empty' : 'error', cancelled ? null : msg);
-                status.html('<div class="alert alert-' + (cancelled ? 'secondary' : 'danger')
-                    + ' py-1 mb-0 small">' + esc(msg) + '</div>');
-                btn.prop('disabled', false).text(orig);
+                return '分析完成';
             }
-        };
-        status.html(
-            '<div class="d-flex align-items-center gap-2 flex-wrap">' +
-            '<div class="spinner-border spinner-border-sm text-primary" role="status"></div>' +
-            '<div class="progress" style="min-width:160px;height:8px;">' +
-            '<div id="ipProg" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div></div>' +
-            '<span id="ipText" class="small text-muted">准备中…</span>' +
-            '<button id="ipCancel" class="btn btn-sm btn-outline-secondary">取消</button></div>'
-        );
-        $('#ipCancel').on('click', function () { $(this).prop('disabled', true).text('取消中…'); cancelAnalyze(opts); });
-        startAnalyze(dim, opts);
+        });
     });
 }
+
+$(function () {
+    AiOutputFeed.initDomEvents();
+    restoreLatestAnalysisJob();
+});

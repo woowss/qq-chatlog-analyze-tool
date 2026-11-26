@@ -52,6 +52,7 @@ from config import (
     SESSION_FILE_DIR,
     STATS_CACHE_DIR,
     UPLOAD_FOLDER,
+    env_number,
 )
 from analyzer.deepseek_client import (
     CALL_MIN_INTERVAL,
@@ -120,6 +121,8 @@ def create_app() -> Flask:
     app.config["SESSION_TYPE"] = "cachelib"
     app.config["SESSION_CACHELIB"] = FileSystemCache(SESSION_FILE_DIR, threshold=500, mode=0o600)
     app.config["SESSION_PERMANENT"] = False
+    # 非永久会话不随每次 GET 回写存储，避免并发只读请求用旧副本覆盖 POST /upload 或作用域修改
+    app.config["SESSION_REFRESH_EACH_REQUEST"] = False
     app.config["SESSION_COOKIE_HTTPONLY"] = True  # 禁止 JS 读取会话 cookie
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"  # 跨站请求不携带 cookie（CSRF 纵深防御）
     # Secure：非回环绑定默认开启（HTTPS 才回传会话 cookie）。详见 _secure_cookie_enabled
@@ -257,7 +260,7 @@ def _startup_report() -> bool:
 
 #: 收到中断信号后，留给"正在跑的那一个月"的收尾时间（秒）。
 #: 设 0 即恢复"按下就退出"的行为。
-SHUTDOWN_GRACE_SECONDS = float(os.getenv("QQCHAT_SHUTDOWN_GRACE_SECONDS") or 5)
+SHUTDOWN_GRACE_SECONDS = env_number("QQCHAT_SHUTDOWN_GRACE_SECONDS", 5.0, 0.0, 300.0)
 
 
 def _on_shutdown_signal(signum, _frame) -> None:

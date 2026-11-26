@@ -37,6 +37,7 @@ CDN 编号并不一致（导出里 id=0 叫「惊讶」而 e100 是「微笑」�
 
 import hashlib
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -393,19 +394,39 @@ def collect(chat, limit: int = 400) -> dict:
 
 
 _COLLECT_MEMO: dict = {}
+_COLLECT_LOCK = threading.Lock()
+
+
+def purge_collect_memo(chat_hash: str) -> int:
+    """清理指定聊天的表情索引内存缓存，防止 /upload 删除或替换后继续复用旧条目。"""
+    if not chat_hash:
+        return 0
+    removed = 0
+    with _COLLECT_LOCK:
+        for key in [k for k in _COLLECT_MEMO if (k[0] if isinstance(k, tuple) else k) == chat_hash]:
+            _COLLECT_MEMO.pop(key, None)
+            removed += 1
+    return removed
 
 
 def collect_cached(chat, chat_hash: str, limit: int = 400) -> dict:
     """collect 的进程内缓存版：习惯页与报告页都会用到，不必每页重扫 数万条消息"""
     if not chat_hash:
         return collect(chat, limit=limit)
-    hit = _COLLECT_MEMO.get(chat_hash)
-    if hit is None:
-        hit = collect(chat, limit=limit)
+    key = (chat_hash, int(limit))
+    with _COLLECT_LOCK:
+        hit = _COLLECT_MEMO.get(key)
+    if hit is not None:
+        return hit
+    computed = collect(chat, limit=limit)
+    with _COLLECT_LOCK:
+        hit = _COLLECT_MEMO.get(key)
+        if hit is not None:
+            return hit
         if len(_COLLECT_MEMO) > 32:
             _COLLECT_MEMO.clear()
-        _COLLECT_MEMO[chat_hash] = hit
-    return hit
+        _COLLECT_MEMO[key] = computed
+        return computed
 
 
 def url_map(faces: dict) -> dict:
