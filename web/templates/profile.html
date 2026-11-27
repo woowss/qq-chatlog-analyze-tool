@@ -129,7 +129,7 @@ function renderProfile(data) {
         // 情绪模式
         html += '<h5 class="border-bottom pb-2 mt-3">情绪模式</h5>' +
             '<div class="row"><div class="col-4"><small class="text-muted">频率</small><br>' +
-            '<span class="badge bg-' + (ep.frequency === 'high' ? 'danger' : ep.frequency === 'medium' ? 'warning' : 'success') + '">' + j(ep.frequency) + '</span></div>' +
+            '<span class="badge bg-' + (ep.frequency === 'high' ? 'danger' : ep.frequency === 'medium' ? 'warning' : ep.frequency === 'low' ? 'success' : 'secondary') + '">' + j(ep.frequency) + '</span></div>' +
             '<div class="col-4"><small class="text-muted">恢复速度</small><br><strong>' + j(ep.recovery_speed) + '</strong></div>' +
             '<div class="col-4"><small class="text-muted">常见状态</small><br>' + j(ep.typical_state) + '</div></div>' +
             '<p class="mt-2"><small class="text-muted">压力反应：</small>' + j(ep.stress_response) + '</p>' +

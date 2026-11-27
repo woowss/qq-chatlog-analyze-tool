@@ -72,7 +72,10 @@ class ResultValidationError(ValueError):
 _CONFIDENCE = ("high", "medium", "low")
 _EMOTIONS = ("快乐", "平静", "焦虑", "沮丧", "愤怒", "兴奋", "疲惫", "无奈", "调侃", "紧张", "数据不足")
 _OVERALL_TONES = ("轻松愉快", "严肃认真", "平淡日常", "紧张焦虑", "温馨亲密", "数据不足")
-_SUPPORT = ("high", "medium", "low")
+_SUPPORT = ("high", "medium", "low", "数据不足")
+_LEVEL_OR_UNKNOWN = ("high", "medium", "low", "数据不足")
+_RECOVERY_SPEEDS = ("fast", "medium", "slow", "数据不足")
+_LANGUAGE_RICHNESS = ("rich", "medium", "simple", "数据不足")
 _MAX_TEXT = 20_000
 _MAX_SHORT_TEXT = 2_000
 _MAX_LIST = 64
@@ -343,7 +346,7 @@ def _validate_profile(result: dict, dimension: str, *, group: bool = False) -> N
         )
 
     emotional = _object(_required(result, "emotional_pattern", dimension), dimension, "emotional_pattern")
-    _required_enum(emotional, "frequency", dimension, _CONFIDENCE)
+    _required_enum(emotional, "frequency", dimension, _LEVEL_OR_UNKNOWN)
     for key in ("typical_state", "stress_response", "support_style"):
         _string(
             _required(emotional, key, dimension, f"emotional_pattern.{key}"),
@@ -358,7 +361,7 @@ def _validate_profile(result: dict, dimension: str, *, group: bool = False) -> N
         lambda value, path: _text_item(value, dimension, path),
         max_items=32,
     )
-    _required_enum(emotional, "recovery_speed", dimension, ("fast", "medium", "slow"))
+    _required_enum(emotional, "recovery_speed", dimension, _RECOVERY_SPEEDS)
 
     intelligence = _object(
         _required(result, "intelligence_indicators", dimension), dimension, "intelligence_indicators"
@@ -370,8 +373,8 @@ def _validate_profile(result: dict, dimension: str, *, group: bool = False) -> N
             f"intelligence_indicators.{key}",
             limit=_MAX_SHORT_TEXT,
         )
-    _required_enum(intelligence, "language_richness", dimension, ("rich", "medium", "simple"))
-    _required_enum(intelligence, "logic_consistency", dimension, _CONFIDENCE)
+    _required_enum(intelligence, "language_richness", dimension, _LANGUAGE_RICHNESS)
+    _required_enum(intelligence, "logic_consistency", dimension, _LEVEL_OR_UNKNOWN)
 
     dynamics = _object(
         _required(result, "relationship_dynamics", dimension), dimension, "relationship_dynamics"
@@ -383,7 +386,7 @@ def _validate_profile(result: dict, dimension: str, *, group: bool = False) -> N
             f"relationship_dynamics.{key}",
             limit=_MAX_SHORT_TEXT,
         )
-    _required_enum(dynamics, "vulnerability_level", dimension, _CONFIDENCE)
+    _required_enum(dynamics, "vulnerability_level", dimension, _LEVEL_OR_UNKNOWN)
     _list(
         _required(dynamics, "what_they_seek", dimension, "relationship_dynamics.what_they_seek"),
         dimension,
@@ -605,3 +608,217 @@ def dimension_is_monthly(dimension: str) -> bool:
 def supports_dimension(dimension: str) -> bool:
     """Whether a model-result schema is defined for ``dimension``."""
     return dimension in _VALIDATORS
+
+
+_PROMPT_LABEL_PREFIXES = ("词汇丰富度", "逻辑一致性", "自我暴露程度", "情绪恢复速度", "频率")
+_COMMENTARY_SEPS = ("—", "--", " - ", "（", "(", "，", ",", ":", "：")
+
+_INSUFFICIENT_ALIASES = {
+    "数据不足": "数据不足",
+    "不足": "数据不足",
+    "未知": "数据不足",
+    "无法判断": "数据不足",
+    "难以判断": "数据不足",
+    "暂无法判断": "数据不足",
+    "无法确定": "数据不足",
+    "不适用": "数据不足",
+    "无": "数据不足",
+    "无明显": "数据不足",
+    "none": "数据不足",
+    "n/a": "数据不足",
+    "na": "数据不足",
+    "insufficient": "数据不足",
+}
+_HML_ALIASES = {
+    "high": "high",
+    "高": "high",
+    "较高": "high",
+    "强": "high",
+    "medium": "medium",
+    "mid": "medium",
+    "moderate": "medium",
+    "中": "medium",
+    "中等": "medium",
+    "适中": "medium",
+    "一般": "medium",
+    "low": "low",
+    "低": "low",
+    "较低": "low",
+    "偏低": "low",
+    "极低": "low",
+    "极少": "low",
+    "少": "low",
+    "弱": "low",
+}
+_SPEED_ALIASES = {
+    "fast": "fast",
+    "quick": "fast",
+    "快": "fast",
+    "很快": "fast",
+    "较快": "fast",
+    "迅速": "fast",
+    "medium": "medium",
+    "moderate": "medium",
+    "normal": "medium",
+    "中": "medium",
+    "中等": "medium",
+    "适中": "medium",
+    "一般": "medium",
+    "slow": "slow",
+    "慢": "slow",
+    "较慢": "slow",
+    "缓慢": "slow",
+}
+_RICHNESS_ALIASES = {
+    "rich": "rich",
+    "high": "rich",
+    "丰富": "rich",
+    "较丰富": "rich",
+    "多样": "rich",
+    "高": "rich",
+    "medium": "medium",
+    "moderate": "medium",
+    "normal": "medium",
+    "中": "medium",
+    "中等": "medium",
+    "适中": "medium",
+    "一般": "medium",
+    "simple": "simple",
+    "low": "simple",
+    "简单": "simple",
+    "较简单": "simple",
+    "简练": "simple",
+    "单一": "simple",
+    "朴素": "simple",
+    "低": "simple",
+}
+
+_ROLES = ("倾诉者", "倾听者", "建议者", "吐槽伙伴", "并肩作战", "数据不足")
+_GROUP_EMOTIONS = ("热闹", "轻松", "温馨", "平淡", "焦虑", "低落", "紧绷", "亢奋", "数据不足")
+
+_ENUM_SPECS: dict[str, tuple[tuple[str | None, str, tuple[str, ...], dict[str, str]], ...]] = {
+    "emotion": (
+        (None, "self_emotion", _EMOTIONS, _INSUFFICIENT_ALIASES),
+        (None, "other_emotion", _EMOTIONS, _INSUFFICIENT_ALIASES),
+        (None, "overall_tone", _OVERALL_TONES, _INSUFFICIENT_ALIASES),
+        (None, "confidence", _CONFIDENCE, _HML_ALIASES),
+    ),
+    "topics": ((None, "confidence", _CONFIDENCE, _HML_ALIASES),),
+    "group_topics": ((None, "confidence", _CONFIDENCE, _HML_ALIASES),),
+    "relationship": (
+        (None, "interaction_style", ("轻松调侃", "深度交流", "互助协作", "日常问候", "混合"), {}),
+        (None, "closeness_trend", ("上升", "下降", "稳定"), {}),
+        (None, "self_role", _ROLES, _INSUFFICIENT_ALIASES),
+        (None, "other_role", _ROLES, _INSUFFICIENT_ALIASES),
+        (
+            None,
+            "emotional_support_self_to_other",
+            _SUPPORT,
+            {**_HML_ALIASES, **_INSUFFICIENT_ALIASES},
+        ),
+        (
+            None,
+            "emotional_support_other_to_self",
+            _SUPPORT,
+            {**_HML_ALIASES, **_INSUFFICIENT_ALIASES},
+        ),
+        (None, "confidence", _CONFIDENCE, _HML_ALIASES),
+    ),
+    "habits": (
+        (None, "emoji_style", ("丰富", "适中", "极少"), {}),
+        (None, "sentence_length", ("短句为主", "长短混合", "长句较多"), {}),
+        (None, "reply_speed", ("秒回型", "适中", "深思熟虑型"), {}),
+        (None, "topic_jumping", ("经常跳跃", "偶尔", "专注一个话题"), {}),
+        (None, "confidence", _CONFIDENCE, _HML_ALIASES),
+    ),
+    "group_dynamics": (
+        (None, "pace", ("日常续命型", "事件驱动型", "深夜爆发型", "常年静默型"), {}),
+        (None, "confidence", _CONFIDENCE, _HML_ALIASES),
+    ),
+    "group_emotion": (
+        (None, "group_emotion", _GROUP_EMOTIONS, _INSUFFICIENT_ALIASES),
+        (None, "confidence", _CONFIDENCE, _HML_ALIASES),
+    ),
+    "ask": ((None, "confidence", _CONFIDENCE, _HML_ALIASES),),
+}
+_PROFILE_ENUM_SPECS: tuple[tuple[str | None, str, tuple[str, ...], dict[str, str]], ...] = (
+    ("emotional_pattern", "frequency", _LEVEL_OR_UNKNOWN, {**_HML_ALIASES, **_INSUFFICIENT_ALIASES}),
+    ("emotional_pattern", "recovery_speed", _RECOVERY_SPEEDS, {**_SPEED_ALIASES, **_INSUFFICIENT_ALIASES}),
+    (
+        "intelligence_indicators",
+        "language_richness",
+        _LANGUAGE_RICHNESS,
+        {**_RICHNESS_ALIASES, **_INSUFFICIENT_ALIASES},
+    ),
+    (
+        "intelligence_indicators",
+        "logic_consistency",
+        _LEVEL_OR_UNKNOWN,
+        {**_HML_ALIASES, **_INSUFFICIENT_ALIASES},
+    ),
+    (
+        "relationship_dynamics",
+        "vulnerability_level",
+        _LEVEL_OR_UNKNOWN,
+        {**_HML_ALIASES, **_INSUFFICIENT_ALIASES},
+    ),
+    (None, "confidence", _CONFIDENCE, _HML_ALIASES),
+)
+_ENUM_SPECS["profile"] = _PROFILE_ENUM_SPECS
+_ENUM_SPECS["member_profiles"] = _PROFILE_ENUM_SPECS
+
+
+def _match_enum_token(text: str, choices: tuple[str, ...], aliases: dict[str, str]) -> str | None:
+    candidate = text.strip()
+    if not candidate:
+        return None
+    if candidate in choices:
+        return candidate
+    lower_choices = {choice.lower(): choice for choice in choices}
+    low = candidate.lower()
+    if low in lower_choices:
+        return lower_choices[low]
+    mapped = aliases.get(low)
+    if mapped and mapped in choices:
+        return mapped
+    return None
+
+
+def _canonicalize_enum_value(value: Any, choices: tuple[str, ...], aliases: dict[str, str]) -> Any:
+    if not isinstance(value, str):
+        return value
+    matched = _match_enum_token(value, choices, aliases)
+    if matched is not None:
+        return matched
+
+    stripped = value.strip()
+    for sep in (":", "："):
+        if sep in stripped:
+            head, tail = stripped.split(sep, 1)
+            if head.strip() in _PROMPT_LABEL_PREFIXES:
+                stripped = tail.strip()
+                matched = _match_enum_token(stripped, choices, aliases)
+                if matched is not None:
+                    return matched
+
+    for sep in _COMMENTARY_SEPS:
+        if sep in stripped:
+            head = stripped.split(sep, 1)[0]
+            matched = _match_enum_token(head, choices, aliases)
+            if matched is not None:
+                return matched
+    return value
+
+
+def normalize_result_enums(dimension: str, result: Any) -> None:
+    """Canonicalize minor LLM formatting/synonym drift on fresh results before validation.
+
+    Does not touch non-string values or unrecognized strings so genuinely invalid
+    model outputs continue to fail ``validate_result`` safely.
+    """
+    if not isinstance(result, dict) or isinstance(result, CachedModelResult):
+        return
+    for section, key, choices, aliases in _ENUM_SPECS.get(dimension, ()):
+        target = result if section is None else result.get(section)
+        if isinstance(target, dict) and key in target:
+            target[key] = _canonicalize_enum_value(target[key], choices, aliases)

@@ -26,6 +26,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -949,6 +950,8 @@ class TestFrontendEscaping(unittest.TestCase):
 
         assets = (self.WEB_ROOT / "templates" / "_report_assets.html").read_text(encoding="utf-8")
         self.assertIn("function esc(s)", assets, "离线导出报告必须保留自包含 esc()")
+        self.assertIn("utils.js", assets)
+        self.assertIn("离线", assets)
 
 
 def _r4_msg(uid: str, ts: int, text: str = "在吗", has_image: bool = False, **kw) -> Message:
@@ -1080,12 +1083,54 @@ class TestInsecureBaseUrlDetection(unittest.TestCase):
     """明文 http 的非本机端点会让 Key 与聊天内容裸奔，启动时就该提醒"""
 
     def test_detection(self):
-        with mock.patch.object(dc, "DEEPSEEK_BASE_URL", "http://api.example.com/v1"):
-            self.assertTrue(dc.is_insecure_base_url())
-        with mock.patch.object(dc, "DEEPSEEK_BASE_URL", "http://127.0.0.1:11434/v1"):
-            self.assertFalse(dc.is_insecure_base_url(), "本机明文端点不算裸奔")
-        with mock.patch.object(dc, "DEEPSEEK_BASE_URL", "https://api.example.com/v1"):
-            self.assertFalse(dc.is_insecure_base_url())
+        from analyzer import llm_runtime
+
+        for url in ("http://api.example.com/v1", "http://api.example.com:8080/v1", "http://[bad/v1"):
+            with mock.patch.object(dc, "DEEPSEEK_BASE_URL", url):
+                self.assertTrue(dc.is_insecure_base_url(), f"应判定为不安全端点: {url}")
+        for url in (
+            "http://127.0.0.1:11434/v1",
+            "http://localhost:8000/v1",
+            "http://[::1]/v1",
+            "http://[::1]:8000/v1",
+            "https://api.example.com/v1",
+        ):
+            with mock.patch.object(dc, "DEEPSEEK_BASE_URL", url):
+                self.assertFalse(dc.is_insecure_base_url(), f"不应误报本机/HTTPS端点: {url}")
+
+        with mock.patch.object(llm_runtime, "_prompt_fingerprint_provider", None):
+            with self.assertRaises(RuntimeError):
+                llm_runtime.default_prompt_fingerprint()
+
+    def test_default_prompt_fingerprint_lazy_registration_without_preimporting_deepseek_client(self):
+        root = Path(__file__).resolve().parent.parent
+        checks = (
+            (
+                "from analyzer import llm_runtime, month_cache as mc; "
+                "v1 = mc._month_key('sys', 'usr'); "
+                "fp1 = llm_runtime.default_prompt_fingerprint(); "
+                "from analyzer import deepseek_client as dc; "
+                "v2 = mc._month_key('sys', 'usr'); "
+                "assert fp1 == dc.PROMPT_FINGERPRINT and v1 == v2"
+            ),
+            (
+                "from analyzer import llm_runtime, vision as vs; "
+                "v1 = vs._images_key([]); "
+                "fp1 = llm_runtime.default_prompt_fingerprint(); "
+                "from analyzer import deepseek_client as dc; "
+                "v2 = vs._images_key([]); "
+                "assert fp1 == dc.PROMPT_FINGERPRINT and v1 == v2"
+            ),
+        )
+        for code in checks:
+            proc = subprocess.run(
+                [sys.executable, "-c", code],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
 
 class TestChatCachePurge(unittest.TestCase):

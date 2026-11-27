@@ -680,6 +680,32 @@ class TestAskAndDuplicateNotice(unittest.TestCase):
         for n in ask_files:
             os.remove(os.path.join(store.AI_CACHE_DIR, n))
 
+    def test_ask_normalizes_confidence_variants_end_to_end(self):
+        """/api/ask 与 answer_question 都要先归一化枚举再校验，不因大小写或中文置信度误报 502。"""
+        guard = api_configured_patcher()
+        guard.start()
+        try:
+            with mock.patch(
+                "analyzer.deepseek_client._call_api",
+                return_value={"answer": "原定周六出发。", "confidence": "高", "evidence": ["周五晚"]},
+            ):
+                r1 = self._ask("什么时候出发", refresh="1")
+            self.assertEqual(r1.status_code, 200, r1.get_data(as_text=True)[:200])
+            self.assertEqual(r1.get_json()["result"]["confidence"], "high")
+
+            with mock.patch(
+                "analyzer.recap_client.answer_question",
+                return_value={"answer": "大致在三月。", "confidence": "中等", "evidence": []},
+            ):
+                r2 = self._ask("大概是哪个月", refresh="1")
+            self.assertEqual(r2.status_code, 200, r2.get_data(as_text=True)[:200])
+            self.assertEqual(r2.get_json()["result"]["confidence"], "medium")
+        finally:
+            guard.stop()
+            for n in os.listdir(store.AI_CACHE_DIR):
+                if n.startswith("ask_" + self.chat_hash + "_"):
+                    os.remove(os.path.join(store.AI_CACHE_DIR, n))
+
 
 class TestJobHistory(unittest.TestCase):
     """7-D 任务历史：白名单字段、新→旧、读取端点与 /api/ 前缀守卫。"""

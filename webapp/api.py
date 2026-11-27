@@ -28,7 +28,7 @@ from flask import jsonify, request, send_file, session
 
 from analyzer.llm_runtime import QuotaExhaustedError, is_api_configured, test_connection
 from analyzer.logger import get_logger
-from analyzer.result_schema import ResultValidationError, validate_result
+from analyzer.result_schema import ResultValidationError, normalize_result_enums, validate_result
 from analyzer.usage import get_usage
 from config import UPLOAD_FOLDER
 from webapp import job_stream
@@ -1407,6 +1407,7 @@ def api_ask():
                 }
             ), 502
         try:
+            normalize_result_enums("ask", result)
             validate_result("ask", result)
         except ResultValidationError as e:
             logger.warning("提问结果结构无效（字段 %s）", e.path)

@@ -54,7 +54,7 @@ from analyzer.llm_runtime import (
     QuotaExhaustedError,
 )
 from analyzer.month_cache import _month_key
-from analyzer.result_schema import ResultValidationError, validate_result
+from analyzer.result_schema import ResultValidationError, normalize_result_enums, validate_result
 from analyzer.group_stats import (
     calc_member_activity,
     calc_member_interaction_summary,
@@ -746,6 +746,7 @@ def _analyze_member(
                 call_api = _call_api if _call_api is not _ORIG_CALL_API else llm_runtime._call_api
                 result = call_api(system_prompt, prompt, max_tokens=max_tokens, tag=tag, dim=tag)
                 if result:
+                    normalize_result_enums(tag, result)
                     try:
                         validate_result(tag, result)
                     except ResultValidationError as e:

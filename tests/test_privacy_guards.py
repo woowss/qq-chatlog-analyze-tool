@@ -598,6 +598,12 @@ class TestSecretsAreScrubbedFromOutwardFacingText(unittest.TestCase):
         self.assertNotIn(token, out)
         self.assertIn("<redacted>", out)
 
+    def test_opencode_key_shaped_strings_are_redacted(self):
+        token = "oc_sk_fake012345_abcdefghijklmnop"
+        out = dc.scrub_secrets(f"401 unauthorized: {token}")
+        self.assertNotIn(token, out)
+        self.assertIn("<redacted>", out)
+
     def test_keyed_value_keeps_the_label(self):
         out = dc.scrub_secrets("apikey=abcdef1234567890 rejected")
         self.assertNotIn("abcdef1234567890", out)

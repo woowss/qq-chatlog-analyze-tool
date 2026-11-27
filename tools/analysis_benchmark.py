@@ -274,7 +274,19 @@ def _write_json_atomic(path: Path, value: dict) -> None:
 def _create_benchmark_client(api_key: str, base_url: str):
     from openai import OpenAI
 
-    return OpenAI(api_key=api_key, base_url=base_url, timeout=60, max_retries=0)
+    from analyzer.llm_runtime import _client_default_headers, _normalize_base_url
+
+    normalized_url = _normalize_base_url(base_url)
+    kwargs: dict[str, Any] = {
+        "api_key": api_key,
+        "base_url": normalized_url,
+        "timeout": 60,
+        "max_retries": 0,
+    }
+    headers = _client_default_headers(normalized_url)
+    if headers:
+        kwargs["default_headers"] = headers
+    return OpenAI(**kwargs)
 
 
 def _review_metrics(records: list[dict], scenarios: dict[str, dict]) -> dict[str, Any]:

@@ -903,6 +903,127 @@ class TestQuotaAndThrottle(unittest.TestCase):
         # 致命错误后剩余月份被中止：调用数不超过月份总数（无重试放大）
         self.assertLessEqual(fake.chat.completions.create.call_count, len(months))
 
+    def test_opencode_entitlement_error_fails_fast(self):
+        """OpenCode Go 订阅缺失（403 EntitlementError）属于不可重试的致命错误"""
+        fake = mock.Mock()
+        fake.chat.completions.create.side_effect = self._err(
+            403, "EntitlementError: OpenCode Go subscription required."
+        )
+        with mock.patch.object(self.dc, "_get_client", return_value=fake):
+            with self.assertRaises(self.dc.QuotaExhaustedError):
+                self.dc._call_api("s", "u", retry=2, tpm_wait=0.01)
+        self.assertEqual(fake.chat.completions.create.call_count, 1)
+
+
+class TestOpenCodeIntegration(unittest.TestCase):
+    """OpenCode Inference / Go 网关的 URL 规整、会话头与探测行为"""
+
+    def test_opencode_url_detection_and_normalization(self):
+        from analyzer import llm_runtime as lr
+
+        cases = [
+            ("https://opencode.ai/inference", "https://opencode.ai/inference/openai/v1"),
+            ("https://opencode.ai/inference/", "https://opencode.ai/inference/openai/v1"),
+            ("https://opencode.ai/inference/openai", "https://opencode.ai/inference/openai/v1"),
+            ("https://opencode.ai/inference/openai/v1", "https://opencode.ai/inference/openai/v1"),
+            (
+                "https://opencode.ai/inference/openai/v1/chat/completions",
+                "https://opencode.ai/inference/openai/v1",
+            ),
+            ("https://opencode.ai/inference/go", "https://opencode.ai/inference/go/openai/v1"),
+            ("https://opencode.ai/inference/go/", "https://opencode.ai/inference/go/openai/v1"),
+            ("https://opencode.ai/inference/go/openai", "https://opencode.ai/inference/go/openai/v1"),
+            ("https://opencode.ai/inference/go/openai/v1", "https://opencode.ai/inference/go/openai/v1"),
+            (
+                "https://opencode.ai/inference/go/openai/v1/chat/completions",
+                "https://opencode.ai/inference/go/openai/v1",
+            ),
+            (
+                "https://opencode.ai/inference/custom/conn_abc123",
+                "https://opencode.ai/inference/custom/conn_abc123",
+            ),
+            ("https://api.deepseek.com/v1", "https://api.deepseek.com/v1"),
+        ]
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(lr._normalize_base_url(raw), expected)
+        self.assertTrue(lr._is_opencode_url("https://opencode.ai/inference/go/openai/v1"))
+        self.assertFalse(lr._is_opencode_url("https://api.deepseek.com/v1"))
+
+    def test_opencode_default_headers(self):
+        from analyzer import llm_runtime as lr
+
+        self.assertIsNone(lr._client_default_headers("https://api.deepseek.com/v1"))
+        with mock.patch.dict(os.environ, {"OPENCODE_SESSION_ID": "ses_custom_123"}):
+            headers = lr._client_default_headers("https://opencode.ai/inference/go/openai/v1")
+        self.assertEqual(headers["x-opencode-session"], "ses_custom_123")
+        self.assertTrue(headers["User-Agent"].startswith("qqchatlog/"))
+
+        with mock.patch.dict(os.environ, {"OPENCODE_SESSION_ID": ""}):
+            auto_headers = lr._client_default_headers("https://opencode.ai/inference/openai/v1")
+        self.assertTrue(auto_headers["x-opencode-session"].startswith("ses_"))
+
+    def test_test_connection_thinking_param_toggle(self):
+        import analyzer.deepseek_client as dc
+
+        fake = mock.Mock()
+        with (
+            mock.patch.object(dc, "is_api_configured", return_value=True),
+            mock.patch.object(dc, "_get_client", return_value=fake),
+            mock.patch.object(dc, "_SEND_THINKING_PARAM", True),
+        ):
+            ok, _detail = dc.test_connection()
+        self.assertTrue(ok)
+        self.assertEqual(
+            fake.chat.completions.create.call_args.kwargs.get("extra_body"),
+            {"thinking": {"type": "disabled"}},
+        )
+
+        fake.reset_mock()
+        with (
+            mock.patch.object(dc, "is_api_configured", return_value=True),
+            mock.patch.object(dc, "_get_client", return_value=fake),
+            mock.patch.object(dc, "_SEND_THINKING_PARAM", False),
+        ):
+            ok, _detail = dc.test_connection()
+        self.assertTrue(ok)
+        self.assertNotIn("extra_body", fake.chat.completions.create.call_args.kwargs)
+
+    def test_benchmark_client_normalizes_opencode_url_and_headers(self):
+        from tools.analysis_benchmark import _create_benchmark_client
+
+        with mock.patch("openai.OpenAI") as openai_cls:
+            _create_benchmark_client("oc_sk_fake0123456789", "https://opencode.ai/inference/go")
+        kw = openai_cls.call_args.kwargs
+        self.assertEqual(kw["base_url"], "https://opencode.ai/inference/go/openai/v1")
+        self.assertIn("x-opencode-session", kw["default_headers"])
+        self.assertTrue(kw["default_headers"]["User-Agent"].startswith("qqchatlog/"))
+
+    def test_reasoning_effort_max_applies_only_when_thinking_enabled(self):
+        import analyzer.deepseek_client as dc
+        from analyzer import llm_runtime as lr
+
+        with mock.patch.object(lr, "REASONING_EFFORT", "max"):
+            with mock.patch.object(lr, "_SEND_THINKING_PARAM", True):
+                on_params = dc._json_request_params("s", "u", 4096, think=True)
+                off_params = dc._json_request_params("s", "u", 4096, think=False)
+            self.assertEqual(on_params.get("reasoning_effort"), "max")
+            self.assertEqual(on_params.get("extra_body"), {"thinking": {"type": "enabled"}})
+            self.assertNotIn("reasoning_effort", off_params)
+            self.assertEqual(off_params.get("extra_body"), {"thinking": {"type": "disabled"}})
+
+            with mock.patch.object(lr, "_SEND_THINKING_PARAM", False):
+                generic_params = dc._json_request_params("s", "u", 4096, think=True)
+            self.assertEqual(generic_params.get("reasoning_effort"), "max")
+            self.assertNotIn("extra_body", generic_params)
+
+        with (
+            mock.patch.object(lr, "REASONING_EFFORT", ""),
+            mock.patch.object(lr, "_SEND_THINKING_PARAM", True),
+        ):
+            default_params = dc._json_request_params("s", "u", 4096, think=True)
+        self.assertNotIn("reasoning_effort", default_params)
+
 
 class TestEmptyMonthSkipped(unittest.TestCase):
     """整月只有撤回/系统消息时，不调用 API"""
