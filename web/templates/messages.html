@@ -28,6 +28,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 </p>
 <div class="d-flex align-items-center gap-2 flex-wrap mb-3 message-scope-actions">
     <button class="btn btn-outline-primary btn-sm" id="useSelectedMessages" type="button" disabled>将所选消息设为分析范围</button>
+    <button class="btn btn-outline-secondary btn-sm" id="selectPageMessages" type="button" disabled>全选本页</button>
+    <button class="btn btn-outline-secondary btn-sm" id="clearSelectedMessages" type="button" disabled>清空已选</button>
     <span class="small text-muted" id="selectedMessageCount" aria-live="polite">已选 0 条（最多 5000 条）</span>
 </div>
 
@@ -68,24 +70,29 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 </form>
 
 <section class="card mb-3" id="keywordTimelineCard" aria-labelledby="keywordTimelineTitle">
-    <div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2">
-        <span id="keywordTimelineTitle">关键词时间线</span>
-        <div class="btn-group btn-group-sm" role="group" aria-label="时间线粒度">
-            <button class="btn btn-outline-secondary active" type="button" data-timeline-granularity="day" aria-pressed="true">按日</button>
-            <button class="btn btn-outline-secondary" type="button" data-timeline-granularity="month" aria-pressed="false">按月</button>
+    <details class="card-collapse" id="keywordTimelineDetails">
+        <summary class="card-header card-collapse-summary">
+            <span id="keywordTimelineTitle">关键词时间线 <small class="text-muted fw-normal">按日 / 按月统计命中分布</small></span>
+            <span class="card-collapse-state small text-muted fw-normal"></span>
+        </summary>
+        <div class="card-body">
+            <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
+                <p class="small text-muted mb-0">复用当前搜索、发言人及日期规则。匹配消息数按消息去重；字面出现次数按可见正文、媒体/表情占位和发言人分别计数。</p>
+                <div class="btn-group btn-group-sm" role="group" aria-label="时间线粒度">
+                    <button class="btn btn-outline-secondary active" type="button" data-timeline-granularity="day" aria-pressed="true">按日</button>
+                    <button class="btn btn-outline-secondary" type="button" data-timeline-granularity="month" aria-pressed="false">按月</button>
+                </div>
+            </div>
+            <div id="timelineSummary" class="small text-muted" aria-live="polite">输入关键词后点“关键词时间线”。</div>
+            <div id="timelineBuckets" class="mt-2"></div>
+            <nav class="d-flex justify-content-between align-items-center mt-2 d-none" id="timelinePager" aria-label="时间线分页">
+                <button class="btn btn-outline-secondary btn-sm" type="button" id="timelinePrev" disabled>较早</button>
+                <span class="small text-muted" id="timelinePageInfo"></span>
+                <button class="btn btn-outline-secondary btn-sm" type="button" id="timelineNext" disabled>较新</button>
+            </nav>
+            <div id="timelineSegments" class="mt-3"></div>
         </div>
-    </div>
-    <div class="card-body">
-        <p class="small text-muted mb-2">复用当前搜索、发言人及日期规则。匹配消息数按消息去重；字面出现次数按可见正文、媒体/表情占位和发言人分别计数。</p>
-        <div id="timelineSummary" class="small text-muted" aria-live="polite">输入关键词后点“关键词时间线”。</div>
-        <div id="timelineBuckets" class="mt-2"></div>
-        <nav class="d-flex justify-content-between align-items-center mt-2 d-none" id="timelinePager" aria-label="时间线分页">
-            <button class="btn btn-outline-secondary btn-sm" type="button" id="timelinePrev" disabled>较早</button>
-            <span class="small text-muted" id="timelinePageInfo"></span>
-            <button class="btn btn-outline-secondary btn-sm" type="button" id="timelineNext" disabled>较新</button>
-        </nav>
-        <div id="timelineSegments" class="mt-3"></div>
-    </div>
+    </details>
 </section>
 
 <div class="alert alert-warning small d-none" id="msgWarn" role="alert"></div>
@@ -128,6 +135,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     function updateSelectedMessageCount() {
         $('#selectedMessageCount').text('已选 ' + selectedScopePositions.size + ' 条（最多 5000 条）');
         $('#useSelectedMessages').prop('disabled', selectedScopePositions.size === 0 || selectedScopePositions.size > 5000);
+        $('#clearSelectedMessages').prop('disabled', selectedScopePositions.size === 0);
+        $('#selectPageMessages').prop('disabled', $('#msgList .msg-scope-check').length === 0);
     }
 
     function params(extra) {
@@ -171,6 +180,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         state.pages = res.pages || 0;
         $('#msgList').html(formatMessages(res.messages || [], highlightId)
             || '<div class="text-muted small p-2">没有符合条件的消息</div>');
+        updateSelectedMessageCount();
         $('#resultMeta').text('共 ' + state.total + ' 条');
         $('#pageInfo').text(state.pages > 1 ? ('第 ' + (res.page || state.page) + ' / ' + state.pages + ' 页') : '');
         var p = res.page || state.page;
@@ -264,6 +274,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     function loadTimeline() {
         var requestId = ++timelineRequestId;
         var q = ($('#q').val() || '').trim();
+        $('#keywordTimelineDetails').prop('open', true);
         if (!q) {
             $('#btnTimeline').prop('disabled', false).text('关键词时间线');
             $('#timelineSummary').text('先输入关键词，再生成时间线。');
@@ -354,6 +365,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         ['q', 'sender', 'month', 'from', 'to'].forEach(function(k) { $('#' + k).val(''); });
         timelineTimeWindow = null;
         timelineResult = null;
+        $('#keywordTimelineDetails').prop('open', false);
         $('#timelineSummary').text('输入关键词后点“关键词时间线”。');
         $('#timelineBuckets, #timelineSegments').empty();
         updateFilterSummary();
@@ -385,6 +397,33 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         } else {
             selectedScopePositions.delete(position);
         }
+        updateSelectedMessageCount();
+    });
+    $('#selectPageMessages').on('click', function() {
+        var hitLimit = false;
+        $('#msgList .msg-scope-check').each(function() {
+            var position = Number(this.getAttribute('data-position'));
+            if (!Number.isInteger(position) || position < 0) return;
+            if (!selectedScopePositions.has(position)) {
+                if (selectedScopePositions.size >= 5000) {
+                    hitLimit = true;
+                    return false;
+                }
+                selectedScopePositions.add(position);
+            }
+            this.checked = true;
+        });
+        $('#contextList .msg-scope-check').each(function() {
+            var position = Number(this.getAttribute('data-position'));
+            if (Number.isInteger(position) && selectedScopePositions.has(position)) this.checked = true;
+        });
+        if (hitLimit) $('#msgWarn').removeClass('d-none').text('一次最多选择 5000 条消息。');
+        updateSelectedMessageCount();
+    });
+    $('#clearSelectedMessages').on('click', function() {
+        selectedScopePositions.clear();
+        $('#msgList .msg-scope-check, #contextList .msg-scope-check').prop('checked', false);
+        if ($('#msgWarn').text() === '一次最多选择 5000 条消息。') $('#msgWarn').addClass('d-none').text('');
         updateSelectedMessageCount();
     });
     $('#useSelectedMessages').on('click', function() {

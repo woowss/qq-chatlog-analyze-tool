@@ -20,7 +20,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 注释结束标记紧贴内容、内容末尾保留换行：模板里的换行会进 HTML，多一个空行就会让
 "私聊报告渲染逐字节不变"的对照失败。
 #}<script>
-// HTML 转义（与 charts.js 中保持一致；下载的报告是自包含的，需要本地定义一份）
+// 故意内联保留，勿在前端去重时删除：常规页面使用 web/static/js/utils.js 提供的 window.esc，
+// 但本文件用于可离线打开的独立导出报告（不继承 base.html，也不加载 utils.js），必须自带 esc()。
 function esc(s) {
     return String(s == null ? '' : s)
         .replace(/&/g, '&amp;')

@@ -5,6 +5,15 @@
 
 ---
 
+## 未发布 · OpenCode Inference 接入、Prompt v2.3、纸墨暖调 UI 与校验修复
+
+- **OpenCode Inference API 与推理档位**：支持规范化 `https://opencode.ai/inference/...`（含 `/go`）网关地址、自动补全默认请求头及 `oc_sk_` 密钥脱敏；新增 `LLM_REASONING_EFFORT`（`minimal` / `low` / `medium` / `high` / `xhigh` / `max`），仅在思考模式开启时透传至请求参数并在启动自检提示（`.env.example` 同步补充示例）。
+- **Prompt v2.3 提示词优化（去 AI 味 + 猫娘总结风）**：重写私聊 `_OBSERVER_CREED`（`PROMPT_VERSION` 升至 `v2.3`）与群聊 `_GROUP_OBSERVER_CREED`，去掉强行脱口秀与法医笔录式括注引用，增加关系与群性质的语境自适应、扩充套话黑名单，并修复仅部分维度含 `counter_evidence` 字段的规则冲突；将跨月整体总括 `SYSTEM_PROMPT_RECAP` 及私聊/群聊人物画像的 `verdict`、`roast_note` 调整为克制有分寸的傲娇毒舌猫娘口吻；`SYSTEM_PROMPT_ASK` 与 `vision.py` 保持不变。
+- **缓存指纹轮换**：因提示词文本变更，默认配置下的缓存指纹同步更新（私聊 `788a64542eaa`、群聊 `755e93d8b0fa`、总括 `c198ba6fe7a5`），旧缓存条目将自然失效并在下次分析时按新版提示词重新生成。
+- **结构校验兼容与运行时修复**：`relationship` 与 `profile` / `member_profiles` 的相关枚举字段允许 `"数据不足"`，并在落盘校验前对全部分析维度及 `/api/ask`（`answer_question`）执行 `normalize_result_enums`；修复 `default_prompt_fingerprint()` 在独立脚本导入顺序下静默返回空串导致缓存键漂移的问题，以及 `is_insecure_base_url()` 误判带端口 IPv6 本机地址（如 `[::1]:8000`）的问题。
+- **前端纸墨暖调配色与交互优化**：将浅/深色主题与 ECharts / 分享副本切换到纸墨暖调配色、对齐深色主按钮与徽章对比度；折叠低频对比工具与时间线抽屉、合并高密指标摘要，并统一导航下拉、深色切换无刷新保留筛选及 `_report_assets.html` 离线 `esc()` 防误删说明。
+- **回滚方式**：回退本次合并提交即可恢复既有界面、配置与校验逻辑；提示词升级前后缓存按各自指纹隔离，旧缓存仍由既有过期清理策略回收。
+
 ## 未发布 · 分析范围、分享报告与评测
 
 - **只读分析计划与范围**：运行前按月份、人物或成员显示缓存状态、预估调用及 token 范围；预览不调用模型，也不写缓存。可按 UTC+8 日期、发言成员、画像目标或选中的消息片段限定输入；范围外消息、回复上下文和图片不会补入，过滤后的分析使用独立范围身份，全量结果仍可复用。

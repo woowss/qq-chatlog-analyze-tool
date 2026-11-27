@@ -20,38 +20,48 @@
 // HTML 转义 window.esc 由 base.html 加载的 js/utils.js 全局提供
 
 // ---------------------------------------------------------------- 主题
-// AList 同款设计语言：主色与深浅变化由 CSS 主题变量提供。
+// 纸墨暖调（Warm Editorial）设计语言：主色与深浅变化由 CSS 主题变量提供。
 // canvas 不认 var()，所以统一在这里读取一次并注入每个图表的 option。
 function themeTokens() {
     var cs = getComputedStyle(document.documentElement);
+    var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
     function v(name, fallback) {
         var x = (cs.getPropertyValue(name) || '').trim();
         return x || fallback;
     }
-    function soft(hex, alpha) {              // #1890ff -> rgba(24,144,255,alpha)
+    function soft(hex, alpha) {              // #2f5d8a -> rgba(47,93,138,alpha)
         var m = /^#?([0-9a-f]{6})$/i.exec(hex);
         if (!m) return hex;
         var n = parseInt(m[1], 16);
         return 'rgba(' + (n >> 16 & 255) + ',' + (n >> 8 & 255) + ',' + (n & 255) + ',' + alpha + ')';
     }
-    var primary = v('--primary', '#1890ff');
-    var accent2 = v('--chart-2', '#fa8c16');
+    var primary = v('--primary', isDark ? '#7db2e8' : '#2f5d8a');
+    var accent2 = v('--chart-2', isDark ? '#e89668' : '#c96a3b');
     return {
+        isDark: isDark,
         primary: primary,
         accent2: accent2,
         primarySoft: soft(primary, 0.12),
         accent2Soft: soft(accent2, 0.12),
-        heat: [v('--chart-heat-low', '#f0f5ff'), v('--chart-heat-mid', '#91d5ff'), v('--chart-heat-high', '#1890ff')],
-        // 饼图 / 词云：antd 分类色，围绕主色取邻近色相
-        palette: [primary, accent2, '#13c2c2', '#722ed1', '#52c41a', '#eb2f96'],
-        wordCloud: ['#1890ff', '#096dd9', '#40a9ff', '#13c2c2', '#5cdbd3', '#69c0ff', '#91d5ff'],
-        axis: v('--chart-axis', 'rgba(0,0,0,.45)'),
-        split: v('--chart-split', '#f0f0f0'),
-        tipBg: v('--chart-tooltip-bg', '#fff'),
-        tipBorder: v('--chart-tooltip-border', '#e8e8e8'),
-        tipText: v('--chart-tooltip-text', 'rgba(0,0,0,.85)'),
-        surface: v('--surface', '#fff'),
-        text: v('--text-secondary', 'rgba(0,0,0,.45)')
+        heat: [
+            v('--chart-heat-low', isDark ? '#222629' : '#f2f5f8'),
+            v('--chart-heat-mid', isDark ? '#3a5d80' : '#9ec0de'),
+            v('--chart-heat-high', isDark ? '#7db2e8' : '#2f5d8a')
+        ],
+        // 饼图 / 词云：纸墨暖调分类色，浅/深色分别校准明度与对比度
+        palette: isDark
+            ? [primary, accent2, '#58c48d', '#a991d4', '#e5a955', '#e0859d']
+            : [primary, accent2, '#2d7a53', '#7b5ea7', '#b46917', '#b8546d'],
+        wordCloud: isDark
+            ? ['#7db2e8', '#9bc5ee', '#e89668', '#58c48d', '#a991d4', '#e5a955', '#8cc2b8']
+            : ['#2f5d8a', '#4a76a3', '#c96a3b', '#2d7a53', '#7b5ea7', '#8c6d46', '#5c7f99'],
+        axis: v('--chart-axis', isDark ? '#a8a299' : '#65615a'),
+        split: v('--chart-split', isDark ? '#2a2724' : '#efeae2'),
+        tipBg: v('--chart-tooltip-bg', isDark ? 'rgba(32, 31, 29, .96)' : 'rgba(255, 255, 255, .96)'),
+        tipBorder: v('--chart-tooltip-border', isDark ? '#312e2a' : '#e8e2d9'),
+        tipText: v('--chart-tooltip-text', isDark ? '#ece9e4' : '#1f2328'),
+        surface: v('--surface', isDark ? '#201f1d' : '#ffffff'),
+        text: v('--text-secondary', isDark ? '#a8a299' : '#65615a')
     };
 }
 var T = themeTokens();
@@ -206,6 +216,7 @@ function renderComparisonChart(domId, overview) {
         return total ? values.map(function (v) { return Math.round(v / total * 1000) / 10; }) : [0, 0];
     }
     var countShares = shares(counts), charShares = shares(chars);
+    var barLabelColor = T.isDark ? '#102133' : '#ffffff';
     chart.setOption(applyChartTheme({
         color: [T.primary, T.accent2],
         tooltip: {
@@ -223,8 +234,8 @@ function renderComparisonChart(domId, overview) {
         xAxis: { type: 'value', max: 100, axisLabel: { formatter: '{value}%' }, splitLine: { show: false } },
         yAxis: { type: 'category', data: ['消息数量', '发言字数'] },
         series: [
-            { name: people[0], type: 'bar', stack: 'people', barMaxWidth: 28, label: { show: true, formatter: '{c}%', color: '#fff' }, data: [countShares[0], charShares[0]] },
-            { name: people[1], type: 'bar', stack: 'people', barMaxWidth: 28, label: { show: true, formatter: '{c}%', color: '#fff' }, data: [countShares[1], charShares[1]] }
+            { name: people[0], type: 'bar', stack: 'people', barMaxWidth: 28, label: { show: true, formatter: '{c}%', color: barLabelColor }, data: [countShares[0], charShares[0]] },
+            { name: people[1], type: 'bar', stack: 'people', barMaxWidth: 28, label: { show: true, formatter: '{c}%', color: barLabelColor }, data: [countShares[1], charShares[1]] }
         ]
     }));
 }

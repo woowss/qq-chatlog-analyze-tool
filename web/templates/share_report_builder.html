@@ -26,7 +26,7 @@
     <button class="btn btn-outline-secondary btn-sm" id="printShare" type="button" disabled>打印 / 导出 PDF</button>
     <a class="btn btn-link btn-sm" href="{{ url_for('report') }}">返回完整报告</a>
 </div>
-<iframe id="sharePreview" class="share-preview" title="脱敏分享报告预览" sandbox="allow-same-origin allow-modals" style="width:100%;height:min(80vh,1100px);border:1px solid var(--border);border-radius:var(--radius-sm)" srcdoc="<!doctype html><html lang='zh-CN'><meta charset='utf-8'><body>生成预览后会显示分享副本。</body></html>"></iframe>
+<iframe id="sharePreview" class="share-preview" title="脱敏分享报告预览" sandbox="allow-same-origin allow-modals" style="width:100%;height:min(80vh,1100px);border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface)" srcdoc="<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><style>html,body{margin:0;padding:1.25rem;font:14px/1.6 system-ui,-apple-system,sans-serif;background:#ffffff;color:#65615a}@media(prefers-color-scheme:dark){html,body{background:#201f1d;color:#a8a299}}</style></head><body>生成预览后会显示分享副本。</body></html>"></iframe>
 {% endblock %}
 
 {% block scripts %}
@@ -35,7 +35,33 @@
     var html = '';
     var frame = document.getElementById('sharePreview');
     var requestVersion = 0;
-    var placeholder = "<!doctype html><html lang='zh-CN'><meta charset='utf-8'><body>预览已清除；请使用当前选项重新生成。</body></html>";
+    var INITIAL_TEXT = '生成预览后会显示分享副本。';
+    var CLEARED_TEXT = '预览已清除；请使用当前选项重新生成。';
+    var currentPlaceholderText = INITIAL_TEXT;
+
+    function placeholderHtml(message) {
+        var cs = getComputedStyle(document.documentElement);
+        var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+        var bg = (cs.getPropertyValue('--surface') || '').trim() || (isDark ? '#201f1d' : '#ffffff');
+        var fg = (cs.getPropertyValue('--text-secondary') || '').trim() || (isDark ? '#a8a299' : '#65615a');
+        return "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><style>" +
+            "html,body{margin:0;padding:1.25rem;font:14px/1.6 system-ui,-apple-system,sans-serif;" +
+            "background:" + bg + ";color:" + fg + ";}</style></head><body>" +
+            esc(message) + "</body></html>";
+    }
+    function syncPlaceholder() {
+        if (!html) frame.srcdoc = placeholderHtml(currentPlaceholderText);
+    }
+    syncPlaceholder();
+    document.addEventListener('themechange', syncPlaceholder);
+    if (window.MutationObserver) {
+        new MutationObserver(function(mutations) {
+            if (mutations.some(function(m) { return m.attributeName === 'data-theme'; })) {
+                syncPlaceholder();
+            }
+        }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    }
+
     function options() {
         var out = {};
         document.querySelectorAll('.share-option').forEach(function(input) { out[input.name] = input.checked; });
@@ -44,7 +70,8 @@
     function clearPreview(message) {
         requestVersion++;
         html = '';
-        frame.srcdoc = placeholder;
+        currentPlaceholderText = CLEARED_TEXT;
+        syncPlaceholder();
         $('#downloadShare, #printShare').prop('disabled', true);
         $('#shareWarnings').empty();
         $('#buildSharePreview').prop('disabled', false).text('生成预览');
@@ -55,7 +82,8 @@
         var requestId = ++requestVersion;
         var button = $(this).prop('disabled', true).text('正在生成…');
         html = '';
-        frame.srcdoc = placeholder;
+        currentPlaceholderText = CLEARED_TEXT;
+        syncPlaceholder();
         $('#downloadShare, #printShare').prop('disabled', true);
         $('#shareWarnings').empty();
         $('#shareStatus').text('正在生成脱敏副本…');

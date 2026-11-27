@@ -58,6 +58,7 @@ from analyzer.deepseek_client import (
     CALL_MIN_INTERVAL,
     CONCURRENCY,
     MAX_TOKENS_BY_DIM,
+    REASONING_EFFORT,
     configure_month_cache,
     is_api_configured,
     is_insecure_base_url,
@@ -198,7 +199,8 @@ def _startup_report() -> bool:
         )
         thinking_dims = [d for d in MAX_TOKENS_BY_DIM if thinking_enabled(d)]
         if thinking_dims:
-            _print_safe(f"  思考模式: {', '.join(thinking_dims)}")
+            effort = f"（推理档位: {REASONING_EFFORT}）" if REASONING_EFFORT else ""
+            _print_safe(f"  思考模式{effort}: {', '.join(thinking_dims)}")
         conflicts = thinking_budget_warnings()
         if conflicts:
             _print_safe("  [WARN] 思考模式与输出预算冲突，这些维度会因截断丢弃结果：")

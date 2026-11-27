@@ -38,6 +38,7 @@ from analyzer import person_context
 from analyzer.shutdown import shutdown_requested
 from analyzer.result_schema import (
     ResultValidationError,
+    normalize_result_enums,
     supports_dimension,
     validate_cached_result,
     validate_result,
@@ -327,6 +328,7 @@ def _analyze_periods(
                     if not result:
                         _mark_failed(period)
                     elif supports_dimension(tag):
+                        normalize_result_enums(tag, result)
                         try:
                             _validate_before_month_cache(tag, result)
                         except ResultValidationError as e:
@@ -714,6 +716,7 @@ def _analyze_person(
                     dim=tag,
                 )
                 if result:
+                    normalize_result_enums(tag, result)
                     try:
                         _validate_before_month_cache(tag, result)
                     except ResultValidationError as e:
@@ -917,6 +920,10 @@ _RUNTIME_REEXPORTS = frozenset(
         "TPM_MAX_ATTEMPTS",
         "TPM_WAIT_SECONDS",
         "_OFFICIAL",
+        "_IS_OPENCODE_DEEPSEEK",
+        "_is_opencode_url",
+        "_normalize_base_url",
+        "_client_default_headers",
         "_DEFAULT_INTERVAL",
         "_DEFAULT_CONCURRENCY",
         "_DEFAULT_MAX_TOKENS",
@@ -924,6 +931,7 @@ _RUNTIME_REEXPORTS = frozenset(
         "MAX_TOKENS_BY_DIM",
         "_THINKING_ENV",
         "_THINKING_NORMALIZED",
+        "REASONING_EFFORT",
         "THINKING_DEFAULT",
         "THINKING_DIMS",
         "_SEND_THINKING_PARAM",

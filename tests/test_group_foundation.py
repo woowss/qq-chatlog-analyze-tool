@@ -370,7 +370,7 @@ class TestChatDataCompatibility(unittest.TestCase):
 
 
 #: 私聊提示词指纹的**绝对值**（默认配置下实测值，显式版本号 + 纯内容哈希）。
-PINNED_PRIVATE_FINGERPRINT = "68875dd158fd"
+PINNED_PRIVATE_FINGERPRINT = "788a64542eaa"
 
 #: 会让上面那个绝对值必然对不上的环境变量（它们都通过常量进哈希）。
 #: 本机配了其中任何一个，说明这位开发者正在用非默认预算/视觉参数跑测试——
@@ -384,7 +384,7 @@ _FINGERPRINT_ENV_KEYS = (
 )
 
 #: 群聊提示词指纹的**绝对值**（默认配置下实测值，显式版本号 + 纯内容哈希）。
-PINNED_GROUP_FINGERPRINT = "e5d7f7647b80"
+PINNED_GROUP_FINGERPRINT = "755e93d8b0fa"
 
 #: 会让群聊指纹绝对值对不上的环境变量。与私聊那份**各自独立**：私聊多一个视觉参数，
 #: 群聊多两个群聊预算（两者的常量元组本来就不同）。

@@ -5,30 +5,30 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>聊天分析分享报告</title>
     <style>
-        :root { color-scheme: light; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: #202633; background: #fff; }
+        :root { color-scheme: light; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: #1f2328; background: #faf8f5; }
         body { max-width: 1040px; margin: 0 auto; padding: 2rem 1.2rem; line-height: 1.6; }
         h1 { text-align: center; margin: .5rem 0; font-size: 1.8rem; }
-        h2 { margin-top: 2rem; padding-bottom: .35rem; border-bottom: 1px solid #d8dee8; font-size: 1.2rem; }
-        .meta, .note { color: #596273; font-size: .9rem; }
+        h2 { margin-top: 2rem; padding-bottom: .35rem; border-bottom: 1px solid #e8e2d9; font-size: 1.2rem; }
+        .meta, .note { color: #65615a; font-size: .9rem; }
         .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .7rem; }
-        .metric, .message { border: 1px solid #d8dee8; border-radius: .5rem; padding: .8rem; }
-        .metric-label { display: block; color: #596273; font-size: .84rem; }
+        .metric, .message { background: #ffffff; border: 1px solid #e8e2d9; border-radius: .5rem; padding: .8rem; }
+        .metric-label { display: block; color: #65615a; font-size: .84rem; }
         .metric-value { font-size: 1.35rem; font-weight: 650; overflow-wrap: anywhere; }
-        table { width: 100%; border-collapse: collapse; margin: .7rem 0 1rem; }
-        th, td { text-align: left; border: 1px solid #d8dee8; padding: .45rem .55rem; vertical-align: top; }
-        th { background: #f1f4f8; }
+        table { width: 100%; border-collapse: collapse; margin: .7rem 0 1rem; background: #ffffff; }
+        th, td { text-align: left; border: 1px solid #e8e2d9; padding: .45rem .55rem; vertical-align: top; }
+        th { background: #f4f1eb; }
         .bar-row { display: grid; grid-template-columns: minmax(90px, 170px) 1fr minmax(45px, auto); gap: .55rem; align-items: center; margin: .4rem 0; }
-        .bar-track { height: .65rem; background: #edf1f6; border-radius: 1rem; overflow: hidden; }
-        .bar { height: 100%; background: #5276ca; border-radius: inherit; }
-        .muted { color: #667085; }
+        .bar-track { height: .65rem; background: #efeae2; border-radius: 1rem; overflow: hidden; }
+        .bar { height: 100%; background: #2f5d8a; border-radius: inherit; }
+        .muted { color: #65615a; }
         .matrix-wrap { overflow-x: auto; }
         .matrix { min-width: max-content; font-size: .78rem; }
         .matrix th, .matrix td { min-width: 2.8rem; padding: .3rem; text-align: center; }
         .matrix .row-label { min-width: 7rem; text-align: left; }
         .messages { display: grid; gap: .55rem; }
-        .message-head { color: #596273; font-size: .82rem; margin-bottom: .25rem; }
+        .message-head { color: #65615a; font-size: .82rem; margin-bottom: .25rem; }
         .message-text { white-space: pre-wrap; overflow-wrap: anywhere; }
-        @media print { body { max-width: none; padding: 0; } h2 { break-after: avoid; } .metric, .message, tr { break-inside: avoid; } }
+        @media print { :root { background: #ffffff; } body { max-width: none; padding: 0; } h2 { break-after: avoid; } .metric, .message, tr { break-inside: avoid; } }
     </style>
 </head>
 <body>

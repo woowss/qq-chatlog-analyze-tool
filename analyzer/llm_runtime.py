@@ -21,8 +21,11 @@ import os
 import re
 import threading
 import time
+import uuid
 from functools import partial
+from importlib.metadata import PackageNotFoundError, version as _package_version
 from typing import Any, Callable, Optional
+from urllib.parse import urlparse, urlunparse
 
 from openai import OpenAI
 
@@ -30,6 +33,7 @@ from config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
     DEEPSEEK_MODEL,
+    env_choice,
     env_int,
     env_number,
     parse_bool,
@@ -41,8 +45,61 @@ from analyzer.usage import record_call
 
 logger = get_logger("deepseek")
 
+
+def _is_opencode_url(base_url: str) -> bool:
+    """判断 base_url 是否指向 OpenCode Inference 网关。"""
+    parsed = urlparse((base_url or "").strip())
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").rstrip("/").lower()
+    return host in ("opencode.ai", "www.opencode.ai") and (
+        path == "/inference" or path.startswith("/inference/")
+    )
+
+
+def _normalize_base_url(base_url: str) -> str:
+    """将 OpenCode Inference 入口地址规整为 OpenAI Chat Completions 所需的 base_url。"""
+    raw = (base_url or "").strip()
+    if not _is_opencode_url(raw):
+        return raw
+    trimmed = raw.rstrip("/")
+    if trimmed.lower().endswith("/chat/completions"):
+        trimmed = trimmed[: -len("/chat/completions")]
+    parsed = urlparse(trimmed)
+    path = parsed.path.rstrip("/")
+    lower_path = path.lower()
+    if lower_path in ("/inference", "/inference/go"):
+        path = f"{path}/openai/v1"
+    elif lower_path in ("/inference/openai", "/inference/go/openai"):
+        path = f"{path}/v1"
+    return urlunparse(parsed._replace(path=path, params="", query="", fragment=""))
+
+
+def _client_user_agent() -> str:
+    """生成用于网关识别的客户端 User-Agent。"""
+    try:
+        ver = _package_version("qqchatlog")
+    except PackageNotFoundError:
+        ver = "dev"
+    return f"qqchatlog/{ver}"
+
+
+_OPENCODE_SESSION_ID = (os.getenv("OPENCODE_SESSION_ID", "") or "").strip() or f"ses_{uuid.uuid4().hex[:24]}"
+
+
+def _client_default_headers(base_url: str) -> Optional[dict[str, str]]:
+    """为 OpenCode Inference/Go 附加必需的会话与客户端标识请求头。"""
+    if not _is_opencode_url(base_url):
+        return None
+    session_id = (os.getenv("OPENCODE_SESSION_ID", "") or "").strip() or _OPENCODE_SESSION_ID
+    return {
+        "x-opencode-session": session_id,
+        "User-Agent": _client_user_agent(),
+    }
+
+
 # 按服务商预设请求并发与节流间隔（阿里云百炼按主账号聚合 TPM，默认值更保守）
 _OFFICIAL = "api.deepseek.com" in DEEPSEEK_BASE_URL.lower()
+_IS_OPENCODE_DEEPSEEK = _is_opencode_url(DEEPSEEK_BASE_URL) and "deepseek" in DEEPSEEK_MODEL.lower()
 _DEFAULT_INTERVAL = 0.5 if _OFFICIAL else 3.0
 _DEFAULT_CONCURRENCY = 6 if _OFFICIAL else 2
 CONCURRENCY = int(env_number("LLM_CONCURRENCY", _DEFAULT_CONCURRENCY, 1, 64))
@@ -87,14 +144,20 @@ def _max_tokens(dim: str, default: int) -> int:
 
 MAX_TOKENS_BY_DIM = {dim: _max_tokens(dim, default) for dim, default in _DEFAULT_MAX_TOKENS.items()}
 
-# 思考模式开关：官方端点默认全开，非官方网关未显式设置时不透传参数；兼容 enabled/disabled 取值
+# 思考模式开关：官方端点与 OpenCode DeepSeek 默认全开，其余未显式设置时不透传；兼容 enabled/disabled
+_REASONING_EFFORT_CHOICES = ("minimal", "low", "medium", "high", "xhigh", "max")
+REASONING_EFFORT = env_choice("LLM_REASONING_EFFORT", "", _REASONING_EFFORT_CHOICES)
 _THINKING_ENV = (os.getenv("LLM_THINKING", "") or "").strip().lower()
 _THINKING_NORMALIZED = {"enabled": "true", "disabled": "false"}.get(_THINKING_ENV, _THINKING_ENV)
-THINKING_DEFAULT = parse_bool(_THINKING_NORMALIZED, _OFFICIAL)
+THINKING_DEFAULT = parse_bool(
+    _THINKING_NORMALIZED, _OFFICIAL or _IS_OPENCODE_DEEPSEEK or bool(REASONING_EFFORT)
+)
 THINKING_DIMS = frozenset(
     s.strip().lower() for s in (os.getenv("LLM_THINKING_DIMS", "") or "").split(",") if s.strip()
 )
-_SEND_THINKING_PARAM = bool(_THINKING_ENV or THINKING_DIMS) or "deepseek" in DEEPSEEK_BASE_URL.lower()
+_SEND_THINKING_PARAM = (
+    bool(_THINKING_ENV or THINKING_DIMS) or "deepseek" in DEEPSEEK_BASE_URL.lower() or _IS_OPENCODE_DEEPSEEK
+)
 
 
 def thinking_enabled(dim: str) -> bool:
@@ -112,10 +175,16 @@ def register_prompt_fingerprint_provider(provider: Callable[[], str]) -> None:
 
 
 def default_prompt_fingerprint() -> str:
-    """返回当前活跃的默认私聊提示词指纹（未注册时为空串）。"""
-    if _prompt_fingerprint_provider is not None:
-        return _prompt_fingerprint_provider()
-    return ""
+    """返回当前活跃的默认私聊提示词指纹（未注册时延迟导入拥有方，仍未注册则抛错）。"""
+    provider = _prompt_fingerprint_provider
+    if provider is None:
+        # 独立脚本/测试可能先导入 month_cache 或 vision，按需延迟触发 deepseek_client 注册
+        import analyzer.deepseek_client  # noqa: F401
+
+        provider = _prompt_fingerprint_provider
+    if provider is None:
+        raise RuntimeError("默认私聊提示词指纹提供器尚未注册")
+    return provider()
 
 
 _call_gate = threading.Lock()
@@ -230,10 +299,15 @@ def _is_plan_exhausted(e: Exception) -> bool:
     """真正的额度耗尽/账号异常（非限流，重试无意义）"""
     status = getattr(e, "status_code", None)
     s = str(e).lower()
-    if status in (401, 403) and "quota" in s:
+    if status in (401, 403) and (
+        "quota" in s
+        or "entitlementerror" in s
+        or "subscription required" in s
+        or "only available from within opencode" in s
+    ):
         return True
     if status == 402 or "insufficient balance" in s:
-        return True  # DeepSeek 官方：余额不足（402 Insufficient Balance）
+        return True  # DeepSeek 官方 / OpenCode：余额不足（402 Insufficient Balance）
     return "arrearage" in s or "free allocated quota exceeded" in s
 
 
@@ -260,8 +334,8 @@ _PLACEHOLDER_KEYS = {"", "你的DeepSeek_API_Key", "你的API_Key"}
 
 #: 长得像 API Key 的字串。刻意**窄**：宽泛的"长字串"规则会把
 #: `session_id=…`、`request-id: …` 这类有用的排障线索一起抹掉。
-#: ① 各家网关通用的 `sk-` 前缀；② 键名后面跟的长值（第 1 组是键名，保留；第 2 组是值，抹掉）。
-_KEY_SHAPED = re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}\b")
+#: ① 各家网关的 `sk-` 与 OpenCode 的 `oc_sk_` 前缀；② 键名后的长值（保留第 1 组键名，抹掉第 2 组值）。
+_KEY_SHAPED = re.compile(r"\b(?:oc_sk_|sk-)[A-Za-z0-9_\-]{8,}\b")
 _KEYED_VALUE = re.compile(
     r"(\b(?:api[_-]?key|apikey|access[_-]?token|authorization)\b\s*[:=]\s*[\"']?)([A-Za-z0-9_\-\.]{12,})",
     re.IGNORECASE,
@@ -303,12 +377,17 @@ def _get_client() -> Optional[OpenAI]:
     if _CLIENT is None:
         with _CLIENT_LOCK:
             if _CLIENT is None:
-                _CLIENT = OpenAI(
-                    api_key=DEEPSEEK_API_KEY,
-                    base_url=DEEPSEEK_BASE_URL,
-                    timeout=REQUEST_TIMEOUT,
-                    max_retries=0,  # 重试由 _call_api 自行实现（指数退避）
-                )
+                base_url = _normalize_base_url(DEEPSEEK_BASE_URL)
+                kwargs: dict[str, Any] = {
+                    "api_key": DEEPSEEK_API_KEY,
+                    "base_url": base_url,
+                    "timeout": REQUEST_TIMEOUT,
+                    "max_retries": 0,  # 重试由 _call_api 自行实现（指数退避）
+                }
+                default_headers = _client_default_headers(base_url)
+                if default_headers:
+                    kwargs["default_headers"] = default_headers
+                _CLIENT = OpenAI(**kwargs)
     return _CLIENT
 
 
@@ -360,7 +439,7 @@ def _request_with_retry(
 
 
 def _json_request_params(system_prompt: str, user_content: str, max_tokens: int, think: bool) -> dict:
-    """JSON 模式的请求参数（思考模式决定 extra_body 与是否下发 temperature）"""
+    """JSON 模式的请求参数（思考模式决定 extra_body、reasoning_effort 与是否下发 temperature）"""
     params: dict = {
         "model": DEEPSEEK_MODEL,
         "messages": [
@@ -371,7 +450,10 @@ def _json_request_params(system_prompt: str, user_content: str, max_tokens: int,
         "response_format": {"type": "json_object"},
     }
     if think:
-        params["extra_body"] = {"thinking": {"type": "enabled"}}
+        if _SEND_THINKING_PARAM or not REASONING_EFFORT:
+            params["extra_body"] = {"thinking": {"type": "enabled"}}
+        if REASONING_EFFORT:
+            params["reasoning_effort"] = REASONING_EFFORT
     else:
         # 非思考模式：temperature 生效，保持原有低随机性以保证 JSON 稳定
         params["temperature"] = 0.3
@@ -554,12 +636,15 @@ def is_api_configured() -> bool:
 
 def is_insecure_base_url() -> bool:
     """base_url 是否为"明文 http 且指向非本机"——这种配置下 Key 与聊天内容会明文过网"""
-    url = (DEEPSEEK_BASE_URL or "").strip().lower()
-    if not url.startswith("http://"):
+    url = (DEEPSEEK_BASE_URL or "").strip()
+    if not url.lower().startswith("http://"):
         return False
-    host = url[len("http://") :].split("/", 1)[0]
-    host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host  # 去掉端口
-    return host not in ("localhost", "127.0.0.1", "::1", "[::1]")
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return True
+    return host not in ("localhost", "127.0.0.1", "::1")
 
 
 # 启动即检查一次：明文 http 的非本机端点会让 API Key 与聊天内容裸奔，值得每次都提醒
@@ -584,9 +669,14 @@ def test_connection() -> tuple:
         return False, "客户端创建失败：检查 DEEPSEEK_BASE_URL 与 DEEPSEEK_API_KEY"
     t0 = time.time()
     try:
-        client.chat.completions.create(
-            model=DEEPSEEK_MODEL, messages=[{"role": "user", "content": "ping"}], max_tokens=1
-        )
+        kwargs: dict[str, Any] = {
+            "model": DEEPSEEK_MODEL,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+        }
+        if _SEND_THINKING_PARAM:
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        client.chat.completions.create(**kwargs)
     except Exception as e:  # noqa: BLE001 —— 错误文本就是产品，这里不吞、原样带回
         # 原样带回，但先洗一遍：第三方网关常把收到的 Key 原样写进错误正文，
         # 而这段文本会直接显示给用户、并进日志（见 scrub_secrets）。

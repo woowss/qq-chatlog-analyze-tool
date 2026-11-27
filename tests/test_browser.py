@@ -433,6 +433,8 @@ class TestBrowserFlows(unittest.TestCase):
 
         before = self.calls.call_count
         self.upload(payload())
+        expect(self.page.locator("#periodCompare details")).not_to_have_attribute("open", "")
+        self.page.locator("#periodCompare summary").click()
         self.page.locator("#periodAFrom").fill("2025-01-02")
         self.page.locator("#periodATo").fill("2025-01-02")
         self.page.locator("#periodBFrom").fill("2025-01-01")
@@ -443,6 +445,8 @@ class TestBrowserFlows(unittest.TestCase):
         expect(self.page.locator("#periodCompareResult")).to_contain_text("样本不足")
 
         self.upload((Path(__file__).parent / "fixtures/group_5p.json").read_bytes())
+        expect(self.page.locator("#periodCompare details")).not_to_have_attribute("open", "")
+        self.page.locator("#periodCompare summary").click()
         self.page.locator("#periodAFrom").fill("2000-01-01")
         self.page.locator("#periodATo").fill("2099-12-31")
         self.page.locator("#periodBFrom").fill("2000-01-01")
@@ -462,8 +466,10 @@ class TestBrowserFlows(unittest.TestCase):
 
         self.upload(payload())
         self.page.goto(self.base + "/messages")
+        expect(self.page.locator("#keywordTimelineDetails")).not_to_have_attribute("open", "")
         self.page.locator("#q").fill("在吗")
         self.page.locator("#btnTimeline").click()
+        expect(self.page.locator("#keywordTimelineDetails")).to_have_attribute("open", "")
         expect(self.page.locator("#timelineSummary")).to_contain_text("共命中 2 条消息")
         expect(self.page.locator("#timelineSummary")).to_contain_text("字面出现 2 次")
         expect(self.page.locator("#timelineSegments .timeline-segment")).to_have_count(1)
@@ -891,8 +897,11 @@ class TestBrowserFlows(unittest.TestCase):
         expect(self.page.locator("#analysisNav + .dropdown-menu a")).to_have_count(6)
 
         self.page.goto(self.base + "/emotion")
-        expect(self.page.locator("#analysisNav")).to_have_attribute("href", "/emotion")
-        expect(self.page.locator("#analysisNav")).not_to_have_attribute("data-bs-toggle", "dropdown")
+        emotion_nav = self.page.locator("#analysisNav")
+        expect(emotion_nav).to_have_attribute("data-bs-toggle", "dropdown")
+        self.assertIn("active", (emotion_nav.get_attribute("class") or "").split())
+        emotion_nav.click()
+        expect(self.page.locator("#analysisNav + .dropdown-menu a")).to_have_count(6)
         subnav = self.page.locator("nav.analysis-subnav")
         expect(subnav.locator("a")).to_have_count(6)
         expect(subnav.locator('a[aria-current="page"]')).to_have_attribute("href", "/emotion")
@@ -917,6 +926,45 @@ class TestBrowserFlows(unittest.TestCase):
         toggler.click()
         expect(self.page.locator("#navbarNav")).to_have_class("navbar-collapse collapse show")
         expect(self.page.locator("#themeToggle")).to_be_visible()
+        self.assertFalse(self.errors, self.errors)
+
+    def test_theme_toggle_skips_reload_on_chart_free_pages_and_message_bulk_select(self):
+        from playwright.sync_api import expect
+        from test_p1 import payload
+
+        self.upload(payload())
+        expect(self.page.locator("#summaryMetrics")).to_contain_text("对话轮次")
+        self.assertEqual(self.page.locator(".card-header", has_text="对话轮次").count(), 0)
+
+        self.page.goto(self.base + "/messages")
+        expect(self.page.locator("#msgList .msg-row")).to_have_count(100)
+        expect(self.page.locator("#selectPageMessages")).to_be_enabled()
+        expect(self.page.locator("#clearSelectedMessages")).to_be_disabled()
+        self.page.locator("#q").fill("在吗")
+        self.page.locator("#selectPageMessages").click()
+        expect(self.page.locator("#selectedMessageCount")).to_contain_text("已选 100 条")
+        expect(self.page.locator("#clearSelectedMessages")).to_be_enabled()
+
+        self.page.evaluate("window.__messagesStayAlive = true")
+        before_theme = self.page.evaluate("document.documentElement.getAttribute('data-theme')")
+        self.page.locator("#themeToggle").click()
+        after_theme = self.page.evaluate("document.documentElement.getAttribute('data-theme')")
+        self.assertNotEqual(before_theme, after_theme)
+        self.assertTrue(self.page.evaluate("window.__messagesStayAlive === true"))
+        expect(self.page.locator("#q")).to_have_value("在吗")
+        expect(self.page.locator("#selectedMessageCount")).to_contain_text("已选 100 条")
+        self.page.locator("#clearSelectedMessages").click()
+        expect(self.page.locator("#selectedMessageCount")).to_contain_text("已选 0 条")
+        expect(self.page.locator("#clearSelectedMessages")).to_be_disabled()
+
+        self.page.goto(self.base + "/report/share")
+        self.page.evaluate("window.__shareStayAlive = true")
+        frame = self.page.locator("#sharePreview")
+        before_srcdoc = frame.get_attribute("srcdoc")
+        self.page.locator("#themeToggle").click()
+        self.assertTrue(self.page.evaluate("window.__shareStayAlive === true"))
+        after_srcdoc = frame.get_attribute("srcdoc")
+        self.assertNotEqual(before_srcdoc, after_srcdoc)
         self.assertFalse(self.errors, self.errors)
 
     def test_unknown_element_warning_details_stay_collapsed_for_private_and_group(self):

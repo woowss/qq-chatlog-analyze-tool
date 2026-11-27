@@ -27,6 +27,7 @@ from analyzer.cache_policy import content_cache_policy  # noqa: E402
 from analyzer.result_schema import (  # noqa: E402
     CachedModelResult,
     ResultValidationError,
+    normalize_result_enums,
     validate_dimension_result,
     validate_result,
 )
@@ -523,6 +524,59 @@ class TestCacheValidationBoundary(unittest.TestCase):
                     chat_hash="schema-member",
                 )
         self.assertEqual([], [name for name in os.listdir(self.cache_dir) if name.startswith("month_")])
+
+    def test_insufficient_data_accepted_and_enum_variants_normalized_for_fresh_calls(self):
+        rel = for_dimension("relationship")
+        rel["emotional_support_self_to_other"] = "数据不足"
+        rel["emotional_support_other_to_self"] = "无法判断"
+        with mock.patch.object(dc, "_call_api", return_value=rel):
+            res = dc._analyze_periods(
+                {"2025-01": [self._message()]},
+                "sys",
+                lambda _period, _messages: "rel-insufficient",
+                max_tokens=1024,
+                tag="relationship",
+                chat_hash="schema-rel-enum",
+            )
+        self.assertEqual(res["2025-01"]["emotional_support_other_to_self"], "数据不足")
+
+        prof = for_dimension("profile")
+        prof["emotional_pattern"]["frequency"] = "数据不足"
+        prof["emotional_pattern"]["recovery_speed"] = "fast — 很快恢复"
+        prof["intelligence_indicators"]["language_richness"] = "词汇丰富度：中等（日常）"
+        prof["intelligence_indicators"]["logic_consistency"] = "High "
+        prof["relationship_dynamics"]["vulnerability_level"] = "无法判断"
+        with mock.patch.object(dc, "_call_api", return_value=prof):
+            person_res = dc._analyze_person(
+                "sys",
+                10,
+                [self._message()],
+                "对方",
+                "{display_name}: {dialog}",
+                1024,
+                tag="profile",
+                chat_hash="schema-prof-enum",
+            )
+        self.assertEqual(person_res["emotional_pattern"]["recovery_speed"], "fast")
+        self.assertEqual(person_res["intelligence_indicators"]["language_richness"], "medium")
+        self.assertEqual(person_res["intelligence_indicators"]["logic_consistency"], "high")
+        self.assertEqual(person_res["relationship_dynamics"]["vulnerability_level"], "数据不足")
+
+        member = for_dimension("member_profiles")
+        member["emotional_pattern"]["recovery_speed"] = "数据不足"
+        member["intelligence_indicators"]["language_richness"] = "丰富"
+        chat = load_chat(Path(__file__).parent / "fixtures/group_5p.json")
+        members = gc.select_ai_members(chat)[:1]
+        with mock.patch.object(gc, "_call_api", return_value=member):
+            member_res = gc._analyze_member(chat, members[0], "sys", "{dialog}", 1024, "member_profiles")
+        self.assertEqual(member_res["intelligence_indicators"]["language_richness"], "rich")
+
+        bad = for_dimension("group_emotion")
+        bad["group_emotion"] = "sk-secret-not-a-label"
+        normalize_result_enums("group_emotion", bad)
+        with self.assertRaises(ResultValidationError) as caught:
+            validate_result("group_emotion", bad)
+        self.assertNotIn("sk-secret-not-a-label", str(caught.exception))
 
 
 def _topics(*weights) -> dict:

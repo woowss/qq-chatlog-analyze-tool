@@ -33,6 +33,7 @@ from analyzer import recap_prompts as rp
 from analyzer.dialog import _has_content
 from analyzer.logger import get_logger
 from analyzer.recap_prompts import SYSTEM_PROMPT_ASK, SYSTEM_PROMPT_RECAP
+from analyzer.result_schema import normalize_result_enums
 from analyzer.shutdown import shutdown_requested
 
 logger = get_logger("app")
@@ -263,6 +264,7 @@ def answer_question(chat, question: str, chat_hash: str = "") -> Optional[dict]:
             llm_stream.emit_event("stage", "自定义提问已取消")
             return None
         if result:
+            normalize_result_enums(ASK_DIMENSION, result)
             llm_stream.emit_result_fallback(result)
             llm_stream.emit_event("stage", "自定义提问回答生成完成")
         return result

@@ -597,5 +597,97 @@ class TestRouteSurfaceUnchanged(unittest.TestCase):
         self.assertEqual(rules["/upload"], "upload")
 
 
+class TestWarmEditorialUiAndInteractions(unittest.TestCase):
+    """纸墨暖调配色、信息降噪与交互修复回归守卫"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = appmod.app.test_client()
+        cls.client.get("/")
+        with cls.client.session_transaction() as sess:
+            token = sess["csrf_token"]
+        headers = {"Origin": "http://localhost:5000", "X-CSRF-Token": token}
+        raw = json.dumps(
+            {
+                "chatInfo": {"name": "对方", "selfUid": "u_self", "selfName": "我"},
+                "statistics": {
+                    "senders": [{"uid": "u_self", "name": "我"}, {"uid": "u_other", "name": "对方"}],
+                    "totalMessages": 2,
+                },
+                "messages": [
+                    {
+                        "id": "m1",
+                        "timestamp": 1735732800000,
+                        "time": "2025-01-01 12:00:00",
+                        "sender": {"uid": "u_self", "name": "我"},
+                        "content": "你好",
+                    },
+                    {
+                        "id": "m2",
+                        "timestamp": 1735732860000,
+                        "time": "2025-01-01 12:01:00",
+                        "sender": {"uid": "u_other", "name": "对方"},
+                        "content": "在吗",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        res = cls.client.post("/upload", data={"file": (io.BytesIO(raw), "ui_smoke.json")}, headers=headers)
+        assert res.status_code == 302, f"上传失败: {res.status_code}"
+        with cls.client.session_transaction() as sess:
+            cls.filepath = sess.get("filepath")
+            cls.chat_hash = sess.get("chat_hash")
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.filepath and os.path.exists(cls.filepath):
+            os.remove(cls.filepath)
+        storemod._purge_chat_caches(cls.chat_hash)
+
+    def test_warm_editorial_palette_tokens_and_share_copy_colors(self):
+        css = (ROOT / "web" / "static" / "css" / "style.css").read_text(encoding="utf-8")
+        self.assertIn("--primary: #2f5d8a;", css)
+        self.assertIn("--bg: #faf8f5;", css)
+        self.assertIn("--bg: #161514;", css)
+        self.assertIn("--chart-2: #e89668;", css)
+        self.assertIn("--bs-btn-color: #102133;", css)
+        self.assertNotIn("#096dd9", css)
+        self.assertNotIn("#1890ff", css)
+
+        charts = (ROOT / "web" / "static" / "js" / "charts.js").read_text(encoding="utf-8")
+        self.assertIn("T.isDark ? '#102133' : '#ffffff'", charts)
+        self.assertNotIn("color: '#fff'", charts)
+
+        share_copy = (ROOT / "web" / "templates" / "share_report_copy.html").read_text(encoding="utf-8")
+        for color in ("#faf8f5", "#ffffff", "#1f2328", "#65615a", "#e8e2d9", "#f4f1eb", "#2f5d8a"):
+            self.assertIn(color, share_copy)
+        self.assertNotIn("#5276ca", share_copy)
+
+    def test_rendered_pages_apply_declutter_and_unified_interactions(self):
+        index_html = self.client.get("/").get_data(as_text=True)
+        self.assertIn("导出私聊或群聊 JSON", index_html)
+
+        dash = self.client.get("/dashboard").get_data(as_text=True)
+        self.assertIn("对话轮次", dash)
+        self.assertNotIn('<div class="card-header">对话轮次</div>', dash)
+        self.assertIn('id="periodCompare"', dash)
+        self.assertIn('<details class="card-collapse">', dash)
+
+        emotion = self.client.get("/emotion").get_data(as_text=True)
+        self.assertRegex(emotion, r'id="analysisNav"[^>]*data-bs-toggle="dropdown"')
+        self.assertIn('class="nav-link dropdown-toggle active"', emotion)
+        self.assertIn("typeof window.echarts !== 'undefined'", emotion)
+
+        msgs = self.client.get("/messages").get_data(as_text=True)
+        self.assertIn('id="selectPageMessages"', msgs)
+        self.assertIn('id="clearSelectedMessages"', msgs)
+        self.assertIn('<details class="card-collapse" id="keywordTimelineDetails">', msgs)
+
+        builder = self.client.get("/report/share").get_data(as_text=True)
+        self.assertIn("syncPlaceholder", builder)
+        self.assertIn("themechange", builder)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
