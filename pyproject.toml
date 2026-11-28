@@ -43,7 +43,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # 开发/CI 用：`pip install -e ".[dev]"`
-dev = ["ruff==0.17.0"]
+dev = ["ruff==0.17.6"]
 # Opt-in browser/CI checks; never a runtime dependency.
 browser-test = ["playwright==1.65.2"]
 
