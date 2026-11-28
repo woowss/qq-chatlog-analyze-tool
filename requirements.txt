@@ -18,7 +18,7 @@ python-dotenv==1.2.4
 #   其余（click/itsdangerous/Jinja2/MarkupSafe/Werkzeug）同属这些包的传递依赖，
 #   固定版本是为了让 CI 与本地装出同一套环境。
 blinker==1.9.0
-click==8.5.0
+click==8.5.1
 colorama==0.4.6
 itsdangerous==2.2.0
 Jinja2==3.1.6
